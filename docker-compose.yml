@@ -1,0 +1,50 @@
+# Stock 策略演进系统独立部署：Node 应用 + PostgreSQL 16
+# 宿主端口仅绑定 127.0.0.1，不得暴露到局域网或公网。
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: stock
+      POSTGRES_DB: stock
+      # 本机单机占位口令，真实连接串见 gitignored 的 .env.local
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stock-local}
+    ports:
+      # 契约缺省 127.0.0.1:5432；本机 5432 被占用时可设 POSTGRES_HOST_PORT 改绑其他端口
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stock -d stock"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://stock:${POSTGRES_PASSWORD:-stock-local}@postgres:5432/stock
+      SERVER_HOST: 0.0.0.0
+      PORT: 8787
+      AGENT_BACKTEST_WORKER_ENABLED: "false"
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:-8787}:8787"
+    volumes:
+      - uploads:/app/server/uploads
+      - backups:/app/datavolume
+    init: true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8787/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  uploads:
+  backups:

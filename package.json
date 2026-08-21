@@ -1,0 +1,47 @@
+{
+  "name": "stock-strategy-evolution",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "tsx server/db/migrate.ts",
+    "server": "tsx server/index.ts",
+    "market:fetch": "tsx scripts/fetch-market.ts",
+    "web:dev": "vite --config web/vite.config.ts",
+    "web:build": "vite build --config web/vite.config.ts",
+    "web:typecheck": "vue-tsc --noEmit -p web/tsconfig.json",
+    "volume:export": "tsx scripts/volume-export.ts",
+    "volume:restore": "tsx scripts/volume-restore.ts",
+    "portable:export": "tsx scripts/portable-export.ts",
+    "portable:restore": "tsx scripts/portable-restore.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@vueform/multiselect": "^2.6.11",
+    "busboy": "1.6.0",
+    "croner": "^10.0.1",
+    "diff": "^9.0.0",
+    "dotenv": "^17.2.1",
+    "echarts": "^6.1.0",
+    "markdown-it": "^15.0.0",
+    "pg": "^8.16.3",
+    "vue": "^3.5.41",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@types/busboy": "1.5.4",
+    "@types/diff": "^7.0.2",
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22.15.30",
+    "@types/pg": "^8.15.5",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "tsx": "^4.20.4",
+    "typescript": "5.8.3",
+    "vite": "7.0.4",
+    "vitest": "3.2.4",
+    "vue-tsc": "^3.3.10"
+  }
+}

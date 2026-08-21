@@ -1,0 +1,145 @@
+{
+  "version": 4,
+  "kind": "portable_fixed_assets",
+  "exported_at": "2026-08-21T05:56:50.450Z",
+  "migration_max": 40,
+  "tables": {
+    "job_prompt": 3,
+    "job_prompt_revision": 13,
+    "job_definition": 7,
+    "strategy_evolution_log": 1,
+    "strategy_document": 8,
+    "strategy_document_revision": 9,
+    "strategy_state": 1
+  },
+  "strategy_hashes": [
+    {
+      "code": "legacy_14070348b8f74b6d68e1dc23",
+      "revision_no": 1,
+      "sha256": "27753bb1894257b0d22a89533eec9eb6c896bcc08f2655e37a8508e0b6fc8757"
+    },
+    {
+      "code": "legacy_1411e6edf5316826d3d2fb5b",
+      "revision_no": 1,
+      "sha256": "331374600c1c2b42fe76e7841325495fac254f7ab30bc1fe55ee55438f781037"
+    },
+    {
+      "code": "legacy_2159abef0cecaf8686b1f82e",
+      "revision_no": 1,
+      "sha256": "9059adf10d48c20b293f0112819925d6443ea5617036efe022e039b41b359eaf"
+    },
+    {
+      "code": "legacy_34cf36c31ac51969bd6fcf01",
+      "revision_no": 1,
+      "sha256": "83dbadf126210f1cd14f83d2a1eb135b62b5a7b5acb791f781045b050585d7d9"
+    },
+    {
+      "code": "legacy_599f0569b68cde132fa0fad7",
+      "revision_no": 1,
+      "sha256": "aad2cb74f6c9e66d7b90d1a3a46660b7268a57ba83802abf3f685ef1aca65783"
+    },
+    {
+      "code": "legacy_599f0569b68cde132fa0fad7",
+      "revision_no": 2,
+      "sha256": "8eb9a42b2451d09505248cbfee64ee0e7a3ee79272d0dba51d38f2563af2abb6"
+    },
+    {
+      "code": "legacy_c8c53cb78d5c4bcc5d3c3907",
+      "revision_no": 1,
+      "sha256": "a2fa5f7929bd1fe8dc17ac86bad6c1c38b388c2064ab454dc6f2195f8c939133"
+    },
+    {
+      "code": "legacy_c9fbd09aafa811c7b40196a8",
+      "revision_no": 1,
+      "sha256": "d48cbd61ec29a74b2a885875660fa28ba6efd10879ccede99e1351605ffbc76f"
+    },
+    {
+      "code": "legacy_fa9c0a81fe644a3637aa71a9",
+      "revision_no": 1,
+      "sha256": "785c1d83f4fafcf03f27e9cc812e284eecc24be1531851bade6795a8847810f5"
+    }
+  ],
+  "prompt_hashes": [
+    {
+      "code": "daily_plan_flow",
+      "revision_no": 1,
+      "sha256": "8ba8bc1bf9e4c8e8a981d9392115ae3b5538ffc9ce312338eed64e63b87f2989"
+    },
+    {
+      "code": "daily_plan_flow",
+      "revision_no": 2,
+      "sha256": "2df3e538cbeac0c359c65288340bc3b7d950d505f07377d91bb39a5aac4efea9"
+    },
+    {
+      "code": "daily_plan_flow",
+      "revision_no": 3,
+      "sha256": "929ef47f4a26af650a6810854c1eff9b98a4bcf36e90f0193d3bba8efabc6cda"
+    },
+    {
+      "code": "daily_plan_flow",
+      "revision_no": 4,
+      "sha256": "1c8ed9aca47bfa55eaef607d9dc6cdada7d2c7aa549bd09fe1244b3c33d16c42"
+    },
+    {
+      "code": "daily_plan_flow",
+      "revision_no": 5,
+      "sha256": "b301b16eca35c9fc95cfe03397577766a8aae39376146a75026400dda6905ebf"
+    },
+    {
+      "code": "midweek_check",
+      "revision_no": 1,
+      "sha256": "1de46af451fbda722f29784f26e8924d47876807d7a1101ec6351aaf319d70c6"
+    },
+    {
+      "code": "midweek_check",
+      "revision_no": 2,
+      "sha256": "1288a3332d38f8bad1ab40ca6dc10c91826b3ebd708939d08d97083045d0c549"
+    },
+    {
+      "code": "midweek_check",
+      "revision_no": 3,
+      "sha256": "0ea512dcb7e8a881e25f7c7856676190326d36653fb4cc37b1e0b098f70a35f6"
+    },
+    {
+      "code": "midweek_check",
+      "revision_no": 4,
+      "sha256": "c153db3bb78fade8e2a188a557f497a57bd67f1f125896a4ff76e267d939c5c6"
+    },
+    {
+      "code": "weekly_review",
+      "revision_no": 1,
+      "sha256": "64f72830e15d2471fcefafd895b591d05b41080b4ffacf62270febf79afed7c5"
+    },
+    {
+      "code": "weekly_review",
+      "revision_no": 2,
+      "sha256": "a4fbd7a97e45947ecfd78923a6597d295ecee2d5507098be549d97741ba6de4e"
+    },
+    {
+      "code": "weekly_review",
+      "revision_no": 3,
+      "sha256": "d873833ded3c7f86981d1918adabdc20454607c923fd274a96093f09c9d57974"
+    },
+    {
+      "code": "weekly_review",
+      "revision_no": 4,
+      "sha256": "180229514d20609980e0d5591e4e544f7ed578acc2f692395ebbc21edb3f81f5"
+    }
+  ],
+  "forbidden": [
+    "system_setting.hithink_api_key",
+    "llm_provider.api_key",
+    "llm_*",
+    "agent_*",
+    "chat_*",
+    "portfolio_*",
+    "pool_*",
+    "market_*",
+    "analysis_*",
+    "backtest_*",
+    "content_*",
+    "job_run*"
+  ],
+  "payload_sha256": "90dcc800b1100dae51d23f6d3603b32d7c8dc4c4b0d078644850dfc160f3a55b",
+  "sha256": "377d31ef3663803efa21711c3fa46063162ccdfe74f43827d70ef9c63bf800e9"
+}

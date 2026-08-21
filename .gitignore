@@ -1,0 +1,37 @@
+# 本机配置与凭据
+.env
+.env.*
+!.env.local.example
+credentials.env
+*.pem
+*.p12
+*.pfx
+*.key
+
+# 依赖、缓存、日志与构建产物
+node_modules/
+.build/
+dist/
+coverage/
+test-results/
+playwright-report/
+artifacts/
+*.log
+*.tsbuildinfo
+.DS_Store
+.vscode/
+.idea/
+.zcode/
+.pi-subagents/
+
+# 本机业务数据、附件与私有备份
+datavolume/
+private-backups/
+server/uploads/
+server/public/app/
+*.dump
+
+# 固定资产只提交人工确认的当前 v4 包；时间戳导出默认不进入 Git
+bootstrap/*
+!bootstrap/stock_init_2026-08-21_135650.manifest.json
+!bootstrap/stock_init_2026-08-21_135650.ndjson.gz
