@@ -39,7 +39,7 @@ describe.skipIf(!prepared)("数据卷 HTTP 路由（stock_test 真实库）", ()
   let pool: pg.Pool;
   let server: TestServer;
   let outDir: string;
-  /** out_dir 相对 PROJECT_ROOT 的路径（路由要求落在 project/ 内） */
+  /** out_dir 相对 PROJECT_ROOT 的路径（路由要求落在仓库根目录内） */
   let outDirRel: string;
   const portableFiles: string[] = [];
 
@@ -57,7 +57,7 @@ describe.skipIf(!prepared)("数据卷 HTTP 路由（stock_test 真实库）", ()
     outDir = await fs.mkdtemp(path.join(os.tmpdir(), "volume-routes-"));
     outDirRel = path.relative(PROJECT_ROOT, outDir);
     if (outDirRel.startsWith("..")) {
-      // os.tmpdir 在 project/ 之外时改用 project/datavolume 下的测试子目录
+      // os.tmpdir 不在仓库根目录内时改用 datavolume 下的测试子目录
       outDir = path.join(PROJECT_ROOT, "datavolume", `test-${process.pid}`);
       outDirRel = path.relative(PROJECT_ROOT, outDir);
       await fs.mkdir(outDir, { recursive: true });

@@ -1,4 +1,4 @@
-// 数据卷导出：pg_dump -Fc → project/datavolume/stock_YYYY-MM-DD_HHmmss.dump + 同名 .manifest.json，
+// 数据卷导出：pg_dump -Fc → datavolume/stock_YYYY-MM-DD_HHmmss.dump + 同名 .manifest.json，
 // 写 volume_snapshot 行，滚动保留最近 14 份（删最旧 dump+manifest+DB 行）。
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九
 //
@@ -13,7 +13,7 @@ import { PROJECT_ROOT } from "../config.js";
 import type { Db } from "../datasource/service.js";
 import { buildManifest, type VolumeManifest } from "./manifest.js";
 
-/** 默认数据卷目录（project/datavolume/，已 gitignore） */
+/** 默认数据卷目录（datavolume/，已 gitignore） */
 export const DEFAULT_VOLUME_DIR = path.join(PROJECT_ROOT, "datavolume");
 /** 滚动保留份数（设计 §九） */
 export const KEEP_SNAPSHOTS = 14;

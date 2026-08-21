@@ -49,7 +49,7 @@ interface Ctx {
   res: http.ServerResponse;
 }
 
-/** 上传根目录（gitignored：project/server/uploads/） */
+/** 上传根目录（gitignored：server/uploads/） */
 export const UPLOADS_DIR = path.join(PROJECT_ROOT, "server", "uploads");
 const UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
 const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
@@ -356,7 +356,7 @@ export const chatRoutes = {
 
   /**
    * POST /api/chat/:sessionId/attachments（multipart，单文件，≤10MB，仅图片）
-   * 落盘 project/server/uploads/{sessionId}/{uuid}{ext} 并登记 chat_attachment。
+   * 落盘 server/uploads/{sessionId}/{uuid}{ext} 并登记 chat_attachment。
    */
   async uploadAttachment({ pool, params, req }: Ctx) {
     const session = await getSession(pool, params.sessionId!);

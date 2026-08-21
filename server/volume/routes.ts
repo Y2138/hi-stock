@@ -1,6 +1,6 @@
 // 数据卷 HTTP 路由：快照列表、手动导出、恢复（只追加，复用 export.ts/restore.ts）
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九、§十
-// 恢复为破坏性操作：这里强制参数校验（路径必须落在 project/ 内且文件存在），
+// 恢复为破坏性操作：这里强制参数校验（路径必须落在仓库根目录内且文件存在），
 // 二次确认与警告文案在 web 侧（数据与同步页）。
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -49,7 +49,7 @@ async function parseDumpPath(value: unknown): Promise<string> {
   }
   const abs = path.resolve(PROJECT_ROOT, raw);
   if (abs !== PROJECT_ROOT && !abs.startsWith(PROJECT_ROOT + path.sep)) {
-    throw apiErrors.badRequest(`path 必须位于 project/ 目录内：${raw}`);
+    throw apiErrors.badRequest(`path 必须位于仓库根目录内：${raw}`);
   }
   const stat = await fs.stat(abs).catch(() => null);
   if (!stat || !stat.isFile()) {
@@ -63,7 +63,7 @@ async function parsePortablePath(value: unknown): Promise<string> {
     throw apiErrors.badRequest("path 必须是 .ndjson.gz 初始化包");
   }
   const abs = path.resolve(PROJECT_ROOT, value.trim());
-  if (!abs.startsWith(PROJECT_ROOT + path.sep)) throw apiErrors.badRequest("初始化包必须位于 project/ 目录内");
+  if (!abs.startsWith(PROJECT_ROOT + path.sep)) throw apiErrors.badRequest("初始化包必须位于仓库根目录内");
   const stat = await fs.stat(abs).catch(() => null);
   if (!stat?.isFile()) throw apiErrors.badRequest(`初始化包不存在：${value}`);
   return abs;
@@ -162,7 +162,7 @@ export const volumeRoutes = {
 
   /**
    * POST /api/volume/export {}：立即导出（kind='manual'），滚动保留由 exportVolume 负责。
-   * body 可选 out_dir（须位于 project/ 内，缺省 project/datavolume/），主要供测试隔离。
+   * body 可选 out_dir（须位于仓库根目录内，缺省 datavolume/），主要供测试隔离。
    */
   async exportNow({ pool, body }: Ctx) {
     const b = (body ?? {}) as Record<string, unknown>;
@@ -173,7 +173,7 @@ export const volumeRoutes = {
       }
       const abs = path.resolve(PROJECT_ROOT, b.out_dir.trim());
       if (abs !== PROJECT_ROOT && !abs.startsWith(PROJECT_ROOT + path.sep)) {
-        throw apiErrors.badRequest(`out_dir 必须位于 project/ 目录内：${b.out_dir}`);
+        throw apiErrors.badRequest(`out_dir 必须位于仓库根目录内：${b.out_dir}`);
       }
       outDir = abs;
     }

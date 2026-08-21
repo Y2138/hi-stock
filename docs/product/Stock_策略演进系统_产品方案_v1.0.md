@@ -17,8 +17,8 @@
 | 编号 | 真实用户决定 | 落地方式 |
 |------|--------------|----------|
 | E1 | 数据库升格为事实源，Markdown 逐步降级为导出/展示层 | 一期仅新结构化数据（任务运行、回测登记）原生入库；既有 Markdown 事实源按模块逐个移交，移交完成前 Markdown 仍是事实源 |
-| E2 | 数据库选型 PostgreSQL | 本地 docker-compose 实例，连接串走 gitignored 的 `project/.env.local` |
-| E3 | 服务端技术栈 Node/TypeScript | 与 `project/` 现有构建器、vitest/playwright 测试同栈 |
+| E2 | 数据库选型 PostgreSQL | 本地 docker-compose 实例，连接串走 gitignored 的 `.env.local` |
+| E3 | 服务端技术栈 Node/TypeScript | 与仓库现有构建器、vitest/playwright 测试同栈 |
 | E4 | 分阶段实施，一期先管任务 + 回测 | 一期：数据库骨架、定时任务运行记录、回测方案/代码/结果登记；二期：标的池、持仓、行情数据结构化；三期：策略版本管理与完整界面 |
 
 ---

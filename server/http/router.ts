@@ -198,7 +198,7 @@ function sendBuildGuide(res: http.ServerResponse): void {
 <body>
   <div class="card">
     <h1>前端产物尚未构建</h1>
-    <p>二期前端（Vue 3）需要先构建才能访问。请在 <code>project/</code> 目录下运行：</p>
+    <p>二期前端（Vue 3）需要先构建才能访问。请在仓库根目录运行：</p>
     <p><code>npm run web:build</code></p>
     <p>构建完成后刷新本页即可；API 在 <code>/api/*</code> 下正常工作。</p>
   </div>

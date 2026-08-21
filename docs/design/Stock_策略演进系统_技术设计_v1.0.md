@@ -7,7 +7,7 @@
 | 目标产品版本 | 一期（任务运行 + 回测台账） |
 | 状态 | 已交付；二期见 `Stock_策略演进系统_技术设计_v2.0.md`，本文保留为一期实现的历史记录 |
 | 更新日期 | 2026-08-15 |
-| 关联 PRD | `project/docs/product/Stock_策略演进系统_产品方案_v1.0.md` 全文 |
+| 关联 PRD | `docs/product/Stock_策略演进系统_产品方案_v1.0.md` 全文 |
 
 > 本文按 `设计文档模板_v1.0.md` 裁剪：与交易事实写入、计划生成、成交校验相关的模板章节（模板 §4 任务流程、§6.2 长任务状态机、§7.3 校验分级、§7.5 回滚与纠错）在一期不适用——一期不产生任何交易事实写入，故删除并在此注明原因；二期移交持仓/计划模块时重新补齐。
 
@@ -20,8 +20,8 @@
 | 编号 | 决策 | 当前结论 | 决策人 |
 |------|------|----------|--------|
 | E1 | 事实源 | 数据库升格为事实源；Markdown 逐模块移交，未移交前 Markdown 仍是事实源 | 真实用户，2026-08-15 |
-| E2 | 数据库 | PostgreSQL 16，本地 docker-compose，连接串在 gitignored `project/.env.local` | 同上 |
-| E3 | 服务端栈 | Node 22 + TypeScript，与 `project/` 现有工具链同栈 | 同上 |
+| E2 | 数据库 | PostgreSQL 16，本地 docker-compose，连接串在 gitignored `.env.local` | 同上 |
+| E3 | 服务端栈 | Node 22 + TypeScript，与仓库现有工具链同栈 | 同上 |
 | E4 | 范围切分 | 一期 = DB 骨架 + 任务运行 + 回测台账 | 同上 |
 
 ### 1.2 设计目标与非目标
@@ -55,7 +55,7 @@
 ## 三、架构与目录
 
 ```
-project/
+./
   docker-compose.yml          postgres:16 + 命名卷 pgdata，127.0.0.1:5432
   .env.local.example          DATABASE_URL 模板（真实 .env.local 被根 .gitignore 覆盖）
   server/
@@ -270,7 +270,7 @@ npm run backtest:register -- --name V26.6 --kind formal \
 ## 八、隐私与安全
 
 - 服务绑定 `127.0.0.1`，无认证；适用前提是单机本机使用，文档与启动日志均声明不得暴露到局域网/公网。
-- 数据库凭据只在 `project/.env.local`（gitignored）；`.env.local.example` 只含占位值。
+- 数据库凭据只在 `.env.local`（gitignored）；`.env.local.example` 只含占位值。
 - 数据库内容含回测与任务元数据，一期不含持仓金额；页面与日志不得输出 `DATABASE_URL`。
 - 无外部网络请求、无云同步、无远程访问入口。
 
@@ -294,7 +294,7 @@ npm run backtest:register -- --name V26.6 --kind formal \
 
 ### 10.3 回归门禁
 
-`npm run typecheck && npm test` 全绿；既有 `test:e2e`/`test:acceptance` 不受影响（新代码不参与静态构建）。`git status` 无 `project/.env.local`、`dist/`、数据库卷等敏感产物。
+`npm run typecheck && npm test` 全绿；既有 `test:e2e`/`test:acceptance` 不受影响（新代码不参与静态构建）。`git status` 无 `.env.local`、`dist/`、数据库卷等敏感产物。
 
 ## 十一、风险与发布
 
@@ -305,7 +305,7 @@ npm run backtest:register -- --name V26.6 --kind formal \
 | 历史报告指标缺失 | 留空不编造 |
 | 阶段蔓延（顺手做二期） | 一期不建二期表，草案只留在本文 |
 
-**发布门禁**：PRD §七 7 条验收全部通过；`AGENTS.md` 与 `project/README.md` 同步完成。
+**发布门禁**：PRD §七 7 条验收全部通过；`AGENTS.md` 与 `README.md` 同步完成。
 
 ## 十二、评审记录
 

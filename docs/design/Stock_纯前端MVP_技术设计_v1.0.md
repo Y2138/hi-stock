@@ -21,7 +21,7 @@
   -> Markdown / CSV 领域适配与严格校验
   -> 来源、哈希、截止日、状态、问题清单
   -> Vite + TypeScript + ECharts 单文件打包
-  -> project/dist/stock-viewer/index.html
+  -> dist/stock-viewer/index.html
   -> file:// 本地只读运行
 ```
 
@@ -107,11 +107,11 @@ not_comparable | unavailable | render_error
 1. 构建开始前在终端显示敏感数据提示。
 2. 预检所有必需文件并完成核心 Markdown 解析；失败时不创建也不覆盖产物。
 3. 每个源文件计算 SHA-256，所有嵌入路径转换为仓库相对路径。
-4. Vite 在 `project/.build/` 生成临时输出，单文件插件内联 JS、CSS 与数据。
+4. Vite 在 `.build/` 生成临时输出，单文件插件内联 JS、CSS 与数据。
 5. 检查临时目录只有 `index.html`，且 HTML 没有绝对用户路径或外部脚本/样式标签。
-6. 全部通过后以重命名原子替换 `project/dist/stock-viewer/index.html`，随后清理临时目录。
+6. 全部通过后以重命名原子替换 `dist/stock-viewer/index.html`，随后清理临时目录。
 
-`project/dist/`、本地依赖、临时构建、浏览器报告和截图均由 Git 忽略。页面没有导出或网络入口。事实更新后的恢复方式是重新构建，不是修改内嵌数据。
+`dist/`、本地依赖、临时构建、浏览器报告和截图均由 Git 忽略。页面没有导出或网络入口。事实更新后的恢复方式是重新构建，不是修改内嵌数据。
 
 ## 六、前端交互
 

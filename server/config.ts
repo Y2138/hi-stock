@@ -1,4 +1,4 @@
-// 服务端配置：读取 DATABASE_URL / PORT，只加载 project/.env.local
+// 服务端配置：读取 DATABASE_URL / PORT，只加载仓库根目录的 .env.local
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v1.0.md §2、§八
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,10 +6,9 @@ import dotenv from "dotenv";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-/** project/ 目录（server/ 的上一级） */
+/** 仓库根目录（server/ 的上一级） */
 export const PROJECT_ROOT = path.resolve(here, "..");
-// 运行连接串只放在 gitignored 的 project/.env.local；datasource/LLM 凭据统一存 PostgreSQL。
-// project/ 复制到任意目录后不读取父目录配置。
+// 运行连接串只放在 gitignored 的 .env.local；datasource/LLM 凭据统一存 PostgreSQL。
 dotenv.config({ path: path.join(PROJECT_ROOT, ".env.local"), quiet: true });
 
 export interface ServerConfig {
@@ -23,7 +22,7 @@ export function loadConfig(): ServerConfig {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
     throw new Error(
-      "缺少 DATABASE_URL：请复制 project/.env.local.example 为 project/.env.local 并填写本机连接串",
+      "缺少 DATABASE_URL：请复制 .env.local.example 为 .env.local 并填写本机连接串",
     );
   }
   const port = Number(process.env.PORT ?? "8787");
