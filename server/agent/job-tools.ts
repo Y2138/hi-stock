@@ -1,14 +1,18 @@
-// 自动 Agent Flow 的窄权限工具：只能维护当前标的池成员的短期关注状态。
-// 不开放角色、研究属性、持仓、策略或任意 SQL 写入。
+// 自动 Agent Flow 的结构化结果工具；任务仍同时使用普通 Agent 的完整工具目录。
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
 import { setPoolAttention } from "../modules/pools/repo.js";
+import { replaceDraftAuctionAssessments, replaceDraftPlaybook } from "../modules/plans/repo.js";
 import { withAgentMutationLock } from "./mutation-lock.js";
 import { insertToolAudit } from "./repo.js";
 import { sha256Json } from "./hash.js";
 import {
   ScheduledPoolAttentionSchema,
+  AuctionAssessmentWriteSchema,
+  DailyPlanWriteSchema,
   validateScheduledPoolAttentionInput,
+  validateAuctionAssessmentWriteInput,
+  validateDailyPlanWriteInput,
 } from "./tool-validation.js";
 
 const DAILY_PREFIX = "每日计划·";
@@ -17,10 +21,10 @@ function result(value: unknown): AgentToolResult<unknown> {
   return { content: [{ type: "text", text: JSON.stringify(value, null, 1) }], details: value };
 }
 
-async function auditError(pool: pg.Pool, sessionId: string, input: unknown): Promise<void> {
+async function auditError(pool: pg.Pool, sessionId: string, toolName: string, input: unknown): Promise<void> {
   await insertToolAudit(pool, {
     session_id: sessionId,
-    tool_name: "pool_attention_write",
+    tool_name: toolName,
     args: { redacted: true, args_sha256: sha256Json(input) },
     result_sha256: null,
     status: "error",
@@ -91,7 +95,85 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
         });
         return result(outcome);
       } catch (error) {
-        await auditError(deps.pool, deps.sessionId, rawInput);
+        await auditError(deps.pool, deps.sessionId, "pool_attention_write", rawInput);
+        throw error;
+      }
+    },
+  };
+}
+
+export function buildJobDailyPlanTool(deps: {
+  pool: pg.Pool;
+  sessionId: string;
+  runId: string;
+}): AgentTool {
+  return {
+    name: "daily_plan_write",
+    label: "写入每日计划盯防预案",
+    description:
+      "一次性提交本计划的结构化预案：position_action 为每笔真实持仓的次日执行预案；off_pool_opportunity 是打板机会的内部兼容名称，只写当前《打板策略》形成的有效信号。A 映射 A，B-抱团/B-主升兼容映射 B，精确信号等级、两类分数、路线名次与风险写入 headline/evidence_md。全量替换式写入，只能调用一次。",
+    parameters: DailyPlanWriteSchema,
+    executionMode: "sequential",
+    execute: async (_toolCallId, rawInput, signal) => {
+      try {
+        if (signal?.aborted) throw new Error("每日计划预案写入已中断");
+        const input = validateDailyPlanWriteInput(rawInput);
+        const outcome = await withAgentMutationLock(deps.pool, async (client) => {
+          const write = await replaceDraftPlaybook(client, {
+            source_job_run_id: deps.runId,
+            items: input.items,
+          });
+          await insertToolAudit(client, {
+            session_id: deps.sessionId,
+            tool_name: "daily_plan_write",
+            args: input,
+            result_sha256: sha256Json(write),
+            status: "ok",
+          });
+          return write;
+        });
+        return result(outcome);
+      } catch (error) {
+        await auditError(deps.pool, deps.sessionId, "daily_plan_write", rawInput);
+        throw error;
+      }
+    },
+  };
+}
+
+export function buildJobAuctionAssessmentTool(deps: {
+  pool: pg.Pool;
+  sessionId: string;
+  runId: string;
+}): AgentTool {
+  return {
+    name: "auction_assessment_write",
+    label: "更新打板机会竞价复核",
+    description:
+      "一次性提交当前每日计划全部打板机会的 T+1 集合竞价复核。必须完整覆盖，不得增加或遗漏代码；前向验证期只允许继续观察、放弃或数据不足，任务成功后才在仪表盘“打板机会”中激活。",
+    parameters: AuctionAssessmentWriteSchema,
+    executionMode: "sequential",
+    execute: async (_toolCallId, rawInput, signal) => {
+      try {
+        if (signal?.aborted) throw new Error("集合竞价研判写入已中断");
+        const input = validateAuctionAssessmentWriteInput(rawInput);
+        const outcome = await withAgentMutationLock(deps.pool, async (client) => {
+          const write = await replaceDraftAuctionAssessments(client, {
+            source_job_run_id: deps.runId,
+            items: input.items,
+          });
+          await insertToolAudit(client, {
+            session_id: deps.sessionId,
+            tool_name: "auction_assessment_write",
+            args: input,
+            result_sha256: sha256Json(write),
+            status: "ok",
+          });
+          return write;
+        });
+        return result(outcome);
+      } catch (error) {
+        await auditError(deps.pool, deps.sessionId, "auction_assessment_write", rawInput);
         throw error;
       }
     },

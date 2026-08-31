@@ -8,6 +8,7 @@ import pg from "pg";
 import { backtestRoutes } from "../modules/backtests/routes.js";
 import { marketRoutes } from "../modules/market/routes.js";
 import { positionRoutes } from "../modules/positions/routes.js";
+import { plansRoutes } from "../modules/plans/routes.js";
 import { listPoolView } from "../modules/pools/repo.js";
 import { volumeRoutes } from "../volume/routes.js";
 import { chatRoutes } from "../agent/routes.js";
@@ -272,6 +273,7 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("POST", "/api/analysis/run", analysisRoutes.run),
     route("GET", "/api/analysis/runs/:id", analysisRoutes.get),
     route("GET", "/api/backtests", backtestRoutes.listRuns),
+    route("GET", "/api/backtests/:id/source", backtestRoutes.getSource),
     route("GET", "/api/backtests/:id", backtestRoutes.getRun),
     route("GET", "/api/memories", memoryRoutes.list),
     route("GET", "/api/memories/:id", memoryRoutes.get),
@@ -283,11 +285,11 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/market/bars", marketRoutes.bars),
     route("GET", "/api/market/structure", marketRoutes.structure),
     route("GET", "/api/market/coverage", marketRoutes.coverage),
-    // 持仓、账户与短线/长线池。
+    // 持仓与短线/长线池。
     route("GET", "/api/positions", positionRoutes.list),
     route("GET", "/api/positions/changes", positionRoutes.changes),
-    route("GET", "/api/account/snapshots", positionRoutes.accountSnapshots),
-    route("GET", "/api/account/summary", positionRoutes.accountSummary),
+    route("GET", "/api/positions/realized-pnl", positionRoutes.realizedPnl),
+    route("GET", "/api/plans/latest", plansRoutes.latest),
     route("GET", "/api/pools/:pool", async ({ params }) => {
       if (params.pool !== "short" && params.pool !== "long") throw apiErrors.notFound("标的池不存在");
       return { data: await listPoolView(pool, params.pool) };

@@ -293,11 +293,6 @@ export async function fetchSnapshot(
       prevClose: row.prev_price == null ? undefined : Number(row.prev_price),
     })));
   }
-  const returned = new Set(quotes.map((quote) => quote.code));
-  const missing = codes.filter((code) => !returned.has(code));
-  if (missing.length > 0) {
-    throw new Error(`行情快照缺少 ${missing.length} 个标的：${missing.slice(0, 10).join(",")}`);
-  }
   return quotes;
 }
 

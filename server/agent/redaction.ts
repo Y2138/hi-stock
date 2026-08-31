@@ -19,8 +19,7 @@ function sourceSummary(value: unknown): Record<string, unknown> {
 }
 
 /**
- * 临时代码只能存在于当前工具调用内存和隔离工作区。
- * 所有消息、事件、审计和资源元数据在持久化前都经过同一递归边界。
+ * 回测源码可以由回测领域表受控保存，但不得进入消息、事件、审计和资源元数据。
  */
 export function redactEphemeralCode(value: unknown, depth = 0): unknown {
   if (depth > 12) return "[层级截断]";
@@ -59,7 +58,13 @@ export function redactEphemeralCode(value: unknown, depth = 0): unknown {
  * 一并收敛为固定提示，避免模型把源码同时复制进自然语言消息。
  */
 export function redactAgentMessage(message: AgentMessage): AgentMessage {
+  const ephemeralResult = message.role === "toolResult"
+    && Boolean((message as AgentMessage & { details?: { ephemeral_code_result?: boolean } }).details?.ephemeral_code_result);
   const copy = redactEphemeralCode(message) as AgentMessage;
+  if (ephemeralResult && copy.role === "toolResult" && Array.isArray(copy.content)) {
+    copy.content = [{ type: "text", text: "已向 Agent 提供固化回测源码；源码不会保存到会话。" }];
+    return copy;
+  }
   if (copy.role !== "assistant") return copy;
   if (!copy.usage || typeof copy.usage !== "object") {
     copy.usage = {
@@ -88,4 +93,17 @@ export function redactAgentMessage(message: AgentMessage): AgentMessage {
 
 export function redactAgentMessages(messages: AgentMessage[]): AgentMessage[] {
   return messages.map(redactAgentMessage);
+}
+
+/** SSE 和低频事件只公开源码元数据，当前模型仍使用工具返回的原始内容。 */
+export function redactEphemeralToolResult(value: unknown): unknown {
+  const details = value && typeof value === "object"
+    ? (value as { details?: { ephemeral_code_result?: boolean } }).details
+    : null;
+  if (!details?.ephemeral_code_result) return redactEphemeralCode(value);
+  const redacted = redactEphemeralCode(value) as Record<string, unknown>;
+  return {
+    ...redacted,
+    content: [{ type: "text", text: "已向 Agent 提供固化回测源码；源码不会保存到会话。" }],
+  };
 }

@@ -48,7 +48,10 @@ async function load(): Promise<void> {
 
 function goToPage(): void {
   if (jobOutput.value) {
-    void router.push({ path: "/jobs", query: { job: jobOutput.value.job_id, tab: "outputs" } });
+    void router.push({ path: "/jobs", query: {
+      job: jobOutput.value.job_id,
+      ...(jobOutput.value.run_id ? { run: jobOutput.value.run_id } : {}),
+    } });
   } else if (backtest.value) {
     void router.push({ path: "/backtests", query: { run: backtest.value.id } });
   } else if (memory.value) {

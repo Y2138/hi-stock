@@ -9,6 +9,7 @@ export interface ActiveAgentRun {
   runId: string;
   agent: Agent;
   startedAt: Date;
+  abortRequested: boolean;
 }
 
 const activeRuns = new Map<string, ActiveAgentRun>();
@@ -51,6 +52,7 @@ export function controlAgentRun(input: {
 
   if (input.action === "abort") {
     // 用户显式停止时不再执行此前排队的干预与追问。
+    run.abortRequested = true;
     run.agent.clearAllQueues();
     run.agent.abort();
     return run;
@@ -62,4 +64,3 @@ export function controlAgentRun(input: {
   else run.agent.followUp(userMessage(text));
   return run;
 }
-

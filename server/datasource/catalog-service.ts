@@ -19,7 +19,7 @@ export type InstrumentKind = "stock" | "etf" | "index" | "board" | "fund" | "fut
 function identityKind(identity: TickerIdentity, boardCodes: ReadonlySet<string>): InstrumentKind {
   if (identity.assetType === "a-share") return "stock";
   if (identity.assetType === "fund-etf") return "etf";
-  if (identity.assetType === "fund-lof" || identity.assetType === "fund-otc") return "fund";
+  if (["fund-lof", "fund-otc", "fund-reits"].includes(identity.assetType)) return "fund";
   return boardCodes.has(identity.code) ? "board" : "index";
 }
 
@@ -155,7 +155,7 @@ export async function syncMarketCatalog(
     const activeCodes = [...new Set([...tickers.map((ticker) => ticker.code), ...boardCodes])];
     await client.query(
       `UPDATE market_instrument SET lifecycle_status = 'inactive', updated_at = now()
-        WHERE source_asset_type IN ('a-share','a-share-index','fund-etf','fund-lof','fund-otc')
+        WHERE source_asset_type IN ('a-share','a-share-index','fund-etf','fund-lof','fund-otc','fund-reits')
           AND NOT (code = ANY($1::text[]))`,
       [activeCodes],
     );

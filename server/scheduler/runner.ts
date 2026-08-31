@@ -7,8 +7,18 @@ import { persistAndPublishSessionEvent } from "../agent/events.js";
 import { buildSystemPrompt } from "../agent/prompt.js";
 import { appendMessage, nextMessageSeq, updateSessionStatus } from "../agent/repo.js";
 import { runAgentSessionTurn } from "../agent/session-runner.js";
+import { getAgentSettings } from "../agent/settings.js";
 import { buildChatTools } from "../agent/tools.js";
-import { buildJobPoolAttentionTool } from "../agent/job-tools.js";
+import {
+  buildJobAuctionAssessmentTool,
+  buildJobDailyPlanTool,
+  buildJobPoolAttentionTool,
+} from "../agent/job-tools.js";
+import {
+  activateAuctionAssessmentsForRun,
+  activatePlaybookForRun,
+  discardDraftAuctionAssessmentsForRun,
+} from "../modules/plans/repo.js";
 import { PROJECT_ROOT } from "../config.js";
 import {
   dailyMarketUpdate,
@@ -104,7 +114,20 @@ function logLine(message: string, at = new Date()): string {
   return `[${at.toISOString()}] ${message}\n`;
 }
 
-/** 当前持仓 + 当前有效标的池 + 活跃指数/板块是日更范围；期货档案单独走 futures_day。 */
+const CORE_MARKET_INDEX_CODES = [
+  "000001.SH",
+  "000016.SH",
+  "000300.SH",
+  "000688.SH",
+  "000852.SH",
+  "000905.SH",
+  "399001.SZ",
+  "399006.SZ",
+] as const;
+
+const DAILY_STRUCTURE_CANDIDATE_LIMIT = 30;
+
+/** 当前持仓、有效标的池、市场结构候选、核心指数和官方行业是日更范围；期货单独走 futures_day。 */
 export async function resolveDailyUpdateScope(
   pool: pg.Pool,
   targetDate: string,
@@ -114,11 +137,66 @@ export async function resolveDailyUpdateScope(
     `SELECT DISTINCT i.code
        FROM market_instrument i
       WHERE i.kind <> 'futures'
-        AND (i.kind IN ('index', 'board') AND i.lifecycle_status = 'active'
+        AND ((i.lifecycle_status = 'active' AND (
+              i.code = ANY($1::text[])
+              OR EXISTS (SELECT 1 FROM market_board board
+                            WHERE board.instrument_id = i.id AND board.active = true
+                              AND board.source = 'hithink' AND board.board_type = 'industry'
+                            AND (i.code LIKE '881%.TI' OR i.code LIKE '884%.TI'))))
           OR EXISTS (SELECT 1 FROM portfolio_position p WHERE p.instrument_id = i.id)
           OR EXISTS (SELECT 1 FROM pool_membership pm
                       WHERE pm.instrument_id = i.id AND pm.effective_to IS NULL))
       ORDER BY i.code`,
+    [[...CORE_MARKET_INDEX_CODES]],
+  );
+  const structureCandidates = await pool.query<{ code: string }>(
+    `WITH raw_signal AS (
+       SELECT event.instrument_id,
+              true AS is_limit_up,
+              false AS is_dragon_tiger,
+              false AS is_org_or_hot_money,
+              event.streak_count,
+              NULL::double precision AS net_amount
+         FROM market_limit_event event
+        WHERE event.trade_date = $1 AND event.event_type = 'up'
+       UNION ALL
+       SELECT entry.instrument_id,
+              false,
+              true,
+              entry.dataset_type IN ('org', 'hot_money'),
+              NULL::integer,
+              entry.net_amount
+         FROM market_dragon_tiger_entry entry
+        WHERE entry.trade_date = $1 AND entry.instrument_id IS NOT NULL
+     ), ranked AS (
+       SELECT signal.instrument_id,
+              bool_or(signal.is_limit_up) AS is_limit_up,
+              bool_or(signal.is_dragon_tiger) AS is_dragon_tiger,
+              bool_or(signal.is_org_or_hot_money) AS is_org_or_hot_money,
+              max(signal.streak_count) AS streak_count,
+              max(signal.net_amount) AS net_amount
+         FROM raw_signal signal
+        GROUP BY signal.instrument_id
+     )
+     SELECT instrument.code
+       FROM ranked
+       JOIN market_instrument instrument ON instrument.id = ranked.instrument_id
+      WHERE instrument.kind = 'stock'
+        AND instrument.lifecycle_status = 'active'
+        AND NOT EXISTS (
+          SELECT 1 FROM pool_membership membership
+           WHERE membership.instrument_id = ranked.instrument_id AND membership.effective_to IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM portfolio_position position WHERE position.instrument_id = ranked.instrument_id
+        )
+      ORDER BY (ranked.is_limit_up AND ranked.is_dragon_tiger) DESC,
+               ranked.is_org_or_hot_money DESC,
+               ranked.streak_count DESC NULLS LAST,
+               ranked.net_amount DESC NULLS LAST,
+               instrument.code
+      LIMIT $2`,
+    [targetDate, DAILY_STRUCTURE_CANDIDATE_LIMIT],
   );
   const futures = await pool.query<{ code: string }>(
     "SELECT code FROM market_instrument WHERE kind = 'futures' ORDER BY code",
@@ -126,14 +204,15 @@ export async function resolveDailyUpdateScope(
   const minute30 = await pool.query<{ code: string }>(
     `SELECT DISTINCT i.code
        FROM market_instrument i
-      WHERE (i.kind = 'index' AND i.lifecycle_status = 'active')
+      WHERE (i.lifecycle_status = 'active' AND i.code = ANY($1::text[]))
          OR EXISTS (SELECT 1 FROM portfolio_position p WHERE p.instrument_id = i.id)
       ORDER BY i.code`,
+    [[...CORE_MARKET_INDEX_CODES]],
   );
   return {
     date: targetDate,
     dayMode,
-    codes: day.rows.map((row) => row.code),
+    codes: [...new Set([...day.rows, ...structureCandidates.rows].map((row) => row.code))].sort(),
     futures: futures.rows.map((row) => row.code),
     minute30: minute30.rows.map((row) => row.code),
   };
@@ -161,12 +240,17 @@ function buildAgentJobPrompt(
       `首行必须是：${RESULT_BANNER}`,
     ].join("\n\n");
   }
-  const capability = config.pool_attention_write
-    ? "这是受控任务流程：数据库查询只读；仅可使用 pool_attention_write 维护当前池成员的短期关注，不得修改持仓、策略、角色或其他业务事实。"
-    : "这是只读任务流程：不得修改策略或数据库业务表；最终 Markdown 会由 Runner 关联本次任务保存。";
-  const tools = config.pool_attention_write
-    ? "可使用 database_schema、database_query 与 pool_attention_write；查询必须遵循 schema_hash 渐进发现协议，数据缺失必须列入缺口。"
-    : "只可使用当前注册的 database_schema 与 database_query；查询必须遵循 schema_hash 渐进发现协议，数据缺失必须列入缺口。";
+  const writes = [
+    config.pool_attention_write ? "pool_attention_write 维护当前池成员的短期关注" : null,
+    config.daily_plan_write ? "daily_plan_write 写入次日执行预案与打板机会结构化数据" : null,
+    definition.code === "auction_opportunity_assessment"
+      ? "auction_assessment_write 更新打板机会的结构化竞价复核"
+      : null,
+  ].filter(Boolean);
+  const capability = "本任务使用与普通 Agent 相同的完整工具集和当前确认制/YOLO 设置；策略发布仍只能创建待真人审核提案。";
+  const tools = writes.length
+    ? `本流程另提供 ${writes.join("、")}。数据库查询仍须遵循 schema_hash 渐进发现协议，数据缺失必须列入缺口。`
+    : "数据库查询须遵循 schema_hash 渐进发现协议，数据缺失必须列入缺口。";
   return [
     `执行系统作业 ${definition.code}（目标日 ${run.target_date}）。`,
     capability,
@@ -235,20 +319,30 @@ async function runAgentFlow(
   sessionId: string,
   strategy: StrategyBundle,
   config: AgentFlowJobConfig,
+  run: JobRunRow,
+  definition: JobDefinitionRow,
 ): Promise<string> {
   const systemPrompt = await buildSystemPrompt(pool, strategy);
-  const tools: AgentTool[] = buildChatTools({ pool, sessionId: null }).filter((tool) =>
-    ["database_schema", "database_query"].includes(tool.name),
-  );
+  const settings = await getAgentSettings(pool);
+  const tools: AgentTool[] = buildChatTools({
+    pool,
+    sessionId,
+    marketDomainToolsEnabled: settings.market_domain_tools_enabled,
+  });
   if (config.pool_attention_write) tools.push(buildJobPoolAttentionTool({ pool, sessionId }));
+  if (config.daily_plan_write) {
+    tools.push(buildJobDailyPlanTool({ pool, sessionId, runId: run.id }));
+  }
+  if (definition.code === "auction_opportunity_assessment") {
+    tools.push(buildJobAuctionAssessmentTool({ pool, sessionId, runId: run.id }));
+  }
   const turn = await runAgentSessionTurn({
     pool,
     sessionId,
     historyMode: "session",
     systemPrompt,
-    systemPromptSuffix: config.pool_attention_write
-      ? "自动作业边界：除 pool_attention_write 可维护当前池成员的短期关注外，其余业务事实、策略和外部文件均只读；不得新增标的、改变角色或覆盖人工关注。结果由 Runner 关联任务保存。"
-      : "自动作业边界：本轮只有只读工具，禁止修改策略、业务表或外部文件；结果由 Runner 关联任务保存。",
+    systemPromptSuffix:
+      "自动作业与普通 Agent 使用相同工具权限和当前确认制/YOLO 设置；策略发布仍只能创建待真人审核提案。任务结果由 Runner 关联本次运行保存。",
     manageSessionStatus: false,
     text: prompt,
     tools,
@@ -440,6 +534,9 @@ async function executeAgentFlow(
   config: AgentFlowJobConfig,
 ): Promise<JobExecutionResult> {
   if (!run.session_id) throw new Error("agent_flow 缺少任务对话");
+  if (definition.code === "auction_opportunity_assessment" && run.attempt_count > 1) {
+    await discardDraftAuctionAssessmentsForRun(deps.pool, run.id);
+  }
   const strategy = await pinJobStrategySnapshot(deps.pool, run);
   const revision = await pinJobPromptRevision(deps.pool, run, definition);
   const prompt = buildAgentJobPrompt(revision.content, run, definition, config);
@@ -450,7 +547,7 @@ async function executeAgentFlow(
     markdown = markdown.startsWith(RESULT_BANNER) ? markdown : `${RESULT_BANNER}\n\n${markdown}`;
     await appendConversationMessage(deps.pool, run.session_id, "assistant", markdown);
   } else {
-    markdown = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, config);
+    markdown = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, config, run, definition);
   }
   return {
     status: "success",
@@ -530,6 +627,8 @@ async function finishRun(
           [run.id],
         )
       ).rows[0]?.id ?? null;
+      await activatePlaybookForRun(client, run.id, outputId);
+      await activateAuctionAssessmentsForRun(client, run.id, outputId);
     }
     await client.query("COMMIT");
     return { run: finished, outputId };
@@ -636,9 +735,11 @@ export async function executeJobRun(deps: RunnerDeps, runId: string): Promise<Jo
     }
     await setJobSessionStatus(deps.pool, finished.run.session_id, result.status, finishedAt)
       .catch((error) => logConversationSyncError(finished.run.id, error));
-    const refreshTargets = detail.job.code === "daily_plan_flow" &&
-      (config as AgentFlowJobConfig).pool_attention_write
-      ? ["jobs", "status", "pools"]
+    const refreshTargets = detail.job.code === "daily_plan_flow"
+      ? ["jobs", "status", "dashboard", "positions",
+          ...((config as AgentFlowJobConfig).pool_attention_write ? ["pools"] : [])]
+      : detail.job.code === "auction_opportunity_assessment"
+        ? ["jobs", "status", "dashboard"]
       : ["jobs", "status"];
     await publishJobRefresh(deps.pool, finished.run.session_id, "任务运行与结果已更新", refreshTargets)
       .catch((error) => logConversationSyncError(finished.run.id, error));
@@ -647,6 +748,9 @@ export async function executeJobRun(deps: RunnerDeps, runId: string): Promise<Jo
     const failedAt = deps.now?.() ?? new Date();
     if (error instanceof AgentRunAbortedError) {
       const cancelled = await cancelRun(deps.pool, run, failedAt);
+      if (detail.job.code === "auction_opportunity_assessment") {
+        await discardDraftAuctionAssessmentsForRun(deps.pool, run.id);
+      }
       if (cancelled.session_id) {
         await appendConversationMessage(deps.pool, cancelled.session_id, "assistant", "任务已由用户中断，不会自动重试。")
           .catch((syncError) => logConversationSyncError(cancelled.id, syncError));
@@ -658,6 +762,9 @@ export async function executeJobRun(deps: RunnerDeps, runId: string): Promise<Jo
       return cancelled;
     }
     const failed = await failOrRetry(deps, run, error, failedAt);
+    if (detail.job.code === "auction_opportunity_assessment" && failed.status === "failed") {
+      await discardDraftAuctionAssessmentsForRun(deps.pool, run.id);
+    }
     await recordFailureInConversation(deps, failed, error, failedAt);
     return failed;
   }

@@ -7,6 +7,7 @@ export const TICKER_ASSET_TYPES = [
   "fund-otc",
   "fund-etf",
   "fund-lof",
+  "fund-reits",
 ] as const;
 export type TickerAssetType = (typeof TICKER_ASSET_TYPES)[number];
 
@@ -91,6 +92,7 @@ const ASSET_TYPE_PRIORITY: Record<TickerAssetType, number> = {
   "fund-etf": 3,
   "fund-lof": 2,
   "fund-otc": 1,
+  "fund-reits": 1,
 };
 
 function deduplicateTickers(rows: TickerIdentity[]): TickerIdentity[] {

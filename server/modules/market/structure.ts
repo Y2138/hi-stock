@@ -13,6 +13,41 @@ export const MARKET_STRUCTURE_DATASETS = [
 ] as const;
 export type MarketStructureDataset = (typeof MARKET_STRUCTURE_DATASETS)[number];
 
+const LADDER_TIER_LABELS: Record<string, string> = {
+  two_board: "2板",
+  three_board: "3板",
+  four_board: "4板",
+  five_board: "5板",
+  six_board: "6板",
+  seven_over: "7板及以上",
+};
+
+function limitLadderItems(ladder: unknown, targetDate: string): Record<string, unknown>[] {
+  if (!ladder || typeof ladder !== "object" || Array.isArray(ladder)) return [];
+  const days = (ladder as Record<string, unknown>).item;
+  if (!Array.isArray(days)) return [];
+  const day = days.find((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const date = String((value as Record<string, unknown>).date ?? "")
+      .replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3");
+    return date === targetDate;
+  }) as Record<string, unknown> | undefined;
+  const boards = day?.boards;
+  if (!boards || typeof boards !== "object" || Array.isArray(boards)) return [];
+  return Object.entries(boards).flatMap(([key, value]) => {
+    if (!Array.isArray(value)) return [];
+    return value.flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const row = item as Record<string, unknown>;
+      const boardNumber = Number(row.board_num);
+      const tier = Number.isFinite(boardNumber) && boardNumber > 0
+        ? `${boardNumber}板`
+        : LADDER_TIER_LABELS[key] ?? key;
+      return [{ ...row, tier }];
+    });
+  });
+}
+
 export async function queryMarketStructure(
   db: Db,
   input: { date: string; dataset: MarketStructureDataset; page: number; size: number },
@@ -49,7 +84,15 @@ export async function queryMarketStructure(
     source_time: null,
     finished_at: null,
   };
+  const ladderSnapshot = await db.query<{ ladder: unknown }>(
+    `SELECT ladder
+       FROM market_limit_ladder_snapshot WHERE target_date = $1
+      ORDER BY id DESC LIMIT 1`,
+    [input.date],
+  );
+  const ladderItems = limitLadderItems(ladderSnapshot.rows[0]?.ladder, input.date);
   let items: unknown[];
+  let rowCount = coverage.row_count;
   if (input.dataset.startsWith("limit_") && input.dataset !== "limit_ladder") {
     const eventType = input.dataset === "limit_up" ? "up" : input.dataset === "limit_down" ? "down" : "break";
     const result = await db.query(
@@ -79,14 +122,8 @@ export async function queryMarketStructure(
     );
     items = result.rows;
   } else if (input.dataset === "limit_ladder") {
-    const result = await db.query(
-      `SELECT id::text, target_date::text, coverage_start::text, coverage_end::text,
-              ladder, fetched_at::text
-         FROM market_limit_ladder_snapshot WHERE target_date = $1
-        ORDER BY id DESC LIMIT 1`,
-      [input.date],
-    );
-    items = result.rows;
+    rowCount = ladderItems.length;
+    items = ladderItems.slice((input.page - 1) * input.size, input.page * input.size);
   } else {
     const datasetType = input.dataset.replace("dragon_tiger_", "");
     const result = await db.query(
@@ -121,7 +158,7 @@ export async function queryMarketStructure(
     coverage: {
       completed_pages: coverage.completed_pages,
       total_pages: coverage.total_pages,
-      row_count: coverage.row_count,
+      row_count: rowCount,
       source_time: coverage.source_time,
       finished_at: coverage.finished_at,
     },
@@ -129,6 +166,10 @@ export async function queryMarketStructure(
     page: input.page,
     size: input.size,
     items,
-    counts: Object.fromEntries(countResult.rows.map((row) => [row.dataset, row.row_count])),
+    counts: {
+      ...Object.fromEntries(countResult.rows.map((row) => [row.dataset, row.row_count])),
+      limit_ladder: ladderItems.length,
+      [input.dataset]: rowCount,
+    },
   };
 }

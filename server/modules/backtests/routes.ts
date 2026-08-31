@@ -4,6 +4,7 @@ import pg from "pg";
 import { apiErrors } from "../../http/router.js";
 import {
   getBacktestRunWithArtifacts,
+  getVersionedBacktestSource,
   listBacktestRuns,
 } from "./repo.js";
 
@@ -25,5 +26,12 @@ export const backtestRoutes = {
     const run = await getBacktestRunWithArtifacts(pool, params.id!);
     if (!run) throw apiErrors.notFound(`回测运行不存在：${params.id}`);
     return { data: run };
+  },
+
+  /** GET /api/backtests/:id/source：只读已最终化的源码版本。 */
+  async getSource({ pool, params }: Ctx) {
+    const source = await getVersionedBacktestSource(pool, params.id!);
+    if (!source) throw apiErrors.notFound(`回测运行没有可查看的固化源码：${params.id}`);
+    return { data: source };
   },
 };

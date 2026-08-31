@@ -284,20 +284,6 @@ function allTools(): UiToolCall[] {
   return messages.value.flatMap((m) => m.tools);
 }
 
-function agentToolCount(turn: UiAgentTurn): number {
-  return turn.messages.reduce((count, message) => count + message.tools.length, 0);
-}
-
-function agentTurnStreaming(turn: UiAgentTurn): boolean {
-  return turn.messages.some((message) => message.streaming);
-}
-
-function agentTurnFailed(turn: UiAgentTurn): boolean {
-  return turn.messages.some(
-    (message) => Boolean(message.errorText) || message.tools.some((tool) => tool.status === "error"),
-  );
-}
-
 function agentTurnTime(turn: UiAgentTurn): string | null {
   return fmtTime(turn.messages[turn.messages.length - 1]?.createdAt);
 }
@@ -1179,78 +1165,56 @@ onBeforeUnmount(() => {
               </div>
 
               <div v-else class="msg agent">
-                <article
-                  class="agent-turn-card"
-                  :class="{
-                    streaming: agentTurnStreaming(turn),
-                    failed: agentTurnFailed(turn),
-                  }"
-                >
-                  <header class="agent-turn-head">
-                    <span class="agent-mark" aria-hidden="true">✦</span>
-                    <span class="agent-turn-title">Agent 执行轨迹</span>
-                    <span v-if="agentToolCount(turn)" class="agent-tool-count">
-                      {{ agentToolCount(turn) }} 次工具调用
-                    </span>
-                    <span
-                      class="badge agent-turn-status"
-                      :class="agentTurnStreaming(turn) ? 'warn' : agentTurnFailed(turn) ? 'bad' : 'ok'"
+                <article class="agent-turn">
+                  <span class="agent-mark" aria-hidden="true">✦</span>
+                  <div class="agent-turn-flow">
+                    <div class="agent-turn-body">
+                      <template v-for="(phase, phaseIndex) in turn.messages" :key="phase.key">
+                        <section
+                          v-if="phase.text"
+                          class="agent-phase"
+                          :class="[
+                            isAgentAnswer(turn, phaseIndex) ? 'answer' : 'thought',
+                            { active: phase.streaming },
+                          ]"
+                        >
+                          <MarkdownView :source="phase.text" breaks />
+                        </section>
+
+                        <section v-if="phase.tools.length" class="agent-phase tools">
+                          <ToolGroupCard
+                            v-for="group in groupToolCalls(phase.tools)"
+                            :key="group.key"
+                            :tools="group.tools"
+                            @decide="(tool, action) => decide(tool, action)"
+                          />
+                        </section>
+
+                        <section
+                          v-if="phase.streaming && !phase.text && phase.tools.length === 0"
+                          class="agent-phase pending"
+                          role="status"
+                          aria-label="Agent 正在思考"
+                        >
+                          <div class="assistant-thinking">
+                            <span>思考与进展</span>
+                            <span class="thinking-dots" aria-hidden="true">
+                              <i></i><i></i><i></i>
+                            </span>
+                          </div>
+                        </section>
+
+                        <div v-if="phase.errorText" class="chat-error-bar">⚠ {{ phase.errorText }}</div>
+                      </template>
+                    </div>
+                    <time
+                      v-if="agentTurnTime(turn)"
+                      class="message-time agent-message-time"
+                      :datetime="turn.messages[turn.messages.length - 1]?.createdAt"
                     >
-                      {{ agentTurnStreaming(turn) ? "执行中" : agentTurnFailed(turn) ? "有异常" : "已完成" }}
-                    </span>
-                  </header>
-
-                  <div class="agent-turn-body">
-                    <template v-for="(phase, phaseIndex) in turn.messages" :key="phase.key">
-                      <section
-                        v-if="phase.text"
-                        class="agent-phase"
-                        :class="[
-                          isAgentAnswer(turn, phaseIndex) ? 'answer' : 'thought',
-                          { active: phase.streaming },
-                        ]"
-                      >
-                        <div class="agent-phase-label">
-                          <span>{{ isAgentAnswer(turn, phaseIndex) ? "Agent 回答" : "思考与进展" }}</span>
-                        </div>
-                        <MarkdownView :source="phase.text" breaks />
-                      </section>
-
-                      <section v-if="phase.tools.length" class="agent-phase tools">
-                        <div class="agent-phase-label">
-                          <span>工具调用</span>
-                          <span class="agent-phase-meta">{{ phase.tools.length }} 项</span>
-                        </div>
-                        <ToolGroupCard
-                          v-for="group in groupToolCalls(phase.tools)"
-                          :key="group.key"
-                          :tools="group.tools"
-                          @decide="(tool, action) => decide(tool, action)"
-                        />
-                      </section>
-
-                      <section
-                        v-if="phase.streaming && !phase.text && phase.tools.length === 0"
-                        class="agent-phase thought pending"
-                        role="status"
-                        aria-label="Agent 正在思考"
-                      >
-                        <div class="agent-phase-label"><span>思考与进展</span></div>
-                        <div class="assistant-thinking">
-                          <span></span><span></span><span></span>
-                        </div>
-                      </section>
-
-                      <div v-if="phase.errorText" class="chat-error-bar">⚠ {{ phase.errorText }}</div>
-                    </template>
+                      {{ agentTurnTime(turn) }}
+                    </time>
                   </div>
-                  <time
-                    v-if="agentTurnTime(turn)"
-                    class="message-time agent-message-time"
-                    :datetime="turn.messages[turn.messages.length - 1]?.createdAt"
-                  >
-                    {{ agentTurnTime(turn) }}
-                  </time>
                 </article>
               </div>
             </template>
@@ -1740,103 +1704,67 @@ onBeforeUnmount(() => {
 }
 
 .agent-message-time {
-  padding: 0 11px 8px;
-  text-align: right;
+  margin-top: 5px;
+  text-align: left;
 }
 
-.agent-turn-card {
-  width: min(88%, 860px);
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  background: var(--paper);
-  box-shadow: 0 1px 0 color-mix(in srgb, var(--ink) 4%, transparent);
+.agent-turn {
+  display: grid;
+  width: min(92%, 900px);
+  min-width: 0;
+  grid-template-columns: 26px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
 }
 
-.chat-view.embedded .agent-turn-card {
+.chat-view.embedded .agent-turn {
   width: 100%;
-}
-
-.agent-turn-card.failed {
-  border-color: color-mix(in srgb, var(--bad) 28%, var(--line));
-}
-
-.agent-turn-head {
-  display: flex;
-  min-height: 40px;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 11px;
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--paper-deep) 74%, var(--card));
 }
 
 .agent-mark {
   display: inline-flex;
-  width: 23px;
-  height: 23px;
+  width: 26px;
+  height: 26px;
   flex: none;
   align-items: center;
   justify-content: center;
-  border-radius: 7px;
-  background: var(--accent-soft);
   color: var(--accent-strong);
-  font-size: 12px;
+  font-size: 15px;
 }
 
-.agent-turn-title {
-  color: var(--ink);
-  font-size: var(--fs-sm);
-  font-weight: 650;
-}
-
-.agent-tool-count {
-  color: var(--ink-faint);
-  font-size: var(--fs-xs);
-}
-
-.agent-turn-status {
-  margin-left: auto;
-  flex: none;
-  font-size: 10px;
+.agent-turn-flow {
+  min-width: 0;
+  padding-top: 2px;
 }
 
 .agent-turn-body {
-  padding: 11px;
+  min-width: 0;
 }
 
 .agent-phase + .agent-phase,
 .agent-phase + .chat-error-bar,
 .chat-error-bar + .agent-phase {
-  margin-top: 10px;
+  margin-top: 12px;
 }
 
 .agent-phase {
   min-width: 0;
 }
 
-.agent-phase-label {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 7px;
-  color: var(--ink-faint);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+.agent-phase :deep(.markdown-view) {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
-.agent-phase-meta {
-  font-weight: 500;
-  letter-spacing: 0;
+.agent-phase :deep(.markdown-view table) {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .agent-phase.thought {
-  padding: 9px 10px;
-  border-left: 2px solid color-mix(in srgb, var(--ink-faint) 55%, var(--line));
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  background: color-mix(in srgb, var(--paper-deep) 72%, transparent);
+  padding: 1px 0 1px 11px;
+  border-left: 2px solid color-mix(in srgb, var(--ink-faint) 48%, var(--line));
   color: var(--ink-soft);
 }
 
@@ -1845,22 +1773,14 @@ onBeforeUnmount(() => {
 }
 
 .agent-phase.answer {
-  padding: 3px 3px 5px;
-}
-
-.agent-phase.answer .agent-phase-label {
-  color: var(--accent-strong);
+  padding: 0;
 }
 
 .agent-phase.tools {
-  padding: 9px 10px;
-  border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--line));
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--accent-soft) 24%, transparent);
-}
-
-.agent-phase.tools .agent-phase-label {
-  color: var(--ink-soft);
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 1px 0;
 }
 
 .agent-phase.active :deep(.markdown-view > :last-child)::after {
@@ -1876,25 +1796,33 @@ onBeforeUnmount(() => {
 }
 
 .assistant-thinking {
-  height: 18px;
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 8px;
+  min-height: 24px;
+  color: var(--ink-soft);
+  font-size: var(--fs-sm);
 }
 
-.assistant-thinking span {
-  width: 6px;
-  height: 6px;
+.thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.thinking-dots i {
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background: var(--ink-faint);
   animation: thinking-pulse 1.15s ease-in-out infinite;
 }
 
-.assistant-thinking span:nth-child(2) {
+.thinking-dots i:nth-child(2) {
   animation-delay: 120ms;
 }
 
-.assistant-thinking span:nth-child(3) {
+.thinking-dots i:nth-child(3) {
   animation-delay: 240ms;
 }
 
@@ -2177,12 +2105,25 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 720px) {
+  .chat-view.embedded .chat-layout {
+    grid-template-columns: minmax(104px, 112px) minmax(0, 1fr);
+  }
+
+  .chat-view.embedded .session-panel {
+    padding-inline: 6px;
+  }
+
   .conversation-toolbar .model-switch-label {
     display: none;
   }
 
   .running-controls {
     gap: 4px;
+    margin-left: auto;
+  }
+
+  .composer-bar {
+    flex-wrap: wrap;
   }
 
   .queue-btn,
@@ -2193,7 +2134,7 @@ onBeforeUnmount(() => {
 
 @media (prefers-reduced-motion: reduce) {
   .msg,
-  .assistant-thinking span,
+  .thinking-dots i,
   .agent-phase.active :deep(.markdown-view > :last-child)::after {
     animation: none;
   }

@@ -78,7 +78,7 @@ export function groupToolCalls(tools: UiToolCall[]): UiToolGroup[] {
 }
 
 /**
- * 把连续 assistant 消息聚合成一轮 Agent 执行轨迹。
+ * 把连续 assistant 消息聚合成一轮连续 Agent 回复流。
  * toolResult 不会生成 UiMessage，因此历史恢复与实时流都以用户消息作为稳定轮次边界。
  */
 export function groupMessagesIntoTurns(

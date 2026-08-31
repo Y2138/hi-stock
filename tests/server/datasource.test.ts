@@ -16,11 +16,19 @@ import {
 import { fetchAllTickers, fetchTickerPage, fetchTradingDays } from "../../server/datasource/hithink-meta.js";
 import { fetchBoardCatalog, fetchBoardConstituents } from "../../server/datasource/hithink-boards.js";
 import { fetchDragonTiger, fetchLimitPoolPage } from "../../server/datasource/hithink-special.js";
+import {
+  HITHINK_DATASET_CAPABILITIES,
+  HITHINK_DATASET_SPECS,
+  fetchHithinkDataset,
+  fetchHithinkDatasetAndStore,
+  normalizeHithinkDatasetRequest,
+} from "../../server/datasource/hithink-datasets.js";
 import { syncAllBoardMemberships, syncBoardMembership, upsertTickerIdentities } from "../../server/datasource/catalog-service.js";
 import { syncLimitDataset, syncLimitLadder } from "../../server/datasource/special-service.js";
 import { calculateIndicators } from "../../server/indicators/formulas.js";
 import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
 import { buildOnDemandBars } from "../../server/modules/market/routes.js";
+import { queryMarketStructure } from "../../server/modules/market/structure.js";
 import indicatorFixture from "../fixtures/指标金样本.json";
 import { fetchFundFlow } from "../../server/datasource/akshare.js";
 import {
@@ -372,6 +380,101 @@ describe("datasource 限流与重试", () => {
     expect(await fetchDragonTiger("all", "2026-08-18", noWait)).toMatchObject({ boardType: "all", tradeDate: "2026-08-18" });
     vi.unstubAllGlobals();
   });
+
+  it("扶摇扩展能力白名单覆盖竞价、热榜/异动和基金研究端点并严格转换参数", async () => {
+    expect(HITHINK_DATASET_CAPABILITIES).toHaveLength(34);
+    expect(new Set(Object.values(HITHINK_DATASET_SPECS).map((spec) => spec.path)).size).toBe(34);
+    const timestamp = Date.parse("2026-08-20T09:25:00+08:00");
+    const mock = vi.fn(async (url: unknown) => {
+      const parsed = new URL(String(url));
+      if (parsed.pathname === "/api/a-share/auction/snapshot") {
+        expect(parsed.searchParams.get("thscodes")).toBe("600519.SH,000001.SZ");
+        expect(parsed.searchParams.get("stage")).toBe("final");
+        return jsonResponse({
+          code: 0,
+          message: "success",
+          data: {
+            timestamp,
+            auction_phase: "final",
+            data_status: "ready",
+            item: [{ thscode: "600519.SH", auction_price: 1500 }],
+          },
+        });
+      }
+      if (parsed.pathname === "/api/fund/performance/indicators-historical") {
+        expect(parsed.searchParams.get("fund_type")).toBe("exchange");
+        expect(parsed.searchParams.get("thscode")).toBe("510300.SH");
+        expect(parsed.searchParams.get("start")).toBe(String(Date.parse("2026-01-01T00:00:00+08:00")));
+        expect(parsed.searchParams.get("end")).toBe(String(Date.parse("2026-08-20T23:59:59.999+08:00")));
+        return jsonResponse({
+          code: 0,
+          message: "success",
+          data: { timestamp, item: [{ date_ms: timestamp, rsi_pct: 52.1 }] },
+        });
+      }
+      throw new Error(`未预期的 URL: ${parsed}`);
+    });
+    vi.stubGlobal("fetch", mock);
+    const auction = await fetchHithinkDataset({
+      capability: "auction_snapshot",
+      codes: ["600519.sh", "000001.SZ", "600519.SH"],
+      stage: "final",
+    }, noWait);
+    expect(auction).toMatchObject({
+      capability: "auction_snapshot",
+      asOfDate: "2026-08-20",
+      dataStatus: "ready",
+      rowCount: 1,
+      request: { codes: ["600519.SH", "000001.SZ"] },
+    });
+    const fund = await fetchHithinkDataset({
+      capability: "fund_performance_indicators",
+      fund_type: "exchange",
+      code: "510300.sh",
+      start: "2026-01-01",
+      end: "2026-08-20",
+    }, noWait);
+    expect(fund).toMatchObject({ capability: "fund_performance_indicators", rowCount: 1 });
+    expect(() => normalizeHithinkDatasetRequest({
+      capability: "fund_profile",
+      fund_type: "exchange",
+      code: "510300.SH",
+      period: "day",
+    })).toThrow("不接受参数 period");
+    expect(() => normalizeHithinkDatasetRequest({
+      capability: "hot_stock_rank_trend",
+      code: "600519.SH",
+      start: "2025-01-01",
+      end: "2026-01-02",
+    })).toThrow("不能超过 1 年");
+    vi.unstubAllGlobals();
+  });
+
+  it("扶摇标的目录识别公募 REITs", async () => {
+    const timestamp = Date.parse("2026-08-20T07:00:00+08:00");
+    vi.stubGlobal("fetch", vi.fn(async (url: unknown) => {
+      const parsed = new URL(String(url));
+      expect(parsed.searchParams.get("asset_type")).toBe("fund-reits");
+      return jsonResponse({
+        code: 0,
+        message: "success",
+        data: {
+          timestamp,
+          item: [{
+            thscode: "180101.SZ",
+            ticker: "180101",
+            name: "测试公募REIT",
+            asset_type: "fund-reits",
+            exchange: "SZ",
+          }],
+        },
+      });
+    }));
+    expect(await fetchTickerPage({ assetTypes: ["fund-reits"] }, noWait)).toMatchObject([
+      { code: "180101.SZ", assetType: "fund-reits" },
+    ]);
+    vi.unstubAllGlobals();
+  });
 });
 
 // ---------- 数据库用例（stock_test；无库时整体 skip） ----------
@@ -390,6 +493,41 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
   afterAll(async () => {
     vi.unstubAllGlobals();
     await pool.end();
+  });
+
+  it("扶摇扩展数据按规范化请求幂等缓存并记录 fetch run", async () => {
+    let unitNav = 1.1;
+    vi.stubGlobal("fetch", vi.fn(async (url: unknown) => {
+      const parsed = new URL(String(url));
+      expect(parsed.pathname).toBe("/api/fund/profile/detail");
+      expect(parsed.searchParams.get("fund_type")).toBe("reits");
+      expect(parsed.searchParams.get("thscode")).toBe("180101.SZ");
+      return jsonResponse({
+        code: 0,
+        message: "success",
+        data: {
+          timestamp: Date.parse("2026-08-20T15:00:00+08:00"),
+          item: [{ thscode: "180101.SZ", fund_name: "测试公募REIT", unit_nav: unitNav }],
+        },
+      });
+    }));
+    const request = { capability: "fund_profile", fund_type: "reits", code: "180101.SZ" } as const;
+    const first = await fetchHithinkDatasetAndStore(pool, request, noWait);
+    unitNav = 1.2;
+    const second = await fetchHithinkDatasetAndStore(pool, request, noWait);
+    expect(second.snapshotId).toBe(first.snapshotId);
+    const stored = await pool.query<{ count: number; unit_nav: number }>(
+      `SELECT count(*)::int AS count,
+              max((payload->'item'->0->>'unit_nav')::numeric)::float8 AS unit_nav
+         FROM hithink_dataset_snapshot WHERE capability = 'fund_profile'`,
+    );
+    expect(stored.rows[0]).toEqual({ count: 1, unit_nav: 1.2 });
+    const runs = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM market_fetch_run
+        WHERE scope->>'pipeline' = 'hithink_dataset' AND scope->>'capability' = 'fund_profile'`,
+    );
+    expect(runs.rows[0]!.count).toBe(2);
+    vi.unstubAllGlobals();
   });
 
   it("通道选择：日线请求路由到 hithink（fuyao 域名）", async () => {
@@ -747,7 +885,7 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     )).rows[0]!.count)).toBe(1);
   });
 
-  it("dailyMarketUpdate 快照日期错配时整组降级历史日线，不写错日数据", async () => {
+  it("dailyMarketUpdate 快照日期错配时记缺口并跳过，不放大为历史请求", async () => {
     const targetDate = "2026-08-20";
     const observedDate = "2026-08-21";
     vi.stubGlobal(
@@ -756,9 +894,6 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
         const parsed = new URL(String(url));
         if (parsed.pathname === "/api/a-share/prices/snapshot") {
           return jsonResponse(snapshotPayload("000333.SZ", observedDate, 11));
-        }
-        if (parsed.pathname === "/api/a-share/prices/historical") {
-          return jsonResponse(klinePayload([targetDate], [10]));
         }
         throw new Error(`未预期的 URL: ${parsed}`);
       }),
@@ -770,16 +905,18 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       { hithinkDeps: noWait },
     );
 
-    expect(summary.gaps).toEqual([]);
-    expect(summary.refetched).toEqual(["000333.SZ"]);
+    expect(summary.gaps).toEqual([
+      { code: "000333.SZ", freq: "day", reason: `快照交易日 ${observedDate} 与目标日 ${targetDate} 不一致` },
+    ]);
+    expect(summary.refetched).toEqual([]);
     const stored = await pool.query<{ bar_date: string }>(
       `SELECT bar_date::text FROM market_bar b JOIN market_instrument i ON i.id = b.instrument_id
         WHERE i.code = '000333.SZ' AND b.freq = 'day' ORDER BY bar_date`,
     );
-    expect(stored.rows).toEqual([{ bar_date: targetDate }]);
+    expect(stored.rows).toEqual([]);
   });
 
-  it("dailyMarketUpdate 将板块与指数同组持久化，单组降级成功不记最终缺口", async () => {
+  it("dailyMarketUpdate 将板块与指数同组持久化，坏标的单独跳过", async () => {
     const targetDate = "2026-08-18";
     const previousDate = "2026-08-17";
     const assets = [
@@ -812,17 +949,21 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       }
       if (parsed.pathname === "/api/a-share-index/prices/snapshot") {
         expect(parsed.searchParams.get("thscodes")).toBe("000300.SH,889999.TI");
-        return jsonResponse({ code: 1002, message: "index snapshot unavailable", data: null });
+        return jsonResponse({
+          code: 0,
+          message: "success",
+          data: {
+            timestamp: Date.parse(`${targetDate}T15:05:00+08:00`),
+            item: [
+              { thscode: "000300.SH", open_price: 10, high_price: 12, low_price: 9, last_price: 11, prev_price: 10 },
+              { thscode: "889999.TI", open_price: 0, high_price: 0, low_price: 0, last_price: 0, prev_price: 10 },
+            ],
+          },
+        });
       }
       if (parsed.pathname === "/api/fund/market/snapshot") {
         expect(parsed.searchParams.get("thscode")).toBe("159516.SZ");
         return jsonResponse(snapshotPayload("159516.SZ", targetDate, 10));
-      }
-      if (parsed.pathname === "/api/a-share/prices/historical") {
-        return jsonResponse({ code: 1002, message: "not a stock", data: null });
-      }
-      if (parsed.pathname === "/api/a-share-index/prices/historical") {
-        return jsonResponse(klinePayload([targetDate], [12]));
       }
       throw new Error(`未预期的 URL: ${parsed}`);
     });
@@ -833,9 +974,11 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       { codes: assets.map((asset) => asset.code), date: targetDate },
       { hithinkDeps: noWait },
     );
-    expect(summary.gaps).toEqual([]);
-    expect(summary.refetched).toEqual(["000300.SH", "889999.TI"]);
-    expect(summary.snapshotRows).toBe(4);
+    expect(summary.gaps).toEqual([
+      { code: "889999.TI", freq: "day", reason: "快照存在非正或非有限 OHLC" },
+    ]);
+    expect(summary.refetched).toEqual([]);
+    expect(summary.snapshotRows).toBe(3);
     expect(fetchMock.mock.calls.map(([url]) => new URL(String(url)).pathname).filter((path) => path.endsWith("/snapshot")))
       .toEqual([
         "/api/a-share/prices/snapshot",
@@ -847,13 +990,60 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
         WHERE i.code = ANY($1::text[]) AND b.freq = 'day' AND b.bar_date = $2`,
       [assets.map((asset) => asset.code), targetDate],
     );
-    expect(stored.rows[0]!.count).toBe(4);
+    expect(stored.rows[0]!.count).toBe(3);
     const degraded = await pool.query<{ gaps: unknown[] }>(
       `SELECT gaps FROM market_fetch_run
         WHERE scope->>'op' = 'snapshot' AND scope->>'kind' = 'index'
         ORDER BY id DESC LIMIT 1`,
     );
     expect(degraded.rows[0]!.gaps).toHaveLength(1);
+  });
+
+  it("dailyMarketUpdate ETF 组内单只基金不支持行情只记该标的缺口，不拖垮同组", async () => {
+    const targetDate = "2026-08-14";
+    for (const [code, name] of [["159516.SZ", "好ETF"], ["560450.SH", "坏基金"]] as const) {
+      const instrument = await pool.query<{ id: string }>(
+        `INSERT INTO market_instrument (code, name, kind) VALUES ($1, $2, 'etf')
+         ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name RETURNING id::text`,
+        [code, name],
+      );
+      await pool.query(
+        `INSERT INTO market_bar
+           (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, channel)
+         VALUES ($1, 'day', '2026-08-13', '2026-08-13T00:00:00Z', 10, 11, 9, 10, 1000, 'test')`,
+        [instrument.rows[0]!.id],
+      );
+    }
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown) => {
+        const parsed = new URL(String(url));
+        if (parsed.pathname === "/api/fund/market/snapshot") {
+          const code = parsed.searchParams.get("thscode");
+          if (code === "560450.SH") {
+            return jsonResponse({ code: 3004, message: "This fund does not support market data" });
+          }
+          return jsonResponse(snapshotPayload(code!, targetDate, 10));
+        }
+        throw new Error(`未预期的 URL: ${parsed}`);
+      }),
+    );
+
+    const summary = await dailyMarketUpdate(
+      pool,
+      { codes: ["159516.SZ", "560450.SH"], date: targetDate },
+      { hithinkDeps: noWait },
+    );
+    expect(summary.gaps).toEqual([
+      { code: "560450.SH", freq: "day", reason: expect.stringContaining("ETF 快照不可用") },
+    ]);
+    expect(summary.snapshotRows).toBe(1);
+    const stored = await pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM market_bar b JOIN market_instrument i ON i.id = b.instrument_id
+        WHERE i.code = ANY($1::text[]) AND b.freq = 'day' AND b.bar_date = $2`,
+      [["159516.SZ", "560450.SH"], targetDate],
+    );
+    expect(stored.rows[0]!.n).toBe(1);
   });
 
   it("单板块成分请求失败时保留上一版有效关系", async () => {
@@ -955,7 +1145,13 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       data: {
         timestamp,
         window: { length: 2, date_list: dateList, board_caps: {} },
-        item: [{ date: dateList[0], boards: {} }],
+        item: [{
+          date: dateList[0],
+          boards: {
+            two_board: [{ name: "测试二板", thscode: "000001.SZ", board_num: 2 }],
+            three_board: [{ name: "测试三板", thscode: "600001.SH", board_num: 3 }],
+          },
+        }],
       },
     })));
 
@@ -971,6 +1167,16 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     expect(snapshots.rows).toEqual(expect.arrayContaining([
       { coverage_start: "2026-08-19", coverage_end: "2026-08-20" },
     ]));
+    expect(await queryMarketStructure(pool, {
+      date: "2026-08-20", dataset: "limit_ladder", page: 1, size: 200,
+    })).toMatchObject({
+      coverage: { row_count: 2 },
+      items: [
+        { name: "测试二板", thscode: "000001.SZ", tier: "2板" },
+        { name: "测试三板", thscode: "600001.SH", tier: "3板" },
+      ],
+      counts: { limit_ladder: 2 },
+    });
 
     const mismatch = await syncLimitLadder(pool, "2026-08-21", noWait);
     expect(mismatch).toMatchObject({

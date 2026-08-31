@@ -7,6 +7,11 @@ import type {
   DatabaseSchemaInput,
 } from "./database-tools.js";
 import type { AgentBacktestRequest, JsonValue } from "../backtest/agent-contract.js";
+import {
+  HITHINK_DATASET_CAPABILITIES,
+  normalizeHithinkDatasetRequest,
+  type HithinkDatasetRequest,
+} from "../datasource/hithink-datasets.js";
 import { WEB_RESEARCH_ALLOWED_DOMAINS, WEB_RESEARCH_CONTRACT_LIMITS } from "./web-research-provider.js";
 
 const IDENTIFIER_PATTERN = "^[a-z][a-z0-9_]{0,62}$";
@@ -173,27 +178,14 @@ const PositionChangePortfolioWriteSchema = strictObject({
   attribution_note: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
   deviation_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
 });
-const AccountSnapshotPortfolioWriteSchema = strictObject({
-  action: Type.Literal("upsert_account_snapshot"),
-  reason: ReasonSchema,
-  snap_date: DateSchema,
-  total_asset: PositiveNumberSchema,
-  cash: Type.Number({ minimum: 0 }),
-  closed_pnl: Type.Number(),
-  market_value: Type.Optional(Type.Number({ minimum: 0 })),
-  precision: Type.Optional(Type.Union([Type.Literal("exact"), Type.Literal("approx")])),
-});
-export const PortfolioWriteSchema = objectRoot(Type.Union([
-  PositionChangePortfolioWriteSchema,
-  AccountSnapshotPortfolioWriteSchema,
-]));
+export const PortfolioWriteSchema = PositionChangePortfolioWriteSchema;
 type PositionChangePortfolioWriteInput =
   Omit<Static<typeof PositionChangePortfolioWriteSchema>, "action" | "decision_origin" | "execution_compliance"> & {
     action: "record_position_change";
     decision_origin: Static<typeof DecisionOriginSchema>;
     execution_compliance: Static<typeof ExecutionComplianceSchema>;
   };
-export type PortfolioWriteInput = PositionChangePortfolioWriteInput | Static<typeof AccountSnapshotPortfolioWriteSchema>;
+export type PortfolioWriteInput = PositionChangePortfolioWriteInput;
 
 const PoolKindSchema = Type.Union([Type.Literal("short"), Type.Literal("long")]);
 const PoolMembershipWriteSchema = strictObject({
@@ -245,6 +237,66 @@ export const ScheduledPoolAttentionSchema = objectRoot(Type.Union([
 ]));
 export type ScheduledPoolAttentionInput = Static<typeof ScheduledPoolAttentionSchema>;
 
+/** 每日计划盯防预案行：持仓次日执行预案 + 打板机会，写入后由任务成功激活。 */
+const PlaybookTextSchema = Type.String({ minLength: 1, maxLength: 2_000 });
+const DailyPlanPlaybookItemSchema = strictObject({
+  item_kind: Type.Union([Type.Literal("position_action"), Type.Literal("off_pool_opportunity")]),
+  code: CodeSchema,
+  grade: Type.Optional(Type.Union([Type.Literal("A"), Type.Literal("B")])),
+  priority: Type.Optional(Type.Integer({ minimum: 1, maximum: 999 })),
+  action: Type.Union([
+    Type.Literal("exit"),
+    Type.Literal("reduce"),
+    Type.Literal("buy"),
+    Type.Literal("hold"),
+    Type.Literal("observe"),
+  ]),
+  trigger_kind: Type.Union([
+    Type.Literal("open"),
+    Type.Literal("price_range"),
+    Type.Literal("condition"),
+  ]),
+  price_lower: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000 })),
+  price_upper: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000 })),
+  headline: Type.String({ minLength: 1, maxLength: 300 }),
+  auction_md: Type.Optional(PlaybookTextSchema),
+  intraday_md: Type.Optional(PlaybookTextSchema),
+  evidence_md: Type.Optional(PlaybookTextSchema),
+  missing_md: Type.Optional(PlaybookTextSchema),
+  invalidation_md: Type.Optional(PlaybookTextSchema),
+  risk_md: Type.Optional(PlaybookTextSchema),
+});
+export const DailyPlanWriteSchema = strictObject({
+  items: Type.Array(DailyPlanPlaybookItemSchema, { minItems: 1, maxItems: 60 }),
+});
+export type DailyPlanWriteRawInput = Static<typeof DailyPlanWriteSchema>;
+
+const AuctionAssessmentItemSchema = strictObject({
+  code: CodeSchema,
+  conclusion: Type.Union([
+    Type.Literal("observe"),
+    Type.Literal("give_up"),
+    Type.Literal("unavailable"),
+  ]),
+  metrics_summary: Type.String({ minLength: 1, maxLength: 1_000 }),
+  assessment_summary: Type.String({ minLength: 1, maxLength: 2_000 }),
+  benchmark_tags: Type.Optional(Type.Array(
+    Type.String({ minLength: 1, maxLength: 100 }),
+    { maxItems: 20 },
+  )),
+  data_status: Type.Union([
+    Type.Literal("ready"),
+    Type.Literal("not_ready"),
+    Type.Literal("missing"),
+    Type.Literal("stale"),
+  ]),
+  data_time: Type.Optional(Type.String({ minLength: 20, maxLength: 40 })),
+});
+export const AuctionAssessmentWriteSchema = strictObject({
+  items: Type.Array(AuctionAssessmentItemSchema, { minItems: 1, maxItems: 4 }),
+});
+export type AuctionAssessmentWriteInput = Static<typeof AuctionAssessmentWriteSchema>;
+
 const RevisionIdSchema = Type.String({ pattern: "^[0-9]+$" });
 const ContentTextSchema = Type.String({ minLength: 1, maxLength: 200_000 });
 const ChangeSummarySchema = Type.Optional(Type.String({ maxLength: 500 }));
@@ -284,8 +336,8 @@ const DatasourceJobConfigSchema = strictObject({
   export_volume: Type.Optional(Type.Boolean()),
 });
 const AgentFlowJobConfigSchema = strictObject({
-  readonly: Type.Optional(Type.Literal(true)),
   pool_attention_write: Type.Optional(Type.Literal(true)),
+  daily_plan_write: Type.Optional(Type.Literal(true)),
 });
 const AnalysisJobConfigSchema = strictObject({
   analysis_type: Type.Union([
@@ -435,12 +487,19 @@ export const RunBacktestSchema = strictObject({
   kind: Type.Optional(Type.Union([Type.Literal("formal"), Type.Literal("research")])),
   research_outline: Type.String({ minLength: 1, maxLength: 4_000 }),
   hypothesis: Type.String({ minLength: 1, maxLength: 4_000 }),
-  codes: Type.Array(CodeSchema, { minItems: 1, maxItems: 100 }),
+  codes: Type.Array(CodeSchema, { maxItems: 100 }),
+  market_event_types: Type.Optional(Type.Array(Type.Union([
+    Type.Literal("up"), Type.Literal("down"), Type.Literal("break"),
+  ]), { maxItems: 3 })),
+  limit_up_universe: Type.Optional(Type.Union([
+    Type.Literal("none"), Type.Literal("mainboard"), Type.Literal("all"),
+  ])),
   start: DateSchema,
   end: DateSchema,
   initial_cash: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000_000_000 })),
   parameters: Type.Optional(Type.Record(IdentifierSchema, Type.Unknown())),
   comparison_run_ids: Type.Optional(Type.Array(RevisionIdSchema, { maxItems: 20 })),
+  base_source_run_id: Type.Optional(RevisionIdSchema),
   source_code: Type.String({
     minLength: 1,
     maxLength: 65_536,
@@ -449,6 +508,11 @@ export const RunBacktestSchema = strictObject({
   }),
 });
 export type RunBacktestInput = AgentBacktestRequest;
+
+export const ReadBacktestSourceSchema = strictObject({
+  run_id: RevisionIdSchema,
+});
+export type ReadBacktestSourceInput = Static<typeof ReadBacktestSourceSchema>;
 
 export const FetchMarketDataSchema = strictObject({
   requests: Type.Optional(Type.Array(
@@ -470,6 +534,49 @@ export const FetchMarketDataSchema = strictObject({
   continue_on_error: Type.Optional(Type.Boolean({ description: "默认 true" })),
 });
 export type FetchMarketDataInput = Static<typeof FetchMarketDataSchema>;
+
+const HithinkDatasetRequestSchema = strictObject({
+  capability: Type.Union(HITHINK_DATASET_CAPABILITIES.map((value) => Type.Literal(value))),
+  code: Type.Optional(Type.String({ minLength: 1, maxLength: 32 })),
+  codes: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 32 }), { minItems: 1, maxItems: 100 })),
+  fund_type: Type.Optional(Type.Union([
+    Type.Literal("otc"), Type.Literal("exchange"), Type.Literal("reits"),
+  ])),
+  stage: Type.Optional(Type.Union([Type.Literal("live"), Type.Literal("final")])),
+  date: Type.Optional(Type.String({ pattern: DATE_PATTERN })),
+  period: Type.Optional(Type.Union([Type.Literal("day"), Type.Literal("hour")])),
+  tags: Type.Optional(Type.Array(Type.Union([
+    Type.Literal("LIMIT_UP"), Type.Literal("LIMIT_DOWN"), Type.Literal("SHARP_RISE"),
+    Type.Literal("SHARP_FALL"), Type.Literal("RAPID_RALLY"), Type.Literal("RAPID_DECLINE"),
+  ]), { minItems: 1, maxItems: 6 })),
+  start: Type.Optional(Type.String({ pattern: DATE_PATTERN })),
+  end: Type.Optional(Type.String({ pattern: DATE_PATTERN })),
+  range: Type.Optional(Type.Union([
+    Type.Literal("week"), Type.Literal("month"), Type.Literal("tmonth"), Type.Literal("hyear"),
+    Type.Literal("year"), Type.Literal("twoyear"), Type.Literal("tyear"), Type.Literal("fyear"),
+    Type.Literal("nowyear"), Type.Literal("now"),
+  ])),
+  nav_type: Type.Optional(Type.Union([Type.Literal("unit"), Type.Literal("adj"), Type.Literal("unit,adj")])),
+  merge_scope: Type.Optional(Type.Union([
+    Type.Literal("all"), Type.Literal("merged"), Type.Literal("separate"),
+  ])),
+  manager_id: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  company_id: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  subscribe: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("upcoming")])),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+  report_type: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  end_date: Type.Optional(Type.String({ pattern: DATE_PATTERN })),
+});
+
+export const FetchHithinkDataSchema = strictObject({
+  requests: Type.Array(HithinkDatasetRequestSchema, { minItems: 1, maxItems: 20 }),
+  continue_on_error: Type.Optional(Type.Boolean({ description: "默认 true" })),
+});
+export interface FetchHithinkDataInput {
+  requests: HithinkDatasetRequest[];
+  continue_on_error?: boolean;
+}
 
 export const TriggerJobSchema = strictObject({
   code: Type.String({ minLength: 1, maxLength: 63, pattern: IDENTIFIER_PATTERN }),
@@ -558,15 +665,6 @@ function isRealDate(value: string): boolean {
 
 export function validatePortfolioWriteInput(input: unknown): PortfolioWriteInput {
   const parsed = validateToolInput<Static<typeof PortfolioWriteSchema>>("portfolio_write", PortfolioWriteSchema, input);
-  if (parsed.action === "upsert_account_snapshot") {
-    if (!isRealDate(parsed.snap_date)) throw new Error(`快照日期不是有效日历日期：${parsed.snap_date}`);
-    if (parsed.cash > parsed.total_asset) throw new Error("可用资金不得大于总资产");
-    if (parsed.market_value !== undefined && parsed.precision !== "approx" &&
-        Math.abs(parsed.total_asset - parsed.cash - parsed.market_value) > 0.01) {
-      throw new Error("精确资金摘要必须满足：总资产 = 证券市值 + 可用资金");
-    }
-    return { ...parsed, reason: parsed.reason.trim() };
-  }
   const decisionOrigin = parsed.decision_origin ?? (parsed.kind === "note" ? "fact_correction" : undefined);
   const executionCompliance = parsed.execution_compliance ?? (parsed.kind === "note" ? "not_applicable" : undefined);
   if (!decisionOrigin) throw new Error(`${parsed.kind} 必须提供 decision_origin`);
@@ -750,12 +848,74 @@ export function validateAnalysisRunInput(input: unknown): AnalysisRunInput {
   return parsed;
 }
 
+export function validateDailyPlanWriteInput(input: unknown): DailyPlanWriteRawInput {
+  const parsed = validateToolInput<DailyPlanWriteRawInput>("daily_plan_write", DailyPlanWriteSchema, input);
+  const seen = new Set<string>();
+  const explicitPriorities: number[] = [];
+  for (const item of parsed.items) {
+    const key = `${item.item_kind}:${item.code}`;
+    if (seen.has(key)) throw new Error(`daily_plan_write items 存在重复条目：${key}`);
+    seen.add(key);
+    if (item.trigger_kind === "price_range" && item.price_lower !== undefined
+      && item.price_upper !== undefined && item.price_lower > item.price_upper) {
+      throw new Error(`daily_plan_write ${item.code} 触发区间下限高于上限`);
+    }
+    if (item.item_kind === "off_pool_opportunity") {
+      if (!item.grade) throw new Error(`daily_plan_write 打板机会 ${item.code} 必须标注 A/B 兼容评级`);
+      if (item.action !== "observe") throw new Error(`daily_plan_write 打板机会 ${item.code} 在前向验证期只能继续观察`);
+      if (!item.evidence_md?.trim()) throw new Error(`daily_plan_write 打板机会 ${item.code} 必须写明策略评分与证据`);
+      if (item.priority === undefined) throw new Error(`daily_plan_write 打板机会 ${item.code} 必须写明策略优先级 priority`);
+      if (item.auction_md !== undefined || item.intraday_md !== undefined) {
+        throw new Error(`daily_plan_write 打板机会 ${item.code} 不接受集合竞价或分时预案字段`);
+      }
+      explicitPriorities.push(item.priority);
+    }
+    if (item.item_kind === "position_action") {
+      if (item.grade !== undefined) throw new Error(`daily_plan_write 持仓预案 ${item.code} 不接受打板评级字段`);
+      if (item.priority !== undefined) throw new Error(`daily_plan_write 持仓预案 ${item.code} 不接受 priority，排序由持仓表顺序决定`);
+    }
+  }
+  if (explicitPriorities.length > 4) throw new Error("daily_plan_write 打板机会最多 4 只");
+  if (new Set(explicitPriorities).size !== explicitPriorities.length) {
+    throw new Error("daily_plan_write 打板机会存在重复 priority，请使用连续不重复的策略优先级");
+  }
+  return parsed;
+}
+
+export function validateAuctionAssessmentWriteInput(input: unknown): AuctionAssessmentWriteInput {
+  const parsed = validateToolInput<AuctionAssessmentWriteInput>(
+    "auction_assessment_write",
+    AuctionAssessmentWriteSchema,
+    input,
+  );
+  const codes = parsed.items.map((item) => item.code);
+  if (new Set(codes).size !== codes.length) throw new Error("auction_assessment_write 存在重复标的");
+  for (const item of parsed.items) {
+    if (item.data_time && Number.isNaN(new Date(item.data_time).getTime())) {
+      throw new Error(`竞价数据时间非法：${item.code}`);
+    }
+    if (item.data_status === "ready" && item.conclusion === "unavailable") {
+      throw new Error(`竞价数据已就绪时不得标记数据不足：${item.code}`);
+    }
+    if (item.data_status !== "ready" && item.conclusion !== "unavailable") {
+      throw new Error(`竞价数据未就绪时只能标记数据不足：${item.code}`);
+    }
+  }
+  return parsed;
+}
+
 export function validateRunBacktestInput(input: unknown): RunBacktestInput {
   const parsed = validateToolInput<Static<typeof RunBacktestSchema>>("run_backtest", RunBacktestSchema, input);
   if (!isRealDate(parsed.start) || !isRealDate(parsed.end) || parsed.start > parsed.end) {
     throw new Error(`回测日期范围非法：${parsed.start} 至 ${parsed.end}`);
   }
   if (new Set(parsed.codes).size !== parsed.codes.length) throw new Error(`回测 ${parsed.name} 的 codes 存在重复项`);
+  if (parsed.codes.length === 0 && (parsed.limit_up_universe ?? "none") === "none") {
+    throw new Error("回测必须提供 codes，或把 limit_up_universe 设为 mainboard/all");
+  }
+  if (new Set(parsed.market_event_types ?? []).size !== (parsed.market_event_types ?? []).length) {
+    throw new Error("market_event_types 存在重复项");
+  }
   const comparisonIds = parsed.comparison_run_ids ?? [];
   if (new Set(comparisonIds).size !== comparisonIds.length) throw new Error("comparison_run_ids 存在重复项");
   const parameters = (parsed.parameters ?? {}) as Record<string, JsonValue>;
@@ -767,13 +927,20 @@ export function validateRunBacktestInput(input: unknown): RunBacktestInput {
     research_outline: parsed.research_outline.trim(),
     hypothesis: parsed.hypothesis.trim(),
     codes: parsed.codes,
+    market_event_types: parsed.market_event_types ?? [],
+    limit_up_universe: parsed.limit_up_universe ?? "none",
     start: parsed.start,
     end: parsed.end,
     initial_cash: parsed.initial_cash ?? 1_000_000,
     parameters,
     comparison_run_ids: comparisonIds,
+    base_source_run_id: parsed.base_source_run_id ?? null,
     source_code: parsed.source_code,
   };
+}
+
+export function validateReadBacktestSourceInput(input: unknown): ReadBacktestSourceInput {
+  return validateToolInput<ReadBacktestSourceInput>("read_backtest_source", ReadBacktestSourceSchema, input);
 }
 
 /** 行情请求除 schema 外再校验真实日历、区间方向与重复项。 */
@@ -803,6 +970,18 @@ export function validateFetchMarketDataInput(input: unknown): FetchMarketDataInp
     throw new Error("批量财务估值请求存在重复代码");
   }
   return parsed;
+}
+
+export function validateFetchHithinkDataInput(input: unknown): FetchHithinkDataInput {
+  const parsed = validateToolInput<FetchHithinkDataInput>(
+    "fetch_hithink_data",
+    FetchHithinkDataSchema,
+    input,
+  );
+  const requests = parsed.requests.map(normalizeHithinkDatasetRequest);
+  const keys = requests.map((request) => JSON.stringify(request));
+  if (new Set(keys).size !== keys.length) throw new Error("扶摇扩展数据请求存在重复项");
+  return { ...parsed, requests };
 }
 
 export function validateTriggerJobInput(input: unknown): TriggerJobInput {

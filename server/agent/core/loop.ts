@@ -5,7 +5,7 @@ import type pg from "pg";
 import type { ResolvedChatModel } from "../ai/runtime.js";
 import { registerAgentRun } from "../run-control.js";
 import { buildChatTools } from "../tools.js";
-import { redactAgentMessages, redactEphemeralCode } from "../redaction.js";
+import { redactAgentMessages, redactEphemeralCode, redactEphemeralToolResult } from "../redaction.js";
 
 export interface AgentCoreFrame {
   type:
@@ -98,7 +98,7 @@ export async function runAgentTurn(deps: {
           data: {
             toolCallId: event.toolCallId,
             name: event.toolName,
-            result: event.partialResult,
+            result: redactEphemeralToolResult(event.partialResult),
           },
         });
         break;
@@ -108,7 +108,7 @@ export async function runAgentTurn(deps: {
           data: {
             toolCallId: event.toolCallId,
             name: event.toolName,
-            result: event.result,
+            result: redactEphemeralToolResult(event.result),
             isError: event.isError,
           },
         });
@@ -129,12 +129,14 @@ export async function runAgentTurn(deps: {
         break;
     }
   });
-  const unregister = registerAgentRun({
+  const activeRun = {
     sessionId: deps.sessionId,
     runId,
     agent,
     startedAt: new Date(),
-  });
+    abortRequested: false,
+  };
+  const unregister = registerAgentRun(activeRun);
   deps.onFrame({ type: "run_started", data: { run_id: runId } });
 
   try {
@@ -148,7 +150,8 @@ export async function runAgentTurn(deps: {
       lastAssistant,
       llmError,
       aborted:
-        lastAssistant?.role === "assistant" && lastAssistant.stopReason === "aborted",
+        activeRun.abortRequested ||
+        (lastAssistant?.role === "assistant" && lastAssistant.stopReason === "aborted"),
     };
   } finally {
     unregister();

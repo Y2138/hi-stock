@@ -24,11 +24,11 @@ const done = computed(() => props.tools.length - running.value - failed.value);
     :tool="tools[0]!"
     @decide="(action) => emit('decide', tools[0]!, action)"
   />
-  <div v-else class="tool-group" :class="{ failed: failed > 0 }">
+  <div v-else class="tool-group" :class="running ? 'running' : failed ? 'error' : 'done'">
     <div class="tool-group-head">
       <span class="dot" :class="running ? 'warn breath' : failed ? 'bad' : 'ok'"></span>
       <span class="tool-group-name">{{ label }}</span>
-      <span class="badge" :class="running ? 'warn' : failed ? 'bad' : 'ok'">
+      <span class="tool-group-state" :class="running ? 'running' : failed ? 'error' : 'done'">
         {{ tools.length }} 项
       </span>
     </div>
@@ -50,8 +50,11 @@ const done = computed(() => props.tools.length - running.value - failed.value);
 </template>
 
 <style scoped>
-/* 气泡内的内联聚合条：与单工具条一致的左侧竖线风格 */
+/* 同名调用沿用工具行语义，展开后只增加明细，不再叠加容器。 */
 .tool-group {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
   border: none;
   border-left: 2px solid var(--line);
   border-radius: 0;
@@ -61,11 +64,14 @@ const done = computed(() => props.tools.length - running.value - failed.value);
   font-size: var(--fs-sm);
 }
 
-.tool-group.failed { border-left-color: var(--up); }
-.tool-group-head { display: flex; align-items: center; gap: 8px; }
-.tool-group-name { font-weight: 600; }
-.tool-group-head .badge { margin-left: auto; }
-.tool-group-summary { margin-top: 7px; color: var(--ink-soft); }
+.tool-group.running { border-left-color: color-mix(in srgb, var(--warn) 72%, var(--line)); }
+.tool-group.error { border-left-color: color-mix(in srgb, var(--bad) 72%, var(--line)); }
+.tool-group-head { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.tool-group-name { min-width: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.tool-group-state { margin-left: auto; flex: none; color: var(--ink-faint); font-size: 11px; }
+.tool-group-state.running { color: var(--warn); }
+.tool-group-state.error { color: var(--bad); }
+.tool-group-summary { margin-top: 7px; color: var(--ink-soft); overflow-wrap: anywhere; }
 .expand-btn {
   border: none;
   background: none;

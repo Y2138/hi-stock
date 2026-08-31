@@ -41,7 +41,7 @@ async function runWorkerContractFixture(sourceCode: string): Promise<Record<stri
   try {
     await Promise.all([
       fs.writeFile(inputPath, JSON.stringify({
-        sdk_version: "stock-backtest-sdk-v1",
+        sdk_version: "stock-backtest-sdk-v2",
         meta: {
           codes: ["SRV001.SZ"],
           start: "2026-01-01",
@@ -57,6 +57,18 @@ async function runWorkerContractFixture(sourceCode: string): Promise<Record<stri
           low: 10,
           close: 10,
           volume: 1_000,
+        }],
+        market_events: [{
+          date: "2026-01-01",
+          type: "up",
+          code: "SRV001.SZ",
+          event_price: 10,
+          streak_count: 2,
+          open_count: 0,
+          first_event_time: "2026-01-01T01:35:00.000Z",
+          last_event_time: "2026-01-01T01:35:00.000Z",
+          industry_name: "测试题材",
+          reason: "测试涨停",
         }],
       })),
       fs.writeFile(strategyPath, sourceCode),
@@ -124,6 +136,29 @@ describe("隔离回测工作器结果诊断", () => {
       error: { kind: "runtime", code: "stack_overflow", phase: "execute_strategy" },
     });
   });
+
+  it("SDK 可按类型和日期读取数据库市场事件", async () => {
+    expect(await runWorkerContractFixture(`
+      export default async function run(sdk) {
+        return {
+          daily_returns: [{ date: "2026-01-01", return: 0 }],
+          metrics: {
+            all_events: sdk.events().length,
+            up_events: sdk.events("up").length,
+            date_events: sdk.eventsOn("2026-01-01").length,
+            date_up_events: sdk.eventsOn("2026-01-01", "up").length
+          },
+          conclusion: "市场事件 SDK 可用",
+          data_gaps: []
+        };
+      }
+    `)).toMatchObject({
+      ok: true,
+      result: {
+        metrics: { all_events: 1, up_events: 1, date_events: 1, date_up_events: 1 },
+      },
+    });
+  });
 });
 
 describe.skipIf(!prepared)("回测验证与只读 API", () => {
@@ -179,8 +214,42 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
     );
   }
 
+  async function seedLimitEventBacktestData(): Promise<void> {
+    await pool.query(
+      `INSERT INTO market_instrument (code, name, kind) VALUES
+         ('000001.SZ', '主板有行情样本', 'stock'),
+         ('000002.SZ', '主板缺行情样本', 'stock'),
+         ('300001.SZ', '创业板背景样本', 'stock')
+       ON CONFLICT (code) DO NOTHING;
+       INSERT INTO market_bar
+         (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, channel)
+       SELECT id, 'day', point.day, point.day::timestamp AT TIME ZONE 'UTC',
+              10, 11, 9.5, 10.5, 1000, 'test'
+         FROM market_instrument
+         CROSS JOIN (VALUES (date '2026-02-02'), (date '2026-02-03')) AS point(day)
+        WHERE code = '000001.SZ'
+       ON CONFLICT DO NOTHING;
+       INSERT INTO market_limit_event
+         (trade_date, event_type, instrument_id, event_price, streak_count, open_count,
+          first_event_time, last_event_time, industry_name, reason, source_row_sha256)
+       SELECT date '2026-02-02', item.event_type, instrument.id, 11, item.streak_count, 0,
+              timestamptz '2026-02-02 01:35:00+00', timestamptz '2026-02-02 01:35:00+00',
+              '测试题材', '数据库事件回测测试', 'backtest-market-event-' || item.event_type || '-' || instrument.code
+         FROM (VALUES
+           ('000001.SZ', 'up', 2),
+           ('000002.SZ', 'up', 1),
+           ('300001.SZ', 'up', 1),
+           ('300001.SZ', 'down', NULL),
+           ('000001.SZ', 'break', 2)
+         ) AS item(code, event_type, streak_count)
+         JOIN market_instrument instrument ON instrument.code = item.code
+       ON CONFLICT (trade_date, event_type, instrument_id) DO NOTHING`,
+    );
+  }
+
   it("未知回测 id → 404，旧 HTTP 创建与激活入口均退役", async () => {
     expect((await api(server.baseUrl, "GET", "/api/backtests/999999")).status).toBe(404);
+    expect((await api(server.baseUrl, "GET", "/api/backtests/999999/source")).status).toBe(404);
     expect((await api(server.baseUrl, "POST", "/api/backtests/run", {})).status).toBe(404);
     expect((await api(server.baseUrl, "POST", "/api/backtests/1/activate", {})).status).toBe(404);
     expect((await api(server.baseUrl, "POST", "/api/backtests", {})).status).toBe(404);
@@ -245,7 +314,63 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
     })).toBe("回测策略运行失败：[STRATEGY_REFERENCE_ERROR] 阶段=执行策略；引用了未定义变量（策略模块第 12 行第 8 列）");
   });
 
-  it("Agent 回测只保存摘要、源码哈希和历史比较，确认后才进入历史且同会话只保留一个最终结论", async () => {
+  it("按数据库涨停事件解析主板候选并注入完整市场事件，缺日线时标记 partial", async () => {
+    await seedLimitEventBacktestData();
+    const run = await runAgentBacktest(pool, sessionId, {
+      name: "数据库涨停候选回测",
+      kind: "research",
+      research_outline: "验证主板涨停候选与全市场事件输入",
+      hypothesis: "主板候选可由涨停事件解析，非主板仍保留为市场背景",
+      codes: [],
+      market_event_types: ["down", "break"],
+      limit_up_universe: "mainboard",
+      start: "2026-02-02",
+      end: "2026-02-03",
+      initial_cash: 1_000_000,
+      parameters: {},
+      comparison_run_ids: [],
+      base_source_run_id: null,
+      source_code: "export default async function run(){ return {}; }",
+    }, {
+      execute: async (input) => {
+        expect(input.meta.codes).toEqual(["000001.SZ", "000002.SZ"]);
+        expect(input.bars).toHaveLength(2);
+        expect(input.market_events).toHaveLength(5);
+        expect(input.market_events).toEqual(expect.arrayContaining([
+          expect.objectContaining({ code: "300001.SZ", type: "up" }),
+          expect.objectContaining({ code: "300001.SZ", type: "down" }),
+        ]));
+        return {
+          result: {
+            metrics: { candidate_count: input.meta.codes.length },
+            conclusion: "数据库市场事件输入有效",
+            data_gaps: [],
+            observations: 1,
+          },
+          error: null,
+          timedOut: false,
+          aborted: false,
+        };
+      },
+    });
+    expect(run).toMatchObject({
+      execution_status: "partial",
+      input_summary: {
+        codes_requested: 0,
+        codes_resolved: 2,
+        codes_available: 1,
+        market_event_count: 5,
+        market_event_counts: { up: 3, down: 1, break: 1 },
+        market_event_coverage_start: "2026-02-02",
+        market_event_coverage_end: "2026-02-02",
+      },
+    });
+    expect(run.data_gaps).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "000002.SZ", reason: "请求区间没有日线" }),
+    ]));
+  });
+
+  it("Agent 回测暂存候选源码，最终化后固化并支持后续继承", async () => {
     await seedServiceBars();
     const prior = await pool.query<{ id: string }>(
       `INSERT INTO backtest_run
@@ -257,7 +382,7 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
                'final', '旧结论摘要', '旧结论边界', now())
        RETURNING id::text`,
     );
-    const sourceSentinel = "SOURCE_SENTINEL_MUST_NEVER_PERSIST";
+    const sourceSentinel = "VERSIONED_BACKTEST_SOURCE_SENTINEL";
     const sourceCode = `
       export default async function run(sdk: any) {
         const marker = "${sourceSentinel}";
@@ -279,6 +404,7 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
       initial_cash: 1_000_000,
       parameters: { fee_rate: 0 },
       comparison_run_ids: [prior.rows[0]!.id],
+      base_source_run_id: null,
       source_code: sourceCode,
     }, {
       execute: async (input, javascript) => {
@@ -305,6 +431,7 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
       comparison_run_ids: [prior.rows[0]!.id],
       code_cleanup_status: "deleted",
       source_size_bytes: Buffer.byteLength(sourceCode, "utf8"),
+      source_retention_status: "candidate",
       session_id: sessionId,
     });
     expect(run.source_sha256).toMatch(/^[0-9a-f]{64}$/);
@@ -315,6 +442,10 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
     );
     expect(persisted.rows[0]!.row).not.toContain(sourceSentinel);
     expect(persisted.rows[0]!.row).not.toContain("source_code");
+    expect((await pool.query(
+      "SELECT source_code, retention_status FROM backtest_run_source WHERE backtest_run_id = $1",
+      [run.id],
+    )).rows[0]).toMatchObject({ source_code: expect.stringContaining(sourceSentinel), retention_status: "candidate" });
     expect((await pool.query(
       "SELECT count(*)::int AS count FROM backtest_run_comparison WHERE run_id = $1 AND compared_run_id = $2",
       [run.id, prior.rows[0]!.id],
@@ -347,6 +478,7 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
     expect(finalized).toMatchObject({
       id: run.id,
       conclusion_status: "final",
+      source_retention_status: "versioned",
       conclusion_summary: "单调样本中固定小幅日收益形成正累计收益",
       applicability_boundary: "仅适用于当前单标的日线样本与零费率参数",
     });
@@ -364,7 +496,16 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
     expect(detailResponse.status).toBe(200);
     expect(detailResponse.json).toMatchObject({
       id: run.id,
+      source_retention_status: "versioned",
       comparisons: [expect.objectContaining({ id: prior.rows[0]!.id, hypothesis: "旧假设" })],
+    });
+    const sourceResponse = await api(server.baseUrl, "GET", `/api/backtests/${run.id}/source`);
+    expect(sourceResponse.status).toBe(200);
+    expect(sourceResponse.json).toMatchObject({
+      backtest_run_id: run.id,
+      source_code: expect.stringContaining(sourceSentinel),
+      source_sha256: run.source_sha256,
+      conclusion_status: "final",
     });
 
     const replacement = await runAgentBacktest(pool, sessionId, {
@@ -378,6 +519,7 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
       initial_cash: 1_000_000,
       parameters: { fee_rate: 0.001 },
       comparison_run_ids: [run.id],
+      base_source_run_id: run.id,
       source_code: sourceCode,
     }, {
       execute: async () => ({
@@ -414,6 +556,13 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
       expect.objectContaining({ id: run.id }),
     ]));
     expect((await api(server.baseUrl, "GET", `/api/backtests/${run.id}`)).status).toBe(404);
+    const supersededSource = await api(server.baseUrl, "GET", `/api/backtests/${run.id}/source`);
+    expect(supersededSource.status).toBe(200);
+    expect(supersededSource.json).toMatchObject({ backtest_run_id: run.id, conclusion_status: "superseded" });
+    expect((await pool.query(
+      "SELECT base_source_run_id::text, retention_status FROM backtest_run JOIN backtest_run_source ON backtest_run_source.backtest_run_id = backtest_run.id WHERE backtest_run.id = $1",
+      [replacement.id],
+    )).rows[0]).toMatchObject({ base_source_run_id: run.id, retention_status: "versioned" });
   });
 
   it("Docker 工作器声明无网、只读、非 root、权限模型、50万行资源与文件上限", async () => {
@@ -437,11 +586,59 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
     ]) expect(source).toContain(boundary);
     expect(source).toContain("AGENT_BACKTEST_TIMEOUT_MS");
     expect(source).toContain("fsp.rm(workspace, { recursive: true, force: true })");
-    expect(AGENT_BACKTEST_WORKER_VERSION).toBe("agent-backtest-worker-v2");
+    expect(AGENT_BACKTEST_WORKER_VERSION).toBe("agent-backtest-worker-v3");
     expect(AGENT_BACKTEST_MAX_ROWS).toBe(500_000);
     expect(AGENT_BACKTEST_INPUT_LIMIT).toBe(128 * 1024 * 1024);
     expect(AGENT_BACKTEST_MEMORY_LIMIT).toBe("1g");
     expect(AGENT_BACKTEST_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it("源码候选保存失败时结果不采纳且运行收敛为 failed", async () => {
+    await seedServiceBars();
+    const marker = "REJECT_SOURCE_PERSISTENCE";
+    await pool.query(
+      `ALTER TABLE backtest_run_source
+       ADD CONSTRAINT backtest_run_source_test_reject
+       CHECK (source_code NOT LIKE '%${marker}%')`,
+    );
+    try {
+      const run = await runAgentBacktest(pool, sessionId, {
+        name: "源码保存失败测试",
+        kind: "research",
+        research_outline: "验证源码保存故障终态",
+        hypothesis: "源码未保存时不能采纳回测结果",
+        codes: ["SRV001.SZ"],
+        start: "2026-01-01",
+        end: "2026-01-30",
+        initial_cash: 1_000_000,
+        parameters: {},
+        comparison_run_ids: [],
+        base_source_run_id: null,
+        source_code: `export default async function run(){ /* ${marker} */ return {}; }`,
+      }, {
+        execute: async () => ({
+          result: {
+            metrics: { total_return_pct: 1 },
+            conclusion: "该结果不应被采纳",
+            data_gaps: [],
+            observations: 1,
+          },
+          error: null,
+          timedOut: false,
+          aborted: false,
+        }),
+      });
+      expect(run).toMatchObject({
+        execution_status: "failed",
+        source_retention_status: "none",
+        code_cleanup_status: "deleted",
+        error_message: "回测源码保存失败，结果未采纳",
+      });
+    } finally {
+      await pool.query(
+        "ALTER TABLE backtest_run_source DROP CONSTRAINT IF EXISTS backtest_run_source_test_reject",
+      );
+    }
   });
 
   it("服务重启把无法恢复源码的运行标记失败", async () => {

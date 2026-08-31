@@ -7,8 +7,10 @@ import type pg from "pg";
 import * as ts from "typescript";
 import { PROJECT_ROOT } from "../config.js";
 import { apiErrors } from "../http/router.js";
+import { cleanupStaleBacktestSourceCandidates } from "../modules/backtests/repo.js";
 import type {
   AgentBacktestBar,
+  AgentBacktestMarketEvent,
   AgentBacktestRequest,
   AgentBacktestRunSummary,
   AgentBacktestWorkerInput,
@@ -69,6 +71,7 @@ const WORKER_PHASES: Record<string, string> = {
   startup: "启动工作器",
   read_input: "读取输入",
   index_bars: "建立行情索引",
+  index_events: "建立市场事件索引",
   load_strategy: "加载策略",
   execute_strategy: "执行策略",
   validate_result: "校验结果",
@@ -384,6 +387,8 @@ function conclusionMarkdown(
   request: AgentBacktestRequest,
   result: AgentBacktestWorkerResult,
   state: { change_seq: string; current_hash: string },
+  resolvedCodeCount: number,
+  marketEventCount: number,
 ): string {
   const compared = request.comparison_run_ids.length ? request.comparison_run_ids.map((id) => `#${id}`).join("、") : "无";
   return [
@@ -393,13 +398,14 @@ function conclusionMarkdown(
     `- 待验证假设：${request.hypothesis}`,
     `- 当前策略：序号 ${state.change_seq} · ${state.current_hash}`,
     `- 数据区间：${request.start} 至 ${request.end}`,
-    `- 标的数量：${request.codes.length}`,
+    `- 标的数量：${resolvedCodeCount}`,
+    `- 市场事件数量：${marketEventCount}`,
     `- 对比历史回测：${compared}`,
     `- 工作器 / SDK：${AGENT_BACKTEST_WORKER_VERSION} / ${AGENT_BACKTEST_SDK_VERSION}`,
     "",
     result.conclusion,
     "",
-    "> 临时代码已删除；本记录只保存思路、输入摘要、指标、结论和缺口，不构成交易建议。",
+    "> 临时执行目录已删除；最终化后源码会固化为可复用版本。本记录不构成交易建议。",
   ].join("\n");
 }
 
@@ -410,6 +416,7 @@ export async function runAgentBacktest(
   options: { signal?: AbortSignal; execute?: typeof executeContainer } = {},
 ): Promise<BacktestRunRow> {
   if (!isAgentBacktestWorkerEnabled()) throw apiErrors.dbUnavailable("Agent 临时代码回测工作器当前已关闭");
+  await cleanupStaleBacktestSourceCandidates(pool);
   const compiled = compileAgentBacktestSource(request.source_code);
   const session = await pool.query<{ session_type: string }>(
     "SELECT session_type FROM chat_session WHERE id = $1",
@@ -433,6 +440,72 @@ export async function runAgentBacktest(
       throw apiErrors.badRequest("comparison_run_ids 包含不存在或尚未完成的回测");
     }
   }
+  if (request.base_source_run_id) {
+    const baseSource = await pool.query<{ id: string }>(
+      `SELECT run.id::text
+         FROM backtest_run run
+         JOIN backtest_run_source source ON source.backtest_run_id = run.id
+        WHERE run.id = $1
+          AND run.conclusion_status IN ('final','superseded')
+          AND source.retention_status = 'versioned'`,
+      [request.base_source_run_id],
+    );
+    if (!baseSource.rows[0]) throw apiErrors.badRequest("base_source_run_id 必须指向已固化源码的最终回测版本");
+  }
+  const limitUpUniverse = request.limit_up_universe ?? "none";
+  const selectedEventTypes = [...new Set([
+    ...(request.market_event_types ?? []),
+    ...(limitUpUniverse === "none" ? [] : ["up" as const]),
+  ])];
+  const eventRows = selectedEventTypes.length === 0
+    ? []
+    : (await pool.query<{
+        date: string;
+        type: "up" | "down" | "break";
+        code: string;
+        event_price: string | null;
+        streak_count: number | null;
+        open_count: number | null;
+        first_event_time: Date | null;
+        last_event_time: Date | null;
+        industry_name: string | null;
+        reason: string | null;
+      }>(
+        `SELECT event.trade_date::text AS date, event.event_type AS type, instrument.code,
+                event.event_price::text, event.streak_count, event.open_count,
+                event.first_event_time, event.last_event_time, event.industry_name, event.reason
+           FROM market_limit_event event
+           JOIN market_instrument instrument ON instrument.id = event.instrument_id
+          WHERE event.trade_date BETWEEN $1::date AND $2::date
+            AND event.event_type = ANY($3::text[])
+          ORDER BY event.trade_date, event.event_type, instrument.code
+          LIMIT $4`,
+        [request.start, request.end, selectedEventTypes, AGENT_BACKTEST_MAX_ROWS + 1],
+      )).rows;
+  if (eventRows.length > AGENT_BACKTEST_MAX_ROWS) {
+    throw apiErrors.badRequest("回测市场事件超过 500000 行上限，请缩小日期范围");
+  }
+  const marketEvents: AgentBacktestMarketEvent[] = eventRows.map((row) => ({
+    date: row.date,
+    type: row.type,
+    code: row.code,
+    event_price: row.event_price === null ? null : Number(row.event_price),
+    streak_count: row.streak_count,
+    open_count: row.open_count,
+    first_event_time: row.first_event_time?.toISOString() ?? null,
+    last_event_time: row.last_event_time?.toISOString() ?? null,
+    industry_name: row.industry_name,
+    reason: row.reason,
+  }));
+  if (marketEvents.some((event) => event.event_price !== null && !Number.isFinite(event.event_price))) {
+    throw apiErrors.conflict("回测市场事件包含非有限价格，已停止执行");
+  }
+  const derivedCodes = marketEvents
+    .filter((event) => event.type === "up")
+    .map((event) => event.code)
+    .filter((code) => limitUpUniverse === "all" || (limitUpUniverse === "mainboard" && /^(600|601|603|605|000|001|002|003)\d{3}\.(SH|SZ)$/.test(code)));
+  const resolvedCodes = [...new Set([...request.codes, ...derivedCodes])].sort();
+  if (resolvedCodes.length === 0) throw apiErrors.badRequest("回测没有可用标的：请提供 codes 或选择有数据的涨停候选范围");
   const barsResult = await pool.query<{
     code: string; date: string; open: string; high: string; low: string; close: string; volume: string | null;
   }>(
@@ -443,7 +516,7 @@ export async function runAgentBacktest(
         AND b.bar_date BETWEEN $2::date AND $3::date
       ORDER BY i.code, b.bar_date
       LIMIT $4`,
-    [request.codes, request.start, request.end, AGENT_BACKTEST_MAX_ROWS + 1],
+    [resolvedCodes, request.start, request.end, AGENT_BACKTEST_MAX_ROWS + 1],
   );
   if (barsResult.rows.length > AGENT_BACKTEST_MAX_ROWS) throw apiErrors.badRequest("回测行情超过 500000 行上限，请缩小标的或日期范围");
   const bars: AgentBacktestBar[] = barsResult.rows.map((row) => ({
@@ -459,13 +532,21 @@ export async function runAgentBacktest(
     throw apiErrors.conflict("回测行情包含非有限价格，已停止执行");
   }
   const availableCodes = [...new Set(bars.map((bar) => bar.code))];
+  const marketEventCounts = Object.fromEntries(
+    (["up", "down", "break"] as const).map((type) => [type, marketEvents.filter((event) => event.type === type).length]),
+  );
   const inputSummary = {
     codes_requested: request.codes.length,
+    codes_resolved: resolvedCodes.length,
     codes_available: availableCodes.length,
     bar_count: bars.length,
+    market_event_count: marketEvents.length,
+    market_event_counts: marketEventCounts,
+    market_event_coverage_start: marketEvents[0]?.date ?? null,
+    market_event_coverage_end: marketEvents.at(-1)?.date ?? null,
     coverage_start: bars.reduce<string | null>((min, bar) => min === null || bar.date < min ? bar.date : min, null),
     coverage_end: bars.reduce<string | null>((max, bar) => max === null || bar.date > max ? bar.date : max, null),
-    input_sha256: sha256(JSON.stringify(bars)),
+    input_sha256: sha256(JSON.stringify({ bars, market_events: marketEvents })),
   };
   const persistedRequest = {
     name: request.name,
@@ -473,11 +554,14 @@ export async function runAgentBacktest(
     research_outline: request.research_outline,
     hypothesis: request.hypothesis,
     codes: request.codes,
+    market_event_types: selectedEventTypes,
+    limit_up_universe: limitUpUniverse,
     start: request.start,
     end: request.end,
     initial_cash: request.initial_cash,
     parameters: request.parameters,
     comparison_run_ids: request.comparison_run_ids,
+    base_source_run_id: request.base_source_run_id,
   };
   const client = await pool.connect();
   let runId: string;
@@ -488,15 +572,15 @@ export async function runAgentBacktest(
          (name, kind, status, config_snapshot, input_manifest, request_json, input_summary,
           service_version, execution_status, progress, execution_origin, session_id,
           strategy_change_seq, strategy_snapshot_hash, research_outline, hypothesis,
-          worker_version, sdk_version, source_sha256, source_size_bytes, code_cleanup_status)
+          worker_version, sdk_version, source_sha256, source_size_bytes, base_source_run_id, code_cleanup_status)
        VALUES ($1, $2, 'archived', $3, '[]', $3, $4, $5, 'running', 10, 'agent_workspace',
-               $6, $7, $8, $9, $10, $5, $11, $12, $13, 'not_applicable')
+               $6, $7, $8, $9, $10, $5, $11, $12, $13, $14, 'not_applicable')
        RETURNING id::text`,
       [
         request.name, request.kind, JSON.stringify(persistedRequest), JSON.stringify(inputSummary),
         AGENT_BACKTEST_WORKER_VERSION, sessionId, state.change_seq, state.current_hash,
         request.research_outline, request.hypothesis, AGENT_BACKTEST_SDK_VERSION,
-        compiled.sha256, compiled.bytes,
+        compiled.sha256, compiled.bytes, request.base_source_run_id,
       ],
     );
     runId = created.rows[0]!.id;
@@ -517,13 +601,14 @@ export async function runAgentBacktest(
   const workerInput: AgentBacktestWorkerInput = {
     sdk_version: AGENT_BACKTEST_SDK_VERSION,
     meta: {
-      codes: request.codes,
+      codes: resolvedCodes,
       start: request.start,
       end: request.end,
       initial_cash: request.initial_cash,
       parameters: request.parameters,
     },
     bars,
+    market_events: marketEvents,
   };
   let worker: WorkerOutcome;
   let cleanupStatus: "deleted" | "cleanup_failed" = "deleted";
@@ -534,19 +619,41 @@ export async function runAgentBacktest(
     worker = { result: null, error: "临时回测工作区清理失败，结果未采纳", timedOut: false, aborted: false };
   }
   if (worker.result && cleanupStatus === "deleted") {
-    const status = worker.result.data_gaps.length > 0 || availableCodes.length < request.codes.length ? "partial" : "success";
+    const status = worker.result.data_gaps.length > 0 || availableCodes.length < resolvedCodes.length ? "partial" : "success";
     const gaps = [
-      ...request.codes.filter((code) => !availableCodes.includes(code)).map((code) => ({ code, reason: "请求区间没有日线" })),
+      ...resolvedCodes.filter((code) => !availableCodes.includes(code)).map((code) => ({ code, reason: "请求区间没有日线" })),
       ...worker.result.data_gaps,
     ];
-    await pool.query(
-      `UPDATE backtest_run
-          SET execution_status=$2, progress=100, metrics_json=$3, metrics=$3,
-              conclusion_md=$4, data_gaps=$5, error_message=NULL, finished_at=now(),
-              code_cleanup_status='deleted'
-        WHERE id=$1`,
-      [runId, status, JSON.stringify(worker.result.metrics), conclusionMarkdown(request, worker.result, state), JSON.stringify(gaps)],
-    );
+    const completed = await pool.connect();
+    try {
+      await completed.query("BEGIN");
+      await completed.query(
+        `UPDATE backtest_run
+            SET execution_status=$2, progress=100, metrics_json=$3, metrics=$3,
+                conclusion_md=$4, data_gaps=$5, error_message=NULL, finished_at=now(),
+                code_cleanup_status='deleted'
+          WHERE id=$1`,
+        [runId, status, JSON.stringify(worker.result.metrics), conclusionMarkdown(request, worker.result, state, resolvedCodes.length, marketEvents.length), JSON.stringify(gaps)],
+      );
+      await completed.query(
+        `INSERT INTO backtest_run_source (backtest_run_id, source_code)
+         VALUES ($1, $2)`,
+        [runId, request.source_code],
+      );
+      await completed.query("COMMIT");
+    } catch {
+      await completed.query("ROLLBACK").catch(() => {});
+      await pool.query(
+        `UPDATE backtest_run
+            SET execution_status='failed', progress=100,
+                error_message='回测源码保存失败，结果未采纳', finished_at=now(),
+                code_cleanup_status='deleted'
+          WHERE id=$1`,
+        [runId],
+      );
+    } finally {
+      completed.release();
+    }
   } else {
     await pool.query(
       `UPDATE backtest_run
@@ -563,6 +670,9 @@ export async function runAgentBacktest(
                         FROM backtest_run_comparison c WHERE c.run_id=r.id), '[]') AS comparison_run_ids,
             r.input_summary, r.metrics_json, r.conclusion_md, r.data_gaps,
             r.worker_version, r.sdk_version, r.source_sha256, r.source_size_bytes,
+            r.base_source_run_id::text,
+            COALESCE((SELECT source.retention_status FROM backtest_run_source source
+                       WHERE source.backtest_run_id = r.id), 'none') AS source_retention_status,
             r.code_cleanup_status, r.error_message, r.created_at
        FROM backtest_run r WHERE r.id=$1`,
     [runId],

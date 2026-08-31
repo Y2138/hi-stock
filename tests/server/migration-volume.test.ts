@@ -141,13 +141,14 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const manifest = await readPortableManifest(exported.payloadPath);
     expect(manifest.version).toBe(4);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(40);
+    expect(manifest.migration_max).toBe(56);
     expect(manifest.tables.strategy_document_revision).toBeGreaterThan(0);
     expect(manifest.tables.job_definition).toBeGreaterThan(0);
     expect(manifest.tables.market_bar).toBeUndefined();
     expect(manifest.tables.pool_membership).toBeUndefined();
     expect(manifest.tables.backtest_run).toBeUndefined();
     expect(manifest.tables.portfolio_position).toBeUndefined();
+    expect(manifest.tables.daily_plan_auction_assessment).toBeUndefined();
     expect(manifest.strategy_hashes.length).toBe(manifest.tables.strategy_document_revision);
 
     const payload = gunzipSync(await fs.readFile(exported.payloadPath)).toString("utf8");
@@ -163,7 +164,11 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       "agent_tool_audit",
       "agent_run_metric",
       "portfolio_position",
+      "portfolio_position_change",
+      "portfolio_realized_pnl_baseline",
       "portfolio_account_snapshot",
+      "daily_plan_playbook",
+      "daily_plan_auction_assessment",
       "pool_membership",
       "market_bar",
       "market_quote_sample",
@@ -183,6 +188,8 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       expect((await target.query("SELECT count(*)::int AS count FROM job_definition")).rows[0]!.count).toBe(manifest.tables.job_definition);
       expect((await target.query("SELECT count(*)::int AS count FROM market_bar")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM portfolio_position")).rows[0]!.count).toBe(0);
+      expect((await target.query("SELECT count(*)::int AS count FROM daily_plan_auction_assessment")).rows[0]!.count).toBe(0);
+      expect((await target.query("SELECT to_regclass('strategy_paper_account')::text AS name")).rows[0]!.name).toBeNull();
       expect((await target.query("SELECT count(*)::int AS count FROM chat_session")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM pool_membership")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM backtest_run")).rows[0]!.count).toBe(0);

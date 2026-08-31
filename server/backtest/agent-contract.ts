@@ -1,5 +1,5 @@
-export const AGENT_BACKTEST_WORKER_VERSION = "agent-backtest-worker-v2";
-export const AGENT_BACKTEST_SDK_VERSION = "stock-backtest-sdk-v1";
+export const AGENT_BACKTEST_WORKER_VERSION = "agent-backtest-worker-v3";
+export const AGENT_BACKTEST_SDK_VERSION = "stock-backtest-sdk-v2";
 export const AGENT_BACKTEST_IMAGE = "node:22-alpine";
 export const AGENT_BACKTEST_SOURCE_LIMIT = 64 * 1024;
 export const AGENT_BACKTEST_INPUT_LIMIT = 128 * 1024 * 1024;
@@ -16,11 +16,14 @@ export interface AgentBacktestRequest {
   research_outline: string;
   hypothesis: string;
   codes: string[];
+  market_event_types?: Array<"up" | "down" | "break">;
+  limit_up_universe?: "none" | "mainboard" | "all";
   start: string;
   end: string;
   initial_cash: number;
   parameters: Record<string, JsonValue>;
   comparison_run_ids: string[];
+  base_source_run_id: string | null;
   source_code: string;
 }
 
@@ -34,6 +37,19 @@ export interface AgentBacktestBar {
   volume: number | null;
 }
 
+export interface AgentBacktestMarketEvent {
+  date: string;
+  type: "up" | "down" | "break";
+  code: string;
+  event_price: number | null;
+  streak_count: number | null;
+  open_count: number | null;
+  first_event_time: string | null;
+  last_event_time: string | null;
+  industry_name: string | null;
+  reason: string | null;
+}
+
 export interface AgentBacktestWorkerInput {
   sdk_version: string;
   meta: {
@@ -44,6 +60,7 @@ export interface AgentBacktestWorkerInput {
     parameters: Record<string, JsonValue>;
   };
   bars: AgentBacktestBar[];
+  market_events: AgentBacktestMarketEvent[];
 }
 
 export interface AgentBacktestWorkerResult {
@@ -71,6 +88,8 @@ export interface AgentBacktestRunSummary {
   sdk_version: string | null;
   source_sha256: string | null;
   source_size_bytes: number | null;
+  base_source_run_id: string | null;
+  source_retention_status: "none" | "candidate" | "versioned";
   code_cleanup_status: string;
   error_message: string | null;
 }

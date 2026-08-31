@@ -138,6 +138,28 @@ async function main() {
     grouped.set(bar.code, rows);
   }
   for (const rows of grouped.values()) Object.freeze(rows);
+  phase = "index_events";
+  const allEvents = [];
+  const eventsByType = new Map();
+  const eventsByDate = new Map();
+  const eventsByDateAndType = new Map();
+  for (const rawEvent of input.market_events ?? []) {
+    const event = Object.freeze(rawEvent);
+    allEvents.push(event);
+    const typed = eventsByType.get(event.type) ?? [];
+    typed.push(event);
+    eventsByType.set(event.type, typed);
+    const dated = eventsByDate.get(event.date) ?? [];
+    dated.push(event);
+    eventsByDate.set(event.date, dated);
+    const key = `${event.date}:${event.type}`;
+    const datedAndTyped = eventsByDateAndType.get(key) ?? [];
+    datedAndTyped.push(event);
+    eventsByDateAndType.set(key, datedAndTyped);
+  }
+  Object.freeze(allEvents);
+  for (const rows of [...eventsByType.values(), ...eventsByDate.values(), ...eventsByDateAndType.values()]) Object.freeze(rows);
+  const empty = Object.freeze([]);
   const sdk = Object.freeze({
     version: input.sdk_version,
     codes: Object.freeze([...input.meta.codes]),
@@ -146,6 +168,10 @@ async function main() {
     initialCash: input.meta.initial_cash,
     parameters: Object.freeze({ ...input.meta.parameters }),
     bars: (code) => grouped.get(code) ?? Object.freeze([]),
+    events: (type) => type === undefined ? allEvents : eventsByType.get(type) ?? empty,
+    eventsOn: (date, type) => type === undefined
+      ? eventsByDate.get(date) ?? empty
+      : eventsByDateAndType.get(`${date}:${type}`) ?? empty,
     stats: Object.freeze({ mean, stdev }),
   });
   phase = "load_strategy";

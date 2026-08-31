@@ -157,12 +157,11 @@ const CONF_STATUS_LABEL: Record<string, string> = {
 </script>
 
 <template>
-  <div class="tool-card" :class="{ failed: tool.status === 'error' }">
+  <div class="tool-card" :class="tool.status">
     <div class="tool-head">
       <span class="dot" :class="tool.status === 'running' ? 'warn breath' : tool.status === 'error' ? 'bad' : 'ok'"></span>
-      <span class="tool-name">{{ label }}</span>
-      <span class="tool-raw num">{{ tool.name }}</span>
-      <span class="badge" :class="tool.status === 'running' ? 'warn' : tool.status === 'error' ? 'bad' : 'ok'">
+      <span class="tool-name" :title="tool.name">{{ label }}</span>
+      <span class="tool-state" :class="tool.status">
         {{ tool.status === "running" ? "运行中" : tool.status === "error" ? "失败" : "完成" }}
       </span>
     </div>
@@ -222,8 +221,11 @@ const CONF_STATUS_LABEL: Record<string, string> = {
 </template>
 
 <style scoped>
-/* 气泡内的内联工具条：不再是独立卡片，用左侧竖线与次级字号区分行为 */
+/* 对话流中的内联工具行：状态、结果和确认区各自保持清晰层级。 */
 .tool-card {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
   border: none;
   border-left: 2px solid var(--line);
   border-radius: 0;
@@ -233,30 +235,46 @@ const CONF_STATUS_LABEL: Record<string, string> = {
   font-size: var(--fs-sm);
 }
 
-.tool-card.failed {
-  border-left-color: var(--up);
+.tool-card.running {
+  border-left-color: color-mix(in srgb, var(--warn) 72%, var(--line));
+}
+
+.tool-card.error {
+  border-left-color: color-mix(in srgb, var(--bad) 72%, var(--line));
 }
 
 .tool-head {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 8px;
 }
 
 .tool-name {
+  min-width: 0;
+  overflow: hidden;
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.tool-raw {
+.tool-state {
+  margin-left: auto;
+  flex: none;
   color: var(--ink-faint);
   font-size: 11px;
 }
 
-.tool-head .badge {
-  margin-left: auto;
+.tool-state.running {
+  color: var(--warn);
+}
+
+.tool-state.error {
+  color: var(--bad);
 }
 
 .tool-args {
+  max-width: 100%;
   color: var(--ink-soft);
   font-size: 11.5px;
   margin-top: 6px;
@@ -266,6 +284,8 @@ const CONF_STATUS_LABEL: Record<string, string> = {
 }
 
 .tool-result {
+  box-sizing: border-box;
+  max-width: 100%;
   background: var(--paper-deep);
   border-radius: 8px;
   padding: 8px 10px;
@@ -279,6 +299,8 @@ const CONF_STATUS_LABEL: Record<string, string> = {
 }
 
 .tool-summary {
+  max-width: 100%;
+  overflow-wrap: anywhere;
   margin-top: 8px;
   border-radius: 8px;
   background: var(--paper-deep);
@@ -323,6 +345,11 @@ const CONF_STATUS_LABEL: Record<string, string> = {
 .payload-kv {
   grid-template-columns: 88px 1fr;
   font-size: 12.5px;
+}
+
+.payload-kv dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .confirm-actions {

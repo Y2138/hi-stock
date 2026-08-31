@@ -78,7 +78,18 @@ export async function seedTestStrategy(pool: pg.Pool, content = "# 测试当前�
       "UPDATE strategy_document SET current_revision_id = $2 WHERE id = $1",
       [document.rows[0]!.id, revision.rows[0]!.id],
     );
-    const stateHash = crypto.createHash("sha256").update(`test_strategy:${revisionHash}`, "utf8").digest("hex");
+    // 清单哈希：与 repo.calculateStrategyHash 同公式（code:revision_sha256 按注入序），
+    // 覆盖迁移产生的其他文档（如 0051 的打板策略）。
+    const manifest = await client.query<{ code: string; sha256: string }>(
+      `SELECT d.code, r.sha256
+         FROM strategy_document d
+         JOIN strategy_document_revision r ON r.id = d.current_revision_id
+        WHERE d.current_revision_id IS NOT NULL
+        ORDER BY d.injection_order, d.id`,
+    );
+    const stateHash = crypto.createHash("sha256")
+      .update(manifest.rows.map((row) => `${row.code}:${row.sha256}`).join("\n"), "utf8")
+      .digest("hex");
     await client.query(
       "INSERT INTO strategy_state (singleton, change_seq, current_hash) VALUES (1, 0, $1)",
       [stateHash],

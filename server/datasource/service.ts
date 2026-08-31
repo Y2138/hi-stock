@@ -10,6 +10,7 @@ import {
   snapshotDate,
   type HithinkDeps,
   type SnapshotKind,
+  type SnapshotQuote,
 } from "./hithink.js";
 import { SinaChannel, type AkshareDeps } from "./akshare.js";
 import type { Bar, Channel, FetchRequest, FetchResult, MarketFreq } from "./types.js";
@@ -492,7 +493,7 @@ export async function dailyMarketUpdate(
   };
   const maDirty = new Set<string>();
 
-  // 第 1 步：股票、指数/板块、ETF 按类型批量快照；单组失败只降级该组。
+  // 第 1 步：股票、指数/板块、ETF 按类型批量快照；坏标的显式记缺口并跳过。
   for (const group of await groupSnapshotCodes(db, scope.codes)) {
     let groupRows = 0;
     const groupGaps: unknown[] = [];
@@ -505,17 +506,39 @@ export async function dailyMarketUpdate(
       continue;
     }
     try {
-      const quotes = await fetchSnapshot(group.codes, hithinkDeps(db, deps), group.kind);
-      const observedDates = [...new Set(quotes.map(snapshotDate))];
-      const invalidQuote = quotes.find((quote) =>
-        quote.open <= 0 || quote.high <= 0 || quote.low <= 0 || quote.close <= 0,
-      );
-      if (observedDates.length !== 1 || observedDates[0] !== scope.date || invalidQuote) {
-        const invalidReason = invalidQuote ? `，且 ${invalidQuote.code} 存在非正 OHLC` : "";
-        throw new Error(`快照交易日 ${observedDates.join(",") || "未知"} 与目标日 ${scope.date} 不一致${invalidReason}`);
+      const failedCodes = new Set<string>();
+      // ETF 端点只接受单只请求：一只基金不支持行情只记该标的缺口，不拖垮同组其余 ETF。
+      let quotes: SnapshotQuote[];
+      if (group.kind === "etf") {
+        quotes = [];
+        for (const code of group.codes) {
+          try {
+            quotes.push(...(await fetchSnapshot([code], hithinkDeps(db, deps), "etf")));
+          } catch (err) {
+            failedCodes.add(code);
+            groupGaps.push({ code, freq: "day", reason: `ETF 快照不可用: ${(err as Error).message}` });
+          }
+        }
+      } else {
+        quotes = await fetchSnapshot(group.codes, hithinkDeps(db, deps), group.kind);
       }
-      for (const quote of quotes) {
+      const quoteByCode = new Map(quotes.map((quote) => [quote.code, quote]));
+      for (const code of group.codes) {
+        if (failedCodes.has(code)) continue;
+        const quote = quoteByCode.get(code);
+        if (!quote) {
+          groupGaps.push({ code, freq: "day", reason: "批量快照未返回该标的" });
+          continue;
+        }
         const barDate = snapshotDate(quote);
+        if (barDate !== scope.date) {
+          groupGaps.push({ code, freq: "day", reason: `快照交易日 ${barDate} 与目标日 ${scope.date} 不一致` });
+          continue;
+        }
+        if ([quote.open, quote.high, quote.low, quote.close].some((value) => !Number.isFinite(value) || value <= 0)) {
+          groupGaps.push({ code, freq: "day", reason: "快照存在非正或非有限 OHLC" });
+          continue;
+        }
         const instrumentId = await ensureInstrument(db, quote.code, undefined, "day");
         // 缺口/除权跳空检测：上一条日线距快照日 >3 个自然日，或快照前收与库内前收偏差 >11%
         const prev = await db.query<{ bar_date: string; close: string }>(
@@ -564,8 +587,9 @@ export async function dailyMarketUpdate(
           jobRunId: deps.jobRunId,
         }),
       );
+      summary.gaps.push(...groupGaps);
     } catch (err) {
-      // 组级快照失败写入获取审计；逐只历史 K 线全部恢复时不计作最终数据缺口。
+      // 实时日更不把一次批量快照失败放大为全组逐只历史请求。
       const snapshotFailure = { reason: `${group.kind} 批量快照不可用: ${(err as Error).message}` };
       summary.fetchRunIds.push(
         await insertFetchRun(db, {
@@ -577,11 +601,7 @@ export async function dailyMarketUpdate(
           jobRunId: deps.jobRunId,
         }),
       );
-      const historical = await backfillDailyCodes(db, group.codes, scope.date, deps);
-      groupRows += historical.rows;
-      summary.refetched.push(...historical.refetched);
-      summary.fetchRunIds.push(...historical.fetchRunIds);
-      summary.gaps.push(...historical.gaps);
+      summary.gaps.push(snapshotFailure);
     }
     summary.snapshotRows += groupRows;
   }

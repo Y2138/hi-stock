@@ -74,27 +74,16 @@ function asText(row: Record<string, unknown>, keys: string[]): string | null {
 
 function normalizeEntry(value: unknown, index: number, tier: string | null = null): StructureEntry {
   const raw = value && typeof value === "object" ? value as Record<string, unknown> : { name: value };
+  tier = tier ?? asText(raw, ["tier"]);
   const code = asText(raw, ["code", "thscode"]);
   const name = asText(raw, ["name", "stock_name", "security_name"]) ?? code ?? "未命名标的";
   const boardCode = asText(raw, ["industry_code", "board_code", "sector_code"]);
-  const boardName = asText(raw, ["industry_name", "board_name", "sector_name"]) ?? "板块待同步";
+  const boardName = asText(raw, ["industry_name", "board_name", "sector_name"]) ?? tier ?? "板块待同步";
   return { key: String(raw.id ?? code ?? `${tier ?? "item"}-${index}`), code, name, boardCode, boardName, tier, raw };
 }
 
-function ladderEntries(): StructureEntry[] {
-  const ladder = data.value?.items[0]?.ladder;
-  if (Array.isArray(ladder)) return ladder.map((item, index) => normalizeEntry(item, index, "连板梯队"));
-  if (!ladder || typeof ladder !== "object") return [];
-  return Object.entries(ladder as Record<string, unknown>).flatMap(([label, value]) => {
-    const tier = /板|梯队/.test(label) ? label : `${label}板`;
-    const items = Array.isArray(value) ? value : [value];
-    return items.map((item, index) => normalizeEntry(item, index, tier));
-  });
-}
-
-const entries = computed<StructureEntry[]>(() => dataset.value === "limit_ladder"
-  ? ladderEntries()
-  : (data.value?.items ?? []).map((item, index) => normalizeEntry(item, index)));
+const entries = computed<StructureEntry[]>(() => (data.value?.items ?? [])
+  .map((item, index) => normalizeEntry(item, index)));
 
 const groups = computed<StructureGroup[]>(() => {
   const grouped = new Map<string, StructureGroup>();

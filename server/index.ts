@@ -12,6 +12,7 @@ import {
   failInterruptedAgentBacktests,
   isAgentBacktestWorkerEnabled,
 } from "./backtest/agent-workspace.js";
+import { cleanupStaleBacktestSourceCandidates } from "./modules/backtests/repo.js";
 import { importLegacyHithinkApiKey } from "./system-settings.js";
 
 async function main(): Promise<void> {
@@ -53,6 +54,8 @@ async function main(): Promise<void> {
     if (cleaned > 0) console.log(`已清理 ${cleaned} 个遗留 Agent 回测临时工作区。`);
     const interrupted = await failInterruptedAgentBacktests(pool);
     if (interrupted > 0) console.log(`已将 ${interrupted} 个重启中断的 Agent 回测标记为失败。`);
+    const staleSources = await cleanupStaleBacktestSourceCandidates(pool);
+    if (staleSources > 0) console.log(`已清理 ${staleSources} 份超期候选回测源码。`);
     const interruptedSessions = await recoverInterruptedAgentSessions(pool);
     if (interruptedSessions > 0) {
       console.log(`已将 ${interruptedSessions} 个重启中断的 Agent 会话标记为失败。`);

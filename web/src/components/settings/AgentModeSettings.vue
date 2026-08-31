@@ -28,7 +28,7 @@ async function changeMode(event: Event): Promise<void> {
   if (
     next &&
     !window.confirm(
-      "开启 YOLO 后，Agent 发起的组合账户、短线/长线池、任务、回测结论确认和记忆写入将跳过确认卡，并通过对应业务 service 直接执行。策略发布仍必须真人确认；临时回测运行本身不走业务写入确认。事务、写锁、状态冲突检测和审计仍然生效。确认开启？",
+      "开启 YOLO 后，Agent 发起的持仓、短线/长线池、任务和记忆写入将跳过确认卡，并通过对应业务 service 直接执行。回测结论最终化本就直接执行；策略发布仍必须真人确认。事务、写锁、状态冲突检测和审计仍然生效。确认开启？",
     )
   ) {
     input.checked = false;

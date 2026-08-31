@@ -31,7 +31,7 @@ services:
       DATABASE_URL: postgres://stock:${POSTGRES_PASSWORD:-stock-local}@postgres:5432/stock
       SERVER_HOST: 0.0.0.0
       PORT: 8787
-      AGENT_BACKTEST_WORKER_ENABLED: "false"
+      AGENT_BACKTEST_WORKER_ENABLED: "true"
     ports:
       - "127.0.0.1:${APP_HOST_PORT:-8787}:8787"
     volumes:

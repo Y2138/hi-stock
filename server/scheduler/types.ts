@@ -89,8 +89,8 @@ export interface AnalysisJobConfig {
 }
 
 export interface AgentFlowJobConfig {
-  readonly?: true;
   pool_attention_write?: true;
+  daily_plan_write?: true;
 }
 
 export type ValidatedJobConfig = DatasourceJobConfig | AnalysisJobConfig | AgentFlowJobConfig;

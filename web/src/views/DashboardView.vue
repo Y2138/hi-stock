@@ -1,14 +1,15 @@
 <script setup lang="ts">
-// 仪表盘（/）：先汇总数据可信度与待处理异常，再展示账户、持仓和常用入口。
-// 口径：资金快照与持仓行情可能来自不同日期，页面分别标注，不混成同一时点资产。
+// 仪表盘（/）：先汇总数据可信度与待处理异常，再展示持仓和常用入口。
+// 口径：只展示当前持仓与最新行情可验证的派生指标。
 import { computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { apiClient } from "../api/client";
 import type {
-  AccountSnapshot,
-  AccountSummary,
+  DailyPlanBoard,
   JobDefinition,
   MarketCoverage,
+  PoolMember,
+  PoolViewData,
   Position,
 } from "../api/types";
 import { FREQ_LABELS } from "../api/types";
@@ -22,7 +23,7 @@ const router = useRouter();
 
 function maintainFactsWithAgent(): void {
   askAi(
-    "请先核对我要记录的成交、账户快照或标的池变化，再通过对应领域工具生成提案。不要根据页面猜测业务事实。",
+    "请先核对我要记录的持仓或标的池变化，再通过对应领域工具生成提案。不要根据页面猜测业务事实。",
     "维护业务事实",
     { confirmation: "打开 Agent 维护业务事实？\n\n页面只提供查询，写入会先由 Agent 核对。" },
   );
@@ -33,20 +34,57 @@ const coverage = useResource<MarketCoverage[]>(() =>
 );
 const jobs = useResource<JobDefinition[]>(() => apiClient.get<JobDefinition[]>("/api/jobs"));
 const positions = useResource<Position[]>(() => apiClient.get<Position[]>("/api/positions"));
-const snapshots = useResource<AccountSnapshot[]>(() =>
-  apiClient.get<AccountSnapshot[]>("/api/account/snapshots"),
+const shortPool = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools/short"));
+const longPool = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools/long"));
+const dailyPlan = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>("/api/plans/latest"));
+
+// 打板机会：404 = 计划尚未生成结构化预案，不算错误。
+const planLoading = computed(() => dailyPlan.loading.value);
+const planMissing = computed(() => !dailyPlan.data.value && dailyPlan.error.value?.status === 404);
+const planError = computed(() => (planMissing.value ? null : dailyPlan.error.value));
+const planEmpty = computed(() => {
+  const board = dailyPlan.data.value;
+  return board !== null && board.opportunities.length === 0;
+});
+const opportunities = computed(() => dailyPlan.data.value?.opportunities ?? []);
+const GRADE_LABELS: Record<string, string> = {
+  A: "双路线共振",
+  B: "单路线信号",
+  C: "旧版待复核",
+};
+const AUCTION_LABELS: Record<string, string> = {
+  worth_entering: "超出当前策略",
+  observe: "继续观察",
+  give_up: "放弃",
+  unavailable: "数据不足",
+};
+const auctionAssessmentCount = computed(() =>
+  opportunities.value.filter((item) => item.auction_assessment !== null).length,
 );
-/** 实时资金摘要：台账（快照锚点+成交变动）现金 + 持仓×最新收盘派生总资金 */
-const summary = useResource<AccountSummary>(() =>
-  apiClient.get<AccountSummary>("/api/account/summary"),
+const isLegacyOpportunitySet = computed(() => opportunities.value.length > 4);
+
+const today = () => new Date().toISOString().slice(0, 10);
+const isRecentAttention = (member: PoolMember) => Boolean(
+  member.attention_reason &&
+  (!member.attention_from || member.attention_from <= today()) &&
+  (!member.attention_until || member.attention_until >= today()),
 );
+const recentAttentionGroups = computed(() => [
+  {
+    label: "短线标的",
+    to: "/short-pool",
+    members: (shortPool.data.value?.members ?? []).filter(isRecentAttention),
+  },
+  {
+    label: "长线标的",
+    to: "/long-pool",
+    members: (longPool.data.value?.members ?? []).filter(isRecentAttention),
+  },
+]);
+const recentAttentionLoading = computed(() => shortPool.loading.value || longPool.loading.value);
+const recentAttentionError = computed(() => shortPool.error.value ?? longPool.error.value);
 
 const dayCoverage = computed(() => coverage.data.value?.find((c) => c.freq === "day") ?? null);
-
-const latestSnapshot = computed(() => {
-  const list = snapshots.data.value;
-  return list && list.length > 0 ? list[list.length - 1]! : null;
-});
 
 const activePositions = computed(() =>
   (positions.data.value ?? []).filter((position) => position.quantity > 0),
@@ -70,12 +108,6 @@ const largestPosition = computed(() => {
     .sort((a, b) => (b.market_value ?? 0) - (a.market_value ?? 0))[0];
   if (!position || total <= 0) return null;
   return { position, ratio: (position.market_value ?? 0) / total };
-});
-
-const cashRatio = computed(() => {
-  const s = summary.data.value;
-  if (!s?.tracked || s.cash === null || !s.total_asset) return null;
-  return s.cash / s.total_asset;
 });
 
 const coverageRows = computed(() => {
@@ -126,26 +158,12 @@ interface AttentionItem {
   to: string;
 }
 
-function daysBetween(from: string, to: string): number {
-  const fromTime = Date.parse(`${from.slice(0, 10)}T00:00:00Z`);
-  const toTime = Date.parse(`${to.slice(0, 10)}T00:00:00Z`);
-  if (!Number.isFinite(fromTime) || !Number.isFinite(toTime)) return 0;
-  return Math.max(0, Math.round((toTime - fromTime) / 86_400_000));
-}
-
-const snapshotLagDays = computed(() => {
-  const snapshotDate = latestSnapshot.value?.snap_date;
-  const marketDate = dayCoverage.value?.last_date;
-  return snapshotDate && marketDate ? daysBetween(snapshotDate, marketDate) : 0;
-});
-
 const attentionItems = computed<AttentionItem[]>(() => {
   const items: AttentionItem[] = [];
   const loadErrors = [
     { key: "coverage", title: "行情覆盖读取失败", error: coverage.error.value, to: "/datasync" },
     { key: "jobs", title: "任务状态读取失败", error: jobs.error.value, to: "/jobs" },
     { key: "positions", title: "持仓读取失败", error: positions.error.value, to: "/positions" },
-    { key: "snapshots", title: "资金快照读取失败", error: snapshots.error.value, to: "/positions" },
   ];
   for (const failure of loadErrors) {
     if (failure.error) {
@@ -185,26 +203,8 @@ const attentionItems = computed<AttentionItem[]>(() => {
     items.push({
       key: "missing-position-quotes",
       title: `${positionSummary.value.missingQuote} 只持仓缺少最新收盘`,
-      detail: "相关市值与浮动盈亏不完整，先补齐行情再判断账户变化",
+      detail: "相关市值与浮动盈亏不完整，先补齐行情再判断持仓状态",
       tone: "bad",
-      to: "/positions",
-    });
-  }
-
-  if (!snapshots.loading.value && !snapshots.error.value && !latestSnapshot.value) {
-    items.push({
-      key: "missing-account-snapshot",
-      title: "尚未记录账户资金快照",
-      detail: "无法核对总资产、现金与证券市值的最新时点",
-      tone: "warn",
-      to: "/positions",
-    });
-  } else if (snapshotLagDays.value > 0) {
-    items.push({
-      key: "stale-account-snapshot",
-      title: `账户快照落后行情 ${snapshotLagDays.value} 天`,
-      detail: `资金记录 ${fmtDate(latestSnapshot.value?.snap_date) ?? "未记录"} · 日线已到 ${fmtDate(dayCoverage.value?.last_date) ?? "未记录"}`,
-      tone: "warn",
       to: "/positions",
     });
   }
@@ -216,15 +216,12 @@ const dashboardLoading = computed(
   () =>
     coverage.loading.value ||
     jobs.loading.value ||
-    positions.loading.value ||
-    snapshots.loading.value,
+    positions.loading.value,
 );
 
-const accountLoading = computed(() => positions.loading.value || summary.loading.value);
-const accountError = computed(() => positions.error.value ?? summary.error.value);
-const accountEmpty = computed(
-  () => !(summary.data.value?.tracked) && (positions.data.value?.length ?? 0) === 0,
-);
+const positionLoading = computed(() => positions.loading.value);
+const positionError = computed(() => positions.error.value);
+const positionEmpty = computed(() => (positions.data.value?.length ?? 0) === 0);
 
 const systemTone = computed<"loading" | "ok" | AttentionTone>(() => {
   if (dashboardLoading.value) return "loading";
@@ -239,13 +236,13 @@ const systemHeadline = computed(() => {
   return "今天的关键数据状态正常";
 });
 
-function money(value: number | null | undefined, precision?: "exact" | "approx"): string {
+function money(value: number | null | undefined): string {
   if (value === null || value === undefined) return "—";
-  return `${precision === "approx" ? "≈" : ""}${fmtNum(Math.round(value))}`;
+  return fmtNum(Math.round(value)) ?? "—";
 }
 
 function signedMoney(value: number): string {
-  return `${value >= 0 ? "+" : ""}${fmtNum(Math.round(value))}`;
+  return `${value >= 0 ? "+" : ""}${fmtNum(Math.round(value)) ?? "—"}`;
 }
 
 function percent(value: number | null): string {
@@ -254,7 +251,14 @@ function percent(value: number | null): string {
 }
 
 function reloadAll(): void {
-  void Promise.all([coverage.reload(), jobs.reload(), positions.reload(), snapshots.reload(), summary.reload()]);
+  void Promise.all([
+    coverage.reload(),
+    jobs.reload(),
+    positions.reload(),
+    shortPool.reload(),
+    longPool.reload(),
+    dailyPlan.reload(),
+  ]);
 }
 
 useUiRefresh("dashboard", reloadAll);
@@ -266,7 +270,7 @@ onMounted(reloadAll);
     <header class="dashboard-head">
       <div class="head-copy">
         <h1>仪表盘</h1>
-        <p>先确认数据与异常，再看账户变化和下一步动作。</p>
+        <p>先确认数据与异常，再看持仓状态和下一步动作。</p>
       </div>
       <div class="head-actions" aria-label="常用操作">
         <button class="btn primary agent-entry" type="button" @click="maintainFactsWithAgent">通过 Agent 记录变化</button>
@@ -284,8 +288,6 @@ onMounted(reloadAll);
         <p>
           日线 {{ fmtDate(dayCoverage?.last_date) ?? "未就绪" }}
           <span aria-hidden="true">·</span>
-          资金快照 {{ fmtDate(latestSnapshot?.snap_date) ?? "未记录" }}
-          <span aria-hidden="true">·</span>
           {{ positionSummary.count }} 只持仓
         </p>
       </div>
@@ -299,45 +301,43 @@ onMounted(reloadAll);
       <article class="card dashboard-card account-card">
         <div class="card-heading">
           <div>
-            <span class="section-label">账户与持仓</span>
-            <h2>关键资金状态</h2>
+            <span class="section-label">当前持仓</span>
+            <h2>关键持仓状态</h2>
           </div>
           <RouterLink to="/positions">查看持仓明细</RouterLink>
         </div>
         <StateBlock
-          :loading="accountLoading"
-          :error="accountError"
-          :empty="accountEmpty"
-          empty-text="暂无账户或持仓记录"
+          :loading="positionLoading"
+          :error="positionError"
+          :empty="positionEmpty"
+          empty-text="暂无持仓记录"
           :skeleton-rows="3"
           @retry="reloadAll"
         >
           <div class="metric-grid">
             <div class="metric-item">
-              <span class="metric-label">总资产</span>
-              <strong class="num">{{ money(summary.data.value?.total_asset) }}</strong>
-              <span class="metric-meta">
-                {{ summary.data.value?.tracked ? `实时 · 锚定 ${fmtDate(summary.data.value.anchor_date)} 快照` : "未同步快照" }}
-              </span>
-            </div>
-            <div class="metric-item">
-              <span class="metric-label">可用现金</span>
-              <strong class="num">{{ money(summary.data.value?.cash) }}</strong>
-              <span class="metric-meta">
-                {{ cashRatio === null ? "同步快照后启用" : `占总资产 ${percent(cashRatio)}` }}
-              </span>
-            </div>
-            <div class="metric-item">
               <span class="metric-label">持仓市值</span>
               <strong class="num">{{ money(positionSummary.marketValue) }}</strong>
-              <span class="metric-meta">{{ fmtDate(dayCoverage?.last_date) ?? "无行情" }} · {{ positionSummary.count }} 只</span>
+              <span class="metric-meta">
+                {{ positionSummary.missingQuote > 0 ? "汇总不完整" : fmtDate(dayCoverage?.last_date) ?? "无行情" }}
+              </span>
             </div>
             <div class="metric-item">
               <span class="metric-label">浮动盈亏</span>
               <strong class="num" :class="positionSummary.pnl >= 0 ? 'up' : 'down'">
                 {{ signedMoney(positionSummary.pnl) }}
               </strong>
-              <span class="metric-meta">按最新持仓收盘价 · 元</span>
+              <span class="metric-meta">{{ positionSummary.missingQuote > 0 ? "汇总不完整" : "按最新持仓收盘价" }} · 元</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">持仓数量</span>
+              <strong class="num">{{ positionSummary.count }}</strong>
+              <span class="metric-meta">当前持仓标的</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">行情缺口</span>
+              <strong class="num" :class="{ down: positionSummary.missingQuote > 0 }">{{ positionSummary.missingQuote }}</strong>
+              <span class="metric-meta">缺少最新收盘</span>
             </div>
           </div>
           <div v-if="largestPosition" class="account-foot">
@@ -364,7 +364,7 @@ onMounted(reloadAll);
             <span class="empty-check" aria-hidden="true">✓</span>
             <div>
               <strong>暂未发现待处理异常</strong>
-              <p>行情缺口、失败任务和资金快照滞后均会集中显示在这里。</p>
+              <p>行情缺口和失败任务会集中显示在这里。</p>
             </div>
           </div>
           <div v-else class="attention-list">
@@ -388,6 +388,119 @@ onMounted(reloadAll);
         </StateBlock>
       </article>
     </div>
+
+    <article class="card dashboard-card recent-attention-card">
+      <div class="card-heading">
+        <div>
+          <span class="section-label">标的池</span>
+          <h2>近期关注</h2>
+        </div>
+      </div>
+      <StateBlock
+        :loading="recentAttentionLoading"
+        :error="recentAttentionError"
+        :skeleton-rows="3"
+        @retry="reloadAll"
+      >
+        <div class="recent-attention-grid">
+          <section v-for="group in recentAttentionGroups" :key="group.to" class="recent-attention-group">
+            <div class="subsection-head">
+              <h3>{{ group.label }}（{{ group.members.length }}）</h3>
+              <RouterLink :to="group.to">查看标的池</RouterLink>
+            </div>
+            <p v-if="group.members.length === 0" class="no-runs">暂无近期关注标的</p>
+            <div v-else class="attention-list">
+              <RouterLink v-for="member in group.members" :key="member.id" :to="group.to" class="attention-item recent-attention-item">
+                <span class="attention-content">
+                  <strong>{{ member.name }}（<span class="num">{{ member.code }}</span>）</strong>
+                  <small>{{ member.attention_reason }}</small>
+                </span>
+                <span class="row-arrow" aria-hidden="true">→</span>
+              </RouterLink>
+            </div>
+          </section>
+        </div>
+      </StateBlock>
+    </article>
+
+    <article class="card dashboard-card plan-opportunities-card">
+      <div class="card-heading">
+        <div>
+          <span class="section-label">
+            每日计划 · {{ dailyPlan.data.value?.plan.target_date ?? "—" }}
+            <template v-if="opportunities.length > 0"> · {{ isLegacyOpportunitySet ? "历史候选" : "打板信号" }} {{ opportunities.length }} · T+1 复核 {{ auctionAssessmentCount }}/{{ opportunities.length }}</template>
+          </span>
+          <h2>打板机会</h2>
+        </div>
+        <span v-if="opportunities.length > 0" class="count-badge active">{{ opportunities.length }}</span>
+      </div>
+      <p class="strategy-scope-note">
+        <template v-if="isLegacyOpportunitySet">当前展示的是旧计划口径；按最新《打板策略》生成的新计划每日最多 4 只。</template>
+        <template v-else>T 日收盘按当前《打板策略》筛选；前向验证期只展示继续观察、放弃或数据不足。</template>
+      </p>
+      <StateBlock
+        :loading="planLoading"
+        :error="planError"
+        :empty="planEmpty"
+        empty-text="本计划没有形成有效打板信号"
+        :skeleton-rows="3"
+        @retry="dailyPlan.reload"
+      >
+        <p v-if="planMissing" class="no-runs">每日计划尚未生成结构化预案，生成后此处展示按策略优先级排序的打板机会。</p>
+        <div v-else-if="opportunities.length > 0" class="plan-opportunity-table-wrap">
+          <table class="data-table plan-opportunity-table">
+            <thead>
+              <tr>
+                <th scope="col">优先级</th>
+                <th scope="col">标的</th>
+                <th scope="col">T 日信号</th>
+                <th scope="col">评分与依据</th>
+                <th scope="col">T+1 竞价复核</th>
+                <th scope="col">风险与失效</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="item in opportunities" :key="item.id">
+                <td class="num">{{ item.priority }}</td>
+                <td>
+                  <RouterLink :to="{ path: '/market', query: { code: item.code, view: 'detail' } }">
+                    <strong>{{ item.name }}</strong>
+                    <small class="num"> {{ item.code }}</small>
+                  </RouterLink>
+                </td>
+                <td class="signal-cell">
+                  <span class="grade-badge" :class="`grade-${item.grade?.toLowerCase()}`">
+                    {{ item.grade ? `${item.grade} · ${GRADE_LABELS[item.grade] ?? "待复核"}` : "数据不足" }}
+                  </span>
+                  <small>{{ item.headline }}</small>
+                </td>
+                <td>
+                  {{ item.auction_assessment?.assessment_summary ?? item.evidence_md ?? item.headline }}
+                  <small v-if="item.auction_assessment && item.evidence_md" class="plan-evidence">T 日依据：{{ item.evidence_md }}</small>
+                  <small v-if="item.missing_md" class="data-gap">数据缺口：{{ item.missing_md }}</small>
+                </td>
+                <td class="auction-result-cell">
+                  <template v-if="item.auction_assessment">
+                    <span class="auction-badge" :class="`auction-${item.auction_assessment.conclusion}`">
+                      {{ AUCTION_LABELS[item.auction_assessment.conclusion] }}
+                    </span>
+                    <small>{{ item.auction_assessment.metrics_summary }}</small>
+                    <small v-if="item.auction_assessment.benchmark_tags.length > 0" class="auction-tags">
+                      {{ item.auction_assessment.benchmark_tags.join(" · ") }}
+                    </small>
+                  </template>
+                  <span v-else class="auction-pending">待 T+1 竞价复核</span>
+                </td>
+                <td class="risk-cell">
+                  <span>{{ item.risk_md ?? "—" }}</span>
+                  <small v-if="item.invalidation_md">失效：{{ item.invalidation_md }}</small>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </StateBlock>
+    </article>
 
     <article class="card dashboard-card health-card dashboard-health">
       <div class="card-heading">
@@ -580,6 +693,14 @@ onMounted(reloadAll);
   margin-top: var(--dashboard-gap);
 }
 
+.plan-opportunities-card {
+  margin-top: var(--dashboard-gap);
+}
+
+.recent-attention-card {
+  margin-top: var(--dashboard-gap);
+}
+
 .dashboard-card {
   min-width: 0;
   padding: 18px 20px;
@@ -749,6 +870,20 @@ onMounted(reloadAll);
   color: var(--ink-faint);
 }
 
+.recent-attention-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-lg);
+}
+
+.recent-attention-group {
+  min-width: 0;
+}
+
+.recent-attention-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
 .empty-attention {
   display: flex;
   align-items: flex-start;
@@ -889,6 +1024,10 @@ onMounted(reloadAll);
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .recent-attention-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .metric-item strong {
     font-size: 18px;
   }
@@ -925,5 +1064,91 @@ onMounted(reloadAll);
   .metric-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+.grade-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+.grade-a {
+  background: color-mix(in srgb, var(--ok) 18%, transparent);
+  color: var(--ok);
+}
+
+.grade-b {
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--warn);
+}
+
+.grade-c {
+  background: color-mix(in srgb, var(--ink-faint) 14%, transparent);
+  color: var(--ink-faint);
+}
+
+.plan-opportunity-table td:nth-child(n + 4) {
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.plan-opportunity-table-wrap {
+  overflow-x: auto;
+}
+
+.plan-opportunity-table {
+  min-width: 980px;
+}
+
+.strategy-scope-note {
+  margin: -4px 0 var(--space-md);
+  color: var(--ink-soft);
+  font-size: var(--fs-sm);
+}
+
+.auction-result-cell small,
+.signal-cell small,
+.risk-cell small,
+.plan-evidence,
+.data-gap {
+  display: block;
+  margin-top: 5px;
+  color: var(--ink-soft);
+  line-height: 1.45;
+}
+
+.data-gap {
+  color: var(--warn);
+}
+
+.auction-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.auction-worth_entering {
+  background: color-mix(in srgb, var(--bad) 16%, transparent);
+  color: var(--bad);
+}
+
+.auction-observe {
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--warn);
+}
+
+.auction-give_up {
+  background: color-mix(in srgb, var(--bad) 16%, transparent);
+  color: var(--bad);
+}
+
+.auction-unavailable,
+.auction-pending,
+.auction-tags {
+  color: var(--ink-faint);
 }
 </style>

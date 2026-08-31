@@ -149,22 +149,52 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     expect((await api(server!.baseUrl, "POST", "/api/chart-annotations", {})).status).toBe(404);
   });
 
-  it("成交事件由领域 service 固化归因、策略快照和来源会话", async () => {
+  it("持仓事件固化归因和每笔卖出收益，累计已实现盈亏不联动退役资金状态", async () => {
+    await pool.query(
+      `INSERT INTO portfolio_account_state (id, cash, closed_pnl, anchor_date)
+       VALUES (true, 0, 123, '2026-08-13')`,
+    );
     await recordPositionChange(pool, {
       code: "600487.SH", kind: "buy", quantity: 600, price: 60, change_date: "2026-08-14",
       source: "chat", source_session_id: sessionId, decision_origin: "strategy_signal",
       execution_compliance: "matched", attribution_note: "按当日已确认信号记录",
     });
+    const partialSell = await recordPositionChange(pool, {
+      code: "600487.SH", kind: "sell", quantity: 200, price: 65, change_date: "2026-08-15",
+      source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
+      execution_compliance: "matched", attribution_note: "部分卖出",
+    });
+    expect(partialSell.change).toMatchObject({ cost_price_before: 60, realized_pnl: 1000 });
+    const positions = await api(server!.baseUrl, "GET", "/api/positions");
+    expect(positions.json).toMatchObject([{ code: "600487.SH", quantity: 400, attribution_breakdown: {
+      strategy_signal: 1, planned_discretionary: 1,
+    } }]);
+    await recordPositionChange(pool, {
+      code: "600487.SH", kind: "sell", quantity: 400, price: 55, change_date: "2026-08-16",
+      source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
+      execution_compliance: "matched", attribution_note: "最终卖出",
+    });
     const changes = await api(server!.baseUrl, "GET", "/api/positions/changes");
     expect(changes.status).toBe(200);
-    expect(changes.json).toMatchObject([{
-      code: "600487.SH", source: "chat", decision_origin: "strategy_signal",
-      execution_compliance: "matched", source_session_id: sessionId,
-      strategy_change_seq: "0", attribution_note: "按当日已确认信号记录",
-    }]);
+    expect(changes.json).toMatchObject([
+      { code: "600487.SH", kind: "sell", cost_price_before: 60, realized_pnl: -2000 },
+      { code: "600487.SH", kind: "sell", cost_price_before: 60, realized_pnl: 1000 },
+      {
+        code: "600487.SH", kind: "buy", source: "chat", decision_origin: "strategy_signal",
+        execution_compliance: "matched", source_session_id: sessionId,
+        strategy_change_seq: "0", attribution_note: "按当日已确认信号记录",
+      },
+    ]);
     expect((changes.json as unknown as Array<{ strategy_snapshot_hash: string }>)[0]!.strategy_snapshot_hash).toMatch(/^[a-f0-9]{64}$/);
-    const positions = await api(server!.baseUrl, "GET", "/api/positions");
-    expect(positions.json).toMatchObject([{ code: "600487.SH", quantity: 600, attribution_breakdown: { strategy_signal: 1 } }]);
+    const summary = await api(server!.baseUrl, "GET", "/api/positions/realized-pnl");
+    expect(summary).toMatchObject({ status: 200, json: {
+      baseline_pnl: 0, event_pnl: -1000, realized_pnl: -1000,
+      sell_count: 2, missing_sell_count: 0, fee_status: "excluded",
+    } });
+    expect((await api(server!.baseUrl, "GET", "/api/positions")).json).toEqual([]);
+    expect((await pool.query(
+      "SELECT cash::float, closed_pnl::float FROM portfolio_account_state WHERE id = true",
+    )).rows[0]).toEqual({ cash: 0, closed_pnl: 123 });
   });
 
   it("计划外例外或执行偏离缺少原因时整笔回滚", async () => {
@@ -257,12 +287,8 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     }] });
   });
 
-  it("账户快照查询保留离散时间序列口径", async () => {
-    await pool.query(
-      `INSERT INTO portfolio_account_snapshot (snap_date,total_asset,market_value,cash,closed_pnl,precision,source)
-       VALUES ('2026-07-22',148900,94393,54500,NULL,'approx','ingest'),('2026-08-14',147476,128496,18980,-27221.09,'exact','ingest')`,
-    );
-    const result = await api(server!.baseUrl, "GET", "/api/account/snapshots");
-    expect((result.json as unknown as Array<{ snap_date: string }>).map((row) => row.snap_date)).toEqual(["2026-07-22", "2026-08-14"]);
+  it("旧账户快照和资金摘要 API 已退役", async () => {
+    expect((await api(server!.baseUrl, "GET", "/api/account/snapshots")).status).toBe(404);
+    expect((await api(server!.baseUrl, "GET", "/api/account/summary")).status).toBe(404);
   });
 });

@@ -419,7 +419,7 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     expect(rendered[0]!.errorText).toBe("已中断");
   });
 
-  it("连续 assistant 消息按用户轮次聚合为一张 Agent 执行轨迹卡", () => {
+  it("连续 assistant 消息按用户轮次聚合为一段 Agent 回复流", () => {
     const rendered = rowsToMessages([
       {
         id: "user-1", session_id: "1", seq: 1, role: "user",

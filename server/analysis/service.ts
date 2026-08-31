@@ -29,12 +29,7 @@ export interface AnalysisRunRow {
   created_at: string;
 }
 
-const SECTORS: Record<string, string> = {
-  有色: "000819.SH", 化工: "516120.SH", 半导体: "980017.SZ", 医药: "000933.SH",
-  电力: "399438.SZ", 煤炭: "399990.SZ", 家电: "159996.SZ", 汽车: "399432.SZ",
-  军工: "399967.SZ", 新能源: "399412.SZ", 机器人: "980022.SZ", CPO: "515880.SH",
-  航空航天: "159241.SZ", 房地产: "512200.SH", 交通: "399433.SZ", 算力: "516510.SH",
-};
+/** 板块温度与市场状态口径：同花顺正式板块一级行业（881 前缀），与 daily_data_update 日更范围同源；不再使用任何代理指数/ETF 映射。 */
 
 interface Bar {
   code: string;
@@ -88,9 +83,31 @@ function grouped(bars: Bar[]): Map<string, Bar[]> {
   return map;
 }
 
+/** 同花顺一级行业板块全集：code → 板块名 */
+async function industryBoards(db: Db): Promise<Map<string, string>> {
+  const result = await db.query<{ code: string; name: string }>(
+    `SELECT i.code, i.name
+       FROM market_board board
+       JOIN market_instrument i ON i.id = board.instrument_id
+      WHERE board.active = true AND board.source = 'hithink' AND board.board_type = 'industry'
+        AND i.code LIKE '881%'
+      ORDER BY i.code`,
+  );
+  return new Map(result.rows.map((row) => [row.code, row.name]));
+}
+
 async function sectorTemperature(db: Db, request: AnalysisRequest) {
-  const labelsByCode = new Map(Object.entries(SECTORS).map(([label, code]) => [code, label]));
-  const codes = request.codes?.length ? request.codes : [...labelsByCode.keys()];
+  const boards = await industryBoards(db);
+  const codes = request.codes?.length ? request.codes : [...boards.keys()];
+  const namesByCode = new Map(boards);
+  const unknown = codes.filter((code) => !namesByCode.has(code));
+  if (unknown.length > 0) {
+    const extra = await db.query<{ code: string; name: string }>(
+      `SELECT code, name FROM market_instrument WHERE code = ANY($1::text[])`,
+      [unknown],
+    );
+    for (const row of extra.rows) namesByCode.set(row.code, row.name);
+  }
   const bars = grouped(await selectBars(db, codes, "day", request.as_of, Math.max(25, request.lookback ?? 60)));
   const gaps: unknown[] = [];
   const items = codes.map((code) => {
@@ -107,7 +124,7 @@ async function sectorTemperature(db: Db, request: AnalysisRequest) {
     const fiveAgo = closes.at(-6) ?? close;
     const avgVolume5 = mean(volumes.slice(-5));
     return {
-      sector: labelsByCode.get(code) ?? code,
+      sector: namesByCode.get(code) ?? code,
       code,
       as_of: rows.at(-1)!.bar_date,
       close,

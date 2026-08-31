@@ -1,13 +1,8 @@
-// 持仓 HTTP 路由处理：持仓查询、事件流、账户快照、手工记录成交
+// 持仓 HTTP 路由处理：当前持仓与变更事件流。
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §十；产品方案 §6.6
 import type pg from "pg";
 import { apiErrors } from "../../http/router.js";
-import {
-  getAccountSummary,
-  listAccountSnapshots,
-  listPositionChanges,
-  listPositions,
-} from "./repo.js";
+import { getRealizedPnlSummary, listPositionChanges, listPositions } from "./repo.js";
 
 interface Ctx {
   pool: pg.Pool;
@@ -31,13 +26,8 @@ export const positionRoutes = {
     return { data: await listPositionChanges(pool, limit) };
   },
 
-  /** GET /api/account/snapshots：账户快照序列（snap_date 升序） */
-  async accountSnapshots({ pool }: Ctx) {
-    return { data: await listAccountSnapshots(pool) };
-  },
-
-  /** GET /api/account/summary：实时资金摘要（台账现金 + 持仓×最新收盘派生市值/总资金） */
-  async accountSummary({ pool }: Ctx) {
-    return { data: await getAccountSummary(pool) };
+  /** GET /api/positions/realized-pnl：历史基线 + 后续卖出事件的累计已实现盈亏。 */
+  async realizedPnl({ pool }: Ctx) {
+    return { data: await getRealizedPnlSummary(pool) };
   },
 };

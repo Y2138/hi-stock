@@ -36,3 +36,9 @@ export function fmtNum(n: number | null | undefined): string | null {
   if (n === null || n === undefined) return null;
   return n.toLocaleString("zh-CN");
 }
+
+/** 价格与成本：最多 4 位小数，去掉无意义尾零。 */
+export function fmtPrice(n: number | null | undefined): string | null {
+  if (n === null || n === undefined) return null;
+  return n.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
+}

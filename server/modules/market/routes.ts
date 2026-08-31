@@ -121,7 +121,7 @@ export function buildOnDemandBars(bars: Bar[]): BarRow[] {
 function remoteKind(assetType: string): InstrumentKind {
   if (assetType === "a-share-index") return "index";
   if (assetType === "fund-etf") return "etf";
-  if (assetType === "fund-lof" || assetType === "fund-otc") return "fund";
+  if (["fund-lof", "fund-otc", "fund-reits"].includes(assetType)) return "fund";
   return "stock";
 }
 

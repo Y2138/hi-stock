@@ -16,7 +16,7 @@ const MAX_DESCRIBE_TABLES = 20;
 // ponytail: 前 128 位足以识别 Schema 漂移，也避免模型抄错长哈希尾部；出现可测碰撞时再改服务端令牌。
 const SCHEMA_VERSION_HEX_LENGTH = 32;
 
-/** 完成事实源切换后只为迁移审计保留，不向新会话暴露的历史文件型表。 */
+/** 完成事实源切换后只为迁移审计或历史数据保留，不向新会话暴露的退役表。 */
 const HIDDEN_LEGACY_TABLES = [
   "task_definition",
   "task_run",
@@ -29,11 +29,15 @@ const HIDDEN_LEGACY_TABLES = [
   "content_document",
   "content_revision",
   "content_legacy_import",
+  "portfolio_position_snapshot_daily",
+  "portfolio_account_snapshot",
+  "portfolio_account_state",
 ] as const;
 
 const SENSITIVE_COLUMNS = new Map<string, Set<string>>([
   ["llm_provider", new Set(["api_key"])],
   ["system_setting", new Set(["hithink_api_key"])],
+  ["backtest_run_source", new Set(["source_code"])],
 ]);
 
 interface BusinessMeta {
@@ -61,6 +65,12 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
     description: "行情拉取批次、降级链路和数据缺口记录。",
     write_policy: "只允许 datasource service 写入。",
   },
+  hithink_dataset_snapshot: {
+    domain: "扶摇扩展数据",
+    description: "集合竞价、热榜、个股异动和基金研究能力按规范化请求保存的最新官方快照。",
+    write_policy: "只允许 fetch_hithink_data 经白名单 datasource service 幂等写入；Agent 只读。",
+    constraints: ["基金持仓、配置和持有人数据是定期披露，不是实时持仓；payload 空值不得补零。"],
+  },
   portfolio_position: {
     domain: "持仓",
     description: "按标的汇总的当前持仓状态。",
@@ -69,19 +79,13 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   },
   portfolio_position_change: {
     domain: "持仓",
-    description: "买入、卖出、调整和备注组成的持仓事件流。",
+    description: "买入、卖出、调整和备注组成的持仓事件流；卖出固化成交前成本和本笔已实现毛盈亏，未计费用。",
     write_policy: "只允许 portfolio_write 经持仓 service 追加。",
   },
-  portfolio_position_snapshot_daily: {
+  portfolio_realized_pnl_baseline: {
     domain: "持仓",
-    description: "持仓的每日价格、盈亏和执行位快照。",
-    write_policy: "只允许持仓快照流程写入；对话 Agent 只读。",
-  },
-  portfolio_account_snapshot: {
-    domain: "持仓",
-    description: "账户总资产、证券市值、可用资金和累计清仓收益的日期快照。",
-    write_policy: "只允许账户摄取流程或 portfolio_write 经组合账户 service 维护。",
-    constraints: ["同一日期只有一个快照；精确记录满足总资产 = 证券市值 + 可用资金。"],
+    description: "累计已实现盈亏的一次性历史基线；增量只统计 through_created_at 之后的卖出事件。",
+    write_policy: "只允许数据库迁移建立；运行时只读。",
   },
   market_board: {
     domain: "行情",
@@ -126,14 +130,19 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   },
   backtest_run: {
     domain: "回测",
-    description: "Agent 自驱回测的研究大纲、假设、策略快照、输入摘要、指标、结论、缺口与终态。",
+    description: "Agent 自驱回测的研究大纲、假设、策略快照、源码继承关系、输入摘要、指标、结论、缺口与终态。",
     write_policy: "只允许 run_backtest 在隔离临时工作区创建运行；历史记录只读。",
-    constraints: ["不保存代码正文、补丁、stdout/stderr、中间文件或临时路径。"],
+    constraints: ["代码正文只进入 backtest_run_source；不保存补丁、stdout/stderr、中间文件或临时路径。"],
   },
   backtest_run_comparison: {
     domain: "回测",
     description: "本次 Agent 回测与历史回测之间的对比关系。",
     write_policy: "只允许 run_backtest 随新运行创建；Agent 和页面只读。",
+  },
+  backtest_run_source: {
+    domain: "回测",
+    description: "成功回测的候选源码与最终化后可复用源码版本；通用查询只开放状态和时间元数据。",
+    write_policy: "只允许 run_backtest 暂存、finalize_backtest 固化；源码正文只能由 read_backtest_source 读取。",
   },
   strategy_state: {
     domain: "当前策略",

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { apiClient } from "../api/client";
-import type { BacktestDetail, BacktestListItem } from "../api/types";
+import type { BacktestDetail, BacktestListItem, BacktestSourceVersion } from "../api/types";
 import MarkdownView from "../components/MarkdownView.vue";
 import ResultLink from "../components/ResultLink.vue";
 import StateBlock from "../components/StateBlock.vue";
@@ -31,6 +31,9 @@ const list = useResource<BacktestListItem[]>(() => apiClient.get<BacktestListIte
 const detailId = ref<string | null>(null);
 const detail = useResource<BacktestDetail>(() => apiClient.get<BacktestDetail>(`/api/backtests/${detailId.value}`));
 const compareIds = ref<string[]>([]);
+const sourceVersion = ref<BacktestSourceVersion | null>(null);
+const sourceLoading = ref(false);
+const sourceVisible = ref(false);
 const route = useRoute();
 const compareRuns = computed(() =>
   (list.data.value ?? []).filter((run) => compareIds.value.includes(run.id)),
@@ -58,7 +61,22 @@ function jsonOrEmpty(value: unknown): string {
 async function openDetail(run: Pick<BacktestListItem, "id">): Promise<void> {
   detailId.value = run.id;
   detail.data.value = null;
+  sourceVersion.value = null;
+  sourceVisible.value = false;
   await detail.reload();
+}
+
+async function toggleSource(run: BacktestDetail): Promise<void> {
+  if (sourceVersion.value?.backtest_run_id === run.id) {
+    sourceVisible.value = !sourceVisible.value;
+    return;
+  }
+  sourceLoading.value = true;
+  const result = await apiClient.get<BacktestSourceVersion>(`/api/backtests/${run.id}/source`);
+  sourceLoading.value = false;
+  if (!result.ok) return;
+  sourceVersion.value = result.data;
+  sourceVisible.value = true;
 }
 
 function toggleCompare(id: string): void {
@@ -72,8 +90,9 @@ function startAgentBacktest(): void {
     [
       "我想验证一个策略思路。请先询问我本次要验证的假设、标的范围和时间区间；不要替我猜交易规则。",
       "确认目标后，从 PostgreSQL 读取最新 strategy_state 与相关策略正文，并按需读取历史 backtest_run/backtest_run_comparison。",
-      "请自行编写临时 TypeScript，通过 run_backtest 在隔离环境执行；源码只放工具参数，禁止复制到普通回复。",
-      "可以在同一会话继续试验和反证；证据完整后使用 finalize_backtest 生成最终结论提案，明确摘要与适用边界。只有最终结论进入回测历史。",
+      "先查看系统提示中的固化回测源码索引；存在策略哈希、SDK 和目标相近的版本时，先用 read_backtest_source 读取并最小改造，没有合适版本才从零编写。",
+      "通过 run_backtest 在隔离环境执行；复用源码时填写 base_source_run_id，完整源码只放工具参数，禁止复制到普通回复。",
+      "可以在同一会话继续试验和反证；证据完整后使用 finalize_backtest 固化最终结论与源码，明确摘要与适用边界。只有最终结论进入回测历史。",
       "若建议调整策略，只能引用已确认的最终回测并创建 strategy_publish_request 待审提案，策略发布必须由我在当前策略页人工确认。",
     ].join("\n"),
     "Agent 回测验证",
@@ -83,7 +102,7 @@ function startAgentBacktest(): void {
 
 function continueFrom(run: BacktestDetail): void {
   askAi(
-    `请读取回测 #${run.id} 的研究大纲、假设、策略快照、输入摘要、指标、结论和缺口。先说明它还缺什么证据，再询问我要延续、修改还是反证这个思路；如需新验证，使用 run_backtest 并把 #${run.id} 放入 comparison_run_ids。源码只能进入工具参数，不能出现在普通回复。`,
+    `请读取回测 #${run.id} 的研究大纲、假设、策略快照、输入摘要、指标、结论和缺口。${run.source_retention_status === "versioned" ? `先调用 read_backtest_source 读取 #${run.id} 的固化源码，并在其基础上做最小修改；` : "该历史记录没有可恢复源码；"}先说明它还缺什么证据，再询问我要延续、修改还是反证这个思路；如需新验证，使用 run_backtest，把 #${run.id} 放入 comparison_run_ids${run.source_retention_status === "versioned" ? `，并将 base_source_run_id 设为 ${run.id}` : ""}。源码只能进入工具参数，不能出现在普通回复。`,
     `延续回测 #${run.id}`,
     {
       sessionType: "backtest",
@@ -131,7 +150,7 @@ watch(() => route.query.run, (id) => {
     <div class="page-head backtest-head">
       <div>
         <h1>回测验证</h1>
-        <div class="sub">默认只展示每次研究过程确认后的最终结论 · 中间运行不污染历史</div>
+        <div class="sub">默认只展示每次研究过程最终化后的结论 · 中间运行不污染历史</div>
       </div>
       <button class="btn primary agent-entry" type="button" @click="startAgentBacktest">让 Agent 验证策略思路</button>
     </div>
@@ -202,17 +221,33 @@ watch(() => route.query.run, (id) => {
                 <dt>执行状态</dt><dd><span class="badge" :class="statusClass(detail.data.value)">{{ EXECUTION_LABELS[detail.data.value.execution_status] }}</span> · {{ detail.data.value.progress }}%</dd>
                 <dt>最终结论摘要</dt><dd>{{ detail.data.value.conclusion_summary ?? "—" }}</dd>
                 <dt>适用边界</dt><dd>{{ detail.data.value.applicability_boundary ?? "—" }}</dd>
-                <dt>确认时间</dt><dd class="num">{{ fmtTime(detail.data.value.finalized_at) ?? "—" }}</dd>
+                <dt>最终化时间</dt><dd class="num">{{ fmtTime(detail.data.value.finalized_at) ?? "—" }}</dd>
                 <dt>研究大纲</dt><dd>{{ detail.data.value.research_outline ?? "历史记录未保存" }}</dd>
                 <dt>待验证假设</dt><dd>{{ detail.data.value.hypothesis ?? "历史记录未保存" }}</dd>
                 <dt>策略快照</dt><dd class="num">序号 {{ detail.data.value.strategy_change_seq ?? "—" }} · {{ shortHash(detail.data.value.strategy_snapshot_hash) }}</dd>
                 <dt>工作器 / SDK</dt><dd class="num">{{ detail.data.value.worker_version ?? detail.data.value.service_version ?? "历史记录" }} / {{ detail.data.value.sdk_version ?? "—" }}</dd>
-                <dt>临时代码</dt><dd class="num">
-                  {{ detail.data.value.code_cleanup_status === "deleted" ? "已删除" : detail.data.value.code_cleanup_status === "cleanup_failed" ? "清理失败，结果未采纳" : "不适用" }}
+                <dt>回测代码</dt><dd class="num source-status">
+                  <span>{{ detail.data.value.source_retention_status === "versioned" ? "已固化" : detail.data.value.code_cleanup_status === "cleanup_failed" ? "清理失败，结果未采纳" : "历史版本未保存" }}</span>
+                  <template v-if="detail.data.value.base_source_run_id"> · 基于 #{{ detail.data.value.base_source_run_id }}</template>
                   <template v-if="detail.data.value.source_sha256"> · SHA {{ shortHash(detail.data.value.source_sha256) }} · {{ detail.data.value.source_size_bytes }} B</template>
+                  <button
+                    v-if="detail.data.value.source_retention_status === 'versioned'"
+                    class="btn compact"
+                    type="button"
+                    :disabled="sourceLoading"
+                    @click="toggleSource(detail.data.value)"
+                  >{{ sourceLoading ? "读取中…" : sourceVisible ? "收起代码" : "查看代码" }}</button>
                 </dd>
                 <dt>开始 / 完成</dt><dd class="num">{{ fmtTime(detail.data.value.started_at) ?? "—" }} → {{ fmtTime(detail.data.value.finished_at) ?? "—" }}</dd>
               </dl>
+
+              <section v-if="sourceVisible && sourceVersion" class="source-view" aria-label="固化回测源码">
+                <div class="source-head">
+                  <strong>回测 #{{ sourceVersion.backtest_run_id }} 源码</strong>
+                  <span class="num">{{ sourceVersion.sdk_version ?? "未知 SDK" }} · {{ fmtTime(sourceVersion.versioned_at) }}</span>
+                </div>
+                <pre class="source-code"><code>{{ sourceVersion.source_code }}</code></pre>
+              </section>
 
               <template v-if="detail.data.value.conclusion_md">
                 <h3 class="detail-sub">回测结论</h3>
@@ -249,6 +284,7 @@ watch(() => route.query.run, (id) => {
 
 <style scoped>
 .detail-actions{display:flex;align-items:center;gap:8px}
+.source-status{display:flex;align-items:center;flex-wrap:wrap;gap:4px}.source-status .btn{margin-left:4px}.source-view{margin:14px 0 4px;border:1px solid var(--line);border-radius:var(--radius-sm);overflow:hidden}.source-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 11px;border-bottom:1px solid var(--line);background:var(--paper-deep);font-size:11.5px}.source-head span{color:var(--ink-soft)}.source-code{max-height:480px;overflow:auto;margin:0;padding:14px;background:var(--paper);font-size:11.5px;line-height:1.55;white-space:pre;tab-size:2}
 .backtest-head,.detail-head,.compare-bar{display:flex;align-items:center;justify-content:space-between;gap:12px}.compare-bar{justify-content:flex-start;margin:0 0 10px;color:var(--ink-soft);font-size:12px}.compare-bar .spacer{flex:1}.backtest-layout{display:grid;grid-template-columns:minmax(260px,32%) minmax(0,1fr);gap:12px;align-items:start}.run-list{padding:12px;max-height:calc(100vh - 245px);overflow:auto}.run-list>.card-title{padding:2px 4px 10px}.run-item{display:grid;width:100%;grid-template-columns:24px minmax(0,1fr) auto;gap:8px;align-items:center;padding:10px 8px;border:1px solid transparent;border-radius:var(--radius-sm);background:transparent;color:var(--ink);text-align:left;cursor:pointer}.run-item:hover{background:var(--paper-deep)}.run-item.active{border-color:var(--accent);background:var(--accent-soft)}.compare-check{display:grid;place-items:center}.compare-check input{pointer-events:none}.run-main{display:grid;gap:3px;min-width:0}.run-main strong{overflow:hidden;font-size:12.5px;text-overflow:ellipsis;white-space:nowrap}.run-main small{overflow:hidden;color:var(--ink-faint);font-size:10.5px;text-overflow:ellipsis;white-space:nowrap}.result-preview{min-width:0;padding:18px 20px}.detail-head{margin-bottom:12px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:14px 0}.metric-grid div{display:grid;gap:4px;padding:10px;border-radius:9px;background:var(--paper-deep)}.metric-grid span{color:var(--ink-soft);font-size:11px}.metric-grid strong{font-family:var(--font-mono)}.detail-kv{grid-template-columns:100px minmax(0,1fr)}.detail-kv dd{overflow-wrap:anywhere}.detail-sub{margin:18px 0 7px;color:var(--ink-soft);font-size:12.5px;font-weight:600}.comparison-list{display:grid;gap:7px}.comparison-list button{display:grid;gap:3px;padding:9px 11px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--paper-deep);color:var(--ink);text-align:left;cursor:pointer}.comparison-list button:hover{border-color:var(--accent)}.comparison-list span{color:var(--ink-soft);font-size:11.5px}details{margin-top:18px;border-top:1px solid var(--line);padding-top:12px}summary{color:var(--ink-soft);font-size:12px;cursor:pointer}.json-view{max-height:220px;overflow:auto;margin:0;padding:10px 12px;border-radius:var(--radius-sm);background:var(--paper-deep);font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all}
 @container business (max-width:760px){.backtest-layout{grid-template-columns:1fr}.run-list{max-height:320px}.metric-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:900px){.backtest-head{align-items:flex-start;flex-direction:column}.backtest-layout{grid-template-columns:1fr}.run-list{max-height:300px}.metric-grid{grid-template-columns:repeat(2,1fr)}}

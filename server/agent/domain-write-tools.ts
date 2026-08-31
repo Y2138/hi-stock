@@ -3,7 +3,7 @@
 // 重新锁定目标状态并校验指纹，防止旧提案覆盖新事实。
 import type pg from "pg";
 import { applyPoolChange, setPoolBoardOrder } from "../modules/pools/repo.js";
-import { recordPositionChange, upsertAccountSnapshot } from "../modules/positions/repo.js";
+import { recordPositionChange } from "../modules/positions/repo.js";
 import { finalizeBacktest } from "../modules/backtests/repo.js";
 import { applyMemoryChange } from "../modules/memory/repo.js";
 import { createJobDefinition, updateJobDefinition } from "../scheduler/repo.js";
@@ -62,16 +62,6 @@ async function oneRow(
 }
 
 async function portfolioState(client: pg.PoolClient, input: PortfolioWriteInput, lock: boolean): Promise<unknown> {
-  if (input.action === "upsert_account_snapshot") {
-    const snapshot = await oneRow(
-      client,
-      `SELECT snap_date::text, total_asset::text, market_value::text, cash::text,
-              closed_pnl::text, precision, source, raw_text
-         FROM portfolio_account_snapshot WHERE snap_date = $1${lock ? " FOR UPDATE" : ""}`,
-      [input.snap_date],
-    );
-    return { snapshot };
-  }
   const instrument = await oneRow(
     client,
     `SELECT id::text, code, name, kind FROM market_instrument WHERE code = $1${lock ? " FOR UPDATE" : ""}`,
@@ -250,7 +240,7 @@ export interface DomainWritePreview {
 }
 
 const DOMAIN_LABELS: Record<DomainWriteToolName, string> = {
-  portfolio_write: "组合账户",
+  portfolio_write: "持仓",
   pool_write: "标的池",
   job_write: "作业",
   finalize_backtest: "回测最终结论",
@@ -260,17 +250,6 @@ const DOMAIN_LABELS: Record<DomainWriteToolName, string> = {
 function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput): Record<string, unknown> {
   if (toolName === "portfolio_write") {
     const value = input as PortfolioWriteInput;
-    if (value.action === "upsert_account_snapshot") {
-      return {
-        snap_date: value.snap_date,
-        total_asset: value.total_asset,
-        market_value: value.market_value ?? Math.round((value.total_asset - value.cash) * 100) / 100,
-        market_value_derived: value.market_value === undefined,
-        cash: value.cash,
-        closed_pnl: value.closed_pnl,
-        precision: value.precision ?? "exact",
-      };
-    }
     return { code: value.code, kind: value.kind, change_date: value.change_date, quantity: value.quantity, price: value.price };
   }
   if (toolName === "pool_write") {
@@ -371,18 +350,6 @@ export async function executeDomainWriteInTransaction(
   switch (toolName) {
     case "portfolio_write": {
       const value = input as PortfolioWriteInput;
-      if (value.action === "upsert_account_snapshot") {
-        return upsertAccountSnapshot(client, {
-          snap_date: value.snap_date,
-          total_asset: value.total_asset,
-          market_value: value.market_value,
-          cash: value.cash,
-          closed_pnl: value.closed_pnl,
-          precision: value.precision,
-          source: "chat",
-          reason: value.reason,
-        });
-      }
       return recordPositionChange(client, {
         code: value.code,
         kind: value.kind,

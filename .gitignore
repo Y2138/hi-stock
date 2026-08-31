@@ -35,3 +35,6 @@ server/public/app/
 bootstrap/*
 !bootstrap/stock_init_2026-08-21_135650.manifest.json
 !bootstrap/stock_init_2026-08-21_135650.ndjson.gz
+
+# 研究中间数据（连板回测等，本机保留不入库）
+支撑/tmp/

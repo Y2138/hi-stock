@@ -25,7 +25,8 @@ export interface SchedulerDeps extends RunnerDeps {
 export class JobScheduler {
   private timer: NodeJS.Timeout | null = null;
   private lastTickAt: Date | null = null;
-  private active: Promise<void> | null = null;
+  private activeTick: Promise<void> | null = null;
+  private readonly workers = new Set<Promise<void>>();
   private stopping = false;
   private started = false;
 
@@ -56,8 +57,8 @@ export class JobScheduler {
   }
 
   private async runTick(now: Date): Promise<void> {
-    if (this.active) return this.active;
-    this.active = (async () => {
+    if (this.activeTick) return this.activeTick;
+    this.activeTick = (async () => {
       const after = this.lastTickAt ?? new Date(now.getTime() - (this.deps.tickMs ?? DEFAULT_TICK_MS));
       const jobs = (await listJobDefinitions(this.deps.pool)).filter((job) => job.enabled);
       for (const job of jobs) {
@@ -66,23 +67,28 @@ export class JobScheduler {
         }
       }
       this.lastTickAt = now;
-      await this.drainQueued(now);
+      this.startWorkers();
     })();
     try {
-      await this.active;
+      await this.activeTick;
     } finally {
-      this.active = null;
+      this.activeTick = null;
     }
   }
 
-  private async drainQueued(now: Date): Promise<void> {
-    await Promise.all(
-      Array.from({ length: MAX_PARALLEL_RUNS }, () => this.drainWorker(now)),
-    );
+  private startWorkers(): void {
+    while (!this.stopping && this.workers.size < MAX_PARALLEL_RUNS) {
+      const worker = this.drainWorker().catch((error) => {
+        console.error(`[scheduler] worker 失败：${(error as Error).message}`);
+      });
+      this.workers.add(worker);
+      void worker.finally(() => this.workers.delete(worker));
+    }
   }
 
-  private async drainWorker(now: Date): Promise<void> {
+  private async drainWorker(): Promise<void> {
     for (let batch = 0; batch < 100 && !this.stopping; batch += 1) {
+      const now = this.deps.now?.() ?? new Date();
       const queued = await this.deps.pool.query<{ id: string }>(
         `SELECT r.id::text
            FROM job_run r JOIN job_definition d ON d.id = r.job_id
@@ -123,7 +129,8 @@ export class JobScheduler {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     if (runtimes.get(this.deps.pool) === this) runtimes.delete(this.deps.pool);
-    await this.active;
+    await this.activeTick;
+    await Promise.all([...this.workers]);
     this.started = false;
   }
 }

@@ -102,6 +102,8 @@ export interface BacktestRun {
   sdk_version: string | null;
   source_sha256: string | null;
   source_size_bytes: number | null;
+  base_source_run_id: string | null;
+  source_retention_status: "none" | "candidate" | "versioned";
   code_cleanup_status: "not_applicable" | "deleted" | "cleanup_failed";
   conclusion_status: "working" | "final" | "superseded";
   conclusion_summary: string | null;
@@ -142,6 +144,21 @@ export interface BacktestDetail extends BacktestListItem {
     conclusion_md: string | null;
     created_at: string;
   }>;
+}
+
+export interface BacktestSourceVersion {
+  backtest_run_id: string;
+  name: string;
+  source_code: string;
+  source_sha256: string;
+  source_size_bytes: number;
+  base_source_run_id: string | null;
+  strategy_change_seq: string | null;
+  strategy_snapshot_hash: string | null;
+  worker_version: string | null;
+  sdk_version: string | null;
+  conclusion_status: "final" | "superseded";
+  versioned_at: string;
 }
 
 // ---- 二期 M3：系统调度作业 ----
@@ -377,6 +394,47 @@ export interface Position {
   attribution_breakdown: Record<string, number>;
 }
 
+// ---- 每日计划盯防预案（server/modules/plans） ----
+
+export interface DailyPlanPlaybookItem {
+  id: string;
+  item_kind: "position_action" | "off_pool_opportunity";
+  code: string;
+  name: string;
+  grade: "A" | "B" | "C" | null;
+  priority: number;
+  action: "exit" | "reduce" | "buy" | "hold" | "observe";
+  trigger_kind: "open" | "price_range" | "condition";
+  price_lower: number | null;
+  price_upper: number | null;
+  headline: string;
+  auction_md: string | null;
+  intraday_md: string | null;
+  evidence_md: string | null;
+  missing_md: string | null;
+  invalidation_md: string | null;
+  risk_md: string | null;
+  target_date: string;
+  auction_assessment: {
+    id: string;
+    output_id: string | null;
+    code: string;
+    conclusion: "worth_entering" | "observe" | "give_up" | "unavailable";
+    metrics_summary: string;
+    assessment_summary: string;
+    benchmark_tags: string[];
+    data_status: "ready" | "not_ready" | "missing" | "stale";
+    data_time?: string;
+    assessed_at: string;
+  } | null;
+}
+
+export interface DailyPlanBoard {
+  plan: { output_id: string; target_date: string; status: string; created_at: string };
+  position_actions: DailyPlanPlaybookItem[];
+  opportunities: DailyPlanPlaybookItem[];
+}
+
 export interface PositionChange {
   id: string;
   instrument_id: string;
@@ -387,6 +445,8 @@ export interface PositionChange {
   quantity: number | null;
   price: number | null;
   amount: number | null;
+  cost_price_before: number | null;
+  realized_pnl: number | null;
   reason: string | null;
   source: string;
   decision_origin: "strategy_signal" | "planned_discretionary" | "unplanned_exception" | "fact_correction" | "unknown";
@@ -400,6 +460,15 @@ export interface PositionChange {
   attribution_note: string | null;
   deviation_reason: string | null;
   created_at: string;
+}
+
+export interface RealizedPnlSummary {
+  baseline_pnl: number;
+  event_pnl: number;
+  realized_pnl: number;
+  sell_count: number;
+  missing_sell_count: number;
+  fee_status: "excluded";
 }
 
 export const CHANGE_KIND_LABELS: Record<string, string> = {
@@ -416,28 +485,6 @@ export const DECISION_ORIGIN_LABELS: Record<string, string> = {
 export const EXECUTION_COMPLIANCE_LABELS: Record<string, string> = {
   matched: "符合", deviated: "偏离", not_applicable: "不适用", unknown: "未知",
 };
-
-export interface AccountSnapshot {
-  snap_date: string;
-  total_asset: number | null;
-  market_value: number | null;
-  cash: number | null;
-  closed_pnl: number | null;
-  raw_text: string | null;
-  precision: "exact" | "approx";
-  source: string;
-}
-
-/** 实时资金摘要（/api/account/summary）：台账现金 + 持仓×最新收盘派生 */
-export interface AccountSummary {
-  tracked: boolean;
-  anchor_date: string | null;
-  cash: number | null;
-  closed_pnl: number | null;
-  market_value: number;
-  total_asset: number | null;
-  missing_quote: number;
-}
 
 // ---- 标的池（server/modules/pools） ----
 
@@ -770,7 +817,7 @@ export const TOOL_LABELS: Record<string, string> = {
   indicator_query: "查询可信行情指标",
   portfolio_write: "维护持仓",
   pool_write: "维护标的池",
-  finalize_backtest: "确认回测结论",
+  finalize_backtest: "固化回测结论",
   memory_query: "查询 Agent 记忆",
   memory_write: "维护 Agent 记忆",
   job_write: "维护系统作业",
