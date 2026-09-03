@@ -10,34 +10,56 @@ import {
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
 
 const IDENTIFIER = /^[a-z][a-z0-9_]*$/;
-const MAX_QUERY_ROWS = 500;
-const MAX_BATCH_QUERIES = 30;
+const MAX_QUERY_ROWS = 100;
+const MAX_BATCH_QUERIES = 5;
 const MAX_DESCRIBE_TABLES = 20;
+const MAX_RESULT_BYTES = 128 * 1024;
 // ponytail: 前 128 位足以识别 Schema 漂移，也避免模型抄错长哈希尾部；出现可测碰撞时再改服务端令牌。
 const SCHEMA_VERSION_HEX_LENGTH = 32;
 
-/** 完成事实源切换后只为迁移审计或历史数据保留，不向新会话暴露的退役表。 */
-const HIDDEN_LEGACY_TABLES = [
-  "task_definition",
-  "task_run",
-  "strategy_doc",
-  "strategy_version",
-  "script_registry",
-  "script_version",
-  "data_dataset",
-  "backtest_artifact",
-  "content_document",
-  "content_revision",
-  "content_legacy_import",
-  "portfolio_position_snapshot_daily",
-  "portfolio_account_snapshot",
-  "portfolio_account_state",
+/** 通用查询只是末级排障能力；未列出的表即使位于 public 也不向模型开放。 */
+const READABLE_TABLES = [
+  "analysis_run",
+  "agent_memory_artifact",
+  "backtest_run",
+  "backtest_run_comparison",
+  "daily_plan_auction_assessment",
+  "daily_plan_playbook",
+  "fundamental_snapshot",
+  "job_definition",
+  "job_run",
+  "job_run_output",
+  "market_bar",
+  "market_board",
+  "market_board_membership",
+  "market_dragon_tiger_entry",
+  "market_fetch_run",
+  "market_indicator_run",
+  "market_indicator_value",
+  "market_instrument",
+  "market_limit_event",
+  "market_quote_latest",
+  "market_special_sync_run",
+  "market_stock_character_metric",
+  "market_trading_day",
+  "pool_membership",
+  "portfolio_position",
+  "portfolio_position_change",
+  "strategy_document",
+  "strategy_evolution_log",
+  "strategy_state",
+  "valuation_snapshot",
 ] as const;
 
 const SENSITIVE_COLUMNS = new Map<string, Set<string>>([
-  ["llm_provider", new Set(["api_key"])],
-  ["system_setting", new Set(["hithink_api_key"])],
-  ["backtest_run_source", new Set(["source_code"])],
+  ["agent_memory_artifact", new Set(["content"])],
+  ["backtest_run", new Set(["engine_path", "output_dir", "report_path", "config_snapshot", "request_json"])],
+  ["fundamental_snapshot", new Set(["raw_summary"])],
+  ["job_run", new Set(["log", "artifacts", "result_md"])],
+  ["job_run_output", new Set(["markdown"])],
+  ["market_dragon_tiger_entry", new Set(["source_payload"])],
+  ["market_limit_event", new Set(["source_payload"])],
+  ["valuation_snapshot", new Set(["raw_summary"])],
 ]);
 
 interface BusinessMeta {
@@ -99,13 +121,19 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   },
   market_indicator_value: {
     domain: "行情指标",
-    description: "按正式计算版本生成的 MA、DIF、DEA 和 MACD 柱当前值。",
+    description: "按正式计算版本生成的 MA、DIF、DEA、MACD 柱和 Wilder RSI14 当前值。",
     write_policy: "只允许指标工作器维护；Agent 只读。",
   },
   market_indicator_run: {
     domain: "行情指标",
     description: "指标输入哈希、复权口径、计算版本、状态和 gaps。",
     write_policy: "只允许指标工作器维护；Agent 只读。",
+  },
+  market_stock_character_metric: {
+    domain: "股性指标",
+    description: "按指标运行和数据日版本化保存最近252日MA10护盘收回率、跌破事件数与收回数。",
+    write_policy: "只允许指标工作器随可信日线指标重算；Agent 只读。",
+    constraints: ["未走满三个后续交易日的跌破事件不进入分母；无成熟事件时比率为 null。"],
   },
   market_limit_event: {
     domain: "市场结构",
@@ -119,7 +147,7 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   },
   pool_membership: {
     domain: "标的池",
-    description: "短线/长线池带有效期的策略角色历史，包含完整研究属性和近期关注；所属行业只读取同花顺官方关系，同一标的只有一个当前角色。",
+    description: "短线/长线池带有效期的策略角色历史，包含完整研究属性、短线止损档位和近期关注；所属行业只读取同花顺官方关系，同一标的只有一个当前角色。",
     write_policy: "只允许 pool_write 经标的池 service 关闭旧行并创建新行。",
     constraints: ["角色变更保留历史；当前有效行以 effective_to IS NULL 判定。"],
   },
@@ -407,20 +435,18 @@ function enumValues(definition: string, column: string): string[] | undefined {
 
 async function loadSchemas(db: Db, requested?: string[]): Promise<InternalTableSchema[]> {
   if (requested) requested.forEach(quoteIdent);
-  const hiddenRequested = requested?.filter((table) =>
-    (HIDDEN_LEGACY_TABLES as readonly string[]).includes(table),
-  );
-  if (hiddenRequested?.length) {
-    throw new Error(`数据库表已退役，不向 Agent 开放：${hiddenRequested.join("、")}`);
+  const unavailable = requested?.filter((table) => !(READABLE_TABLES as readonly string[]).includes(table));
+  if (unavailable?.length) {
+    throw new Error(`数据库表不在 Agent 排障读取清单中：${unavailable.join("、")}`);
   }
   const tableResult = await db.query<{ table_name: string }>(
     `SELECT c.relname AS table_name
        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = 'public' AND c.relkind = 'r'
-        AND NOT (c.relname = ANY($2::text[]))
+        AND c.relname = ANY($2::text[])
         AND ($1::text[] IS NULL OR c.relname = ANY($1::text[]))
       ORDER BY c.relname`,
-    [requested?.length ? requested : null, HIDDEN_LEGACY_TABLES],
+    [requested?.length ? requested : null, READABLE_TABLES],
   );
   const tables = tableResult.rows.map((row) => row.table_name);
   if (requested?.length) {
@@ -443,7 +469,7 @@ async function loadSchemas(db: Db, requested?: string[]): Promise<InternalTableS
          LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
         WHERE n.nspname = 'public' AND c.relname = ANY($1::text[])
         ORDER BY c.relname, a.attnum`,
-      [tables],
+      [READABLE_TABLES],
     ),
     db.query<RawConstraint>(
       `SELECT c.relname AS table_name, con.conname AS name, con.contype AS type,
@@ -454,8 +480,9 @@ async function loadSchemas(db: Db, requested?: string[]): Promise<InternalTableS
          JOIN pg_class c ON c.oid = con.conrelid
          JOIN pg_namespace n ON n.oid = c.relnamespace
          LEFT JOIN pg_class ref ON ref.oid = con.confrelid
-        WHERE n.nspname = 'public'
+        WHERE n.nspname = 'public' AND c.relname = ANY($1::text[])
         ORDER BY c.relname, con.conname`,
+      [READABLE_TABLES],
     ),
     db.query<RawIndex>(
       `SELECT c.relname AS table_name, idx.relname AS name, i.indisunique AS unique,
@@ -514,7 +541,8 @@ async function loadSchemas(db: Db, requested?: string[]): Promise<InternalTableS
         predicate: index.predicate,
       }));
     const foreignKeys = constraints
-      .filter((item) => item.type === "f" && item.referenced_table)
+      .filter((item) => item.type === "f" && item.referenced_table &&
+        (READABLE_TABLES as readonly string[]).includes(item.referenced_table))
       .map((item) => ({
         name: item.name,
         columns: (item.columns ?? []).map((attnum) => nameFor(table, attnum)),
@@ -691,7 +719,9 @@ function buildFilters(meta: InternalTableSchema, filters: DatabaseFilter[] | und
     const op = filter.op ?? "eq";
     const hasValue = Object.prototype.hasOwnProperty.call(filter, "value");
     if (op === "is_null" || op === "not_null") {
-      if (hasValue) throw new Error(`filters[${index}] 的 ${op} 不允许提供 value`);
+      if (hasValue && filter.value !== null && filter.value !== undefined) {
+        throw new Error(`filters[${index}] 的 ${op} 不允许提供非空 value`);
+      }
       return op === "is_null" ? `${column} IS NULL` : `${column} IS NOT NULL`;
     }
     if (!hasValue || filter.value === null || filter.value === undefined) {
@@ -731,6 +761,36 @@ function boundedInt(value: unknown, fallback: number, max: number, label: string
   return Number(actual);
 }
 
+interface RowsQueryResult {
+  name?: string;
+  table: string;
+  schema_hash: string;
+  rows: unknown[];
+  returned: number;
+  limit: number;
+  truncated: boolean;
+  next_offset?: number;
+  truncation_reason?: string;
+}
+
+function enforceResultBudget(results: unknown[], offsets: Array<number | null>, totalQueries: number): void {
+  while (Buffer.byteLength(JSON.stringify({ queries: results, total_queries: totalQueries }, null, 1), "utf8") > MAX_RESULT_BYTES) {
+    let index = results.length - 1;
+    while (index >= 0) {
+      const rows = (results[index] as { rows?: unknown[] }).rows;
+      if (Array.isArray(rows) && rows.length > 0) break;
+      index -= 1;
+    }
+    if (index < 0) throw new Error("通用排障查询元信息超过结果大小上限，请减少查询项");
+    const item = results[index] as RowsQueryResult;
+    item.rows.pop();
+    item.returned = item.rows.length;
+    item.truncated = true;
+    item.next_offset = offsets[index]! + item.rows.length;
+    item.truncation_reason = `通用排障查询总结果超过 ${MAX_RESULT_BYTES} bytes，请缩小字段或使用纵向业务工具`;
+  }
+}
+
 /** 每项查询执行前重算并校验对应表的 schema_hash，然后构建参数化只读 SQL。 */
 export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown> {
   const input = validateDatabaseQueryInput(rawInput);
@@ -743,6 +803,7 @@ export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown>
   assertSchemaHashes(schemas, input.queries);
 
   const results: unknown[] = [];
+  const offsets: Array<number | null> = [];
   for (const request of input.queries) {
     const meta = schemas.find((schema) => schema.table === request.table)!;
     if (request.columns && new Set(request.columns).size !== request.columns.length) {
@@ -756,11 +817,13 @@ export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown>
         params,
       );
       results.push({ name: request.name, table: meta.table, schema_hash: meta.schema_hash, count: Number(result.rows[0]!.count) });
+      offsets.push(null);
       continue;
     }
-    const columns = request.columns?.length
-      ? request.columns
-      : meta.all_columns.filter((column) => !column.sensitive).map((column) => column.name);
+    if (!request.columns?.length) {
+      throw new Error(`${request.table} 普通行查询必须显式提供 columns；统计请使用 mode=count`);
+    }
+    const columns = request.columns;
     columns.forEach((column) => columnOf(meta, column));
     const order = (request.order_by ?? []).map((item) => {
       columnOf(meta, item.column);
@@ -783,8 +846,11 @@ export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown>
       rows: result.rows,
       returned: result.rows.length,
       limit,
+      truncated: false,
     });
+    offsets.push(offset);
   }
+  enforceResultBudget(results, offsets, input.queries.length);
   return { queries: results, total_queries: results.length };
 }
 

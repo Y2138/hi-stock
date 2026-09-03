@@ -6,6 +6,7 @@ import { resolveRemoteTicker } from "../../datasource/catalog-service.js";
 import { fetchKline } from "../../datasource/hithink.js";
 import { fetchAndStore } from "../../datasource/service.js";
 import type { Bar } from "../../datasource/types.js";
+import { calculateIndicators } from "../../indicators/formulas.js";
 import { MARKET_STRUCTURE_DATASETS, queryMarketStructure } from "./structure.js";
 import {
   findInstrumentByCode,
@@ -90,6 +91,7 @@ function ema(values: number[], period: number): number[] {
 /** 第三方临时 K 线只在响应内补指标，不写 market_instrument / market_bar。 */
 export function buildOnDemandBars(bars: Bar[]): BarRow[] {
   const closes = bars.map((bar) => bar.close);
+  const indicators = calculateIndicators(closes);
   const ma5 = rollingAverage(closes, 5);
   const ma10 = rollingAverage(closes, 10);
   const ma20 = rollingAverage(closes, 20);
@@ -106,6 +108,7 @@ export function buildOnDemandBars(bars: Bar[]): BarRow[] {
     low: bar.low,
     close: bar.close,
     volume: bar.volume ?? null,
+    turnover: bar.turnover ?? null,
     ma5: ma5[index]!,
     ma10: ma10[index]!,
     ma20: ma20[index]!,
@@ -113,6 +116,7 @@ export function buildOnDemandBars(bars: Bar[]): BarRow[] {
     dif: dif[index]!,
     dea: dea[index]!,
     macd_hist: (dif[index]! - dea[index]!) * 2,
+    rsi14: indicators[index]!.rsi14,
     adjustment: bar.adjustment ?? null,
     channel: "hithink_on_demand",
   }));

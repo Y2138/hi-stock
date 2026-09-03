@@ -39,7 +39,17 @@ import {
 import { createConfirmation } from "./confirmations.js";
 import { persistAndPublishSessionEvent } from "./events.js";
 import { sha256Json } from "./hash.js";
-import { buildMarketDomainTools } from "./market-domain-tools.js";
+import {
+  buildDailyPlanContextTool,
+  buildLimitUpSignalTool,
+  buildMarketDomainTools,
+} from "./market-domain-tools.js";
+import { buildBusinessContextTools } from "./business-context-tools.js";
+import {
+  buildJobAuctionAssessmentTool,
+  buildJobDailyPlanTool,
+  buildJobPoolAttentionTool,
+} from "./job-tools.js";
 import { withAgentMutationLock } from "./mutation-lock.js";
 import { insertToolAudit } from "./repo.js";
 import { getAgentSettings } from "./settings.js";
@@ -64,7 +74,6 @@ import {
   PortfolioWriteSchema,
   ReadBacktestSourceSchema,
   TriggerJobSchema,
-  UiRefreshSchema,
   WebSearchSchema,
   validateAnalysisRunInput,
   validateJobWriteInput,
@@ -81,7 +90,6 @@ import {
   validatePortfolioWriteInput,
   validateReadBacktestSourceInput,
   validateTriggerJobInput,
-  validateUiRefreshInput,
   validateWebSearchInput,
   type FetchMarketDataInput,
   type FetchHithinkDataInput,
@@ -91,7 +99,6 @@ import {
   type ReadBacktestSourceInput,
   type StrategyPublishRequestInput,
   type TriggerJobInput,
-  type UiRefreshInput,
   type WebSearchInput,
 } from "./tool-validation.js";
 
@@ -119,12 +126,11 @@ export interface ChatToolDeps {
   webResearch?: WebResearchProvider;
 }
 
-const RESULT_TEXT_LIMIT = 60_000;
-
 function textResult(data: unknown, details?: unknown): AgentToolResult<unknown> {
-  let text = JSON.stringify(data, null, 1) ?? "null";
-  if (text.length > RESULT_TEXT_LIMIT) text = `${text.slice(0, RESULT_TEXT_LIMIT)}\n…（结果过长已截断）`;
-  return { content: [{ type: "text", text }], details: details ?? data };
+  return {
+    content: [{ type: "text", text: JSON.stringify(data, null, 1) ?? "null" }],
+    details: details ?? data,
+  };
 }
 
 function sourceResult(data: Record<string, unknown>): AgentToolResult<unknown> {
@@ -132,6 +138,15 @@ function sourceResult(data: Record<string, unknown>): AgentToolResult<unknown> {
     content: [{ type: "text", text: JSON.stringify(data, null, 1) }],
     details: { ...data, ephemeral_code_result: true },
   };
+}
+
+async function publishRefresh(deps: ChatToolDeps, targets: string[], reason: string): Promise<void> {
+  if (!deps.sessionId) return;
+  await persistAndPublishSessionEvent(deps.pool, {
+    session_id: deps.sessionId,
+    event_type: "ui_refresh",
+    data: { targets, reason, requested_at: new Date().toISOString() },
+  });
 }
 
 async function withAudit<T>(
@@ -210,15 +225,15 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
   }> = [
     {
       name: "portfolio_write",
-      label: "维护持仓",
-      description: "通过 record_position_change 记录买入、卖出、调整或备注，并逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。服务端统一经过持仓 service；不能直接指定表或字段。",
+      label: "批量维护持仓",
+      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。服务端统一经过持仓 service；不能直接指定表或字段。",
       parameters: PortfolioWriteSchema,
       validate: validatePortfolioWriteInput,
     },
     {
       name: "pool_write",
-      label: "维护标的池",
-      description: "新增、更新、迁移或结束短线/长线池角色，并维护近期关注与官方行业展示顺序。新增、迁池或改变策略角色前必须先按系统提示词的“标的入池评估指引”同时评估短线、波段和长线，形成唯一策略归属；关键数据不足时不得调用。新增必须完成角色、分级、评分、股性、阶段、标签和评估摘要；股票必须已有同花顺官方行业关系，不接受本地板块标签或自行指定行业字段。服务端保留历史角色行，同一标的只能有一个当前角色。",
+      label: "批量维护标的池",
+      description: "一次提交一批新增、更新、迁移、结束角色或板块排序操作并在同一事务执行。新增、迁池或改变策略角色前必须先按系统提示词的“标的入池评估指引”同时评估短线、波段和长线，形成唯一策略归属；关键数据不足时不得调用。新增必须完成角色、分级、评分、股性、阶段、标签和评估摘要；新增或迁入短线池还必须明确 stop_loss_mode（ma5/ma10/fixed_90），不得猜测。股票必须已有同花顺官方行业关系，不接受本地板块标签或自行指定行业字段。服务端保留历史角色行，同一标的只能有一个当前角色。",
       parameters: PoolWriteSchema,
       validate: validatePoolWriteInput,
     },
@@ -251,8 +266,8 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
     description: `${spec.description} ${spec.name === "finalize_backtest" ? "验证完成后由 Agent 直接事务执行，不要求真人批准。" : "确认制生成待确认提案；YOLO 模式直接事务执行。"}执行前重验目标状态，所有领域写工具共享数据库级写锁并写审计。`,
     parameters: spec.parameters,
     executionMode: "sequential",
-    execute: guard(deps, spec.name, spec.validate, async (params) =>
-      withAgentMutationLock(pool, async (client) => {
+    execute: guard(deps, spec.name, spec.validate, async (params) => {
+      const response = await withAgentMutationLock(pool, async (client) => {
         const preview = await previewDomainWrite(client, spec.name, params, { sessionId: deps.sessionId });
         const publicPreview = publicDomainWritePreview(preview);
         const settings = await getAgentSettings(client);
@@ -307,33 +322,29 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
           },
           proposal,
         );
-      }),
-    ),
+      });
+      const details = response.details as { auto_approved?: boolean; direct?: boolean } | undefined;
+      if (deps.sessionId && (details?.auto_approved || details?.direct)) {
+        const targets: Record<DomainWriteToolName, string[]> = {
+          portfolio_write: ["positions", "dashboard", "status"],
+          pool_write: ["pools", "dashboard"],
+          job_write: ["jobs", "dashboard", "status"],
+          finalize_backtest: ["backtests"],
+          memory_write: ["memories"],
+        };
+        await publishRefresh(deps, targets[spec.name], `${spec.name} 已执行`);
+      }
+      return response;
+    }),
   }));
 
   return [
-    {
-      name: "database_schema",
-      label: "发现数据库结构",
-      description:
-        "渐进式发现数据库。list_tables 返回轻量表索引（表名、领域、业务说明、schema_hash），应使用 tables 只获取相关表；再用 describe_tables 获取完整结构。describe 收到旧 hash 时会返回当前结构和新 hash；后续查询必须使用新 hash。",
-      parameters: DatabaseSchemaSchema,
-      execute: guard<DatabaseSchemaInput>(deps, "database_schema", validateDatabaseSchemaInput, async (params) => {
-        const result = textResult(await discoverDatabaseSchema(pool, params));
-        return withAudit(deps, "database_schema", params, "ok", result);
-      }),
-    },
-    {
-      name: "database_query",
-      label: "查询数据库",
-      description:
-        "执行结构化只读查询。每项查询必须携带 database_schema 返回的对应 schema_hash；服务端执行前重算哈希，变化即拒绝。支持过滤、排序、计数和分页，最多 30 项、每项最多 500 行；不接受原始 SQL，敏感凭据列不可读。",
-      parameters: DatabaseQuerySchema,
-      execute: guard<DatabaseQueryInput>(deps, "database_query", validateDatabaseQueryInput, async (params) => {
-        const result = textResult(await queryDatabase(pool, params));
-        return withAudit(deps, "database_query", params, "ok", result);
-      }),
-    },
+    ...buildBusinessContextTools({ pool, sessionId: deps.sessionId }),
+    ...(deps.marketDomainToolsEnabled
+      ? buildMarketDomainTools({ pool, sessionId: deps.sessionId })
+      : []),
+    buildDailyPlanContextTool({ pool, sessionId: deps.sessionId }),
+    buildLimitUpSignalTool({ pool, sessionId: deps.sessionId }),
     {
       name: "memory_query",
       label: "查询 Agent 记忆",
@@ -372,10 +383,10 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
         }, "ok", result);
       }),
     },
-    ...(deps.marketDomainToolsEnabled
-      ? buildMarketDomainTools({ pool, sessionId: deps.sessionId })
-      : []),
     ...domainWriteTools,
+    buildJobPoolAttentionTool({ pool, sessionId: deps.sessionId }),
+    buildJobDailyPlanTool({ pool, sessionId: deps.sessionId }),
+    buildJobAuctionAssessmentTool({ pool, sessionId: deps.sessionId }),
     {
       name: "strategy_publish_request",
       label: "提交策略发布提案",
@@ -447,7 +458,9 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
           context.onUpdate?.(textResult({ completed: items.length, total: params.requests.length, latest: items.at(-1) }));
         }
         const result = textResult({ total: items.length, items });
-        return withAudit(deps, "analysis_run", params, "ok", result);
+        const auditedResult = await withAudit(deps, "analysis_run", params, "ok", result);
+        await publishRefresh(deps, ["market", "dashboard"], "复合分析已完成");
+        return auditedResult;
       }),
     },
     {
@@ -516,8 +529,8 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
         "一次批量补拉行情及 A 股财务/估值并幂等落库。行情放 requests，最新财务三表与估值放 financial_requests；服务端顺序执行并流式汇报进度，不要为每个标的分别调用。默认单项失败后继续其余项。",
       parameters: FetchMarketDataSchema,
       executionMode: "sequential",
-      execute: guard<FetchMarketDataInput>(deps, "fetch_market_data", validateFetchMarketDataInput, async (params, context) =>
-        withAgentMutationLock(pool, async (client) => {
+      execute: guard<FetchMarketDataInput>(deps, "fetch_market_data", validateFetchMarketDataInput, async (params, context) => {
+        const toolResult = await withAgentMutationLock(pool, async (client) => {
         const items: Array<FetchStoreOutcome | FinancialStoreOutcome | { code: string; freq?: string; error: string }> = [];
         let succeeded = 0;
         let failed = 0;
@@ -593,8 +606,10 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
           status: "ok",
         });
         return toolResult;
-        }),
-      ),
+        });
+        await publishRefresh(deps, ["market", "positions", "pools", "datasync", "status"], "行情或财务数据已补拉");
+        return toolResult;
+      }),
     },
     {
       name: "fetch_hithink_data",
@@ -603,8 +618,8 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
         "批量查询并缓存扶摇官方集合竞价、热榜、个股异动和基金资料/净值/收益/回撤/披露持仓/配置/经理/财务/资讯等数据。每项 capability 只接受白名单参数，结果先写入 PostgreSQL hithink_dataset_snapshot 再返回；基金持仓均为定期披露而非实时持仓。ETF/LOF 行情继续使用 fetch_market_data。默认单项失败后继续其余项。",
       parameters: FetchHithinkDataSchema,
       executionMode: "sequential",
-      execute: guard<FetchHithinkDataInput>(deps, "fetch_hithink_data", validateFetchHithinkDataInput, async (params, context) =>
-        withAgentMutationLock(pool, async (client) => {
+      execute: guard<FetchHithinkDataInput>(deps, "fetch_hithink_data", validateFetchHithinkDataInput, async (params, context) => {
+        const toolResult = await withAgentMutationLock(pool, async (client) => {
           const items: Array<HithinkDatasetStoreOutcome | { capability: string; error: string }> = [];
           let succeeded = 0;
           let failed = 0;
@@ -655,14 +670,16 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
             status: failed === params.requests.length ? "error" : "ok",
           });
           return toolResult;
-        }),
-      ),
+        });
+        await publishRefresh(deps, ["market", "datasync", "status"], "扶摇研究数据已补拉");
+        return toolResult;
+      }),
     },
     {
       name: "trigger_job",
       label: "触发系统作业",
       description:
-        "按 job_definition.code 手动排队一个系统作业。只接受 datasource、analysis 或受控 agent_flow 定义与可选目标日；Runner 会重新校验 config，自动流程最多拥有显式配置的窄权限。调用成功表示已排队，不代表作业已完成；后续查询 job_run 确认终态。",
+        "按作业 code 手动排队一个受控系统作业。调用成功只表示已排队，后续通过 job_context_query 查询终态，不要轮询通用数据库表。",
       parameters: TriggerJobSchema,
       executionMode: "sequential",
       execute: guard<TriggerJobInput>(deps, "trigger_job", validateTriggerJobInput, async (params) => {
@@ -685,6 +702,13 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
           });
           await client.query("COMMIT");
           wakeScheduler(pool);
+          if (deps.sessionId) {
+            await persistAndPublishSessionEvent(pool, {
+              session_id: deps.sessionId,
+              event_type: "ui_refresh",
+              data: { targets: ["jobs", "status"], reason: `作业 ${params.code} 已排队` },
+            });
+          }
           return textResult(summary);
         } catch (error) {
           await client.query("ROLLBACK").catch(() => {});
@@ -695,30 +719,25 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
       }),
     },
     {
-      name: "ui_refresh",
-      label: "刷新页面数据",
+      name: "database_schema",
+      label: "低优先级·排查数据库结构",
       description:
-        "向当前工作台发出受控模块刷新请求。只能选择白名单模块；前端只重新读取对应模块的数据，不执行点击、输入、导航或任意浏览器控制，也不覆盖未提交编辑。数据写入成功后按实际影响合并为一次调用。",
-      parameters: UiRefreshSchema,
-      executionMode: "sequential",
-      execute: guard<UiRefreshInput>(deps, "ui_refresh", validateUiRefreshInput, async (params) => {
-        if (!deps.sessionId) throw new Error("ui_refresh 只能在交互 Agent session 中使用");
-        const requestedAt = new Date().toISOString();
-        await persistAndPublishSessionEvent(pool, {
-          session_id: deps.sessionId,
-          event_type: "ui_refresh",
-          data: {
-            targets: params.targets,
-            reason: params.reason,
-            requested_at: requestedAt,
-          },
-        });
-        const result = textResult({
-          message: "已向工作台发出模块数据刷新请求",
-          targets: params.targets,
-          requested_at: requestedAt,
-        });
-        return withAudit(deps, "ui_refresh", params, "ok", result);
+        "仅在纵向业务工具无法解释数据缺口或运行异常时使用。只发现服务端正面清单中的只读表；先 list_tables，再按相关表 describe_tables。不得用于普通业务事实查询。",
+      parameters: DatabaseSchemaSchema,
+      execute: guard<DatabaseSchemaInput>(deps, "database_schema", validateDatabaseSchemaInput, async (params) => {
+        const result = textResult(await discoverDatabaseSchema(pool, params));
+        return withAudit(deps, "database_schema", params, "ok", result);
+      }),
+    },
+    {
+      name: "database_query",
+      label: "低优先级·排查数据库数据",
+      description:
+        "仅在纵向业务工具失败、返回矛盾或需要定位运行异常时使用。只能查询服务端正面清单中的只读表；每项必须携带 schema_hash，普通行查询必须显式选择 columns。最多 5 项、每项 100 行，不接受原始 SQL。",
+      parameters: DatabaseQuerySchema,
+      execute: guard<DatabaseQueryInput>(deps, "database_query", validateDatabaseQueryInput, async (params) => {
+        const result = textResult(await queryDatabase(pool, params));
+        return withAudit(deps, "database_query", params, "ok", result);
       }),
     },
   ];

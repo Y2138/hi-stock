@@ -141,8 +141,9 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const manifest = await readPortableManifest(exported.payloadPath);
     expect(manifest.version).toBe(4);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(56);
+    expect(manifest.migration_max).toBe(66);
     expect(manifest.tables.strategy_document_revision).toBeGreaterThan(0);
+    expect(manifest.tables.strategy_score_benchmark).toBe(1);
     expect(manifest.tables.job_definition).toBeGreaterThan(0);
     expect(manifest.tables.market_bar).toBeUndefined();
     expect(manifest.tables.pool_membership).toBeUndefined();
@@ -173,6 +174,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       "market_bar",
       "market_quote_sample",
       "market_indicator_value",
+      "market_stock_character_metric",
       "agent_memory_artifact",
       "backtest_run",
       "job_run",
@@ -185,6 +187,8 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const target = createPool(targetUrl);
     try {
       expect((await target.query("SELECT count(*)::int AS count FROM strategy_document_revision")).rows[0]!.count).toBe(manifest.tables.strategy_document_revision);
+      expect((await target.query("SELECT count(*)::int AS count FROM strategy_score_benchmark")).rows[0]!.count).toBe(1);
+      expect((await target.query("SELECT sha256 FROM strategy_score_benchmark")).rows[0]!.sha256).toBe("95e2fec5477da81a4e952b195b64b7ae262d92687cc726e6657077db3f764ea2");
       expect((await target.query("SELECT count(*)::int AS count FROM job_definition")).rows[0]!.count).toBe(manifest.tables.job_definition);
       expect((await target.query("SELECT count(*)::int AS count FROM market_bar")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM portfolio_position")).rows[0]!.count).toBe(0);

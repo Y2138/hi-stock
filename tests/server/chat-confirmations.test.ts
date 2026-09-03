@@ -44,13 +44,18 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
   it("portfolio_write 默认只生成 pending，批准后在同一事务维护事件流、当前态和审计", async () => {
     const result = await findTool("portfolio_write").execute("tc-portfolio", {
       reason: "登记用户确认的买入",
-      code: "990001.SZ",
-      kind: "buy",
-      quantity: 10,
-      price: 12.5,
-      change_date: "2026-08-17",
-      decision_origin: "strategy_signal",
-      execution_compliance: "matched",
+      changes: [
+        {
+          code: "990001.SZ",
+          kind: "buy",
+          quantity: 10,
+          price: 12.5,
+          change_date: "2026-08-17",
+          decision_origin: "strategy_signal",
+          execution_compliance: "matched",
+        },
+        { code: "990001.SZ", kind: "note", change_date: "2026-08-17" },
+      ],
     });
     const details = result.details as { confirmation_id: string; tool_name: string };
     expect(details.tool_name).toBe("portfolio_write");
@@ -64,7 +69,8 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
     const approved = await approveConfirmation(pool, details.confirmation_id);
     unsubscribe();
     expect(approved.status).toBe("approved");
-    expect((approved.result as { position: { quantity: number } }).position.quantity).toBe(10);
+    expect((approved.result as { total: number; items: Array<{ position: { quantity: number } | null }> }).total).toBe(2);
+    expect((approved.result as { items: Array<{ position: { quantity: number } | null }> }).items[0]!.position!.quantity).toBe(10);
     const position = await pool.query(
       "SELECT quantity::float, cost_price::float FROM portfolio_position",
     );
@@ -157,22 +163,47 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
        SELECT $1,id,'2026-08-17' FROM market_instrument WHERE code='990001.SZ'`,
       [board.rows[0]!.id],
     );
+    await expect(findTool("pool_write").execute("tc-pool-missing-stop", {
+      reason: "短线止损档位缺失必须拒绝",
+      operations: [{
+        action: "add",
+        code: "990001.SZ",
+        pool: "short",
+        role: "观察",
+        grade: "A",
+        score: 5,
+        tags: ["确认测试"],
+        stock_character: "中波动",
+        stage: "观察",
+        evaluation_summary: "已完成确认制永久测试所需评估",
+        effective_from: "2026-08-17",
+      }],
+    })).rejects.toThrow("必须提供 stop_loss_mode");
     const poolProposal = await findTool("pool_write").execute("tc-pool", {
       reason: "登记标的池角色",
-      action: "add",
-      code: "990001.SZ",
-      pool: "short",
-      role: "观察",
-      grade: "A",
-      score: 5,
-      tags: ["确认测试"],
-      stock_character: "中波动",
-      stage: "观察",
-      evaluation_summary: "已完成确认制永久测试所需评估",
-      effective_from: "2026-08-17",
+      operations: [
+        {
+          action: "add",
+          code: "990001.SZ",
+          pool: "short",
+          role: "观察",
+          grade: "A",
+          score: 5,
+          tags: ["确认测试"],
+          stock_character: "中波动",
+          stop_loss_mode: "ma10",
+          stage: "观察",
+          evaluation_summary: "已完成确认制永久测试所需评估",
+          effective_from: "2026-08-17",
+        },
+        { action: "set_board_order", pool: "short", board_codes: ["881999.TI"] },
+      ],
     });
     await approveConfirmation(pool, (poolProposal.details as { confirmation_id: string }).confirmation_id);
-    expect((await pool.query("SELECT role FROM pool_membership WHERE effective_to IS NULL")).rows[0]!.role).toBe("观察");
+    expect((await pool.query("SELECT role, stop_loss_mode FROM pool_membership WHERE effective_to IS NULL")).rows[0]).toEqual({
+      role: "观察",
+      stop_loss_mode: "ma10",
+    });
 
     const promptProposal = await findTool("job_write").execute("tc-prompt", {
       reason: "创建测试作业提示词",

@@ -4,6 +4,7 @@ import { inServiceTransaction, type TransactionDb } from "../../db/transaction.j
 
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
 export type PoolKind = "short" | "long";
+export type StopLossMode = "ma5" | "ma10" | "fixed_90";
 
 export interface PoolMemberRow {
   id: string;
@@ -13,6 +14,7 @@ export interface PoolMemberRow {
   score: number | null;
   tags: string[];
   stock_character: string | null;
+  stop_loss_mode: StopLossMode | null;
   stage: string | null;
   evaluation_summary: string | null;
   effective_from: string;
@@ -56,7 +58,7 @@ export interface PoolViewData {
 
 const MEMBER_SELECT = `SELECT membership.id::text, membership.pool, membership.role,
   membership.grade, membership.score::float8, membership.tags,
-  membership.stock_character, membership.stage, membership.evaluation_summary,
+  membership.stock_character, membership.stop_loss_mode, membership.stage, membership.evaluation_summary,
   membership.effective_from::text, membership.effective_to::text, membership.note,
   membership.attention_reason, membership.attention_from::text, membership.attention_until::text,
   instrument.code, instrument.name, instrument.kind,
@@ -153,6 +155,7 @@ export interface PoolChangeInput {
   score?: number;
   tags?: string[];
   stock_character?: string;
+  stop_loss_mode?: StopLossMode;
   stage?: string;
   evaluation_summary?: string;
   attention_reason?: string | null;
@@ -243,7 +246,7 @@ export async function applyPoolChange(
     }
 
     const attentionOnly = input.action === "update" && before?.pool === input.pool &&
-      [input.role, input.grade, input.score, input.tags, input.stock_character, input.stage,
+      [input.role, input.grade, input.score, input.tags, input.stock_character, input.stop_loss_mode, input.stage,
        input.evaluation_summary, input.note].every((value) => value === undefined) &&
       [input.attention_reason, input.attention_from, input.attention_until].some((value) => value !== undefined);
     if (attentionOnly) {
@@ -261,6 +264,11 @@ export async function applyPoolChange(
     const stockCharacter = requiredText(input.stock_character ?? before?.stock_character, "stock_character");
     const stage = requiredText(input.stage ?? before?.stage, "stage");
     const evaluationSummary = requiredText(input.evaluation_summary ?? before?.evaluation_summary, "evaluation_summary");
+    if (input.pool === "long" && input.stop_loss_mode !== undefined) throw new Error("长线池角色不使用短线止损档位");
+    const stopLossMode = input.pool === "short" ? input.stop_loss_mode ?? before?.stop_loss_mode ?? null : null;
+    if (input.pool === "short" && (input.action === "add" || before?.pool !== "short") && stopLossMode === null) {
+      throw new Error("新增或迁入短线池必须配置 stop_loss_mode");
+    }
     const score = input.score ?? before?.score;
     if (score === null || score === undefined || !Number.isFinite(score)) throw new Error("score 必须是有限数值");
     const tags = (input.tags ?? before?.tags)?.map((tag) => String(tag).trim());
@@ -290,14 +298,14 @@ export async function applyPoolChange(
     if (before) await client.query("UPDATE pool_membership SET effective_to = $2 WHERE id = $1", [before.id, input.effective_from]);
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO pool_membership
-         (instrument_id, pool, role, grade, score, tags, stock_character, stage,
+         (instrument_id, pool, role, grade, score, tags, stock_character, stop_loss_mode, stage,
           evaluation_summary, attention_reason,
           attention_from, attention_until, evaluation_session_id, effective_from, note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        RETURNING id::text`,
       [
-        instrumentId, input.pool, role, grade, score, JSON.stringify(tags), stockCharacter, stage,
-        evaluationSummary,
+        instrumentId, input.pool, role, grade, score, JSON.stringify(tags), stockCharacter, stopLossMode,
+        stage, evaluationSummary,
         input.attention_reason === undefined ? before?.attention_reason ?? null : input.attention_reason,
         attentionFrom, attentionUntil, input.evaluation_session_id ?? null,
         input.effective_from, input.note ?? before?.note ?? null,

@@ -1,0 +1,4 @@
+interface:
+  display_name: "AKShare 数据研究"
+  short_description: "无需 Token 的多市场财经数据获取、校验、研究与可复现导出工作流"
+  default_prompt: "使用 $akshare 获取、校验并整理所需的财经数据。"

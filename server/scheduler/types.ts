@@ -88,9 +88,6 @@ export interface AnalysisJobConfig {
   request?: { codes?: string[]; as_of?: string; lookback?: number };
 }
 
-export interface AgentFlowJobConfig {
-  pool_attention_write?: true;
-  daily_plan_write?: true;
-}
+export type AgentFlowJobConfig = Record<string, never>;
 
 export type ValidatedJobConfig = DatasourceJobConfig | AnalysisJobConfig | AgentFlowJobConfig;

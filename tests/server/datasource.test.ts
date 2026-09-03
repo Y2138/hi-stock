@@ -25,10 +25,16 @@ import {
 } from "../../server/datasource/hithink-datasets.js";
 import { syncAllBoardMemberships, syncBoardMembership, upsertTickerIdentities } from "../../server/datasource/catalog-service.js";
 import { syncLimitDataset, syncLimitLadder } from "../../server/datasource/special-service.js";
-import { calculateIndicators } from "../../server/indicators/formulas.js";
+import { calculateDefenseRecovery, calculateIndicators } from "../../server/indicators/formulas.js";
 import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
 import { buildOnDemandBars } from "../../server/modules/market/routes.js";
 import { queryMarketStructure } from "../../server/modules/market/structure.js";
+import {
+  buildLimitUpFeatureRows,
+  empiricalMidrank,
+  scoreLimitUpFeatureRows,
+  type LimitUpBenchmark,
+} from "../../server/modules/market/limit-up-signals.js";
 import indicatorFixture from "../fixtures/指标金样本.json";
 import { fetchFundFlow } from "../../server/datasource/akshare.js";
 import {
@@ -62,6 +68,59 @@ function textResponse(text: string): Response {
     text: async () => text,
   } as unknown as Response;
 }
+
+describe("打板固定基准评分", () => {
+  it("经验中位秩正确处理并列值，路线阈值还必须同时通过当日前2名", () => {
+    expect(empiricalMidrank(2, [1, 2, 2, 3])).toBe(0.5);
+    const features = {
+      theme_share: 1, theme_max_streak: 1, theme_tier_count: 1, market_hhi: 1,
+      market_limit_up_count: 0, theme_turnover_log: 0, seal_turnover_ratio: 1,
+      seal_minutes: 0, theme_pre5_return: 1, theme_width: 1, stock_pre5_return: 1,
+      persistence_5d: 1, above_ma20: 1, promotion_rate: 1, negative_feedback: 0,
+      first_board_share: 1, core_position: 1,
+    };
+    const rows: Parameters<typeof scoreLimitUpFeatureRows>[0] = ["600001.SH", "600002.SH", "600003.SH"].map((code) => ({
+      event: {
+        date: "2026-08-20", event_type: "up", code, name: code, streak_count: 2,
+        open_count: 0, first_event_time: "2026-08-20T01:30:00Z", reason: "机器人",
+        is_st: false, is_new: false, seal_money: 100, max_seal_money: 100, turnover: 100,
+      },
+      mainTheme: "机器人",
+      features,
+      missingInputs: [],
+    }));
+    const distributions = Object.fromEntries([
+      "theme_share", "theme_max_streak", "theme_tier_count", "market_hhi",
+      "market_limit_up_count", "theme_turnover_log", "seal_turnover_ratio", "seal_minutes",
+      "theme_pre5_return", "theme_width", "stock_pre5_return",
+    ].map((key) => [key, [0, 1]])) as LimitUpBenchmark["distributions"];
+    const candidates = scoreLimitUpFeatureRows(rows, {
+      code: "test", revision_id: "1", training_start: "2025-01-01", training_end: "2025-06-30",
+      methodology: "test", distributions, sample_counts: {}, source_summary: {}, sha256: "0".repeat(64),
+    });
+    expect(candidates.filter((item) => item.signal_grade === "A").map((item) => item.code))
+      .toEqual(["600001.SH", "600002.SH"]);
+    expect(candidates.find((item) => item.code === "600003.SH")).toMatchObject({
+      cluster_rank: 3, momentum_rank: 3, signal_grade: null,
+    });
+  });
+
+  it("09:25一字板按0分钟处理，近5日持续性不把T日自身计入且名称可兜底排除ST", () => {
+    const tradingDates = ["2026-08-13", "2026-08-14", "2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20"];
+    const events = tradingDates.map((date, index) => ({
+      date, event_type: "up" as const, code: `60000${index + 1}.SH`, name: `样本${index + 1}`,
+      streak_count: 1, open_count: 0, first_event_time: `${date}T01:25:00Z`,
+      reason: index === 5 ? "机器人" : "旧题材", is_st: false, is_new: false,
+      seal_money: 100, max_seal_money: 100, turnover: 100,
+    }));
+    events.push({ ...events.at(-1)!, code: "600099.SH", name: "*ST样本" });
+    const bars = events.map((event) => ({ date: event.date, code: event.code, open: 10, close: 10, turnover: 100 }));
+    const rows = buildLimitUpFeatureRows({ events, bars, tradingDates, targetDates: ["2026-08-20"] });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.features.seal_minutes).toBe(0);
+    expect(rows[0]!.features.persistence_5d).toBe(0);
+  });
+});
 
 /** 构造扶摇 kline 信封：dates 与 closes 等长 */
 function klinePayload(dates: string[], closes: number[]): unknown {
@@ -154,9 +213,10 @@ describe("datasource 限流与重试", () => {
     expect(bars[4]).toMatchObject({ ma5: 3, ma10: null, channel: "hithink_on_demand" });
     expect(bars[59]).toMatchObject({ ma5: 58, ma60: 30.5 });
     expect(bars[59]!.macd_hist).toBeTypeOf("number");
+    expect(bars[59]!.rsi14).toBeTypeOf("number");
   });
 
-  it("正式日线指标一版与 pandas/ta 金样本在混合容差内一致", () => {
+  it("正式日线指标三版与 pandas/ta 金样本一致，并按 Wilder 口径计算 RSI14", () => {
     const actual = calculateIndicators(indicatorFixture.input);
     for (const expected of indicatorFixture.expected) {
       const point = actual[expected.index]!;
@@ -169,6 +229,25 @@ describe("datasource 限流与重试", () => {
       if (referenceHist === null) expect(point.macdHist).toBeNull();
       else expect(Math.abs(point.macdHist! - referenceHist)).toBeLessThanOrEqual(1e-10 + 1e-9 * Math.abs(referenceHist));
     }
+    const rising = calculateIndicators(Array.from({ length: 15 }, (_, index) => index + 1));
+    const falling = calculateIndicators(Array.from({ length: 15 }, (_, index) => 15 - index));
+    const flat = calculateIndicators(Array(15).fill(10));
+    expect(rising[13]!.rsi14).toBeNull();
+    expect(rising[14]!.rsi14).toBe(100);
+    expect(falling[14]!.rsi14).toBe(0);
+    expect(flat[14]!.rsi14).toBe(50);
+  });
+
+  it("护盘收回率只统计跌破MA10且已走满三个后续交易日的事件", () => {
+    const rows = [
+      11, 9, 9, 10.1, 11, 9, 9, 9, 9, 11, 9,
+    ].map((close) => ({ close, ma10: 10 }));
+    expect(calculateDefenseRecovery(rows)).toEqual({
+      inputRowCount: 11,
+      eventCount: 2,
+      recoveredCount: 1,
+      recoveryRate: 0.5,
+    });
   });
 
   it("统一请求队列遵守优先级，连续五个高优先请求后放行低优先请求", async () => {
@@ -1046,6 +1125,87 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     expect(stored.rows[0]!.n).toBe(1);
   });
 
+  it("dailyMarketUpdate 隔离批量坏代码和单标的补拉错误，后续标的仍落库", async () => {
+    const targetDate = "2026-09-02";
+    const previousDate = "2026-09-01";
+    const codes = ["118058.SZ", "600091.SH", "600092.SH"];
+    for (const code of codes) {
+      const instrument = await pool.query<{ id: string }>(
+        `INSERT INTO market_instrument (code, name, kind) VALUES ($1, $1, 'stock')
+         ON CONFLICT (code) DO UPDATE SET kind = 'stock' RETURNING id::text`,
+        [code],
+      );
+      if (code === "600092.SH") {
+        await pool.query(
+          `INSERT INTO market_bar
+             (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, channel)
+           VALUES ($1, 'day', $2, $3, 10, 11, 9, 10, 1000, 'test')`,
+          [instrument.rows[0]!.id, previousDate, `${previousDate}T00:00:00Z`],
+        );
+      }
+    }
+    const snapshotBatches: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: unknown) => {
+      const parsed = new URL(String(url));
+      if (parsed.pathname === "/api/a-share/prices/snapshot") {
+        const batch = parsed.searchParams.get("thscodes")!;
+        snapshotBatches.push(batch);
+        if (batch.includes("118058.SZ")) {
+          return jsonResponse({ code: 3004, message: "Unknown thscode: 118058.SZ" });
+        }
+        return jsonResponse({
+          code: 0,
+          message: "success",
+          data: {
+            timestamp: Date.parse(`${targetDate}T15:05:00+08:00`),
+            item: batch.split(",").map((code) => ({
+              thscode: code,
+              open_price: 10,
+              high_price: 12,
+              low_price: 9,
+              last_price: 11,
+              prev_price: 10,
+              volume: 1000,
+            })),
+          },
+        });
+      }
+      if (parsed.pathname.endsWith("/historical") && parsed.searchParams.get("thscode") === "600091.SH") {
+        return jsonResponse({ code: 3004, message: "模拟单标的历史数据错误" });
+      }
+      throw new Error(`未预期的 URL: ${parsed}`);
+    }));
+
+    const summary = await dailyMarketUpdate(
+      pool,
+      { codes, date: targetDate },
+      { hithinkDeps: noWait, channels: [new HithinkChannel(noWait)] },
+    );
+
+    expect(snapshotBatches).toEqual([
+      "118058.SZ,600091.SH,600092.SH",
+      "118058.SZ",
+      "600091.SH,600092.SH",
+    ]);
+    expect(summary.snapshotRows).toBe(1);
+    expect(summary.gaps).toEqual([
+      { code: "118058.SZ", freq: "day", reason: expect.stringContaining("Unknown thscode: 118058.SZ") },
+      { code: "600091.SH", freq: "day", reason: expect.stringContaining("日线处理失败") },
+    ]);
+    expect(Number((await pool.query(
+      `SELECT count(*) FROM market_bar b JOIN market_instrument i ON i.id = b.instrument_id
+        WHERE i.code = '600092.SH' AND b.freq = 'day' AND b.bar_date = $1`,
+      [targetDate],
+    )).rows[0]!.count)).toBe(1);
+    const run = await pool.query<{ rows_written: number; gaps: Array<{ code: string }> }>(
+      `SELECT rows_written, gaps FROM market_fetch_run
+        WHERE scope->>'op' = 'snapshot' AND scope->>'kind' = 'stock'
+        ORDER BY id DESC LIMIT 1`,
+    );
+    expect(run.rows[0]).toMatchObject({ rows_written: 1 });
+    expect(run.rows[0]!.gaps.map((gap) => gap.code)).toEqual(["118058.SZ", "600091.SH"]);
+  });
+
   it("单板块成分请求失败时保留上一版有效关系", async () => {
     await upsertTickerIdentities(pool, [
       {
@@ -1136,6 +1296,26 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     expect(runs.rows[0]).toEqual({ n: 2, partial: 2 });
   });
 
+  it("涨跌停池允许供应商用 pages=0 表示目标日空结果", async () => {
+    const targetDate = "2026-08-18";
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({
+      code: 0,
+      message: "success",
+      data: {
+        timestamp: Date.parse(`${targetDate}T15:40:00+08:00`),
+        pagination: { page: 1, pages: 0, total: 0 },
+        item: [],
+      },
+    })));
+    expect(await syncLimitDataset(pool, "down", targetDate, noWait)).toMatchObject({
+      status: "success",
+      rows: 0,
+      completedPages: 0,
+      totalPages: 0,
+      gaps: [],
+    });
+  });
+
   it("连板天梯兼容两种供应商日期格式且仍严格校验目标日", async () => {
     const timestamp = Date.parse("2026-08-20T15:40:00+08:00");
     let dateList = ["2026-08-20", "2026-08-19"];
@@ -1185,8 +1365,14 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     });
   });
 
-  it("行情 upsert 与指标 dirty 原子提交，generation 递增后全历史重算", async () => {
+  it("行情 upsert 与指标 dirty 原子提交，generation 递增后按近六年窗口全量重算", async () => {
     const instrumentId = await ensureInstrument(pool, "601999.SH", "指标测试股票", "day");
+    await pool.query(
+      `INSERT INTO market_bar
+         (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, adjustment, channel)
+       VALUES ($1, 'day', '2019-01-02', '2019-01-02T00:00:00Z', 10, 11, 9, 10, 1000, 'none', 'legacy_test')`,
+      [instrumentId],
+    );
     const bars = indicatorFixture.input.map((close, index) => {
       const date = new Date(Date.UTC(2026, 0, 1 + index)).toISOString().slice(0, 10);
       return { date, open: close, high: close + 1, low: close - 1, close, volume: 1000, adjustment: "forward" as const };
@@ -1209,6 +1395,20 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       "SELECT count(*) FROM market_indicator_value WHERE instrument_id = $1 AND freq = 'day'",
       [instrumentId],
     )).rows[0]!.count)).toBe(indicatorFixture.input.length);
+    expect(Number((await pool.query(
+      "SELECT rsi14 FROM market_indicator_value WHERE instrument_id = $1 AND freq = 'day' ORDER BY bar_date DESC LIMIT 1",
+      [instrumentId],
+    )).rows[0]!.rsi14)).toBeGreaterThanOrEqual(0);
+    expect((await pool.query(
+      `SELECT calculation_version, input_row_count, defense_break_count, defense_recovered_count
+         FROM market_stock_character_metric WHERE instrument_id = $1`,
+      [instrumentId],
+    )).rows[0]).toEqual({
+      calculation_version: "最近252日股性指标一版",
+      input_row_count: indicatorFixture.input.length,
+      defense_break_count: expect.any(Number),
+      defense_recovered_count: expect.any(Number),
+    });
     expect(Number((await pool.query(
       "SELECT count(*) FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
       [instrumentId],

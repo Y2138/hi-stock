@@ -27,6 +27,8 @@ export interface Bar {
   low: number;
   close: number;
   volume?: number;
+  /** 成交额（原始货币）；供应商未提供时留空，不用收盘价×成交量伪造。 */
+  turnover?: number;
   /** 复权口径 forward/none；未知则省略（落库为 NULL） */
   adjustment?: "forward" | "none";
 }

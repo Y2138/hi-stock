@@ -288,6 +288,7 @@ export interface MarketBar {
   low: number;
   close: number;
   volume: number | null;
+  turnover: number | null;
   ma5: number | null;
   ma10: number | null;
   ma20: number | null;
@@ -295,6 +296,7 @@ export interface MarketBar {
   dif: number | null;
   dea: number | null;
   macd_hist: number | null;
+  rsi14: number | null;
   adjustment: string | null;
   channel: string;
 }
@@ -362,7 +364,52 @@ export interface MarketStructureResponse {
   page: number;
   size: number;
   items: Array<Record<string, unknown>>;
+  limit_up_signals: LimitUpSignalResult | null;
   counts?: Partial<Record<MarketStructureDataset, number>>;
+}
+
+export interface LimitUpSignalCandidate {
+  code: string;
+  name: string;
+  main_theme: string;
+  streak_count: number;
+  open_count: number | null;
+  seal_money: number | null;
+  turnover: number | null;
+  features: Record<string, number | null>;
+  ranks: Record<string, number>;
+  cluster_score: number;
+  momentum_score: number;
+  cluster_rank: number;
+  momentum_rank: number;
+  cluster_signal: boolean;
+  momentum_signal: boolean;
+  signal_grade: "A" | "B-抱团" | "B-主升" | null;
+  data_status: "ready" | "data_insufficient";
+  missing_inputs: string[];
+  neutral_inputs: string[];
+  risk_flags: string[];
+}
+
+export interface LimitUpSignalResult {
+  date: string;
+  strategy_revision_id: string | null;
+  benchmark: {
+    code: string;
+    revision_id: string;
+    training_start: string;
+    training_end: string;
+    methodology: string;
+    sample_counts: Record<string, number>;
+    source_summary: Record<string, unknown>;
+    sha256: string;
+  } | null;
+  status: "success" | "partial" | "unavailable";
+  gaps: string[];
+  candidate_count: number;
+  signal_count: number;
+  signals: LimitUpSignalCandidate[];
+  candidates: LimitUpSignalCandidate[];
 }
 
 export type MarketStructureDataset =
@@ -496,6 +543,7 @@ export interface PoolMember {
   score: number | null;
   tags: string[];
   stock_character: string | null;
+  stop_loss_mode: "ma5" | "ma10" | "fixed_90" | null;
   stage: string | null;
   evaluation_summary: string | null;
   effective_from: string;
@@ -814,6 +862,8 @@ export const TOOL_LABELS: Record<string, string> = {
   market_snapshot_query: "查询最新行情快照",
   board_query: "查询板块与成分",
   market_event_query: "查询市场结构",
+  daily_plan_context_query: "查询每日计划确定性上下文",
+  limit_up_signal_query: "查询打板确定性评分",
   indicator_query: "查询可信行情指标",
   portfolio_write: "维护持仓",
   pool_write: "维护标的池",

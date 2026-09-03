@@ -17,6 +17,8 @@ import {
   queryMarketStructure,
   type MarketStructureDataset,
 } from "../modules/market/structure.js";
+import { queryLimitUpSignals } from "../modules/market/limit-up-signals.js";
+import { queryDailyPlanContext } from "../modules/plans/daily-context.js";
 import { insertToolAudit } from "./repo.js";
 import { getAgentSettings } from "./settings.js";
 import { sha256Json } from "./hash.js";
@@ -53,6 +55,8 @@ const MarketEventSchema = strict({
   page: Type.Optional(Type.Integer({ minimum: 1, maximum: 10000 })),
   size: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
 });
+const LimitUpSignalSchema = strict({ date: DateString });
+const DailyPlanContextSchema = strict({ date: DateString });
 const IndicatorSchema = strict({
   codes: Type.Array(Code, { minItems: 1, maxItems: 20 }),
   freq: Type.Optional(Type.Union([Type.Literal("day"), Type.Literal("30m"), Type.Literal("futures_day")])),
@@ -62,9 +66,7 @@ const IndicatorSchema = strict({
 });
 
 function toolResult(value: unknown): AgentToolResult<unknown> {
-  let text = JSON.stringify(value);
-  if (text.length > 60_000) text = `${text.slice(0, 60_000)}…[截断]`;
-  return { content: [{ type: "text", text }], details: value };
+  return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
 }
 
 async function assertEnabled(pool: pg.Pool): Promise<void> {
@@ -90,8 +92,9 @@ async function audited(
   name: string,
   args: unknown,
   operation: () => Promise<unknown>,
+  requireMarketSwitch = true,
 ): Promise<AgentToolResult<unknown>> {
-  await assertEnabled(deps.pool);
+  if (requireMarketSwitch) await assertEnabled(deps.pool);
   const value = stripSourcePayload(await operation());
   await insertToolAudit(deps.pool, {
     session_id: deps.sessionId,
@@ -101,6 +104,34 @@ async function audited(
     status: "ok",
   });
   return toolResult(value);
+}
+
+/** 打板评分是当前策略的正式只读执行能力，不受可选市场领域工具开关影响。 */
+export function buildLimitUpSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+  return {
+    name: "limit_up_signal_query",
+    label: "查询打板确定性评分",
+    description: "按目标交易日完整读取涨停事件、真实封单与成交额、历史日线和当前打板策略的版本化固定研究基准，由服务端一次性计算全部候选的抱团分、主升分、路线名次、有效信号、风险与数据缺口；结果不分页、不截断，不要再用通用查询手算分位或分数。",
+    parameters: LimitUpSignalSchema,
+    execute: async (_id, raw) => {
+      const input = validateToolInput<Static<typeof LimitUpSignalSchema>>("limit_up_signal_query", LimitUpSignalSchema, raw);
+      return audited(deps, "limit_up_signal_query", input, () => queryLimitUpSignals(deps.pool, input.date), false);
+    },
+  };
+}
+
+/** 每日计划的机械计算与覆盖门禁始终可用，不受可选市场领域工具开关影响。 */
+export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+  return {
+    name: "daily_plan_context_query",
+    label: "查询每日计划确定性上下文",
+    description: "按目标日一次性返回完整881一级行业市场状态与温度、七类市场结构同步、短线池逐只右侧六条件、左侧反转质量分与ATR止损、试盘启动分阶段证据，以及右侧>左侧>试盘的唯一信号选择；同时返回持仓止损档位、冷却期、止盈/止损位、退出候选与MA10护盘收回率。只返回结论和必要数值证据，不返回原始行情序列；每日计划不得再用通用数据库工具手算。",
+    parameters: DailyPlanContextSchema,
+    execute: async (_id, raw) => {
+      const input = validateToolInput<Static<typeof DailyPlanContextSchema>>("daily_plan_context_query", DailyPlanContextSchema, raw);
+      return audited(deps, "daily_plan_context_query", input, () => queryDailyPlanContext(deps.pool, input.date), false);
+    },
+  };
 }
 
 export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool[] {
@@ -169,7 +200,7 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
     {
       name: "indicator_query",
       label: "查询可信行情指标",
-      description: "查询最多 20 个标的、每个最多 120 个时点的 MA/MACD，并返回计算版本、复权、status 和 gaps；untrusted 不包装为成功。",
+      description: "查询最多 20 个标的、每个最多 120 个实际行情时点的 OHLCV、MA/MACD/RSI14，并返回计算版本、复权、status 和 gaps；limit 表示每只标的最近 N 根，不是自然日数，untrusted 不包装为成功。",
       parameters: IndicatorSchema,
       execute: async (_id, raw) => {
         const input = validateToolInput<Static<typeof IndicatorSchema>>("indicator_query", IndicatorSchema, raw);
@@ -199,6 +230,12 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
               values: bars.slice(-(input.limit ?? 120)).map((bar) => ({
                 bar_date: bar.bar_date,
                 bar_time: bar.bar_time,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+                turnover: bar.turnover,
                 ma5: bar.ma5,
                 ma10: bar.ma10,
                 ma20: bar.ma20,
@@ -206,6 +243,7 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
                 dif: bar.dif,
                 dea: bar.dea,
                 macd_hist: bar.macd_hist,
+                rsi14: bar.rsi14,
               })),
             });
           }

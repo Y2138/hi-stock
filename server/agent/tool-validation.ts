@@ -75,7 +75,7 @@ const IdentifierSchema = Type.String({
 
 const HashSchema = Type.String({ minLength: 64, maxLength: 64, pattern: HASH_PATTERN });
 
-const FILTER_OPERATORS = [
+const VALUE_FILTER_OPERATORS = [
   "eq",
   "ne",
   "gt",
@@ -85,14 +85,30 @@ const FILTER_OPERATORS = [
   "in",
   "like",
   "ilike",
-  "is_null",
-  "not_null",
 ] as const;
 
-const FilterSchema = strictObject({
-  column: IdentifierSchema,
-  op: Type.Optional(Type.Union(FILTER_OPERATORS.map((value) => Type.Literal(value)))),
-  value: Type.Optional(Type.Unknown()),
+const FilterSchema = Type.Union([
+  strictObject({
+    column: IdentifierSchema,
+    op: Type.Union([Type.Literal("is_null"), Type.Literal("not_null")], {
+      description: "判空操作符；不需要 value，兼容模型显式传入 value:null。",
+    }),
+    value: Type.Optional(Type.Null({
+      description: "判空过滤器无需此字段；若模型生成该字段，只允许 null。",
+    })),
+  }),
+  strictObject({
+    column: IdentifierSchema,
+    op: Type.Optional(Type.Union(VALUE_FILTER_OPERATORS.map((value) => Type.Literal(value)), {
+      description: "缺省为 eq；in 使用 1-100 项数组，like/ilike 使用字符串。",
+    })),
+    value: Type.Unknown({
+      description: "普通过滤器必填且不能为 null；查询 NULL 请改用 is_null/not_null。",
+    }),
+  }),
+], {
+  description:
+    "过滤器二选一：判空使用 {column,op:'is_null'|'not_null'}；其他操作使用 {column,op,value}。",
 });
 
 const SelectSchema = strictObject({
@@ -110,7 +126,7 @@ const SelectSchema = strictObject({
       { maxItems: 20 },
     ),
   ),
-  limit: Type.Optional(Type.Integer({ minimum: 0, maximum: 500 })),
+  limit: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
   offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 10_000 })),
   mode: Type.Optional(Type.Union([Type.Literal("rows"), Type.Literal("count")])),
 });
@@ -131,7 +147,7 @@ export const DatabaseSchemaSchema = objectRoot(Type.Union([
 ]));
 
 export const DatabaseQuerySchema = strictObject({
-  queries: Type.Array(SelectSchema, { minItems: 1, maxItems: 30 }),
+  queries: Type.Array(SelectSchema, { minItems: 1, maxItems: 5 }),
 });
 
 const WebResearchDomainSchema = Type.Union(
@@ -164,9 +180,38 @@ const ExecutionComplianceSchema = Type.Union([
   Type.Literal("not_applicable"), Type.Literal("unknown"),
 ]);
 
-const PositionChangePortfolioWriteSchema = strictObject({
-  action: Type.Optional(Type.Literal("record_position_change")),
-  reason: ReasonSchema,
+export const PortfolioContextQuerySchema = strictObject({
+  codes: Type.Optional(Type.Array(CodeSchema, { minItems: 1, maxItems: 50 })),
+  recent_change_limit: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
+});
+export type PortfolioContextQueryInput = Static<typeof PortfolioContextQuerySchema>;
+
+export const PoolContextQuerySchema = strictObject({
+  pools: Type.Optional(Type.Array(Type.Union([Type.Literal("short"), Type.Literal("long")]), {
+    minItems: 1,
+    maxItems: 2,
+  })),
+  codes: Type.Optional(Type.Array(CodeSchema, { minItems: 1, maxItems: 200 })),
+  include_boards: Type.Optional(Type.Boolean()),
+});
+export type PoolContextQueryInput = Static<typeof PoolContextQuerySchema>;
+
+export const JobContextQuerySchema = strictObject({
+  job_codes: Type.Optional(Type.Array(IdentifierSchema, { minItems: 1, maxItems: 20 })),
+  prompt_codes: Type.Optional(Type.Array(IdentifierSchema, { minItems: 1, maxItems: 20 })),
+  target_date: Type.Optional(DateSchema),
+  recent_runs_per_job: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+  include_output_content: Type.Optional(Type.Boolean()),
+  include_prompt_content: Type.Optional(Type.Boolean()),
+});
+export type JobContextQueryInput = Static<typeof JobContextQuerySchema>;
+
+export const StrategyDocumentQuerySchema = strictObject({
+  codes: Type.Array(IdentifierSchema, { minItems: 1, maxItems: 20 }),
+});
+export type StrategyDocumentQueryInput = Static<typeof StrategyDocumentQuerySchema>;
+
+const PositionChangeSchema = strictObject({
   code: CodeSchema,
   kind: Type.Union([Type.Literal("buy"), Type.Literal("sell"), Type.Literal("adjust"), Type.Literal("note")]),
   quantity: Type.Optional(PositiveNumberSchema),
@@ -178,64 +223,94 @@ const PositionChangePortfolioWriteSchema = strictObject({
   attribution_note: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
   deviation_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
 });
-export const PortfolioWriteSchema = PositionChangePortfolioWriteSchema;
-type PositionChangePortfolioWriteInput =
-  Omit<Static<typeof PositionChangePortfolioWriteSchema>, "action" | "decision_origin" | "execution_compliance"> & {
-    action: "record_position_change";
+export const PortfolioWriteSchema = strictObject({
+  reason: ReasonSchema,
+  changes: Type.Array(PositionChangeSchema, { minItems: 1, maxItems: 50 }),
+});
+const LegacyPortfolioWriteSchema = strictObject({
+  action: Type.Optional(Type.Literal("record_position_change")),
+  reason: ReasonSchema,
+  ...PositionChangeSchema.properties,
+});
+export type PositionChangePortfolioWriteInput =
+  Omit<Static<typeof PositionChangeSchema>, "decision_origin" | "execution_compliance"> & {
     decision_origin: Static<typeof DecisionOriginSchema>;
     execution_compliance: Static<typeof ExecutionComplianceSchema>;
   };
-export type PortfolioWriteInput = PositionChangePortfolioWriteInput;
+export type PortfolioWriteInput = {
+  reason: string;
+  changes: PositionChangePortfolioWriteInput[];
+};
 
 const PoolKindSchema = Type.Union([Type.Literal("short"), Type.Literal("long")]);
-const PoolMembershipWriteSchema = strictObject({
-  reason: ReasonSchema,
-  action: Type.Union([Type.Literal("add"), Type.Literal("update"), Type.Literal("remove")]),
-  code: CodeSchema,
+const StopLossModeSchema = Type.Union([
+  Type.Literal("ma5"), Type.Literal("ma10"), Type.Literal("fixed_90"),
+]);
+const PoolWriteOperationSchema = strictObject({
+  action: Type.Union([
+    Type.Literal("add"), Type.Literal("update"), Type.Literal("remove"), Type.Literal("set_board_order"),
+  ]),
+  code: Type.Optional(CodeSchema),
   pool: PoolKindSchema,
   role: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
   grade: Type.Optional(Type.String({ minLength: 1, maxLength: 50 })),
   score: Type.Optional(Type.Number()),
   tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { minItems: 1, maxItems: 100 })),
   stock_character: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+  stop_loss_mode: Type.Optional(StopLossModeSchema),
   stage: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
   evaluation_summary: Type.Optional(Type.String({ minLength: 1, maxLength: 4_000 })),
   attention_reason: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 500 }), Type.Null()])),
   attention_from: Type.Optional(Type.Union([DateSchema, Type.Null()])),
   attention_until: Type.Optional(Type.Union([DateSchema, Type.Null()])),
-  effective_from: DateSchema,
+  effective_from: Type.Optional(DateSchema),
   note: Type.Optional(Type.String({ maxLength: 2_000 })),
+  board_codes: Type.Optional(Type.Array(CodeSchema, { maxItems: 200 })),
 });
-const PoolBoardOrderSchema = strictObject({
+export const PoolWriteSchema = strictObject({
   reason: ReasonSchema,
-  action: Type.Literal("set_board_order"),
-  pool: PoolKindSchema,
-  board_codes: Type.Array(CodeSchema, { maxItems: 200 }),
+  operations: Type.Array(PoolWriteOperationSchema, { minItems: 1, maxItems: 50 }),
 });
-export const PoolWriteSchema = objectRoot(Type.Union([PoolMembershipWriteSchema, PoolBoardOrderSchema]));
-export type PoolWriteInput = Static<typeof PoolWriteSchema>;
-
-const ScheduledPoolAttentionMarkSchema = strictObject({
-  reason: ReasonSchema,
-  action: Type.Literal("mark"),
-  code: CodeSchema,
-  pool: PoolKindSchema,
-  attention_status: Type.Union([Type.Literal("qualified"), Type.Literal("approaching")]),
-  attention_reason: Type.String({ minLength: 1, maxLength: 420 }),
-  attention_from: DateSchema,
-  attention_until: DateSchema,
-});
-const ScheduledPoolAttentionClearSchema = strictObject({
-  reason: ReasonSchema,
-  action: Type.Literal("clear"),
-  code: CodeSchema,
-  pool: PoolKindSchema,
-});
-export const ScheduledPoolAttentionSchema = objectRoot(Type.Union([
-  ScheduledPoolAttentionMarkSchema,
-  ScheduledPoolAttentionClearSchema,
+const LegacyPoolWriteSchema = objectRoot(Type.Union([
+  strictObject({ reason: ReasonSchema, ...PoolWriteOperationSchema.properties }),
+  strictObject({
+    reason: ReasonSchema,
+    action: Type.Literal("set_board_order"),
+    pool: PoolKindSchema,
+    board_codes: Type.Array(CodeSchema, { maxItems: 200 }),
+  }),
 ]));
-export type ScheduledPoolAttentionInput = Static<typeof ScheduledPoolAttentionSchema>;
+export type PoolWriteOperation = Static<typeof PoolWriteOperationSchema>;
+export type PoolWriteInput = { reason: string; operations: PoolWriteOperation[] };
+
+const ScheduledPoolAttentionItemSchema = strictObject({
+  action: Type.Union([Type.Literal("mark"), Type.Literal("clear")]),
+  code: CodeSchema,
+  pool: PoolKindSchema,
+  attention_status: Type.Optional(Type.Union([Type.Literal("qualified"), Type.Literal("approaching")])),
+  attention_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 420 })),
+  attention_from: Type.Optional(DateSchema),
+  attention_until: Type.Optional(DateSchema),
+});
+export const ScheduledPoolAttentionSchema = strictObject({
+  reason: ReasonSchema,
+  items: Type.Array(ScheduledPoolAttentionItemSchema, { minItems: 1, maxItems: 100 }),
+});
+const LegacyScheduledPoolAttentionSchema = objectRoot(Type.Union([
+  strictObject({
+    reason: ReasonSchema,
+    action: Type.Literal("mark"),
+    code: CodeSchema,
+    pool: PoolKindSchema,
+    attention_status: Type.Union([Type.Literal("qualified"), Type.Literal("approaching")]),
+    attention_reason: Type.String({ minLength: 1, maxLength: 420 }),
+    attention_from: DateSchema,
+    attention_until: DateSchema,
+  }),
+  strictObject({ reason: ReasonSchema, action: Type.Literal("clear"), code: CodeSchema, pool: PoolKindSchema }),
+]));
+export type ScheduledPoolAttentionItem = Static<typeof ScheduledPoolAttentionItemSchema>;
+export type ScheduledPoolAttentionInput = { reason: string; items: ScheduledPoolAttentionItem[] };
 
 /** 每日计划盯防预案行：持仓次日执行预案 + 打板机会，写入后由任务成功激活。 */
 const PlaybookTextSchema = Type.String({ minLength: 1, maxLength: 2_000 });
@@ -335,10 +410,7 @@ const DatasourceJobConfigSchema = strictObject({
   ]),
   export_volume: Type.Optional(Type.Boolean()),
 });
-const AgentFlowJobConfigSchema = strictObject({
-  pool_attention_write: Type.Optional(Type.Literal(true)),
-  daily_plan_write: Type.Optional(Type.Literal(true)),
-});
+const AgentFlowJobConfigSchema = strictObject({});
 const AnalysisJobConfigSchema = strictObject({
   analysis_type: Type.Union([
     Type.Literal("sector_temperature"),
@@ -584,25 +656,6 @@ export const TriggerJobSchema = strictObject({
 });
 export type TriggerJobInput = Static<typeof TriggerJobSchema>;
 
-const UiRefreshTargetSchema = Type.Union([
-  Type.Literal("dashboard"),
-  Type.Literal("positions"),
-  Type.Literal("jobs"),
-  Type.Literal("pools"),
-  Type.Literal("market"),
-  Type.Literal("strategies"),
-  Type.Literal("backtests"),
-  Type.Literal("memories"),
-  Type.Literal("datasync"),
-  Type.Literal("status"),
-]);
-
-export const UiRefreshSchema = strictObject({
-  targets: Type.Array(UiRefreshTargetSchema, { minItems: 1, maxItems: 10 }),
-  reason: Type.String({ minLength: 1, maxLength: 300 }),
-});
-export type UiRefreshInput = Static<typeof UiRefreshSchema>;
-
 function argumentBytes(input: unknown): number {
   let json: string;
   try {
@@ -663,95 +716,200 @@ function isRealDate(value: string): boolean {
   return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }
 
-export function validatePortfolioWriteInput(input: unknown): PortfolioWriteInput {
-  const parsed = validateToolInput<Static<typeof PortfolioWriteSchema>>("portfolio_write", PortfolioWriteSchema, input);
-  const decisionOrigin = parsed.decision_origin ?? (parsed.kind === "note" ? "fact_correction" : undefined);
-  const executionCompliance = parsed.execution_compliance ?? (parsed.kind === "note" ? "not_applicable" : undefined);
-  if (!decisionOrigin) throw new Error(`${parsed.kind} 必须提供 decision_origin`);
-  if (!executionCompliance) throw new Error(`${parsed.kind} 必须提供 execution_compliance`);
-  if ((decisionOrigin === "unplanned_exception" || executionCompliance === "deviated") && !parsed.deviation_reason?.trim()) {
-    throw new Error("计划外例外或执行偏离必须提供 deviation_reason");
-  }
-  const normalized: PositionChangePortfolioWriteInput = {
-    ...parsed,
-    action: "record_position_change",
-    code: parsed.code.trim(),
-    reason: parsed.reason.trim(),
-    decision_origin: decisionOrigin,
-    execution_compliance: executionCompliance,
-    ...(parsed.attribution_note ? { attribution_note: parsed.attribution_note.trim() } : {}),
-    ...(parsed.deviation_reason ? { deviation_reason: parsed.deviation_reason.trim() } : {}),
-  };
-  if (!isRealDate(normalized.change_date)) throw new Error(`成交日期不是有效日历日期：${normalized.change_date}`);
-  if ((normalized.kind === "buy" || normalized.kind === "sell") &&
-      (normalized.quantity === undefined || normalized.price === undefined)) {
-    throw new Error(`${normalized.kind} 必须携带正数 quantity 与 price`);
-  }
-  if (normalized.kind === "adjust" && normalized.quantity === undefined && normalized.price === undefined) {
-    throw new Error("adjust 需要 quantity 或 price 至少一项");
-  }
-  if (normalized.kind === "note" && (normalized.quantity !== undefined || normalized.price !== undefined)) {
-    throw new Error("note 不允许携带 quantity 或 price");
-  }
+function uniqueValues(values: string[] | undefined, label: string, uppercase = false): string[] | undefined {
+  const normalized = values?.map((value) => uppercase ? value.trim().toUpperCase() : value.trim());
+  if (normalized && new Set(normalized).size !== normalized.length) throw new Error(`${label} 存在重复项`);
   return normalized;
 }
 
-export function validatePoolWriteInput(input: unknown): PoolWriteInput {
-  const parsed = validateToolInput<PoolWriteInput>("pool_write", PoolWriteSchema, input);
-  if (parsed.action === "set_board_order") {
-    if (new Set(parsed.board_codes).size !== parsed.board_codes.length) throw new Error("pool_write board_codes 不得重复");
-    return { ...parsed, reason: parsed.reason.trim(), board_codes: parsed.board_codes.map((code) => code.trim()) };
-  }
-  if (!isRealDate(parsed.effective_from)) {
-    throw new Error(`生效日期不是有效日历日期：${parsed.effective_from}`);
-  }
-  if (parsed.action === "add") {
-    for (const field of ["role", "grade", "score", "tags", "stock_character", "stage", "evaluation_summary"] as const) {
-      if (parsed[field] === undefined || parsed[field] === null || parsed[field] === "") throw new Error(`pool_write add 必须提供 ${field}`);
-    }
-  }
-  if (parsed.action === "remove" &&
-      [parsed.role, parsed.grade, parsed.score, parsed.tags, parsed.stock_character, parsed.stage,
-       parsed.evaluation_summary, parsed.attention_reason,
-       parsed.attention_from, parsed.attention_until].some((value) => value !== undefined)) {
-    throw new Error("pool_write remove 只允许 code、pool、effective_from 和 reason");
-  }
-  const tags = parsed.tags?.map((tag) => tag.trim());
-  if (tags?.some((tag) => tag.startsWith("板块："))) {
-    throw new Error("pool_write tags 不再接受“板块：”本地标签；所属行业只读取同花顺官方关系");
-  }
+export function validatePortfolioContextQueryInput(input: unknown): PortfolioContextQueryInput {
+  const parsed = validateToolInput<PortfolioContextQueryInput>(
+    "portfolio_context_query", PortfolioContextQuerySchema, input,
+  );
+  return { ...parsed, codes: uniqueValues(parsed.codes, "portfolio_context_query codes", true) };
+}
+
+export function validatePoolContextQueryInput(input: unknown): PoolContextQueryInput {
+  const parsed = validateToolInput<PoolContextQueryInput>("pool_context_query", PoolContextQuerySchema, input);
   return {
     ...parsed,
-    code: parsed.code.trim(),
-    reason: parsed.reason.trim(),
-    role: parsed.role?.trim(),
-    grade: parsed.grade?.trim(),
-    stock_character: parsed.stock_character?.trim(),
-    stage: parsed.stage?.trim(),
-    evaluation_summary: parsed.evaluation_summary?.trim(),
-    tags,
+    pools: uniqueValues(parsed.pools, "pool_context_query pools") as Array<"short" | "long"> | undefined,
+    codes: uniqueValues(parsed.codes, "pool_context_query codes", true),
   };
 }
 
-export function validateScheduledPoolAttentionInput(input: unknown): ScheduledPoolAttentionInput {
-  const parsed = validateToolInput<ScheduledPoolAttentionInput>(
-    "pool_attention_write",
-    ScheduledPoolAttentionSchema,
-    input,
-  );
-  if (parsed.action === "mark") {
-    if (!isRealDate(parsed.attention_from) || !isRealDate(parsed.attention_until)) {
-      throw new Error("近期关注起止日期必须是有效日历日期");
-    }
-    if (parsed.attention_until < parsed.attention_from) throw new Error("近期关注结束日期不得早于开始日期");
-    return {
-      ...parsed,
-      code: parsed.code.trim(),
-      reason: parsed.reason.trim(),
-      attention_reason: parsed.attention_reason.trim(),
-    };
+export function validateJobContextQueryInput(input: unknown): JobContextQueryInput {
+  const parsed = validateToolInput<JobContextQueryInput>("job_context_query", JobContextQuerySchema, input);
+  if (parsed.target_date && !isRealDate(parsed.target_date)) {
+    throw new Error(`作业目标日期不是有效日历日期：${parsed.target_date}`);
   }
-  return { ...parsed, code: parsed.code.trim(), reason: parsed.reason.trim() };
+  return {
+    ...parsed,
+    job_codes: uniqueValues(parsed.job_codes, "job_context_query job_codes"),
+    prompt_codes: uniqueValues(parsed.prompt_codes, "job_context_query prompt_codes"),
+  };
+}
+
+export function validateStrategyDocumentQueryInput(input: unknown): StrategyDocumentQueryInput {
+  const parsed = validateToolInput<StrategyDocumentQueryInput>(
+    "strategy_document_query", StrategyDocumentQuerySchema, input,
+  );
+  return { codes: uniqueValues(parsed.codes, "strategy_document_query codes")! };
+}
+
+export function validatePortfolioWriteInput(input: unknown): PortfolioWriteInput {
+  let reason: string;
+  let changes: Array<Static<typeof PositionChangeSchema>>;
+  if (input && typeof input === "object" && Array.isArray((input as { changes?: unknown }).changes)) {
+    const parsed = validateToolInput<Static<typeof PortfolioWriteSchema>>("portfolio_write", PortfolioWriteSchema, input);
+    reason = parsed.reason;
+    changes = parsed.changes;
+  } else {
+    const legacy = validateToolInput<Static<typeof LegacyPortfolioWriteSchema>>(
+      "portfolio_write",
+      LegacyPortfolioWriteSchema,
+      input,
+    );
+    const { reason: legacyReason, action: _action, ...change } = legacy;
+    reason = legacyReason;
+    changes = [change];
+  }
+  return {
+    reason: reason.trim(),
+    changes: changes.map((change) => {
+      const decisionOrigin = change.decision_origin ?? (change.kind === "note" ? "fact_correction" : undefined);
+      const executionCompliance = change.execution_compliance ?? (change.kind === "note" ? "not_applicable" : undefined);
+      if (!decisionOrigin) throw new Error(`${change.code} ${change.kind} 必须提供 decision_origin`);
+      if (!executionCompliance) throw new Error(`${change.code} ${change.kind} 必须提供 execution_compliance`);
+      if ((decisionOrigin === "unplanned_exception" || executionCompliance === "deviated") && !change.deviation_reason?.trim()) {
+        throw new Error(`${change.code} 计划外例外或执行偏离必须提供 deviation_reason`);
+      }
+      const normalized: PositionChangePortfolioWriteInput = {
+        ...change,
+        code: change.code.trim(),
+        decision_origin: decisionOrigin,
+        execution_compliance: executionCompliance,
+        ...(change.attribution_note ? { attribution_note: change.attribution_note.trim() } : {}),
+        ...(change.deviation_reason ? { deviation_reason: change.deviation_reason.trim() } : {}),
+      };
+      if (!isRealDate(normalized.change_date)) throw new Error(`成交日期不是有效日历日期：${normalized.change_date}`);
+      if ((normalized.kind === "buy" || normalized.kind === "sell") &&
+          (normalized.quantity === undefined || normalized.price === undefined)) {
+        throw new Error(`${normalized.code} ${normalized.kind} 必须携带正数 quantity 与 price`);
+      }
+      if (normalized.kind === "adjust" && normalized.quantity === undefined && normalized.price === undefined) {
+        throw new Error(`${normalized.code} adjust 需要 quantity 或 price 至少一项`);
+      }
+      if (normalized.kind === "note" && (normalized.quantity !== undefined || normalized.price !== undefined)) {
+        throw new Error(`${normalized.code} note 不允许携带 quantity 或 price`);
+      }
+      return normalized;
+    }),
+  };
+}
+
+export function validatePoolWriteInput(input: unknown): PoolWriteInput {
+  let reason: string;
+  let operations: PoolWriteOperation[];
+  if (input && typeof input === "object" && Array.isArray((input as { operations?: unknown }).operations)) {
+    const parsed = validateToolInput<Static<typeof PoolWriteSchema>>("pool_write", PoolWriteSchema, input);
+    reason = parsed.reason;
+    operations = parsed.operations;
+  } else {
+    const legacy = validateToolInput<Static<typeof LegacyPoolWriteSchema>>("pool_write", LegacyPoolWriteSchema, input);
+    const { reason: legacyReason, ...operation } = legacy;
+    reason = legacyReason;
+    operations = [operation];
+  }
+  const targetKeys = new Set<string>();
+  const normalized = operations.map((operation) => {
+    const key = operation.action === "set_board_order" ? `board:${operation.pool}` : `member:${operation.code}`;
+    if (targetKeys.has(key)) throw new Error(`pool_write operations 存在重复目标：${key}`);
+    targetKeys.add(key);
+    if (operation.action === "set_board_order") {
+      if (operation.code || operation.effective_from || operation.role || operation.tags) {
+        throw new Error("pool_write set_board_order 只允许 pool 和 board_codes");
+      }
+      if (!operation.board_codes) throw new Error("pool_write set_board_order 必须提供 board_codes");
+      if (new Set(operation.board_codes).size !== operation.board_codes.length) throw new Error("pool_write board_codes 不得重复");
+      return { ...operation, board_codes: operation.board_codes.map((code) => code.trim()) };
+    }
+    if (!operation.code || !operation.effective_from) throw new Error(`pool_write ${operation.action} 必须提供 code 和 effective_from`);
+    if (operation.board_codes !== undefined) throw new Error(`pool_write ${operation.action} 不接受 board_codes`);
+    if (!isRealDate(operation.effective_from)) throw new Error(`生效日期不是有效日历日期：${operation.effective_from}`);
+    if (operation.action === "add") {
+      for (const field of ["role", "grade", "score", "tags", "stock_character", "stage", "evaluation_summary"] as const) {
+        if (operation[field] === undefined || operation[field] === null || operation[field] === "") {
+          throw new Error(`pool_write add 必须提供 ${field}`);
+        }
+      }
+      if (operation.pool === "short" && operation.stop_loss_mode === undefined) {
+        throw new Error("pool_write add 短线成员必须提供 stop_loss_mode");
+      }
+    }
+    if (operation.pool === "long" && operation.stop_loss_mode !== undefined) throw new Error("pool_write 长线角色不使用 stop_loss_mode");
+    if (operation.action === "remove" &&
+        [operation.role, operation.grade, operation.score, operation.tags, operation.stock_character,
+         operation.stop_loss_mode, operation.stage, operation.evaluation_summary, operation.attention_reason,
+         operation.attention_from, operation.attention_until].some((value) => value !== undefined)) {
+      throw new Error("pool_write remove 只允许 code、pool 和 effective_from");
+    }
+    const tags = operation.tags?.map((tag) => tag.trim());
+    if (tags?.some((tag) => tag.startsWith("板块："))) {
+      throw new Error("pool_write tags 不再接受“板块：”本地标签；所属行业只读取同花顺官方关系");
+    }
+    return {
+      ...operation,
+      code: operation.code.trim(),
+      role: operation.role?.trim(),
+      grade: operation.grade?.trim(),
+      stock_character: operation.stock_character?.trim(),
+      stage: operation.stage?.trim(),
+      evaluation_summary: operation.evaluation_summary?.trim(),
+      tags,
+    };
+  });
+  return { reason: reason.trim(), operations: normalized };
+}
+
+export function validateScheduledPoolAttentionInput(input: unknown): ScheduledPoolAttentionInput {
+  let reason: string;
+  let items: ScheduledPoolAttentionItem[];
+  if (input && typeof input === "object" && Array.isArray((input as { items?: unknown }).items)) {
+    const parsed = validateToolInput<Static<typeof ScheduledPoolAttentionSchema>>(
+      "pool_attention_write", ScheduledPoolAttentionSchema, input,
+    );
+    reason = parsed.reason;
+    items = parsed.items;
+  } else {
+    const legacy = validateToolInput<Static<typeof LegacyScheduledPoolAttentionSchema>>(
+      "pool_attention_write", LegacyScheduledPoolAttentionSchema, input,
+    );
+    const { reason: legacyReason, ...item } = legacy;
+    reason = legacyReason;
+    items = [item];
+  }
+  const seen = new Set<string>();
+  const normalized = items.map((item) => {
+    const key = `${item.pool}:${item.code.toUpperCase()}`;
+    if (seen.has(key)) throw new Error(`pool_attention_write items 存在重复标的：${key}`);
+    seen.add(key);
+    if (item.action === "mark") {
+      if (!item.attention_status || !item.attention_reason || !item.attention_from || !item.attention_until) {
+        throw new Error(`${item.code} mark 必须提供关注状态、原因和起止日期`);
+      }
+      if (!isRealDate(item.attention_from) || !isRealDate(item.attention_until)) {
+        throw new Error(`${item.code} 近期关注起止日期必须是有效日历日期`);
+      }
+      if (item.attention_until < item.attention_from) throw new Error(`${item.code} 近期关注结束日期不得早于开始日期`);
+      return { ...item, code: item.code.trim(), attention_reason: item.attention_reason.trim() };
+    }
+    if (item.attention_status || item.attention_reason || item.attention_from || item.attention_until) {
+      throw new Error(`${item.code} clear 不接受关注状态、原因或日期`);
+    }
+    return { ...item, code: item.code.trim() };
+  });
+  return { reason: reason.trim(), items: normalized };
 }
 
 function validTimestamp(value: string): boolean {
@@ -990,12 +1148,4 @@ export function validateTriggerJobInput(input: unknown): TriggerJobInput {
     throw new Error(`作业目标日不是有效日历日期：${parsed.target_date}`);
   }
   return parsed;
-}
-
-export function validateUiRefreshInput(input: unknown): UiRefreshInput {
-  const parsed = validateToolInput<UiRefreshInput>("ui_refresh", UiRefreshSchema, input);
-  if (new Set(parsed.targets).size !== parsed.targets.length) {
-    throw new Error("ui_refresh targets 存在重复项");
-  }
-  return { ...parsed, reason: parsed.reason.trim() };
 }

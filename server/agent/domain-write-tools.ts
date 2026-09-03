@@ -22,6 +22,7 @@ import {
   type JobWriteInput,
   type FinalizeBacktestInput,
   type MemoryWriteInput,
+  type PoolWriteOperation,
   type PoolWriteInput,
   type PortfolioWriteInput,
 } from "./tool-validation.js";
@@ -61,13 +62,13 @@ async function oneRow(
   return result.rows[0] ?? null;
 }
 
-async function portfolioState(client: pg.PoolClient, input: PortfolioWriteInput, lock: boolean): Promise<unknown> {
+async function portfolioState(client: pg.PoolClient, code: string, lock: boolean): Promise<unknown> {
   const instrument = await oneRow(
     client,
     `SELECT id::text, code, name, kind FROM market_instrument WHERE code = $1${lock ? " FOR UPDATE" : ""}`,
-    [input.code],
+    [code],
   );
-  if (!instrument) throw new Error(`未知标的代码：${input.code}`);
+  if (!instrument) throw new Error(`未知标的代码：${code}`);
   const position = await oneRow(
     client,
     `SELECT instrument_id::text, quantity::text, cost_price::text, cost_basis,
@@ -85,7 +86,7 @@ async function portfolioState(client: pg.PoolClient, input: PortfolioWriteInput,
   return { instrument, position, latest_change: latestChange };
 }
 
-async function poolState(client: pg.PoolClient, input: PoolWriteInput, lock: boolean): Promise<unknown> {
+async function poolState(client: pg.PoolClient, input: PoolWriteOperation, lock: boolean): Promise<unknown> {
   if (input.action === "set_board_order") {
     const rows = await client.query(
       `SELECT preference.board_instrument_id::text, instrument.code, preference.sort
@@ -104,7 +105,7 @@ async function poolState(client: pg.PoolClient, input: PoolWriteInput, lock: boo
   if (!instrument) throw new Error(`未知标的代码：${input.code}`);
   const current = await oneRow(
     client,
-    `SELECT id::text, pool, role, grade, score::text, tags, stock_character, stage,
+    `SELECT id::text, pool, role, grade, score::text, tags, stock_character, stop_loss_mode, stage,
             evaluation_summary, attention_reason,
             attention_from::text, attention_until::text, effective_from::text, effective_to::text, note
        FROM pool_membership
@@ -117,6 +118,9 @@ async function poolState(client: pg.PoolClient, input: PoolWriteInput, lock: boo
   }
   if ((input.action === "update" || input.action === "remove") && !current) {
     throw new Error(`标的 ${input.code} 在 ${input.pool} 池没有当前角色行`);
+  }
+  if (input.action !== "remove" && input.pool === "short" && current?.pool !== "short" && !input.stop_loss_mode) {
+    throw new Error("新增或迁入短线池必须配置 stop_loss_mode");
   }
   return { instrument, current };
 }
@@ -222,8 +226,25 @@ async function targetState(
   sessionId?: string | null,
 ): Promise<unknown> {
   switch (toolName) {
-    case "portfolio_write": return portfolioState(client, input as PortfolioWriteInput, lock);
-    case "pool_write": return poolState(client, input as PoolWriteInput, lock);
+    case "portfolio_write": {
+      const value = input as PortfolioWriteInput;
+      const states = [];
+      for (const code of [...new Set(value.changes.map((change) => change.code))].sort()) {
+        states.push(await portfolioState(client, code, lock));
+      }
+      return states;
+    }
+    case "pool_write": {
+      const value = input as PoolWriteInput;
+      const operations = [...value.operations].sort((left, right) => {
+        const leftKey = left.action === "set_board_order" ? `board:${left.pool}` : `member:${left.code}`;
+        const rightKey = right.action === "set_board_order" ? `board:${right.pool}` : `member:${right.code}`;
+        return leftKey.localeCompare(rightKey);
+      });
+      const states = [];
+      for (const operation of operations) states.push(await poolState(client, operation, lock));
+      return states;
+    }
     case "job_write": return jobState(client, input as JobWriteInput, lock);
     case "finalize_backtest": return backtestState(client, input as FinalizeBacktestInput, lock, sessionId);
     case "memory_write": return memoryState(client, input as MemoryWriteInput, lock);
@@ -250,22 +271,34 @@ const DOMAIN_LABELS: Record<DomainWriteToolName, string> = {
 function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput): Record<string, unknown> {
   if (toolName === "portfolio_write") {
     const value = input as PortfolioWriteInput;
-    return { code: value.code, kind: value.kind, change_date: value.change_date, quantity: value.quantity, price: value.price };
+    return {
+      count: value.changes.length,
+      changes: value.changes.map((change) => ({
+        code: change.code,
+        kind: change.kind,
+        change_date: change.change_date,
+        quantity: change.quantity,
+        price: change.price,
+      })),
+    };
   }
   if (toolName === "pool_write") {
     const value = input as PoolWriteInput;
-    if (value.action === "set_board_order") return { pool: value.pool, board_codes: value.board_codes };
     return {
-      code: value.code,
-      pool: value.pool,
-      effective_from: value.effective_from,
-      role: value.role,
-      grade: value.grade,
-      score: value.score,
-      stage: value.stage,
-      attention_reason: value.attention_reason,
-      attention_from: value.attention_from,
-      attention_until: value.attention_until,
+      count: value.operations.length,
+      operations: value.operations.map((operation) => operation.action === "set_board_order"
+        ? { action: operation.action, pool: operation.pool, board_codes: operation.board_codes }
+        : {
+            action: operation.action,
+            code: operation.code,
+            pool: operation.pool,
+            effective_from: operation.effective_from,
+            role: operation.role,
+            grade: operation.grade,
+            score: operation.score,
+            stop_loss_mode: operation.stop_loss_mode,
+            stage: operation.stage,
+          }),
     };
   }
   if (toolName === "job_write") {
@@ -310,7 +343,9 @@ async function buildDomainWritePreview(
   sessionId?: string | null,
 ): Promise<DomainWritePreview> {
   const state = await targetState(client, toolName, input, lock, sessionId);
-  const action = "action" in input ? String(input.action) : toolName;
+  const action = toolName === "portfolio_write" || toolName === "pool_write"
+    ? "batch"
+    : "action" in input ? String(input.action) : toolName;
   return {
     tool_name: toolName,
     domain: DOMAIN_LABELS[toolName],
@@ -350,43 +385,55 @@ export async function executeDomainWriteInTransaction(
   switch (toolName) {
     case "portfolio_write": {
       const value = input as PortfolioWriteInput;
-      return recordPositionChange(client, {
-        code: value.code,
-        kind: value.kind,
-        quantity: value.quantity,
-        price: value.price,
-        change_date: value.change_date,
-        reason: value.reason,
-        source: "chat",
-        source_session_id: options.sessionId,
-        decision_origin: value.decision_origin,
-        execution_compliance: value.execution_compliance,
-        plan_output_id: value.plan_output_id,
-        attribution_note: value.attribution_note,
-        deviation_reason: value.deviation_reason,
-      });
+      const items = [];
+      for (const change of value.changes) {
+        items.push(await recordPositionChange(client, {
+          code: change.code,
+          kind: change.kind,
+          quantity: change.quantity,
+          price: change.price,
+          change_date: change.change_date,
+          reason: value.reason,
+          source: "chat",
+          source_session_id: options.sessionId,
+          decision_origin: change.decision_origin,
+          execution_compliance: change.execution_compliance,
+          plan_output_id: change.plan_output_id,
+          attribution_note: change.attribution_note,
+          deviation_reason: change.deviation_reason,
+        }));
+      }
+      return { total: items.length, items };
     }
     case "pool_write": {
       const value = input as PoolWriteInput;
-      if (value.action === "set_board_order") return setPoolBoardOrder(client, value.pool, value.board_codes);
-      return applyPoolChange(client, {
-        action: value.action,
-        code: value.code,
-        pool: value.pool,
-        role: value.role,
-        grade: value.grade,
-        score: value.score,
-        tags: value.tags,
-        stock_character: value.stock_character,
-        stage: value.stage,
-        evaluation_summary: value.evaluation_summary,
-        attention_reason: value.attention_reason,
-        attention_from: value.attention_from,
-        attention_until: value.attention_until,
-        effective_from: value.effective_from,
-        note: value.note,
-        evaluation_session_id: options.sessionId,
-      });
+      const items = [];
+      for (const operation of value.operations) {
+        if (operation.action === "set_board_order") {
+          items.push(await setPoolBoardOrder(client, operation.pool, operation.board_codes!));
+          continue;
+        }
+        items.push(await applyPoolChange(client, {
+          action: operation.action,
+          code: operation.code!,
+          pool: operation.pool,
+          role: operation.role,
+          grade: operation.grade,
+          score: operation.score,
+          tags: operation.tags,
+          stock_character: operation.stock_character,
+          stop_loss_mode: operation.stop_loss_mode,
+          stage: operation.stage,
+          evaluation_summary: operation.evaluation_summary,
+          attention_reason: operation.attention_reason,
+          attention_from: operation.attention_from,
+          attention_until: operation.attention_until,
+          effective_from: operation.effective_from!,
+          note: operation.note,
+          evaluation_session_id: options.sessionId,
+        }));
+      }
+      return { total: items.length, items };
     }
     case "job_write": {
       const value = input as JobWriteInput;

@@ -3,7 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import type pg from "pg";
 import { setAiRuntimeForTests } from "../../server/agent/ai/runtime.js";
-import { buildJobPoolAttentionTool } from "../../server/agent/job-tools.js";
+import { buildChatTools } from "../../server/agent/tools.js";
 import { acquireAgentMutationLock } from "../../server/agent/mutation-lock.js";
 import { acquireMarketMutationLock } from "../../server/datasource/mutation-lock.js";
 import { controlAgentRun, getActiveAgentRun } from "../../server/agent/run-control.js";
@@ -78,11 +78,10 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(jobs.find((job) => job.code === "midweek_check")?.cron).toBe("30 17 * * 2");
     expect(jobs.find((job) => job.code === "weekly_review")?.cron).toBe("0 20 * * 0");
     expect(jobs.find((job) => job.code === "auction_opportunity_assessment")?.cron).toBe("30 9 * * 1-5");
-    expect(jobs.find((job) => job.code === "daily_plan_flow")?.config).toEqual({
-      daily_plan_write: true,
-      pool_attention_write: true,
-    });
-    expect(jobs.filter((job) => job.job_type === "agent_flow" && job.code !== "daily_plan_flow")
+    const dailyPlan = jobs.find((job) => job.code === "daily_plan_flow")!;
+    expect(dailyPlan.cron).toBe("15 17 * * 1-5");
+    expect(dailyPlan.config).toEqual({});
+    expect(jobs.filter((job) => job.job_type === "agent_flow")
       .every((job) => Object.keys(job.config).length === 0)).toBe(true);
     expect(
       jobs
@@ -115,6 +114,13 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         new Date("2026-08-17T02:00:00Z"),
       ).map((date) => date.toISOString()),
     ).toEqual(["2026-08-17T01:00:00.000Z"]);
+    expect(
+      cronOccurrences(
+        dailyPlan.cron,
+        new Date("2026-08-28T00:00:00Z"),
+        new Date("2026-08-31T10:00:00Z"),
+      ).map((date) => date.toISOString()),
+    ).toEqual(["2026-08-28T09:15:00.000Z", "2026-08-31T09:15:00.000Z"]);
   });
 
   it("日更范围包含核心指数、官方行业和当日池外市场结构候选，不跟随全量目录膨胀", async () => {
@@ -294,23 +300,34 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(historical.target_date).toBe("2026-08-20");
   });
 
-  it("每日计划窄权限工具只维护池内自动关注且不覆盖人工关注", async () => {
-    await pool.query("INSERT INTO market_instrument (code,name,kind) VALUES ('990088.SZ','关注工具测试','stock')");
+  it("共享工具目录可维护自动关注并自动绑定当前计划运行", async () => {
+    await pool.query(
+      `INSERT INTO market_instrument (code,name,kind) VALUES
+         ('990088.SZ','关注工具测试','stock'),
+         ('990089.SZ','预案工具测试','stock')`,
+    );
     await pool.query(
       `INSERT INTO pool_membership (instrument_id,pool,role,effective_from)
        SELECT id,'short','观察','2026-08-01' FROM market_instrument WHERE code='990088.SZ'`,
     );
+    await pool.query(
+      `INSERT INTO portfolio_position (instrument_id,quantity,cost_price)
+       SELECT id,100,10 FROM market_instrument WHERE code='990089.SZ'`,
+    );
     const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-18");
-    const tool = buildJobPoolAttentionTool({ pool, sessionId: run.session_id! });
+    const tools = buildChatTools({ pool, sessionId: run.session_id! });
+    const tool = tools.find((item) => item.name === "pool_attention_write")!;
     await tool.execute("tc-attention-mark", {
       reason: "每日计划识别出接近完整条件",
-      action: "mark",
-      code: "990088.SZ",
-      pool: "short",
-      attention_status: "approaching",
-      attention_reason: "仍缺放量站稳关键位",
-      attention_from: "2026-08-18",
-      attention_until: "2026-08-25",
+      items: [{
+        action: "mark",
+        code: "990088.SZ",
+        pool: "short",
+        attention_status: "approaching",
+        attention_reason: "仍缺放量站稳关键位",
+        attention_from: "2026-08-18",
+        attention_until: "2026-08-25",
+      }],
     });
     expect((await pool.query(
       "SELECT attention_reason,attention_from::text,attention_until::text FROM pool_membership WHERE effective_to IS NULL",
@@ -322,12 +339,23 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     await pool.query("UPDATE pool_membership SET attention_reason='人工持续跟踪' WHERE effective_to IS NULL");
     await expect(tool.execute("tc-attention-clear", {
       reason: "本轮已不接近条件",
-      action: "clear",
-      code: "990088.SZ",
-      pool: "short",
+      items: [{ action: "clear", code: "990088.SZ", pool: "short" }],
     })).rejects.toThrow("不得清除");
     expect((await pool.query("SELECT attention_reason FROM pool_membership WHERE effective_to IS NULL")).rows[0]!.attention_reason)
       .toBe("人工持续跟踪");
+
+    await tools.find((item) => item.name === "daily_plan_write")!.execute("tc-plan-write", {
+      items: [{
+        item_kind: "position_action",
+        code: "990089.SZ",
+        action: "hold",
+        trigger_kind: "open",
+        headline: "继续观察",
+      }],
+    });
+    expect((await pool.query<{ source_job_run_id: string }>(
+      "SELECT source_job_run_id::text FROM daily_plan_playbook WHERE code='990089.SZ'",
+    )).rows[0]!.source_job_run_id).toBe(run.id);
   });
 
   it("调度器最多并行三个任务，且 datasource 保持单路执行", async () => {
@@ -737,7 +765,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         async () => {
           await finalGate;
           return fauxAssistantMessage([
-            fauxText("> AI 生成预览，未经用户确认，不是交易建议，也未写入内容库或业务表。\n\n# 统一执行器"),
+            fauxText("> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。\n\n# 统一执行器"),
           ]);
         },
       ]);
@@ -794,6 +822,76 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     }
   });
 
+  it("agent_flow 只把带结果标记的普通 stop 视为完成，进度文本或长度上限会受控续写", async () => {
+    const faux = fauxProvider();
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const model = models.getModels("faux")[0]!;
+    setAiRuntimeForTests({
+      models,
+      model,
+      provider: "faux",
+      providerName: "Faux",
+      modelId: model.id,
+    });
+    try {
+      faux.setResponses([
+        fauxAssistantMessage([fauxText("工具数据已经齐全，我继续整理最终结果。")]),
+        fauxAssistantMessage([fauxText("")], { stopReason: "length" }),
+        fauxAssistantMessage([
+          fauxText("> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。\n\n# 截断后完成"),
+        ]),
+      ]);
+      const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
+      const finished = await executeJobRun({ pool, databaseUrl: prepared!.url }, run.id);
+      expect(finished).toMatchObject({ status: "success", attempt_count: 1, next_retry_at: null });
+      const messages = await pool.query<{ role: string; text: string }>(
+        "SELECT role, content #>> '{content,0,text}' AS text FROM chat_message WHERE session_id = $1 ORDER BY seq",
+        [run.session_id],
+      );
+      expect(messages.rows.map((row) => row.role)).toEqual([
+        "user", "assistant", "user", "assistant", "user", "assistant", "assistant",
+      ]);
+      expect(messages.rows[2]!.text).toContain("已有的完整工具结果继续");
+      expect(messages.rows[4]!.text).toContain("已有的完整工具结果继续");
+      expect(messages.rows.every((row) => !row.text?.includes("任务将在计划时间自动重试"))).toBe(true);
+    } finally {
+      setAiRuntimeForTests(null);
+    }
+  });
+
+  it("agent_flow 连续未生成合格最终结果时达到明确上限并进入任务重试", async () => {
+    const faux = fauxProvider();
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const model = models.getModels("faux")[0]!;
+    setAiRuntimeForTests({
+      models,
+      model,
+      provider: "faux",
+      providerName: "Faux",
+      modelId: model.id,
+    });
+    try {
+      faux.setResponses(Array.from({ length: 4 }, () =>
+        fauxAssistantMessage([fauxText("仍在处理，尚未生成最终结果。")])));
+      const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
+      const finished = await executeJobRun({
+        pool,
+        databaseUrl: prepared!.url,
+        retryDelayMs: 1_000,
+      }, run.id);
+      expect(finished).toMatchObject({ status: "queued", attempt_count: 1 });
+      expect(finished!.log).toContain("未在 4 个受控执行段内生成完整最终结果");
+      expect((await pool.query(
+        "SELECT count(*)::int AS count FROM job_run_output WHERE run_id = $1",
+        [run.id],
+      )).rows[0]!.count).toBe(0);
+    } finally {
+      setAiRuntimeForTests(null);
+    }
+  });
+
   it("集合竞价任务成功后激活结构化判断并刷新打板机会", async () => {
     await pool.query("INSERT INTO market_instrument (code,name,kind) VALUES ('990091.SZ','竞价机会测试','stock')");
     const planRun = await queueManualJob(pool, "daily_plan_flow", "2026-08-18");
@@ -845,7 +943,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
           { stopReason: "toolUse" },
         ),
         fauxAssistantMessage([
-          fauxText("> AI 生成预览，未经用户确认，不是交易建议，也未写入内容库或业务表。\n\n# 集合竞价研判完成"),
+          fauxText("> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。\n\n# 集合竞价研判完成"),
         ]),
       ]);
       const run = await queueManualJob(pool, "auction_opportunity_assessment", "2026-08-19");

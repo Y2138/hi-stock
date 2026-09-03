@@ -49,7 +49,8 @@ export async function fetchLimitPoolPage(
   if (![result.timestampMs, result.page, result.pages, result.total].every(Number.isFinite)) {
     throw new Error("扶摇涨跌停分页字段异常");
   }
-  if (result.page !== input.page || result.pages < result.page || result.total < result.items.length) {
+  const emptyPage = result.page === 1 && result.pages === 0 && result.total === 0 && result.items.length === 0;
+  if (result.page !== input.page || (!emptyPage && result.pages < result.page) || result.total < result.items.length) {
     throw new Error("扶摇涨跌停分页回显不一致");
   }
   return result;

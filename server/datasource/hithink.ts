@@ -170,6 +170,7 @@ interface KlineItem {
   low_price?: number;
   close_price?: number;
   volume?: number;
+  turnover?: number;
 }
 
 /**
@@ -223,6 +224,7 @@ export async function fetchKline(req: FetchRequest, deps: HithinkDeps = {}): Pro
       low: Number(r.low_price),
       close: Number(r.close_price),
       volume: r.volume == null ? undefined : Number(r.volume),
+      turnover: r.turnover == null ? undefined : Number(r.turnover),
       adjustment,
     }));
   }
@@ -241,6 +243,7 @@ export interface SnapshotQuote {
   low: number;
   close: number;
   volume?: number;
+  turnover?: number;
   prevClose?: number;
 }
 
@@ -290,6 +293,7 @@ export async function fetchSnapshot(
       low: Number(row.low_price),
       close: Number(row.last_price),
       volume: row.volume == null ? undefined : Number(row.volume),
+      turnover: row.turnover == null ? undefined : Number(row.turnover),
       prevClose: row.prev_price == null ? undefined : Number(row.prev_price),
     })));
   }

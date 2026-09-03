@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type pg from "pg";
 import { apiErrors } from "../http/router.js";
 
-export const ANALYSIS_SERVICE_VERSION = "analysis-v1";
+export const ANALYSIS_SERVICE_VERSION = "analysis-v2";
 export const ANALYSIS_TYPES = ["sector_temperature", "key_levels", "long_valuation"] as const;
 export type AnalysisType = (typeof ANALYSIS_TYPES)[number];
 type Db = Pick<pg.Pool, "query">;
@@ -38,7 +38,7 @@ interface Bar {
   high: string;
   low: string;
   close: string;
-  volume: string;
+  volume: string | null;
   bar_time: string;
 }
 
@@ -83,6 +83,107 @@ function grouped(bars: Bar[]): Map<string, Bar[]> {
   return map;
 }
 
+export interface MarketRegimeResult {
+  status: "success" | "partial" | "unavailable";
+  state: "牛市" | "震荡" | "熊市" | null;
+  as_of: string | null;
+  base_date: string | null;
+  composite_index: number | null;
+  ma5: number | null;
+  ma20: number | null;
+  roc5_pct: number | null;
+  coverage: {
+    expected_boards: number;
+    available_boards: number;
+    required_dates: number;
+    available_dates: number;
+    missing_codes: string[];
+  };
+  reason: string | null;
+}
+
+function unavailableMarketRegime(expectedBoards: number, reason: string): MarketRegimeResult {
+  return {
+    status: "unavailable",
+    state: null,
+    as_of: null,
+    base_date: null,
+    composite_index: null,
+    ma5: null,
+    ma20: null,
+    roc5_pct: null,
+    coverage: {
+      expected_boards: expectedBoards,
+      available_boards: 0,
+      required_dates: 21,
+      available_dates: 0,
+      missing_codes: [],
+    },
+    reason,
+  };
+}
+
+/** 全部一级行业等权日收益合成综合指数；窗口内任一板块缺数时不输出伪完整状态。 */
+function marketRegime(codes: string[], bars: Map<string, Bar[]>): MarketRegimeResult {
+  if (codes.length === 0) return unavailableMarketRegime(0, "没有有效的 881 一级行业板块");
+  const dates = [...new Set(codes.flatMap((code) => (bars.get(code) ?? []).map((bar) => bar.bar_date)))].sort();
+  const requiredDates = dates.slice(-21);
+  if (requiredDates.length < 21) {
+    const unavailable = unavailableMarketRegime(codes.length, `综合指数至少需要 21 个交易日，当前仅 ${requiredDates.length} 日`);
+    unavailable.as_of = requiredDates.at(-1) ?? null;
+    unavailable.base_date = requiredDates.at(0) ?? null;
+    unavailable.coverage.available_dates = requiredDates.length;
+    return unavailable;
+  }
+  const closes = new Map<string, Map<string, number>>();
+  for (const code of codes) {
+    closes.set(code, new Map((bars.get(code) ?? []).map((bar) => [bar.bar_date, Number(bar.close)])));
+  }
+  const completeCodes = codes.filter((code) => requiredDates.every((date) => Number.isFinite(closes.get(code)?.get(date))));
+  const missingCodes = codes.filter((code) => !completeCodes.includes(code));
+  const coverage = {
+    expected_boards: codes.length,
+    available_boards: completeCodes.length,
+    required_dates: 21,
+    available_dates: requiredDates.length,
+    missing_codes: missingCodes,
+  };
+  if (missingCodes.length > 0) {
+    return {
+      ...unavailableMarketRegime(codes.length, `综合指数窗口有 ${missingCodes.length} 个一级行业缺数`),
+      status: "partial",
+      as_of: requiredDates.at(-1)!,
+      base_date: requiredDates.at(0)!,
+      coverage,
+    };
+  }
+
+  const points = [100];
+  for (let index = 1; index < requiredDates.length; index += 1) {
+    const date = requiredDates[index]!;
+    const previousDate = requiredDates[index - 1]!;
+    const dailyReturn = mean(codes.map((code) => closes.get(code)!.get(date)! / closes.get(code)!.get(previousDate)! - 1))!;
+    points.push(points.at(-1)! * (1 + dailyReturn));
+  }
+  const composite = points.at(-1)!;
+  const ma5 = mean(points.slice(-5))!;
+  const ma20 = mean(points.slice(-20))!;
+  const roc5Pct = (composite / points.at(-6)! - 1) * 100;
+  const state = ma5 > ma20 && roc5Pct > 0 ? "牛市" : ma5 < ma20 && roc5Pct < 0 ? "熊市" : "震荡";
+  return {
+    status: "success",
+    state,
+    as_of: requiredDates.at(-1)!,
+    base_date: requiredDates.at(0)!,
+    composite_index: composite,
+    ma5,
+    ma20,
+    roc5_pct: roc5Pct,
+    coverage,
+    reason: null,
+  };
+}
+
 /** 同花顺一级行业板块全集：code → 板块名 */
 async function industryBoards(db: Db): Promise<Map<string, string>> {
   const result = await db.query<{ code: string; name: string }>(
@@ -96,9 +197,32 @@ async function industryBoards(db: Db): Promise<Map<string, string>> {
   return new Map(result.rows.map((row) => [row.code, row.name]));
 }
 
-async function sectorTemperature(db: Db, request: AnalysisRequest) {
+export interface SectorTemperatureOutcome {
+  result: {
+    average_temperature: number | null;
+    available_average_temperature: number | null;
+    state: string;
+    market_regime: MarketRegimeResult;
+    sectors: Array<{
+      sector: string;
+      code: string;
+      as_of: string;
+      close: number;
+      ma20: number;
+      temperature: number;
+      day_return_pct: number;
+      five_day_return_pct: number;
+      volume_ratio_5: number | null;
+    }>;
+  };
+  gaps: unknown[];
+  input: { requested_codes: number; available_codes: number; latest_date: string | null };
+}
+
+export async function querySectorTemperature(db: Db, request: AnalysisRequest): Promise<SectorTemperatureOutcome> {
   const boards = await industryBoards(db);
-  const codes = request.codes?.length ? request.codes : [...boards.keys()];
+  const defaultUniverse = !request.codes?.length;
+  const codes = defaultUniverse ? [...boards.keys()] : request.codes!;
   const namesByCode = new Map(boards);
   const unknown = codes.filter((code) => !namesByCode.has(code));
   if (unknown.length > 0) {
@@ -108,7 +232,7 @@ async function sectorTemperature(db: Db, request: AnalysisRequest) {
     );
     for (const row of extra.rows) namesByCode.set(row.code, row.name);
   }
-  const bars = grouped(await selectBars(db, codes, "day", request.as_of, Math.max(25, request.lookback ?? 60)));
+  const bars = grouped(await selectBars(db, codes, "day", request.as_of, Math.max(60, request.lookback ?? 60)));
   const gaps: unknown[] = [];
   const items = codes.map((code) => {
     const rows = bars.get(code) ?? [];
@@ -134,12 +258,21 @@ async function sectorTemperature(db: Db, request: AnalysisRequest) {
       five_day_return_pct: (close / fiveAgo - 1) * 100,
       volume_ratio_5: avgVolume5 && avgVolume5 > 0 ? (volumes.at(-1) ?? 0) / avgVolume5 : null,
     };
-  }).filter(Boolean);
-  const average = mean(items.map((item) => item!.temperature));
+  }).filter((item): item is NonNullable<typeof item> => item !== null);
+  const availableAverage = mean(items.map((item) => item!.temperature));
+  const average = items.length === codes.length ? availableAverage : null;
+  const regime = defaultUniverse
+    ? marketRegime(codes, bars)
+    : unavailableMarketRegime(codes.length, "市场状态只使用完整的 881 一级行业全集计算");
+  if (defaultUniverse && regime.status !== "success" && gaps.length === 0) {
+    gaps.push({ scope: "market_regime", reason: regime.reason });
+  }
   return {
     result: {
       average_temperature: average,
+      available_average_temperature: availableAverage,
       state: average === null ? "数据不足" : average < 30 ? "低温" : average < 50 ? "偏冷" : average < 60 ? "中性" : average < 75 ? "偏暖" : "高温",
+      market_regime: regime,
       sectors: items,
     },
     gaps,
@@ -288,7 +421,7 @@ export async function executeAnalysis(db: Db, raw: AnalysisRequest): Promise<Ana
   await db.query("UPDATE analysis_run SET status = 'running', started_at = now() WHERE id = $1", [id]);
   try {
     const outcome = request.analysis_type === "sector_temperature"
-      ? await sectorTemperature(db, request)
+      ? await querySectorTemperature(db, request)
       : request.analysis_type === "key_levels"
         ? await keyLevels(db, request)
         : await longValuation(db, request);

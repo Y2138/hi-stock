@@ -1,19 +1,12 @@
 import crypto from "node:crypto";
 import path from "node:path";
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
 import { executeAnalysis, type AnalysisRequest } from "../analysis/service.js";
 import { persistAndPublishSessionEvent } from "../agent/events.js";
 import { buildSystemPrompt } from "../agent/prompt.js";
 import { appendMessage, nextMessageSeq, updateSessionStatus } from "../agent/repo.js";
 import { runAgentSessionTurn } from "../agent/session-runner.js";
-import { getAgentSettings } from "../agent/settings.js";
-import { buildChatTools } from "../agent/tools.js";
-import {
-  buildJobAuctionAssessmentTool,
-  buildJobDailyPlanTool,
-  buildJobPoolAttentionTool,
-} from "../agent/job-tools.js";
 import {
   activateAuctionAssessmentsForRun,
   activatePlaybookForRun,
@@ -55,6 +48,8 @@ import type {
 
 const MAX_LOG_CHARS = 100_000;
 const RESULT_BANNER = "> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。";
+const AGENT_FLOW_FINALIZE_PROMPT =
+  `上一执行段达到输出上限或尚未产生合格最终正文。请优先基于本对话已有的完整工具结果继续，只有上下文已经压缩且摘要明确缺少完成任务所需字段时才补查缺失部分；结构化写入尚未完成时先完成，已经完成时不要重复调用。最后输出完整 Markdown，首行必须是：${RESULT_BANNER}`;
 export const DEFAULT_RETRY_DELAY_MS = 5 * 60_000;
 
 class AgentRunAbortedError extends Error {
@@ -125,8 +120,6 @@ const CORE_MARKET_INDEX_CODES = [
   "399006.SZ",
 ] as const;
 
-const DAILY_STRUCTURE_CANDIDATE_LIMIT = 30;
-
 /** 当前持仓、有效标的池、市场结构候选、核心指数和官方行业是日更范围；期货单独走 futures_day。 */
 export async function resolveDailyUpdateScope(
   pool: pg.Pool,
@@ -194,9 +187,8 @@ export async function resolveDailyUpdateScope(
                ranked.is_org_or_hot_money DESC,
                ranked.streak_count DESC NULLS LAST,
                ranked.net_amount DESC NULLS LAST,
-               instrument.code
-      LIMIT $2`,
-    [targetDate, DAILY_STRUCTURE_CANDIDATE_LIMIT],
+               instrument.code`,
+    [targetDate],
   );
   const futures = await pool.query<{ code: string }>(
     "SELECT code FROM market_instrument WHERE kind = 'futures' ORDER BY code",
@@ -231,7 +223,6 @@ function buildAgentJobPrompt(
   template: string,
   run: JobRunRow,
   definition: JobDefinitionRow,
-  config: AgentFlowJobConfig,
 ): string {
   if (run.attempt_count > 1) {
     return [
@@ -240,21 +231,11 @@ function buildAgentJobPrompt(
       `首行必须是：${RESULT_BANNER}`,
     ].join("\n\n");
   }
-  const writes = [
-    config.pool_attention_write ? "pool_attention_write 维护当前池成员的短期关注" : null,
-    config.daily_plan_write ? "daily_plan_write 写入次日执行预案与打板机会结构化数据" : null,
-    definition.code === "auction_opportunity_assessment"
-      ? "auction_assessment_write 更新打板机会的结构化竞价复核"
-      : null,
-  ].filter(Boolean);
-  const capability = "本任务使用与普通 Agent 相同的完整工具集和当前确认制/YOLO 设置；策略发布仍只能创建待真人审核提案。";
-  const tools = writes.length
-    ? `本流程另提供 ${writes.join("、")}。数据库查询仍须遵循 schema_hash 渐进发现协议，数据缺失必须列入缺口。`
-    : "数据库查询须遵循 schema_hash 渐进发现协议，数据缺失必须列入缺口。";
+  const capability = "本任务与普通对话、续写和用户干预使用同一完整工具集及当前确认制/YOLO 设置；Agent 按任务需要自行选择工具，策略发布仍只能创建待真人审核提案。";
   return [
     `执行系统作业 ${definition.code}（目标日 ${run.target_date}）。`,
     capability,
-    tools,
+    "数据库查询须遵循 schema_hash 渐进发现协议，数据缺失必须列入缺口。",
     `请直接输出完整 Markdown。首行必须是：${RESULT_BANNER}`,
     "以下是数据库内固化的流程提示词；遵循其读取范围和输出结构：",
     template,
@@ -318,24 +299,8 @@ async function runAgentFlow(
   prompt: string,
   sessionId: string,
   strategy: StrategyBundle,
-  config: AgentFlowJobConfig,
-  run: JobRunRow,
-  definition: JobDefinitionRow,
 ): Promise<string> {
   const systemPrompt = await buildSystemPrompt(pool, strategy);
-  const settings = await getAgentSettings(pool);
-  const tools: AgentTool[] = buildChatTools({
-    pool,
-    sessionId,
-    marketDomainToolsEnabled: settings.market_domain_tools_enabled,
-  });
-  if (config.pool_attention_write) tools.push(buildJobPoolAttentionTool({ pool, sessionId }));
-  if (config.daily_plan_write) {
-    tools.push(buildJobDailyPlanTool({ pool, sessionId, runId: run.id }));
-  }
-  if (definition.code === "auction_opportunity_assessment") {
-    tools.push(buildJobAuctionAssessmentTool({ pool, sessionId, runId: run.id }));
-  }
   const turn = await runAgentSessionTurn({
     pool,
     sessionId,
@@ -345,13 +310,18 @@ async function runAgentFlow(
       "自动作业与普通 Agent 使用相同工具权限和当前确认制/YOLO 设置；策略发布仍只能创建待真人审核提案。任务结果由 Runner 关联本次运行保存。",
     manageSessionStatus: false,
     text: prompt,
-    tools,
+    continuationPrompt: AGENT_FLOW_FINALIZE_PROMPT,
+    isCompleteAssistantText: (text) => text.startsWith(RESULT_BANNER),
   });
   if (turn.aborted) throw new AgentRunAbortedError();
   if (turn.llmError) throw new Error(turn.llmError);
+  const stopReason = turn.lastAssistant?.role === "assistant" ? turn.lastAssistant.stopReason : undefined;
+  if (stopReason === "error") {
+    throw new Error(turn.lastAssistant?.role === "assistant" ? turn.lastAssistant.errorMessage ?? "LLM 调用失败" : "LLM 调用失败");
+  }
   const markdown = textOfAssistant(turn.lastAssistant);
-  if (!markdown) throw new Error("agent_flow 未产生 Markdown 文本");
-  return markdown.startsWith(RESULT_BANNER) ? markdown : `${RESULT_BANNER}\n\n${markdown}`;
+  if (!markdown.startsWith(RESULT_BANNER)) throw new Error("agent_flow 未产生带完成标记的最终 Markdown");
+  return markdown;
 }
 
 async function pinJobStrategySnapshot(pool: pg.Pool, run: JobRunRow): Promise<StrategyBundle> {
@@ -539,7 +509,7 @@ async function executeAgentFlow(
   }
   const strategy = await pinJobStrategySnapshot(deps.pool, run);
   const revision = await pinJobPromptRevision(deps.pool, run, definition);
-  const prompt = buildAgentJobPrompt(revision.content, run, definition, config);
+  const prompt = buildAgentJobPrompt(revision.content, run, definition);
   let markdown: string;
   if (deps.agentFlow) {
     await appendConversationMessage(deps.pool, run.session_id, "user", prompt);
@@ -547,7 +517,7 @@ async function executeAgentFlow(
     markdown = markdown.startsWith(RESULT_BANNER) ? markdown : `${RESULT_BANNER}\n\n${markdown}`;
     await appendConversationMessage(deps.pool, run.session_id, "assistant", markdown);
   } else {
-    markdown = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, config, run, definition);
+    markdown = await runAgentFlow(deps.pool, prompt, run.session_id, strategy);
   }
   return {
     status: "success",
@@ -736,8 +706,7 @@ export async function executeJobRun(deps: RunnerDeps, runId: string): Promise<Jo
     await setJobSessionStatus(deps.pool, finished.run.session_id, result.status, finishedAt)
       .catch((error) => logConversationSyncError(finished.run.id, error));
     const refreshTargets = detail.job.code === "daily_plan_flow"
-      ? ["jobs", "status", "dashboard", "positions",
-          ...((config as AgentFlowJobConfig).pool_attention_write ? ["pools"] : [])]
+      ? ["jobs", "status", "dashboard", "positions", "pools"]
       : detail.job.code === "auction_opportunity_assessment"
         ? ["jobs", "status", "dashboard"]
       : ["jobs", "status"];

@@ -60,7 +60,7 @@ export function validateJobConfig(jobType: JobType, input: unknown): ValidatedJo
       return { analysis_type: config.analysis_type, ...(config.request ? { request: config.request as AnalysisJobConfig["request"] } : {}) };
     }
     case "agent_flow": {
-      // 兼容已保存的旧配置；readonly 不再改变定时 Agent 权限，也不向新工具输入暴露。
+      // 兼容迁移前的旧配置；Agent Flow 与普通对话统一使用共享工具目录。
       noUnknownKeys(config, ["readonly", "pool_attention_write", "daily_plan_write"]);
       if (config.readonly !== undefined && config.readonly !== true) {
         throw new Error("agent_flow 旧 config.readonly 只能为 true");
@@ -71,10 +71,7 @@ export function validateJobConfig(jobType: JobType, input: unknown): ValidatedJo
       if (config.daily_plan_write !== undefined && config.daily_plan_write !== true) {
         throw new Error("agent_flow config.daily_plan_write 只能为 true");
       }
-      return {
-        ...(config.pool_attention_write ? { pool_attention_write: true as const } : {}),
-        ...(config.daily_plan_write ? { daily_plan_write: true as const } : {}),
-      };
+      return {};
     }
   }
 }

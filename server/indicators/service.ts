@@ -1,7 +1,12 @@
-// 指标脏序列全历史重算：单序列锁、generation 防旧结果提交、原子替换当前值。
+// 指标脏序列按正式窗口全量重算：单序列锁、generation 防旧结果提交、原子替换当前值。
 import crypto from "node:crypto";
 import type pg from "pg";
-import { calculateIndicators, INDICATOR_CALCULATION_VERSION } from "./formulas.js";
+import {
+  calculateDefenseRecovery,
+  calculateIndicators,
+  INDICATOR_CALCULATION_VERSION,
+  STOCK_CHARACTER_CALCULATION_VERSION,
+} from "./formulas.js";
 
 export type IndicatorFreq = "day" | "30m" | "futures_day";
 
@@ -111,6 +116,11 @@ export async function recomputeIndicatorSeries(
               bar.adjustment, instrument.kind
          FROM market_bar bar JOIN market_instrument instrument ON instrument.id = bar.instrument_id
         WHERE bar.instrument_id = $1 AND bar.freq = $2
+          AND ($2 <> 'day' OR bar.bar_date >= (
+            SELECT max(boundary.bar_date) - INTERVAL '6 years'
+              FROM market_bar boundary
+             WHERE boundary.instrument_id = $1 AND boundary.freq = $2
+          ))
         ORDER BY bar.bar_date, bar.bar_time`,
       [dirty.instrument_id, dirty.freq],
     );
@@ -169,22 +179,52 @@ export async function recomputeIndicatorSeries(
         dif: values[index]!.dif,
         dea: values[index]!.dea,
         macd_hist: values[index]!.macdHist,
+        rsi14: values[index]!.rsi14,
       }));
       await client.query(
         `WITH incoming AS (
            SELECT * FROM jsonb_to_recordset($4::jsonb) AS item(
              bar_date date, bar_time timestamptz,
              ma5 float8, ma10 float8, ma20 float8, ma60 float8,
-             dif float8, dea float8, macd_hist float8
+             dif float8, dea float8, macd_hist float8, rsi14 float8
            )
          )
          INSERT INTO market_indicator_value
            (instrument_id, freq, bar_date, bar_time, run_id,
-            ma5, ma10, ma20, ma60, dif, dea, macd_hist, status)
-         SELECT $1,$2,bar_date,bar_time,$3,ma5,ma10,ma20,ma60,dif,dea,macd_hist,$5
+            ma5, ma10, ma20, ma60, dif, dea, macd_hist, rsi14, status)
+         SELECT $1,$2,bar_date,bar_time,$3,ma5,ma10,ma20,ma60,dif,dea,macd_hist,rsi14,$5
            FROM incoming`,
         [dirty.instrument_id, dirty.freq, run.rows[0]!.id, JSON.stringify(payload), status === "untrusted" ? "untrusted" : "ready"],
       );
+      if (dirty.freq === "day" && bars.rows[0]!.kind === "stock") {
+        const metric = calculateDefenseRecovery(bars.rows.map((bar, index) => ({
+          close: bar.close,
+          ma10: values[index]!.ma10,
+        })));
+        await client.query(
+          `INSERT INTO market_stock_character_metric
+             (instrument_id, as_of_date, calculation_version, indicator_run_id,
+              input_row_count, defense_break_count, defense_recovered_count, defense_recovery_ma10)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (instrument_id, as_of_date, calculation_version) DO UPDATE SET
+             indicator_run_id = EXCLUDED.indicator_run_id,
+             input_row_count = EXCLUDED.input_row_count,
+             defense_break_count = EXCLUDED.defense_break_count,
+             defense_recovered_count = EXCLUDED.defense_recovered_count,
+             defense_recovery_ma10 = EXCLUDED.defense_recovery_ma10,
+             computed_at = now()`,
+          [
+            dirty.instrument_id,
+            bars.rows.at(-1)!.bar_date,
+            STOCK_CHARACTER_CALCULATION_VERSION,
+            run.rows[0]!.id,
+            metric.inputRowCount,
+            metric.eventCount,
+            metric.recoveredCount,
+            metric.recoveryRate,
+          ],
+        );
+      }
     }
     await client.query(
       "DELETE FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = $2 AND generation = $3",

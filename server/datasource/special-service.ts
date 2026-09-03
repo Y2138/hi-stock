@@ -192,8 +192,9 @@ export async function syncLimitDataset(
             `INSERT INTO market_limit_event
                (trade_date, event_type, instrument_id, event_price, streak_count, open_count,
                 first_event_time, last_event_time, industry_name, reason,
+                is_st, is_new, seal_money, max_seal_money, turnover,
                 source_payload, source_row_sha256, fetched_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now())
              ON CONFLICT (trade_date, event_type, instrument_id) DO UPDATE SET
                event_price = EXCLUDED.event_price,
                streak_count = EXCLUDED.streak_count,
@@ -202,6 +203,11 @@ export async function syncLimitDataset(
                last_event_time = EXCLUDED.last_event_time,
                industry_name = EXCLUDED.industry_name,
                reason = EXCLUDED.reason,
+               is_st = EXCLUDED.is_st,
+               is_new = EXCLUDED.is_new,
+               seal_money = EXCLUDED.seal_money,
+               max_seal_money = EXCLUDED.max_seal_money,
+               turnover = EXCLUDED.turnover,
                source_payload = EXCLUDED.source_payload,
                source_row_sha256 = EXCLUDED.source_row_sha256,
                fetched_at = now()`,
@@ -216,6 +222,11 @@ export async function syncLimitDataset(
               last,
               typeof item.industry_name === "string" ? item.industry_name : null,
               typeof item.limit_up_reason === "string" ? item.limit_up_reason : null,
+              typeof item.is_st === "boolean" ? item.is_st : null,
+              typeof item.is_new === "boolean" ? item.is_new : null,
+              nullableNumber(item.seal_money),
+              nullableNumber(item.max_seal_money),
+              nullableNumber(item.turnover),
               JSON.stringify(payload),
               sha256(item),
             ],

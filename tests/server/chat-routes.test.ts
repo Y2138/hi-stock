@@ -359,6 +359,57 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     }
   }, 15_000);
 
+  it("未触发上下文压缩时向后续对话保留完整工具结果与共享工具目录", async () => {
+    const session = await createSession(pool, "完整上下文测试");
+    const fullResult = `完整工具结果开始\n${"A".repeat(70_000)}\n完整工具结果结束`;
+    await appendMessage(pool, {
+      session_id: session.id,
+      seq: 1,
+      role: "user",
+      json: { role: "user", content: [{ type: "text", text: "查询完整数据" }], timestamp: Date.now() },
+    });
+    await appendMessage(pool, {
+      session_id: session.id,
+      seq: 2,
+      role: "assistant",
+      json: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "full-result", name: "database_query", arguments: { queries: [] } }],
+        stopReason: "toolUse",
+        timestamp: Date.now(),
+      },
+    });
+    await appendMessage(pool, {
+      session_id: session.id,
+      seq: 3,
+      role: "tool",
+      json: {
+        role: "toolResult",
+        toolCallId: "full-result",
+        toolName: "database_query",
+        content: [{ type: "text", text: fullResult }],
+        isError: false,
+        timestamp: Date.now(),
+      },
+    });
+    faux.setResponses([
+      async (context) => {
+        const toolResult = context.messages.find((message) => message.role === "toolResult");
+        expect(toolResult?.role === "toolResult" ? toolResult.content[0] : null)
+          .toMatchObject({ type: "text", text: fullResult });
+        expect(context.tools?.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+          "pool_attention_write",
+          "daily_plan_write",
+          "auction_assessment_write",
+        ]));
+        return fauxAssistantMessage([fauxText("已基于完整工具结果继续回答")]);
+      },
+    ]);
+    const result = await postSse(session.id, { text: "继续分析" });
+    expect(result.frames.map((frame) => frame.type)).not.toContain("context_compacted");
+    expect(result.frames.map((frame) => frame.type)).toContain("done");
+  });
+
   it("SSE 消息流：text + done 帧，消息持久化往返", async () => {
     faux.setResponses([fauxAssistantMessage([fauxText("你好，我是工作台助手")])]);
     const session = await createSession(pool);
@@ -396,6 +447,24 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     expect(second.frames.map((f) => f.type)).toContain("done");
     const after = await api(server.baseUrl, "GET", `/api/chat/sessions/${session.id}/messages`);
     expect((after.json as unknown as unknown[]).length).toBe(4);
+  });
+
+  it("交互对话达到输出上限时自动续写，不要求用户再次发送继续", async () => {
+    faux.setResponses([
+      fauxAssistantMessage([fauxText("")], { stopReason: "length" }),
+      fauxAssistantMessage([fauxText("已在同一轮补齐最终结果。")]),
+    ]);
+    const session = await createSession(pool, "输出上限续写测试");
+    const result = await postSse(session.id, { text: "生成完整结果" });
+    expect(result.frames.map((frame) => frame.type)).toContain("done");
+    expect(result.frames.filter((frame) => frame.type === "assistant_start")).toHaveLength(2);
+    const messages = await pool.query<{ role: string; text: string }>(
+      "SELECT role, content #>> '{content,0,text}' AS text FROM chat_message WHERE session_id = $1 ORDER BY seq",
+      [session.id],
+    );
+    expect(messages.rows.map((row) => row.role)).toEqual(["user", "assistant", "user", "assistant"]);
+    expect(messages.rows[2]!.text).toContain("已有结果继续完成");
+    expect(messages.rows[3]!.text).toBe("已在同一轮补齐最终结果。");
   });
 
   it("历史恢复把主动中断显示为已中断，不泄露 Responses 缺少终态的适配器错误", () => {
@@ -481,13 +550,15 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
         [
           fauxToolCall("portfolio_write", {
             reason: "登记用户要求的买入",
-            code: "990003.SZ",
-            kind: "buy",
-            quantity: 10,
-            price: 12,
-            change_date: "2026-08-17",
-            decision_origin: "strategy_signal",
-            execution_compliance: "matched",
+            changes: [{
+              code: "990003.SZ",
+              kind: "buy",
+              quantity: 10,
+              price: 12,
+              change_date: "2026-08-17",
+              decision_origin: "strategy_signal",
+              execution_compliance: "matched",
+            }],
           }),
         ],
         { stopReason: "toolUse" },

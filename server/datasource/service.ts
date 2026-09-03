@@ -1,4 +1,4 @@
-// datasource 服务：通道编排（扶摇 → akshare 通道优先级见 数据获取规范.md）、
+// datasource 服务：通道编排（扶摇 → 新浪/东财受控降级）、
 // market_bar 幂等落库、MA5/10/20/60 补算、market_fetch_run 留痕、每日更新链路。
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §5.1、§5.4
 import type pg from "pg";
@@ -88,6 +88,7 @@ export async function storeBars(
   const lows: number[] = [];
   const closes: number[] = [];
   const volumes: (number | null)[] = [];
+  const turnovers: (number | null)[] = [];
   const adjustments: (string | null)[] = [];
   for (const bar of bars) {
     dates.push(bar.date);
@@ -97,20 +98,22 @@ export async function storeBars(
     lows.push(bar.low);
     closes.push(bar.close);
     volumes.push(bar.volume ?? null);
+    turnovers.push(bar.turnover ?? null);
     adjustments.push(bar.adjustment ?? null);
   }
   const r = await db.query<{ rows_written: number }>(
     `WITH written AS (
        INSERT INTO market_bar
-       (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, adjustment, channel)
-       SELECT $1, $2, d, t, o, h, l, c, v, adj, $3
+       (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, turnover, adjustment, channel)
+       SELECT $1, $2, d, t, o, h, l, c, v, amount, adj, $3
        FROM unnest(
          $4::date[], $5::timestamptz[], $6::numeric[], $7::numeric[],
-         $8::numeric[], $9::numeric[], $10::numeric[], $11::text[]
-       ) AS u(d, t, o, h, l, c, v, adj)
+         $8::numeric[], $9::numeric[], $10::numeric[], $11::numeric[], $12::text[]
+       ) AS u(d, t, o, h, l, c, v, amount, adj)
        ON CONFLICT (instrument_id, freq, bar_date, bar_time) DO UPDATE SET
          open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
          volume = EXCLUDED.volume,
+         turnover = EXCLUDED.turnover,
          adjustment = COALESCE(EXCLUDED.adjustment, market_bar.adjustment),
          channel = EXCLUDED.channel, fetched_at = now()
        RETURNING bar_date
@@ -126,7 +129,7 @@ export async function storeBars(
        RETURNING 1
      )
      SELECT count(*)::int AS rows_written FROM written`,
-    [instrumentId, freq, channel, dates, times, opens, highs, lows, closes, volumes, adjustments],
+    [instrumentId, freq, channel, dates, times, opens, highs, lows, closes, volumes, turnovers, adjustments],
   );
   return r.rows[0]?.rows_written ?? bars.length;
 }
@@ -438,7 +441,7 @@ async function backfillDailyCodes(
     try {
       const outcome = await fetchAndStore(
         db,
-        { code, freq: "day", start: addDays(targetDate, -45), end: targetDate },
+        { code, freq: "day", start: addDays(targetDate, -65), end: targetDate },
         deps,
       );
       rows += outcome.rowsWritten;
@@ -471,6 +474,34 @@ async function groupSnapshotCodes(db: Db, codes: string[]): Promise<Array<{ kind
     .map(([kind, groupCodes]) => ({ kind, codes: groupCodes }));
 }
 
+type DailySnapshotGap = { code: string; freq: "day"; reason: string };
+
+/** 批量优先；整批失败时顺序二分，直到只跳过确实失败的单个标的。 */
+async function fetchSnapshotWithIsolation(
+  db: Db,
+  codes: string[],
+  kind: Exclude<SnapshotKind, "etf">,
+  deps: ServiceDeps,
+): Promise<{ quotes: SnapshotQuote[]; gaps: DailySnapshotGap[] }> {
+  const quotes: SnapshotQuote[] = [];
+  const gaps: DailySnapshotGap[] = [];
+  const fetchBatch = async (batch: string[]): Promise<void> => {
+    try {
+      quotes.push(...(await fetchSnapshot(batch, hithinkDeps(db, deps), kind)));
+    } catch (err) {
+      if (batch.length === 1) {
+        gaps.push({ code: batch[0]!, freq: "day", reason: `${kind} 快照不可用: ${(err as Error).message}` });
+        return;
+      }
+      const midpoint = Math.floor(batch.length / 2);
+      await fetchBatch(batch.slice(0, midpoint));
+      await fetchBatch(batch.slice(midpoint));
+    }
+  };
+  await fetchBatch(codes);
+  return { quotes, gaps };
+}
+
 /**
  * 每日更新链路（设计 §5.4）：
  * 1. 股票/指数/板块/ETF 按类型请求快照并追加最新交易日；缺口 >1 日或除权跳空对该标的 kline 重拉；
@@ -491,7 +522,7 @@ export async function dailyMarketUpdate(
     gaps: [],
     fetchRunIds: [],
   };
-  const maDirty = new Set<string>();
+  const maDirty = new Map<string, string>();
 
   // 第 1 步：股票、指数/板块、ETF 按类型批量快照；坏标的显式记缺口并跳过。
   for (const group of await groupSnapshotCodes(db, scope.codes)) {
@@ -505,40 +536,43 @@ export async function dailyMarketUpdate(
       summary.gaps.push(...historical.gaps);
       continue;
     }
-    try {
-      const failedCodes = new Set<string>();
-      // ETF 端点只接受单只请求：一只基金不支持行情只记该标的缺口，不拖垮同组其余 ETF。
-      let quotes: SnapshotQuote[];
-      if (group.kind === "etf") {
-        quotes = [];
-        for (const code of group.codes) {
-          try {
-            quotes.push(...(await fetchSnapshot([code], hithinkDeps(db, deps), "etf")));
-          } catch (err) {
-            failedCodes.add(code);
-            groupGaps.push({ code, freq: "day", reason: `ETF 快照不可用: ${(err as Error).message}` });
-          }
-        }
-      } else {
-        quotes = await fetchSnapshot(group.codes, hithinkDeps(db, deps), group.kind);
-      }
-      const quoteByCode = new Map(quotes.map((quote) => [quote.code, quote]));
+    const failedCodes = new Set<string>();
+    // ETF 端点只接受单只请求；股票/指数先批量，失败后才二分隔离坏标的。
+    let quotes: SnapshotQuote[];
+    if (group.kind === "etf") {
+      quotes = [];
       for (const code of group.codes) {
-        if (failedCodes.has(code)) continue;
-        const quote = quoteByCode.get(code);
-        if (!quote) {
-          groupGaps.push({ code, freq: "day", reason: "批量快照未返回该标的" });
-          continue;
+        try {
+          quotes.push(...(await fetchSnapshot([code], hithinkDeps(db, deps), "etf")));
+        } catch (err) {
+          failedCodes.add(code);
+          groupGaps.push({ code, freq: "day", reason: `ETF 快照不可用: ${(err as Error).message}` });
         }
-        const barDate = snapshotDate(quote);
-        if (barDate !== scope.date) {
-          groupGaps.push({ code, freq: "day", reason: `快照交易日 ${barDate} 与目标日 ${scope.date} 不一致` });
-          continue;
-        }
-        if ([quote.open, quote.high, quote.low, quote.close].some((value) => !Number.isFinite(value) || value <= 0)) {
-          groupGaps.push({ code, freq: "day", reason: "快照存在非正或非有限 OHLC" });
-          continue;
-        }
+      }
+    } else {
+      const isolated = await fetchSnapshotWithIsolation(db, group.codes, group.kind, deps);
+      quotes = isolated.quotes;
+      groupGaps.push(...isolated.gaps);
+      for (const gap of isolated.gaps) failedCodes.add(gap.code);
+    }
+    const quoteByCode = new Map(quotes.map((quote) => [quote.code, quote]));
+    for (const code of group.codes) {
+      if (failedCodes.has(code)) continue;
+      const quote = quoteByCode.get(code);
+      if (!quote) {
+        groupGaps.push({ code, freq: "day", reason: "批量快照未返回该标的" });
+        continue;
+      }
+      const barDate = snapshotDate(quote);
+      if (barDate !== scope.date) {
+        groupGaps.push({ code, freq: "day", reason: `快照交易日 ${barDate} 与目标日 ${scope.date} 不一致` });
+        continue;
+      }
+      if ([quote.open, quote.high, quote.low, quote.close].some((value) => !Number.isFinite(value) || value <= 0)) {
+        groupGaps.push({ code, freq: "day", reason: "快照存在非正或非有限 OHLC" });
+        continue;
+      }
+      try {
         const instrumentId = await ensureInstrument(db, quote.code, undefined, "day");
         // 缺口/除权跳空检测：上一条日线距快照日 >3 个自然日，或快照前收与库内前收偏差 >11%
         const prev = await db.query<{ bar_date: string; close: string }>(
@@ -553,12 +587,12 @@ export async function dailyMarketUpdate(
           (quote.prevClose != null && Math.abs(quote.prevClose - Number(prevRow.close)) / Number(prevRow.close) > 0.11) ||
           dayDiff(barDate, prevRow.bar_date) > 3;
         if (needRefetch) {
-          const start = prevRow ? addDays(prevRow.bar_date, 1) : addDays(barDate, -45);
+          const start = prevRow ? addDays(prevRow.bar_date, 1) : addDays(barDate, -65);
           const outcome = await fetchAndStore(db, { code: quote.code, freq: "day", start, end: barDate }, deps);
           summary.refetched.push(quote.code);
           summary.fetchRunIds.push(outcome.fetchRunId);
           groupRows += outcome.rowsWritten;
-          maDirty.add(instrumentId);
+          maDirty.set(instrumentId, code);
           continue;
         }
         groupRows += await storeBars(
@@ -572,43 +606,36 @@ export async function dailyMarketUpdate(
             low: quote.low,
             close: quote.close,
             volume: quote.volume,
+            turnover: quote.turnover,
             adjustment: group.kind === "stock" ? "forward" : "none",
           }],
           "hithink",
         );
-        maDirty.add(instrumentId);
+        maDirty.set(instrumentId, code);
+      } catch (err) {
+        groupGaps.push({ code, freq: "day", reason: `日线处理失败: ${(err as Error).message}` });
       }
-      summary.fetchRunIds.push(
-        await insertFetchRun(db, {
-          channel: "hithink",
-          scope: { instruments: group.codes, kind: group.kind, freq: "day", date: scope.date, op: "snapshot" },
-          rowsWritten: groupRows,
-          gaps: groupGaps,
-          jobRunId: deps.jobRunId,
-        }),
-      );
-      summary.gaps.push(...groupGaps);
-    } catch (err) {
-      // 实时日更不把一次批量快照失败放大为全组逐只历史请求。
-      const snapshotFailure = { reason: `${group.kind} 批量快照不可用: ${(err as Error).message}` };
-      summary.fetchRunIds.push(
-        await insertFetchRun(db, {
-          channel: "hithink",
-          scope: { instruments: group.codes, kind: group.kind, freq: "day", date: scope.date, op: "snapshot" },
-          rowsWritten: 0,
-          degradedFrom: "hithink:snapshot",
-          gaps: [snapshotFailure],
-          jobRunId: deps.jobRunId,
-        }),
-      );
-      summary.gaps.push(snapshotFailure);
     }
+    summary.fetchRunIds.push(
+      await insertFetchRun(db, {
+        channel: "hithink",
+        scope: { instruments: group.codes, kind: group.kind, freq: "day", date: scope.date, op: "snapshot" },
+        rowsWritten: groupRows,
+        gaps: groupGaps,
+        jobRunId: deps.jobRunId,
+      }),
+    );
+    summary.gaps.push(...groupGaps);
     summary.snapshotRows += groupRows;
   }
 
   // 第 2 步：补算 MA（fetchAndStore 内部已对重拉标的算过，这里补快照追加路径）
-  for (const instrumentId of maDirty) {
-    await recomputeMa(db, instrumentId, "day");
+  for (const [instrumentId, code] of maDirty) {
+    try {
+      await recomputeMa(db, instrumentId, "day");
+    } catch (err) {
+      summary.gaps.push({ code, freq: "day", reason: `均线重算失败: ${(err as Error).message}` });
+    }
   }
 
   // 第 3 步：期货主力连续（当年起窗口覆盖拉取）

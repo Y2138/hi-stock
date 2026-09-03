@@ -181,9 +181,7 @@ export async function compactSessionContext(input: {
 }): Promise<CompactedContext> {
   const previousThrough = input.session.context_summary_through_seq ?? 0;
   const visibleRows = input.historyRows.filter((row) => row.seq > previousThrough);
-  const visibleMessages = truncateToolResults(
-    visibleRows.map((row) => redactAgentMessage(row.content as AgentMessage)),
-  );
+  const visibleMessages = visibleRows.map((row) => redactAgentMessage(row.content as AgentMessage));
   const currentPrompt = withSummary(
     input.systemPrompt,
     input.session.context_summary,

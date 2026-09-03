@@ -51,6 +51,7 @@ export const PORTABLE_TABLES: readonly PortableTableSpec[] = [
   { table: "strategy_evolution_log", columns: ["id", "outline", "conclusion", "adjustments", "adoption_status", "strategy_hash_before", "strategy_hash_after", "created_at", "decided_at"], orderBy: ["id"], identity: true, jsonColumns: ["adjustments"] },
   { table: "strategy_document", columns: ["id", "code", "title", "role", "injection_order", "current_revision_id", "created_at", "updated_at"], orderBy: ["id"], identity: true },
   { table: "strategy_document_revision", columns: ["id", "document_id", "revision_no", "content", "sha256", "source", "created_at"], orderBy: ["id"], identity: true },
+  { table: "strategy_score_benchmark", columns: ["id", "document_revision_id", "benchmark_code", "training_start", "training_end", "methodology", "distributions", "sample_counts", "source_summary", "sha256", "created_at"], orderBy: ["id"], identity: true, jsonColumns: ["distributions", "sample_counts", "source_summary"], dateColumns: ["training_start", "training_end"] },
   { table: "strategy_state", columns: ["singleton", "change_seq", "current_hash", "last_evolution_id", "updated_at"], orderBy: ["singleton"] },
 ] as const;
 
@@ -230,11 +231,13 @@ const RESET_STATEMENTS = [
   "DELETE FROM market_limit_ladder_snapshot",
   "DELETE FROM market_limit_event",
   "DELETE FROM market_special_sync_run",
+  "DELETE FROM market_stock_character_metric",
   "DELETE FROM market_indicator_value",
   "DELETE FROM market_indicator_run",
   "DELETE FROM market_indicator_dirty",
   "DELETE FROM job_run_output",
   "DELETE FROM strategy_evolution_backtest",
+  "DELETE FROM strategy_score_benchmark",
   "DELETE FROM strategy_state",
   "UPDATE strategy_document SET current_revision_id = NULL",
   "DELETE FROM strategy_document_revision",
@@ -310,6 +313,20 @@ async function restorePayload(pool: pg.Pool, payloadPath: string): Promise<void>
   try {
     await client.query("BEGIN");
     await client.query("SET CONSTRAINTS ALL DEFERRED");
+    const benchmarkTemplates = await client.query<{
+      benchmark_code: string;
+      training_start: string;
+      training_end: string;
+      methodology: string;
+      distributions: unknown;
+      sample_counts: unknown;
+      source_summary: unknown;
+      sha256: string;
+    }>(
+      `SELECT benchmark_code, training_start::text, training_end::text, methodology,
+              distributions, sample_counts, source_summary, sha256
+         FROM strategy_score_benchmark ORDER BY id`,
+    );
     for (const statement of RESET_STATEMENTS) await client.query(statement);
     const lines = readline.createInterface({ input: fs.createReadStream(payloadPath).pipe(createGunzip()), crlfDelay: Infinity });
     let headerSeen = false;
@@ -338,6 +355,24 @@ async function restorePayload(pool: pg.Pool, payloadPath: string): Promise<void>
     }
     await flush();
     if (!headerSeen) throw new Error("初始化包 payload 为空");
+    const benchmarkCount = await client.query<{ count: number }>("SELECT count(*)::int AS count FROM strategy_score_benchmark");
+    if (benchmarkCount.rows[0]!.count === 0) {
+      for (const benchmark of benchmarkTemplates.rows) {
+        await client.query(
+          `INSERT INTO strategy_score_benchmark
+             (document_revision_id, benchmark_code, training_start, training_end, methodology,
+              distributions, sample_counts, source_summary, sha256)
+           SELECT document.current_revision_id, $1, $2, $3, $4, $5, $6, $7, $8
+             FROM strategy_document document
+            WHERE document.code = 'limit_up_board' AND document.current_revision_id IS NOT NULL`,
+          [
+            benchmark.benchmark_code, benchmark.training_start, benchmark.training_end,
+            benchmark.methodology, benchmark.distributions, benchmark.sample_counts,
+            benchmark.source_summary, benchmark.sha256,
+          ],
+        );
+      }
+    }
     await resetSequences(client);
     await client.query("COMMIT");
   } catch (error) {

@@ -33,6 +33,7 @@ export interface BarRow {
   low: number;
   close: number;
   volume: number | null;
+  turnover: number | null;
   ma5: number | null;
   ma10: number | null;
   ma20: number | null;
@@ -40,6 +41,7 @@ export interface BarRow {
   dif: number | null;
   dea: number | null;
   macd_hist: number | null;
+  rsi14: number | null;
   adjustment: string | null;
   channel: string;
 }
@@ -119,7 +121,7 @@ export async function listBars(
   }
   const r = await db.query<BarRow>(
     `SELECT bar.bar_date::text, bar.bar_time, bar.open::float, bar.high::float,
-            bar.low::float, bar.close::float, bar.volume::float,
+            bar.low::float, bar.close::float, bar.volume::float, bar.turnover::float,
             CASE WHEN $3 THEN indicator.ma5::float ELSE bar.ma5::float END AS ma5,
             CASE WHEN $3 THEN indicator.ma10::float ELSE bar.ma10::float END AS ma10,
             CASE WHEN $3 THEN indicator.ma20::float ELSE bar.ma20::float END AS ma20,
@@ -127,6 +129,7 @@ export async function listBars(
             CASE WHEN $3 THEN indicator.dif::float ELSE NULL END AS dif,
             CASE WHEN $3 THEN indicator.dea::float ELSE NULL END AS dea,
             CASE WHEN $3 THEN indicator.macd_hist::float ELSE NULL END AS macd_hist,
+            CASE WHEN $3 THEN indicator.rsi14::float ELSE NULL END AS rsi14,
             bar.adjustment, bar.channel
        FROM market_bar bar
        LEFT JOIN market_indicator_value indicator

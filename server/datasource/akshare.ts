@@ -1,12 +1,12 @@
 // akshare 通道：直连底层公开 HTTP（不经 Python）
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §5.3
 // 覆盖扶摇缺失的能力：新浪 30 分钟线、新浪期货主力连续日线、东财个股资金流。
-// 接口参数口径引用 数据获取规范.md §二，注释不复制；响应格式以 2026-08-16 实测为准：
+// 响应格式以 2026-08-16 实测为准：
 //   - 新浪两个接口均为 jsonp 包裹（前缀含一段注释脚本 + "var="），主体是 JSON 数组；
 //   - 30m 元素字段 day/open/high/low/close/volume/amount（字符串）；
 //   - 期货日线元素字段 d/o/h/l/c/v/p/s（字符串，全历史，客户端按窗口过滤）；
 //   - 东财 push2delay 日级 klt=101 实测只返回最近一个交易日（6 列：日期+主力/小单/中单/大单/超大单净额），
-//     与规范描述的历史深度不一致，留痕待规范修订。
+//     不得把该近期快照当作完整历史数据。
 
 import { defaultSleep, type SleepFn } from "./ratelimit.js";
 import type { Bar, Channel, FetchRequest } from "./types.js";
@@ -16,7 +16,7 @@ const SINA_KLINE_URL =
 const SINA_FUTURES_URL =
   "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var=/InnerFuturesNewService.getDailyKLine";
 const EASTMONEY_FFLOW_URL = "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get";
-/** 东财接口固定 ut 参数（公开接口常量，非凭据，见 数据获取规范.md §2.3） */
+/** 东财接口固定 ut 参数（公开接口常量，非凭据） */
 const EASTMONEY_UT = "b2884a393a59ad64002292a3e90d46a5";
 
 const TICKER_RE = /^\d{6}\.(?:SH|SZ)$/;
@@ -44,7 +44,7 @@ async function getText(url: URL, timeoutMs: number): Promise<string> {
   return res.text();
 }
 
-/** 新浪公开接口瞬时错误最多重试 1 次（口径见 数据获取规范.md） */
+/** 新浪公开接口瞬时错误最多重试 1 次 */
 async function getWithRetry(url: URL, deps: AkshareDeps): Promise<string> {
   const sleep = deps.sleep ?? defaultSleep;
   try {
@@ -115,6 +115,7 @@ export async function fetchSina30m(req: FetchRequest, deps: AkshareDeps = {}): P
       low: toNumber(row.low, "low"),
       close: toNumber(row.close, "close"),
       volume: toNumber(row.volume, "volume"),
+      turnover: row.amount == null ? undefined : toNumber(row.amount, "amount"),
       adjustment: "none",
     });
   }
@@ -163,7 +164,7 @@ export interface FundFlowRow {
 }
 
 /**
- * 东财个股资金流（push2delay，参数按 数据获取规范.md §2.3）。
+ * 东财个股资金流（push2delay）。
  * 沪市 secid=1.*、深市 secid=0.*。klt=101 实测仅返回最近一个交易日。
  * 本模块只取数解析，资金流暂无对应表（market_bar.freq 不含资金流），由调用方决定用途。
  */

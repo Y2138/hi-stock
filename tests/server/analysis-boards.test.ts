@@ -82,9 +82,16 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
     expect(sectors.map((item) => item.code)).toEqual(["881101.TI", "881102.TI"]);
     expect(sectors.map((item) => item.sector)).toEqual(["半导体", "电力"]);
     expect(sectors.map((item) => item.temperature)).toEqual([100, 50]);
-    const result = row.result_json as { average_temperature: number; state: string };
-    expect(result.average_temperature).toBe(75);
-    expect(result.state).toBe("高温");
+    const result = row.result_json as {
+      average_temperature: number | null;
+      available_average_temperature: number;
+      state: string;
+      market_regime: { status: string; state: string | null };
+    };
+    expect(result.average_temperature).toBeNull();
+    expect(result.available_average_temperature).toBe(75);
+    expect(result.state).toBe("数据不足");
+    expect(result.market_regime).toMatchObject({ status: "partial", state: null });
     expect(row.data_gaps).toEqual([{ code: "881103.TI", reason: "日线不足 20 条（5）" }]);
   });
 
@@ -104,6 +111,22 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
     expect(resultSectors(row).map((item) => item.code)).toEqual(["881102.TI"]);
     await pool.query(
       `UPDATE market_board SET active = true WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = '881101.TI')`,
+    );
+  });
+
+  it("完整一级行业全集合成 MA5/MA20/ROC5 并确定市场状态", async () => {
+    await pool.query(
+      `UPDATE market_board SET active = false WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = '881103.TI')`,
+    );
+    const row = await executeAnalysis(pool, { analysis_type: "sector_temperature" });
+    expect(row.status).toBe("success");
+    expect((row.result_json as { market_regime: unknown }).market_regime).toMatchObject({
+      status: "success",
+      state: "牛市",
+      coverage: { expected_boards: 2, available_boards: 2, required_dates: 21 },
+    });
+    await pool.query(
+      `UPDATE market_board SET active = true WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = '881103.TI')`,
     );
   });
 });

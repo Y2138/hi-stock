@@ -25,7 +25,7 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
   async function insertLegacyContent(input: {
     code: string;
     title: string;
-    contentType: "strategy" | "trading_plan";
+    contentType: "strategy" | "guidance" | "trading_plan";
     legacyPath: string;
     content: string;
   }): Promise<string> {
@@ -82,6 +82,20 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
       legacyPath: "交易计划/明日交易计划_2026-08-18.md",
       content: "# 历史计划\n\n迁入任务结果",
     });
+    await insertLegacyContent({
+      code: "retired_expectation_review",
+      title: "预期校对",
+      contentType: "guidance",
+      legacyPath: "预期校对.md",
+      content: "# 预期校对\n\n不应进入当前策略或 Agent 上下文",
+    });
+    await insertLegacyContent({
+      code: "retired_data_rules",
+      title: "数据获取规范",
+      contentType: "guidance",
+      legacyPath: "数据获取规范.md",
+      content: "# 数据获取规范\n\n不应进入当前策略或 Agent 上下文",
+    });
     await pool.query(
       `INSERT INTO job_run (job_id, target_date, trigger_kind, status, result_md, finished_at)
        SELECT id, '2026-08-17', 'manual', 'success', '# 既有运行结果', now()
@@ -98,6 +112,9 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
       await fs.copyFile(path.join(sourceDir, file), path.join(migrationDir, file));
     }
     expect((await runMigrations(pool, migrationDir)).applied).toEqual([18, 19, 20, 21]);
+    const migration64 = files.find((file) => file.startsWith("0064_"))!;
+    await fs.copyFile(path.join(sourceDir, migration64), path.join(migrationDir, migration64));
+    expect((await runMigrations(pool, migrationDir)).applied).toEqual([64]);
     server = await startTestServer(pool);
     sessionId = (await createSession(pool, "策略演进测试")).id;
   });
@@ -117,10 +134,23 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     };
     expect(bundle.documents).toHaveLength(1);
     expect(bundle.documents[0]).toMatchObject({ code: "investment_strategy", current_content: "# 投资总策略\n\n初始最终正文" });
+    const currentDocuments = await pool.query<{ code: string; sha256: string }>(
+      `SELECT document.code, revision.sha256
+         FROM strategy_document document
+         JOIN strategy_document_revision revision ON revision.id = document.current_revision_id
+        ORDER BY document.injection_order, document.id`,
+    );
+    expect(currentDocuments.rows).toHaveLength(1);
     expect(bundle.state).toMatchObject({
       change_seq: "0",
-      current_hash: sha256(`investment_strategy:${bundle.documents[0]!.current_sha256}`),
+      current_hash: sha256(currentDocuments.rows.map((row) => `${row.code}:${row.sha256}`).join("\n")),
     });
+    expect((await pool.query(
+      "SELECT count(*)::int AS count FROM content_document WHERE title IN ('预期校对', '数据获取规范')",
+    )).rows[0]!.count).toBe(0);
+    const systemPrompt = await buildSystemPrompt(pool);
+    expect(systemPrompt).not.toContain("# 预期校对");
+    expect(systemPrompt).not.toContain("# 数据获取规范");
     expect(Number((await pool.query("SELECT count(*) FROM strategy_evolution_log")).rows[0]!.count)).toBe(0);
 
     const outputs = await api(server.baseUrl, "GET", "/api/jobs/daily_plan_flow/outputs?limit=20");
@@ -204,7 +234,8 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     expect((await pool.query("SELECT proposed_changes FROM strategy_publish_proposal WHERE id = $1", [proposalId])).rows[0]!.proposed_changes).toBeNull();
     const prompt = await buildSystemPrompt(pool);
     expect(prompt).toContain("change_seq=1");
-    expect(prompt).toContain("新增边界");
+    expect(prompt).toContain("code=investment_strategy");
+    expect(prompt).not.toContain("新增边界");
   });
 
   it("批准前整体基线变化会标记 conflict 且不改正文；拒绝也会清除拟议全文", async () => {

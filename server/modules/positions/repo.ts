@@ -107,7 +107,7 @@ export async function listPositions(db: Db): Promise<PositionRow[]> {
 }
 
 /** 变更事件流（join instrument，change_date/id 降序） */
-export async function listPositionChanges(db: Db, limit = 100): Promise<PositionChangeRow[]> {
+export async function listPositionChanges(db: Db, limit = 100, codes?: string[]): Promise<PositionChangeRow[]> {
   const r = await db.query<PositionChangeRow>(
     `SELECT c.id::text, c.instrument_id::text, i.code, i.name,
             c.change_date::text, c.kind, c.quantity::float, c.price::float, c.amount::float,
@@ -120,9 +120,10 @@ export async function listPositionChanges(db: Db, limit = 100): Promise<Position
        FROM portfolio_position_change c
        JOIN market_instrument i ON i.id = c.instrument_id
        LEFT JOIN job_run_output plan ON plan.id = c.plan_output_id
+      WHERE ($2::text[] IS NULL OR i.code = ANY($2::text[]))
       ORDER BY c.change_date DESC, c.id DESC
       LIMIT $1`,
-    [limit],
+    [limit, codes?.length ? codes : null],
   );
   return r.rows;
 }

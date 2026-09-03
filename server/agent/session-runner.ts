@@ -86,6 +86,10 @@ export interface AgentSessionTurnInput {
   manageSessionStatus?: boolean;
   titleFromText?: boolean;
   onFrame?: (frame: AgentCoreFrame) => void;
+  /** 缺省以非空普通 stop 为完成；自动作业可额外要求结果横幅等业务完成标记。 */
+  isCompleteAssistantText?: (text: string) => boolean;
+  continuationPrompt?: string;
+  maxContinuationTurns?: number;
 }
 
 export interface AgentSessionTurnResult extends AgentTurnResult {
@@ -93,6 +97,27 @@ export interface AgentSessionTurnResult extends AgentTurnResult {
 }
 
 const INTERRUPTED_SESSION_ERROR = "服务重启：上一进程中的 Agent 运行已中断";
+const DEFAULT_CONTINUATION_PROMPT =
+  "上一执行段因输出上限或尚未形成完整最终答复而结束。请基于本对话已有结果继续完成当前用户请求；已成功的工具不要重复调用，只补齐必要缺口并给出完整最终答复。";
+export const DEFAULT_MAX_AGENT_CONTINUATION_TURNS = 3;
+
+function assistantText(message: AgentMessage | null): string {
+  if (!message || message.role !== "assistant") return "";
+  return message.content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text")
+    .map((part) => part.text)
+    .join("")
+    .trim();
+}
+
+/**
+ * Agent loop 终止契约：aborted/error 立即终止；length/toolUse/空结果/未通过业务门禁均续写；
+ * 只有非空普通 stop 且通过门禁才成功，续写超过上限则失败，禁止静默成功或无限循环。
+ */
+function agentTurnCompleted(turn: AgentTurnResult, isCompleteText: (text: string) => boolean): boolean {
+  if (turn.aborted || turn.llmError || !turn.lastAssistant || turn.lastAssistant.role !== "assistant") return false;
+  return turn.lastAssistant.stopReason === "stop" && isCompleteText(assistantText(turn.lastAssistant));
+}
 
 /** 服务重启后，非调度器接管的 running 会话不可能仍有进程内 Agent。 */
 export async function recoverInterruptedAgentSessions(
@@ -252,19 +277,44 @@ export async function runAgentSessionTurn(
     };
 
     try {
-      const turn = await runAgentTurn({
-        pool: input.pool,
-        sessionId: session.id,
-        runtime,
-        systemPrompt: context.systemPrompt,
-        messages: context.messages,
-        text: input.text,
-        images: input.images,
-        runId,
-        tools,
-        onFrame: onCoreFrame,
-        onMessageCompleted,
-      });
+      const isCompleteText = input.isCompleteAssistantText ?? ((text: string) => text.length > 0);
+      const maxContinuationTurns = Math.min(
+        Math.max(input.maxContinuationTurns ?? DEFAULT_MAX_AGENT_CONTINUATION_TURNS, 0),
+        DEFAULT_MAX_AGENT_CONTINUATION_TURNS,
+      );
+      let nextText = input.text;
+      let messages = context.messages;
+      let continuationTurns = 0;
+      let turn: AgentTurnResult;
+      while (true) {
+        turn = await runAgentTurn({
+          pool: input.pool,
+          sessionId: session.id,
+          runtime,
+          systemPrompt: context.systemPrompt,
+          messages,
+          text: nextText,
+          images: continuationTurns === 0 ? input.images : undefined,
+          runId,
+          tools,
+          onFrame: onCoreFrame,
+          onMessageCompleted,
+        });
+        const stopReason = turn.lastAssistant?.role === "assistant"
+          ? turn.lastAssistant.stopReason
+          : undefined;
+        if (turn.aborted || turn.llmError || stopReason === "aborted" || stopReason === "error" ||
+            agentTurnCompleted(turn, isCompleteText)) break;
+        if (continuationTurns >= maxContinuationTurns) {
+          throw new Error(
+            `Agent 未在 ${maxContinuationTurns + 1} 个受控执行段内生成完整最终结果` +
+            `（最后 stopReason=${stopReason ?? "missing"}）`,
+          );
+        }
+        continuationTurns += 1;
+        messages = turn.messages;
+        nextText = input.continuationPrompt ?? DEFAULT_CONTINUATION_PROMPT;
+      }
       flushToolUpdates();
       await frameChain;
 
@@ -289,16 +339,19 @@ export async function runAgentSessionTurn(
             data: { status: "cancelled" },
           });
         }
-      } else if (turn.llmError) {
+      } else if (turn.llmError || (turn.lastAssistant?.role === "assistant" && turn.lastAssistant.stopReason === "error")) {
+        const errorMessage = turn.llmError ||
+          (turn.lastAssistant?.role === "assistant" ? turn.lastAssistant.errorMessage : undefined) ||
+          "LLM 调用失败";
         await persistAndPublishSessionEvent(input.pool, {
           session_id: session.id,
           event_type: "session_error",
-          data: { code: "LLM_ERROR", message: turn.llmError },
+          data: { code: "LLM_ERROR", message: errorMessage },
         });
         if (manageStatus) {
           await updateSessionStatus(input.pool, session.id, {
             status: "failed",
-            error_summary: turn.llmError,
+            error_summary: errorMessage,
           });
           await persistAndPublishSessionEvent(input.pool, {
             session_id: session.id,
@@ -315,7 +368,8 @@ export async function runAgentSessionTurn(
         });
       }
       await metrics.finish(
-        turn.aborted ? "cancelled" : turn.llmError ? "failed" : "complete",
+        turn.aborted ? "cancelled" : turn.llmError ||
+          (turn.lastAssistant?.role === "assistant" && turn.lastAssistant.stopReason === "error") ? "failed" : "complete",
         freshMessages,
       );
       return { ...turn, freshMessages };

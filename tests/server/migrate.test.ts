@@ -23,10 +23,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
 
   it("连续执行两次幂等：第二次不重复应用", async () => {
     const first = await runMigrations(pool);
-    expect(first.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56]);
+    expect(first.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]);
     const second = await runMigrations(pool);
     expect(second.applied).toEqual([]);
-    expect(second.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56]);
+    expect(second.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]);
     // 表结构真实存在，0005 已按领域重命名非前缀表
     const tables = await pool.query(
       "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
@@ -78,6 +78,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "market_limit_event",
       "market_limit_ladder_snapshot",
       "market_special_sync_run",
+      "market_stock_character_metric",
       "market_system_tracking",
       "market_trading_day",
       "pool_board_preference",
@@ -97,6 +98,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "strategy_evolution_backtest",
       "strategy_evolution_log",
       "strategy_publish_proposal",
+      "strategy_score_benchmark",
       "strategy_state",
       "strategy_version",
       "system_setting",
@@ -144,12 +146,48 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(dailyPlan).toContain("短线候选集合不得局限于当前短线池");
     expect(dailyPlan).toContain("## 打板机会最终输出口径");
     expect(dailyPlan).toContain("每日最多 4 只");
+    expect(dailyPlan).toContain("## 每日计划确定性完成门禁");
+    expect(dailyPlan).toContain("首先调用一次 `daily_plan_context_query");
+    expect(dailyPlan).toContain("success` 且 0 页、0 行是合法空集");
+    expect(dailyPlan).toContain("## 每日计划垂类计算门禁");
+    expect(dailyPlan).toContain("短线池右侧六条件重算与持仓触发位计算");
+    expect(dailyPlan).toContain("## 左侧反转与试盘启动完成门禁");
+    expect(dailyPlan).toContain("右侧 > 左侧 > 试盘");
+    expect(dailyPlan).toContain("不得把“未命中”写成“未核验”");
     expect(dailyPlan).not.toContain("市场结构池外机会");
     expect(dailyPlan).not.toContain("## 策略模拟账户信号");
     expect(dailyPlan).not.toContain("paper_trade_signal_write");
     expect(dailyPlan).toContain("## 执行纪律与预案结构化输出");
+    expect(dailyPlan).toContain("## 打板确定性评分");
+    expect(dailyPlan).toContain("`limit_up_signal_query`");
     expect(dailyPlan).not.toContain("0.2bp 即 0.002%");
     expect(dailyPlan).not.toContain("按本次计划需要，可参考");
+    expect(dailyPlan).not.toContain("预期校对");
+    const activePrompts = await pool.query<{ content: string }>(
+      `SELECT revision.content
+         FROM job_prompt prompt
+         JOIN job_prompt_revision revision ON revision.id = prompt.current_revision_id
+        WHERE prompt.code IN ('daily_plan_flow', 'midweek_check', 'weekly_review')`,
+    );
+    expect(activePrompts.rows.every((row) => !row.content.includes("数据获取规范"))).toBe(true);
+    const benchmark = (await pool.query<{
+      benchmark_code: string;
+      training_start: string;
+      training_end: string;
+      seal_samples: number;
+      sha256: string;
+    }>(
+      `SELECT benchmark_code, training_start::text, training_end::text,
+              (sample_counts ->> 'seal_turnover_ratio')::int AS seal_samples, sha256
+         FROM strategy_score_benchmark`,
+    )).rows[0]!;
+    expect(benchmark).toEqual({
+      benchmark_code: "daban_v1_3_fixed_20250901_20260122",
+      training_start: "2025-09-01",
+      training_end: "2026-01-22",
+      seal_samples: 5177,
+      sha256: "95e2fec5477da81a4e952b195b64b7ae262d92687cc726e6657077db3f764ea2",
+    });
     const auction = (await pool.query<{ code: string; cron: string; job_type: string; config: Record<string, unknown>; content: string }>(
       `SELECT definition.code, definition.cron, definition.job_type, definition.config, revision.content
          FROM job_definition definition

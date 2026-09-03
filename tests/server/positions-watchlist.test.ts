@@ -236,8 +236,8 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     );
     await pool.query(
       `INSERT INTO pool_membership
-         (instrument_id, pool, role, grade, score, tags, stock_character, stage, evaluation_summary, effective_from)
-       SELECT id, 'short', '短线', 'A', 5.5, '["CPO"]', '高波动', '右侧确认', '完整短线评估', '2026-08-18'
+         (instrument_id, pool, role, grade, score, tags, stock_character, stop_loss_mode, stage, evaluation_summary, effective_from)
+       SELECT id, 'short', '短线', 'A', 5.5, '["CPO"]', '高波动', 'ma5', '右侧确认', '完整短线评估', '2026-08-18'
          FROM market_instrument WHERE code = '600487.SH'`,
     );
     await pool.query(
@@ -250,7 +250,10 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
       action: "update", code: "600487.SH", pool: "short", tags: ["板块：测试"], effective_from: "2026-08-18",
     })).rejects.toThrow("所属行业只读取同花顺官方关系");
     const short = await api(server!.baseUrl, "GET", "/api/pools/short");
-    expect(short.json).toMatchObject({ pool: "short", members: [{ code: "600487.SH", stock_character: "高波动" }] });
+    expect(short.json).toMatchObject({
+      pool: "short",
+      members: [{ code: "600487.SH", stock_character: "高波动", stop_loss_mode: "ma5" }],
+    });
     const shortView = short.json as unknown as {
       members: Array<{ boards: Array<{ code: string; name: string; board_type: string; level: string }> }>;
       boards: Array<{ code: string; member_count: number; level: string }>;

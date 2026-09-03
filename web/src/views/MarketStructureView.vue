@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { apiClient, type ApiFail } from "../api/client";
-import type { MarketStructureDataset, MarketStructureResponse } from "../api/types";
+import type { LimitUpSignalCandidate, MarketStructureDataset, MarketStructureResponse } from "../api/types";
 import StateBlock from "../components/StateBlock.vue";
 import UiInput from "../components/ui/UiInput.vue";
 import { useUiRefresh } from "../composables/useUiRefresh";
@@ -137,6 +137,40 @@ function formatMoney(value: unknown): string | null {
   return `${value >= 0 ? "+" : "−"}${formatted}`;
 }
 
+function formatAmount(value: number | null): string {
+  if (value === null) return "—";
+  return new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 2 }).format(value);
+}
+
+function limitSignal(item: StructureEntry): LimitUpSignalCandidate | null {
+  const value = item.raw.limit_up_signal;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as unknown as LimitUpSignalCandidate
+    : null;
+}
+
+function signalScoreLine(item: StructureEntry): string | null {
+  const signal = limitSignal(item);
+  if (!signal) return null;
+  const clusterRank = signal.cluster_rank > 0 ? `#${signal.cluster_rank}` : "未排名";
+  const momentumRank = signal.momentum_rank > 0 ? `#${signal.momentum_rank}` : "未排名";
+  return `${signal.main_theme} · 抱团 ${signal.cluster_score.toFixed(2)} ${clusterRank} · 主升 ${signal.momentum_score.toFixed(2)} ${momentumRank}`;
+}
+
+function signalInputLine(item: StructureEntry): string | null {
+  const signal = limitSignal(item);
+  if (!signal) return null;
+  const ratio = signal.features.seal_turnover_ratio;
+  return `封单 ${formatAmount(signal.seal_money)} · 成交额 ${formatAmount(signal.turnover)} · 封成比 ${ratio == null ? "—" : ratio.toFixed(3)}`;
+}
+
+function signalIssueLine(item: StructureEntry): string | null {
+  const signal = limitSignal(item);
+  if (!signal) return null;
+  if (signal.data_status === "data_insufficient") return `数据不足：${signal.missing_inputs.join("、")}`;
+  return signal.risk_flags.length ? `风险：${signal.risk_flags.join("、")}` : null;
+}
+
 function itemMetrics(item: StructureEntry): string[] {
   const row = item.raw;
   const result: string[] = [];
@@ -203,6 +237,16 @@ onMounted(() => void load());
         </div>
       </div>
       <p v-if="data?.gaps.length" class="local-warning">数据存在缺口：{{ JSON.stringify(data.gaps) }}</p>
+      <div v-if="dataset === 'limit_up' && data?.limit_up_signals" class="signal-summary" :class="data.limit_up_signals.status">
+        <strong>打板确定性评分</strong>
+        <span>候选 {{ data.limit_up_signals.candidate_count }} · 有效信号 {{ data.limit_up_signals.signal_count }}</span>
+        <span v-if="data.limit_up_signals.benchmark" class="num">
+          固定基准 {{ data.limit_up_signals.benchmark.code }} · 训练期 {{ data.limit_up_signals.benchmark.training_start }} 至 {{ data.limit_up_signals.benchmark.training_end }}
+        </span>
+      </div>
+      <p v-if="dataset === 'limit_up' && data?.limit_up_signals?.gaps.length" class="local-warning">
+        打板评分缺口：{{ data.limit_up_signals.gaps.join("；") }}
+      </p>
       <StateBlock :loading="loading" :error="error" :empty="entries.length === 0" empty-text="该交易日暂无此类市场结构数据" :skeleton-rows="7" @retry="load">
         <div class="board-list">
           <article v-for="group in groups" :key="group.key" class="board-section">
@@ -220,9 +264,17 @@ onMounted(() => void load());
                 :disabled="!item.code"
                 @click="openMarket(item.code)"
               >
-                <span class="instrument-name"><strong>{{ item.name }}</strong><small class="num">{{ item.code ?? "—" }}</small></span>
+                <span class="instrument-name">
+                  <strong>{{ item.name }}</strong>
+                  <em v-if="limitSignal(item)?.signal_grade" class="signal-grade">{{ limitSignal(item)?.signal_grade }}</em>
+                  <em v-else-if="limitSignal(item)?.data_status === 'data_insufficient'" class="signal-grade missing">数据不足</em>
+                  <small class="num">{{ item.code ?? "—" }}</small>
+                </span>
                 <span v-if="itemMetrics(item).length" class="metric-line">{{ itemMetrics(item).join(" · ") }}</span>
+                <span v-if="signalScoreLine(item)" class="signal-line">{{ signalScoreLine(item) }}</span>
+                <span v-if="signalInputLine(item)" class="metric-line">{{ signalInputLine(item) }}</span>
                 <span v-if="itemReason(item)" class="reason">{{ itemReason(item) }}</span>
+                <span v-if="signalIssueLine(item)" class="signal-issue">{{ signalIssueLine(item) }}</span>
               </button>
             </div>
           </article>
@@ -236,6 +288,7 @@ onMounted(() => void load());
 .structure-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:16px}.date-control{display:flex;flex:none;align-items:center;gap:8px;color:var(--ink);font-size:var(--fs-sm)}.date-control>span{white-space:nowrap}
 .structure-tabs{display:grid;grid-template-columns:repeat(7,minmax(78px,1fr));margin-top:2px;border-bottom:1px solid var(--line)}.structure-tab{display:flex;align-items:center;justify-content:center;gap:7px;min-width:0;min-height:38px;padding:5px 8px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--ink-soft);cursor:pointer}.structure-tab:hover{color:var(--ink)}.structure-tab.active{border-bottom-color:var(--accent);color:var(--accent-ink);font-weight:700}.structure-tab.active.up{border-bottom-color:var(--up);color:var(--up)}.structure-tab.active.down{border-bottom-color:var(--down);color:var(--down)}.structure-tab strong{overflow:hidden;font-size:var(--fs-sm);text-overflow:ellipsis;white-space:nowrap}.tab-count{flex:none;color:inherit;font-size:10px;text-align:center}
 .data-panel{min-width:0;margin-top:12px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:4px}.panel-title{display:flex;align-items:baseline;gap:9px}.panel-head h2{font-size:var(--fs-lg)}.panel-title>.num{color:var(--ink-soft);font-size:var(--fs-xs)}.panel-status{display:flex;align-items:center;gap:7px;color:var(--ink);font-size:var(--fs-xs)}.updated-at{color:var(--ink-soft)}.local-warning{margin:8px 0 12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--warn-bg);color:var(--warn);font-size:var(--fs-sm)}
-.board-list{display:flex;flex-direction:column}.board-section{display:grid;grid-template-columns:minmax(110px,145px) minmax(0,1fr);gap:18px;min-width:0;padding:14px 0 15px;border-top:1px solid var(--line)}.board-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:5px 0}.board-head>strong,.board-link{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}.board-head>.num{flex:none;color:var(--accent-ink);font-size:var(--fs-xs)}.board-link{border:0;background:transparent;padding:0;color:var(--accent-ink);cursor:pointer;font:inherit}.board-link:hover{text-decoration:underline}.instrument-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(205px,1fr));column-gap:18px;row-gap:2px}.instrument-card{display:grid;align-content:start;gap:3px;min-width:0;min-height:62px;padding:5px 7px;border:0;border-radius:5px;background:transparent;color:var(--ink);text-align:left;cursor:pointer}.instrument-card:hover:not(:disabled){background:var(--accent-soft)}.instrument-card:disabled{cursor:default}.instrument-name{display:flex;align-items:baseline;justify-content:space-between;gap:6px;min-width:0}.instrument-name strong{overflow:hidden;font-size:var(--fs-sm);text-overflow:ellipsis;white-space:nowrap}.instrument-name small{flex:none;color:var(--ink-faint);font-size:10px}.metric-line{overflow:hidden;color:var(--ink-soft);font-size:10.5px;text-overflow:ellipsis;white-space:nowrap}.reason{display:-webkit-box;overflow:hidden;color:var(--ink);font-size:10.5px;line-height:1.35;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+.signal-summary{display:flex;align-items:center;gap:12px;margin:9px 0;padding:9px 11px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--paper-deep);font-size:var(--fs-xs)}.signal-summary strong{font-size:var(--fs-sm)}.signal-summary .num{margin-left:auto;color:var(--ink-soft)}.signal-summary.partial,.signal-summary.unavailable{border-color:color-mix(in srgb,var(--warn) 35%,var(--line));background:var(--warn-bg)}
+.board-list{display:flex;flex-direction:column}.board-section{display:grid;grid-template-columns:minmax(110px,145px) minmax(0,1fr);gap:18px;min-width:0;padding:14px 0 15px;border-top:1px solid var(--line)}.board-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:5px 0}.board-head>strong,.board-link{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}.board-head>.num{flex:none;color:var(--accent-ink);font-size:var(--fs-xs)}.board-link{border:0;background:transparent;padding:0;color:var(--accent-ink);cursor:pointer;font:inherit}.board-link:hover{text-decoration:underline}.instrument-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));column-gap:18px;row-gap:5px}.instrument-card{display:grid;align-content:start;gap:3px;min-width:0;min-height:86px;padding:7px;border:0;border-radius:5px;background:transparent;color:var(--ink);text-align:left;cursor:pointer}.instrument-card:hover:not(:disabled){background:var(--accent-soft)}.instrument-card:disabled{cursor:default}.instrument-name{display:flex;align-items:baseline;gap:6px;min-width:0}.instrument-name strong{overflow:hidden;font-size:var(--fs-sm);text-overflow:ellipsis;white-space:nowrap}.instrument-name small{flex:none;margin-left:auto;color:var(--ink-faint);font-size:10px}.signal-grade{flex:none;padding:1px 4px;border-radius:4px;background:var(--up-bg);color:var(--up);font-size:9px;font-style:normal;font-weight:700}.signal-grade.missing{background:var(--warn-bg);color:var(--warn)}.metric-line{overflow:hidden;color:var(--ink-soft);font-size:10.5px;text-overflow:ellipsis;white-space:nowrap}.signal-line{overflow:hidden;color:var(--accent-ink);font-size:10.5px;font-weight:600;text-overflow:ellipsis;white-space:nowrap}.reason{display:-webkit-box;overflow:hidden;color:var(--ink);font-size:10.5px;line-height:1.35;-webkit-box-orient:vertical;-webkit-line-clamp:2}.signal-issue{display:-webkit-box;overflow:hidden;color:var(--warn);font-size:10px;line-height:1.3;-webkit-box-orient:vertical;-webkit-line-clamp:2}
 @media(max-width:980px){.structure-tabs{grid-template-columns:repeat(4,minmax(0,1fr))}.board-section{grid-template-columns:110px minmax(0,1fr)}}@media(max-width:720px){.structure-heading{align-items:stretch;flex-direction:column}.date-control{align-self:flex-start}.structure-tabs{grid-template-columns:repeat(2,minmax(0,1fr))}.panel-head{align-items:flex-start;flex-direction:column}.board-section{grid-template-columns:1fr;gap:5px}.board-head{padding-bottom:0}.instrument-grid{grid-template-columns:1fr}}
 </style>

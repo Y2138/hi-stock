@@ -171,16 +171,16 @@ async function validatePromptBinding(db: Db, jobType: JobType, value: unknown): 
   return prompt.rows[0].id;
 }
 
-export async function listJobRuns(db: Db, jobId: string, limit: number): Promise<JobRunRow[]> {
+export async function listJobRuns(db: Db, jobId: string, limit: number, targetDate?: string): Promise<JobRunRow[]> {
   const result = await db.query<JobRunRow>(
     `SELECT id::text, job_id::text, task_run_id::text, prompt_revision_id::text,
             session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
             target_date::text, trigger_kind,
             scheduled_for, status, attempt_count, next_retry_at, log, artifacts, data_gaps,
             result_md, started_at, finished_at, created_at
-       FROM job_run WHERE job_id = $1
+       FROM job_run WHERE job_id = $1 AND ($3::date IS NULL OR target_date = $3::date)
       ORDER BY job_run.created_at DESC, job_run.id DESC LIMIT $2`,
-    [jobId, limit],
+    [jobId, limit, targetDate ?? null],
   );
   return result.rows;
 }
@@ -212,10 +212,12 @@ export async function listJobOutputs(
   db: Db,
   jobId: string,
   limit: number,
+  targetDate?: string,
 ): Promise<JobRunOutputRow[]> {
   const result = await db.query<JobRunOutputRow>(
-    `${OUTPUT_SELECT} WHERE job_id = $1 ORDER BY target_date DESC, id DESC LIMIT $2`,
-    [jobId, limit],
+    `${OUTPUT_SELECT} WHERE job_id = $1 AND ($3::date IS NULL OR target_date = $3::date)
+      ORDER BY target_date DESC, id DESC LIMIT $2`,
+    [jobId, limit, targetDate ?? null],
   );
   return result.rows;
 }
