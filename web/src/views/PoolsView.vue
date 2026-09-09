@@ -105,16 +105,19 @@ function onKeydown(event: KeyboardEvent): void {
 
 function maintainWithAgent(): void {
   askAi(
-    `请维护标的池，当前页面是${title.value}。新增、迁池或改变策略角色时，先按“标的入池评估指引”同时评估短线、波段和长线；当前页面和我提出的池别只能作为待验证假设，不得预设结论。优先查询数据库并按需补拉行情、财务和估值；只有故事性、催化剂、公告或外部风险证据不足时才使用 web_search。形成唯一策略归属并完整展示适配矩阵、数据截止和缺口后，才能用 pool_write 提案；关键数据不足或无法可靠区分时不要写入。`,
+    `请维护标的池，当前页面是${title.value}。新增、迁池或改变角色时只加载并调用一次 pool_onboard；把我明确的池别或角色直接传入，未明确时采用服务端推荐。服务端会统一完成数据同步、正式指标重算、版本化五维股性/阶段/评分和入池确认卡，不要再组合行情、分析或 pool_write。当前买入信号和止损都不属于入池判断。`,
     "维护标的池",
     { confirmation: `打开 Agent 维护${title.value}？\n\n页面本身只查询，业务事实由 Agent 核对后写入。` },
   );
 }
 
 function markAttentionWithAgent(member: PoolMember): void {
+  const instruction = isAttention(member)
+    ? "请先让我选择调整关注原因/期限或直接移出近期关注；移除时将 attention_reason、attention_from、attention_until 同时设为 null。"
+    : "请先让我确认关注原因与期限。";
   askAi(
     `请维护${title.value}标的 ${member.name}（${member.code}）的近期关注。先查询当前有效 pool_membership，` +
-    "仅使用 pool_write update 修改 attention_reason、attention_from、attention_until，保留原角色和全部研究属性；请先让我确认关注原因与期限，写入成功后刷新 pools。",
+    `仅使用 pool_write update 修改 attention_reason、attention_from、attention_until，保留原角色和全部研究属性；${instruction}写入成功后刷新 pools。`,
     `近期关注 · ${member.name}`,
     { confirmation: `打开 Agent 处理 ${member.name} 的近期关注？\n\n页面不会直接改写标的池。` },
   );
@@ -257,7 +260,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                   <td class="attention-cell">
                     <strong v-if="isAttention(member)" class="cell-clamp clamp-2">{{ member.attention_reason }}</strong>
                     <span v-else class="muted">未关注</span>
-                    <div class="attention-footer"><span class="muted">{{ isAttention(member) ? `${fmtDate(member.attention_from) ?? "现在"}–${fmtDate(member.attention_until) ?? "持续"}` : "—" }}</span><button class="detail-trigger agent-entry" type="button" @click.stop="markAttentionWithAgent(member)">{{ isAttention(member) ? "调整" : "关注" }}</button></div>
+                    <div class="attention-footer"><span class="muted">{{ isAttention(member) ? `${fmtDate(member.attention_from) ?? "现在"}–${fmtDate(member.attention_until) ?? "持续"}` : "—" }}</span><button class="detail-trigger agent-entry" type="button" @click.stop="markAttentionWithAgent(member)">{{ isAttention(member) ? "调整 / 移除" : "关注" }}</button></div>
                   </td>
                   <td class="row-action-cell"><button class="btn compact" type="button" @click.stop="goMarket(member.code)">查看行情</button></td>
                 </tr>
@@ -283,7 +286,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           </dl>
           <section v-if="showResearch" class="detail-section"><h3>研究摘要</h3><p>{{ detailMember.evaluation_summary ?? "暂无研究摘要" }}</p></section>
           <section v-if="showResearch" class="detail-section"><h3>研究标签</h3><div v-if="researchTags(detailMember).length" class="detail-tags"><span v-for="tag in researchTags(detailMember)" :key="tag" class="badge">{{ tag }}</span></div><p v-else class="muted">暂无研究标签</p></section>
-          <section class="detail-section"><h3>近期关注</h3><template v-if="isAttention(detailMember)"><p>{{ detailMember.attention_reason }}</p><div class="muted">{{ fmtDate(detailMember.attention_from) ?? "现在" }}–{{ fmtDate(detailMember.attention_until) ?? "持续" }}</div></template><p v-else class="muted">当前未关注</p><button class="btn compact agent-entry" type="button" @click="markAttentionWithAgent(detailMember)">{{ isAttention(detailMember) ? "调整关注" : "标记关注" }}</button></section>
+          <section class="detail-section"><h3>近期关注</h3><template v-if="isAttention(detailMember)"><p>{{ detailMember.attention_reason }}</p><div class="muted">{{ fmtDate(detailMember.attention_from) ?? "现在" }}–{{ fmtDate(detailMember.attention_until) ?? "持续" }}</div></template><p v-else class="muted">当前未关注</p><button class="btn compact agent-entry" type="button" @click="markAttentionWithAgent(detailMember)">{{ isAttention(detailMember) ? "调整或移除关注" : "标记关注" }}</button></section>
         </div>
       </aside>
     </div>

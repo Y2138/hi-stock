@@ -19,8 +19,9 @@ import {
   touchSession,
   updateSessionStatus,
 } from "./repo.js";
-import { getAgentSettings } from "./settings.js";
-import { buildChatTools } from "./tools.js";
+import { redactAgentMessages } from "./redaction.js";
+import { buildChatTools, JOB_FLOW_TOOL_BUNDLES, type ToolScope } from "./tools.js";
+import { createOnDemandToolSet } from "./tool-catalog.js";
 
 const sessionQueues = new Map<string, Promise<void>>();
 const MAX_PERSISTED_FRAME_BYTES = 64 * 1024;
@@ -80,6 +81,8 @@ export interface AgentSessionTurnInput {
   text: string;
   images?: ImageContent[];
   tools?: AgentTool[];
+  /** 工具装配范围：缺省按交互会话裁剪任务流程工具；agent_flow 按 jobCode 裁剪领域工具并保留永久 Web 能力。 */
+  toolScope?: ToolScope;
   historyMode?: "session" | "empty";
   systemPrompt?: string;
   systemPromptSuffix?: string;
@@ -88,7 +91,7 @@ export interface AgentSessionTurnInput {
   onFrame?: (frame: AgentCoreFrame) => void;
   /** 缺省以非空普通 stop 为完成；自动作业可额外要求结果横幅等业务完成标记。 */
   isCompleteAssistantText?: (text: string) => boolean;
-  continuationPrompt?: string;
+  continuationPrompt?: string | (() => string);
   maxContinuationTurns?: number;
 }
 
@@ -115,7 +118,7 @@ function assistantText(message: AgentMessage | null): string {
  * 只有非空普通 stop 且通过门禁才成功，续写超过上限则失败，禁止静默成功或无限循环。
  */
 function agentTurnCompleted(turn: AgentTurnResult, isCompleteText: (text: string) => boolean): boolean {
-  if (turn.aborted || turn.llmError || !turn.lastAssistant || turn.lastAssistant.role !== "assistant") return false;
+  if (turn.aborted || turn.llmError || turn.toolLoopError || !turn.lastAssistant || turn.lastAssistant.role !== "assistant") return false;
   return turn.lastAssistant.stopReason === "stop" && isCompleteText(assistantText(turn.lastAssistant));
 }
 
@@ -211,11 +214,13 @@ export async function runAgentSessionTurn(
       });
     }
 
-    const tools = input.tools ?? buildChatTools({
+    const availableTools = input.tools ?? buildChatTools({
       pool: input.pool,
       sessionId: session.id,
-      marketDomainToolsEnabled: (await getAgentSettings(input.pool)).market_domain_tools_enabled,
-    });
+    }, input.toolScope);
+    const preload = input.toolScope?.kind === "job" && !input.tools && Object.hasOwn(JOB_FLOW_TOOL_BUNDLES, input.toolScope.jobCode)
+      ? JOB_FLOW_TOOL_BUNDLES[input.toolScope.jobCode] ?? [] : [];
+    const toolSet = createOnDemandToolSet(availableTools, preload);
     const runId = crypto.randomUUID();
     let nextSeq = await nextMessageSeq(input.pool, session.id);
     const metrics = await AgentRunMetricRecorder.start({
@@ -225,12 +230,13 @@ export async function runAgentSessionTurn(
       modelId: session.model_id,
       systemPrompt: context.systemPrompt,
       historyMessages: context.messages,
-      tools,
+      tools: toolSet.initialTools,
       compacted: context.compacted,
     });
 
     let frameChain = Promise.resolve();
     const pendingToolUpdates = new Map<string, AgentCoreFrame>();
+    let toolUpdateTimer: ReturnType<typeof setTimeout> | undefined;
     const enqueueFrame = (frame: AgentCoreFrame): void => {
       frameChain = frameChain.then(async () => {
         if (frame.type !== "text") {
@@ -244,6 +250,8 @@ export async function runAgentSessionTurn(
       });
     };
     const flushToolUpdates = (): void => {
+      clearTimeout(toolUpdateTimer);
+      toolUpdateTimer = undefined;
       for (const frame of pendingToolUpdates.values()) enqueueFrame(frame);
       pendingToolUpdates.clear();
     };
@@ -252,6 +260,7 @@ export async function runAgentSessionTurn(
       if (frame.type === "tool_update") {
         const toolCallId = String(frame.data.toolCallId ?? "unknown");
         pendingToolUpdates.set(toolCallId, frame);
+        toolUpdateTimer ??= setTimeout(flushToolUpdates, 1_000);
         return;
       }
       flushToolUpdates();
@@ -296,14 +305,15 @@ export async function runAgentSessionTurn(
           text: nextText,
           images: continuationTurns === 0 ? input.images : undefined,
           runId,
-          tools,
+          tools: toolSet.currentTools(),
+          prepareToolsForNextTurn: toolSet.syncContext,
           onFrame: onCoreFrame,
           onMessageCompleted,
         });
         const stopReason = turn.lastAssistant?.role === "assistant"
           ? turn.lastAssistant.stopReason
           : undefined;
-        if (turn.aborted || turn.llmError || stopReason === "aborted" || stopReason === "error" ||
+        if (turn.aborted || turn.llmError || turn.toolLoopError || stopReason === "aborted" || stopReason === "error" ||
             agentTurnCompleted(turn, isCompleteText)) break;
         if (continuationTurns >= maxContinuationTurns) {
           throw new Error(
@@ -313,12 +323,16 @@ export async function runAgentSessionTurn(
         }
         continuationTurns += 1;
         messages = turn.messages;
-        nextText = input.continuationPrompt ?? DEFAULT_CONTINUATION_PROMPT;
+        nextText = typeof input.continuationPrompt === "function"
+          ? input.continuationPrompt()
+          : input.continuationPrompt ?? DEFAULT_CONTINUATION_PROMPT;
       }
       flushToolUpdates();
       await frameChain;
 
-      const freshMessages = turn.messages.slice(context.messages.length);
+      const redactedMessages = redactAgentMessages(turn.messages);
+      const lastAssistant = [...redactedMessages].reverse().find((message) => message.role === "assistant") ?? null;
+      const freshMessages = redactedMessages.slice(context.messages.length);
       await touchSession(
         input.pool,
         session.id,
@@ -337,6 +351,23 @@ export async function runAgentSessionTurn(
             session_id: session.id,
             event_type: "session_status",
             data: { status: "cancelled" },
+          });
+        }
+      } else if (turn.toolLoopError) {
+        await persistAndPublishSessionEvent(input.pool, {
+          session_id: session.id,
+          event_type: "session_error",
+          data: { code: "AGENT_TOOL_LOOP", message: turn.toolLoopError },
+        });
+        if (manageStatus) {
+          await updateSessionStatus(input.pool, session.id, {
+            status: "failed",
+            error_summary: turn.toolLoopError,
+          });
+          await persistAndPublishSessionEvent(input.pool, {
+            session_id: session.id,
+            event_type: "session_status",
+            data: { status: "failed" },
           });
         }
       } else if (turn.llmError || (turn.lastAssistant?.role === "assistant" && turn.lastAssistant.stopReason === "error")) {
@@ -368,11 +399,11 @@ export async function runAgentSessionTurn(
         });
       }
       await metrics.finish(
-        turn.aborted ? "cancelled" : turn.llmError ||
+        turn.aborted ? "cancelled" : turn.toolLoopError || turn.llmError ||
           (turn.lastAssistant?.role === "assistant" && turn.lastAssistant.stopReason === "error") ? "failed" : "complete",
         freshMessages,
       );
-      return { ...turn, freshMessages };
+      return { ...turn, messages: redactedMessages, lastAssistant, freshMessages };
     } catch (error) {
       flushToolUpdates();
       await frameChain.catch(() => {});

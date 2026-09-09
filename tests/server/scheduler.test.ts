@@ -3,6 +3,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import type pg from "pg";
 import { setAiRuntimeForTests } from "../../server/agent/ai/runtime.js";
+import * as hithinkDatasets from "../../server/datasource/hithink-datasets.js";
+import { createJobCompletionGate } from "../../server/agent/job-workflow.js";
 import { buildChatTools } from "../../server/agent/tools.js";
 import { acquireAgentMutationLock } from "../../server/agent/mutation-lock.js";
 import { acquireMarketMutationLock } from "../../server/datasource/mutation-lock.js";
@@ -19,10 +21,68 @@ import {
 } from "../../server/scheduler/repo.js";
 import { executeJobRun, resolveDailyUpdateScope } from "../../server/scheduler/runner.js";
 import { JobScheduler } from "../../server/scheduler/service.js";
-import { cronOccurrences, shanghaiDate } from "../../server/scheduler/time.js";
+import { cronOccurrences, dailyMarketGate, shanghaiDate } from "../../server/scheduler/time.js";
 import { api, prepareTestDb, resetSchema, seedTestStrategy, startTestServer, type TestServer } from "./helpers.js";
 
 const prepared = await prepareTestDb();
+
+function dailyReadCalls() {
+  return [
+    fauxToolCall("strategy_document_query", { codes: ["test_strategy", "limit_up_board"] }),
+    fauxToolCall("daily_plan_context_query", { date: "2026-08-17" }),
+    fauxToolCall("swing_signal_query", { date: "2026-08-17" }),
+    fauxToolCall("limit_up_signal_query", { date: "2026-08-17" }),
+  ];
+}
+
+function dailyWriteResponse() {
+  return fauxAssistantMessage([fauxToolCall("pool_attention_write", { reason: "完整扫描后无新增候选", items: [] })], { stopReason: "toolUse" });
+}
+
+it("任务完成门禁只接受本次正确日期的工具结果，并按真实持仓要求结构化写入", () => {
+  const gate = createJobCompletionGate("daily_plan_flow", "2026-08-17");
+  function observed(name: string, args: Record<string, unknown>, details: unknown, isError = false) {
+    gate.observe({ type: "tool_start", data: { toolCallId: name, name, args } });
+    gate.observe({ type: "tool_end", data: { toolCallId: name, name, isError, result: { details } } });
+  }
+  observed("strategy_document_query", { codes: ["test_strategy"] }, {});
+  observed("daily_plan_context_query", { date: "2026-08-16" }, { positions: { position_count: 1 } });
+  observed("swing_signal_query", { date: "2026-08-17" }, {});
+  observed("limit_up_signal_query", { date: "2026-08-17" }, { signals: [] });
+  observed("pool_attention_write", { items: [] }, {}, true);
+  expect(gate.missing()).toEqual(["daily_plan_context_query", "pool_attention_write"]);
+  observed("daily_plan_context_query", { date: "2026-08-17" }, {
+    positions: { position_count: 1, items: [{ code: "600000.SH" }] },
+  });
+  observed("pool_attention_write", { items: [] }, {});
+  expect(gate.missing()).toEqual(["daily_plan_write"]);
+  observed("daily_plan_write", { items: [] }, {});
+  expect(gate.missing()[0]).toContain("必须完整覆盖");
+  observed("daily_plan_write", { items: [{ code: "600000.SH", item_kind: "position_action" }] }, {});
+  expect(gate.missing()).toEqual([]);
+  expect(createJobCompletionGate("daily_plan_flow", "2026-08-17").missing()).toContain("pool_attention_write");
+  expect(createJobCompletionGate("constructor", "2026-08-17").missing()).toEqual([]);
+
+  const closed = createJobCompletionGate("auction_opportunity_assessment", "2026-08-16");
+  closed.observe({ type: "tool_start", data: { toolCallId: "closed", name: "auction_context_query", args: { date: "2026-08-16" } } });
+  closed.observe({ type: "tool_end", data: { toolCallId: "closed", name: "auction_context_query", isError: false,
+    result: { details: { market_day: { should_run: false } } } } });
+  expect(closed.missing()).toEqual([]);
+
+  const weekly = createJobCompletionGate("weekly_review", "2026-08-17");
+  function poolResult(args: Record<string, unknown>, pools: unknown[]) {
+    weekly.observe({ type: "tool_start", data: { toolCallId: "pool", name: "pool_context_query", args } });
+    weekly.observe({ type: "tool_end", data: { toolCallId: "pool", name: "pool_context_query", isError: false,
+      result: { details: { pools } } } });
+  }
+  poolResult({ codes: ["600000.SH"] }, [{ pool: "short", member_count: 1 }]);
+  expect(weekly.missing().some((name) => name.includes("完整摘要"))).toBe(true);
+  poolResult({}, [{ pool: "short", member_count: 1 }, { pool: "long", member_count: 1 }]);
+  poolResult({ codes: ["600000.SH"] }, [{ pool: "short", member_count: 1 }]);
+  expect(weekly.missing().some((name) => name.includes("完整摘要"))).toBe(false);
+  expect(weekly.missing()).toContain("analysis_run");
+});
+
 
 function dailySummary(gaps: unknown[] = []) {
   return {
@@ -63,7 +123,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     await pool.end();
   });
 
-  it("迁移初始化八个受控作业，新增市场作业默认关闭，cron 固定按上海时区解析", async () => {
+  it("迁移初始化八个受控作业，板块目录与成分同步默认启用，cron 固定按上海时区解析", async () => {
     const jobs = await listJobDefinitions(pool);
     expect(jobs.map((job) => job.code)).toEqual([
       "auction_opportunity_assessment",
@@ -85,27 +145,44 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       .every((job) => Object.keys(job.config).length === 0)).toBe(true);
     expect(
       jobs
-        .filter((job) => ["market_catalog_sync", "board_membership_sync", "daily_market_structure"].includes(job.code))
-        .every((job) => job.enabled === false),
+        .filter((job) => ["market_catalog_sync", "board_membership_sync"].includes(job.code))
+        .every((job) => job.enabled === true),
     ).toBe(true);
+    expect(jobs.find((job) => job.code === "daily_market_structure")?.enabled).toBe(false);
     const prompts = await pool.query<{ code: string; content: string }>(
       `SELECT p.code, r.content FROM job_prompt p JOIN job_prompt_revision r ON r.id = p.current_revision_id ORDER BY p.code`,
     );
     expect(prompts.rows).toHaveLength(4);
-    expect(prompts.rows.every((row) => row.content.includes("当前最终策略"))).toBe(true);
-    expect(prompts.rows.every((row) => row.content.includes("job_run_output"))).toBe(true);
+    expect(prompts.rows.filter((row) => row.code !== "auction_opportunity_assessment")
+      .every((row) => row.content.includes("当前最终策略"))).toBe(true);
+    expect(prompts.rows.filter((row) => row.code !== "auction_opportunity_assessment")
+      .every((row) => row.content.includes("job_run_output"))).toBe(true);
     expect(prompts.rows.every((row) => !row.content.includes(".md"))).toBe(true);
-    expect(prompts.rows.some((row) => row.content.includes("## 近期关注维护"))).toBe(true);
     expect(prompts.rows.every((row) => !row.content.includes("## 策略模拟账户信号"))).toBe(true);
+    const dailyPrompt = prompts.rows.find((row) => row.code === "daily_plan_flow")!.content;
+    const midweekPrompt = prompts.rows.find((row) => row.code === "midweek_check")!.content;
+    const weeklyPrompt = prompts.rows.find((row) => row.code === "weekly_review")!.content;
+    expect(dailyPrompt).toContain("pool_attention_write");
+    expect(dailyPrompt).toContain("daily_plan_context_query");
+    expect(dailyPrompt.length).toBeLessThan(4_000);
+    expect(midweekPrompt).toContain("pool_context_query");
+    expect(midweekPrompt.length).toBeLessThan(1_200);
+    expect(weeklyPrompt).toContain("analysis_run(long_valuation)");
+    expect(weeklyPrompt.length).toBeLessThan(1_200);
+    expect([dailyPrompt, midweekPrompt, weeklyPrompt]
+      .every((content) => !content.includes("本节替代前文"))).toBe(true);
     const auctionPrompt = prompts.rows.find((row) => row.code === "auction_opportunity_assessment")!.content;
+    expect(auctionPrompt).toContain("tool_catalog");
+    expect(auctionPrompt).toContain("auction_context_query");
     expect(auctionPrompt).toContain("auction_short_term_benchmark");
     expect(auctionPrompt).toContain("auction_snapshot");
-    expect(auctionPrompt).toContain("stage='final'");
-    expect(auctionPrompt).toContain("延续确认·一字排队观察");
-    expect(auctionPrompt).toContain("延续确认·换手晋级观察");
-    expect(auctionPrompt).toContain("不得对打板候选使用 `worth_entering`");
-    expect(auctionPrompt).not.toContain("放弃（非排队口径）");
-    expect(auctionPrompt).toContain("不得自动买入、自动入池或自动标记近期关注");
+    expect(auctionPrompt).toContain('stage="final"');
+    expect(auctionPrompt).toContain("signal_passed/one_word_continue");
+    expect(auctionPrompt).toContain("signal_passed/turnover_advance");
+    expect(auctionPrompt).toContain("items` 必须与 `opportunities` 代码全集完全一致");
+    expect(auctionPrompt).not.toContain("worth_entering");
+    expect(auctionPrompt).not.toContain("本节替代前文");
+    expect(auctionPrompt).toContain("不交易、不改持仓、不入池、不修改近期关注或策略");
     expect(shanghaiDate(new Date("2026-08-16T16:30:00Z"))).toBe("2026-08-17");
     expect(
       cronOccurrences(
@@ -300,22 +377,42 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(historical.target_date).toBe("2026-08-20");
   });
 
+  it("交易日历缺行时工作日继续取实际行情，周末仍跳过", async () => {
+    await expect(dailyMarketGate(pool, "2026-08-24", new Date("2026-08-24T08:00:00Z")))
+      .resolves.toEqual({ action: "run", mode: "snapshot" });
+    await expect(dailyMarketGate(pool, "2026-08-22", new Date("2026-08-24T08:00:00Z")))
+      .resolves.toEqual({ action: "skip", reason: "目标日 2026-08-22 为非交易日" });
+  });
+
   it("共享工具目录可维护自动关注并自动绑定当前计划运行", async () => {
     await pool.query(
       `INSERT INTO market_instrument (code,name,kind) VALUES
+         ('990086.SZ','人工关注测试','stock'),
+         ('990087.SZ','过期自动关注测试','stock'),
          ('990088.SZ','关注工具测试','stock'),
          ('990089.SZ','预案工具测试','stock')`,
     );
     await pool.query(
       `INSERT INTO pool_membership (instrument_id,pool,role,effective_from)
-       SELECT id,'short','观察','2026-08-01' FROM market_instrument WHERE code='990088.SZ'`,
+       SELECT id,'short','观察','2026-08-01' FROM market_instrument WHERE code IN ('990086.SZ','990087.SZ','990088.SZ','990089.SZ')`,
+    );
+    await pool.query(
+      `UPDATE pool_membership membership
+          SET attention_reason = CASE instrument.code
+                WHEN '990086.SZ' THEN '人工持续跟踪'
+                ELSE '每日计划·即将符合：上一计划遗留'
+              END,
+              attention_from = '2026-08-17', attention_until = '2026-08-25'
+         FROM market_instrument instrument
+        WHERE instrument.id = membership.instrument_id
+          AND instrument.code IN ('990086.SZ','990087.SZ')`,
     );
     await pool.query(
       `INSERT INTO portfolio_position (instrument_id,quantity,cost_price)
        SELECT id,100,10 FROM market_instrument WHERE code='990089.SZ'`,
     );
     const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-18");
-    const tools = buildChatTools({ pool, sessionId: run.session_id! });
+    const tools = buildChatTools({ pool, sessionId: run.session_id! }, { kind: "job", jobCode: "daily_plan_flow" });
     const tool = tools.find((item) => item.name === "pool_attention_write")!;
     await tool.execute("tc-attention-mark", {
       reason: "每日计划识别出接近完整条件",
@@ -324,24 +421,74 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         code: "990088.SZ",
         pool: "short",
         attention_status: "approaching",
-        attention_reason: "仍缺放量站稳关键位",
+        attention_reason: "每日计划·即将符合：仍缺放量站稳关键位",
         attention_from: "2026-08-18",
         attention_until: "2026-08-25",
       }],
     });
     expect((await pool.query(
-      "SELECT attention_reason,attention_from::text,attention_until::text FROM pool_membership WHERE effective_to IS NULL",
+      `SELECT attention_reason,attention_from::text,attention_until::text
+         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id=membership.instrument_id
+        WHERE membership.effective_to IS NULL AND instrument.code='990088.SZ'`,
     )).rows[0]).toEqual({
       attention_reason: "每日计划·即将符合：仍缺放量站稳关键位",
       attention_from: "2026-08-18",
       attention_until: "2026-08-25",
     });
-    await pool.query("UPDATE pool_membership SET attention_reason='人工持续跟踪' WHERE effective_to IS NULL");
+    expect((await pool.query(
+      `SELECT instrument.code, membership.attention_reason
+         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id=membership.instrument_id
+        WHERE instrument.code IN ('990086.SZ','990087.SZ') ORDER BY instrument.code`,
+    )).rows).toEqual([
+      { code: "990086.SZ", attention_reason: "人工持续跟踪" },
+      { code: "990087.SZ", attention_reason: null },
+    ]);
+    const heldResult = await tool.execute("tc-attention-held", {
+      reason: "已持仓标的不进入近期关注",
+      items: [{
+        action: "mark",
+        code: "990089.SZ",
+        pool: "short",
+        attention_status: "qualified",
+        attention_reason: "满足信号但已经持仓",
+        attention_from: "2026-08-18",
+        attention_until: "2026-08-25",
+      }],
+    });
+    expect(heldResult.details).toMatchObject({
+      items: [
+        { code: "990089.SZ", action: "skip", suppressed_by: "existing_position" },
+        { code: "990088.SZ", action: "clear", reconciled: true },
+      ],
+    });
+    expect((await pool.query(
+      `SELECT attention_reason FROM pool_membership membership
+        JOIN market_instrument instrument ON instrument.id=membership.instrument_id
+       WHERE instrument.code='990089.SZ'`,
+    )).rows[0]!.attention_reason).toBeNull();
+    await tool.execute("tc-attention-empty", {
+      reason: "本轮没有符合或即将符合条件的标的",
+      items: [],
+    });
+    expect((await pool.query(
+      `SELECT attention_reason FROM pool_membership membership
+        JOIN market_instrument instrument ON instrument.id=membership.instrument_id
+       WHERE instrument.code='990088.SZ'`,
+    )).rows[0]!.attention_reason).toBeNull();
+    await pool.query(
+      `UPDATE pool_membership membership SET attention_reason='人工持续跟踪'
+         FROM market_instrument instrument
+        WHERE instrument.id=membership.instrument_id AND instrument.code='990088.SZ'`,
+    );
     await expect(tool.execute("tc-attention-clear", {
       reason: "本轮已不接近条件",
       items: [{ action: "clear", code: "990088.SZ", pool: "short" }],
     })).rejects.toThrow("不得清除");
-    expect((await pool.query("SELECT attention_reason FROM pool_membership WHERE effective_to IS NULL")).rows[0]!.attention_reason)
+    expect((await pool.query(
+      `SELECT attention_reason FROM pool_membership membership
+        JOIN market_instrument instrument ON instrument.id=membership.instrument_id
+       WHERE instrument.code='990088.SZ'`,
+    )).rows[0]!.attention_reason)
       .toBe("人工持续跟踪");
 
     await tools.find((item) => item.name === "daily_plan_write")!.execute("tc-plan-write", {
@@ -759,9 +906,14 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       });
       faux.setResponses([
         fauxAssistantMessage(
-          [fauxToolCall("memory_query", { limit: 1 })],
+          [fauxToolCall("tool_catalog", { names: ["job_context_query"] })],
           { stopReason: "toolUse" },
         ),
+        fauxAssistantMessage(
+          [fauxToolCall("job_context_query", { job_codes: ["daily_plan_flow"] }), ...dailyReadCalls()],
+          { stopReason: "toolUse" },
+        ),
+        dailyWriteResponse(),
         async () => {
           await finalGate;
           return fauxAssistantMessage([
@@ -780,7 +932,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
           "SELECT role FROM chat_message WHERE session_id = $1 ORDER BY seq",
           [run.session_id],
         )).rows;
-        if (runningMessages.length >= 3) break;
+        if (runningMessages.length >= 11) break;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       const runningStatus = (await pool.query<{ session_status: string }>(
@@ -789,23 +941,19 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       )).rows[0]!.session_status;
       releaseFinal();
       const finished = await execution;
-      expect(runningMessages).toEqual([
-        { role: "user" },
-        { role: "assistant" },
-        { role: "tool" },
+      expect(runningMessages.map((row) => row.role)).toEqual([
+        "user", "assistant", "tool", "assistant", ...Array(5).fill("tool"), "assistant", "tool",
       ]);
       expect(runningStatus).toBe("running");
+      const toolErrors = await pool.query("SELECT content->>'toolName' AS tool, content->'content' AS error FROM chat_message WHERE session_id=$1 AND role='tool' AND content->>'isError'='true'", [run.session_id]);
+      expect(toolErrors.rows).toEqual([]);
       expect(finished).toMatchObject({ status: "success", session_id: run.session_id });
       const messages = await pool.query(
         "SELECT role FROM chat_message WHERE session_id = $1 ORDER BY seq",
         [run.session_id],
       );
-      expect(messages.rows).toEqual([
-        { role: "user" },
-        { role: "assistant" },
-        { role: "tool" },
-        { role: "assistant" },
-        { role: "assistant" },
+      expect(messages.rows.map((row) => row.role)).toEqual([
+        ...runningMessages.map((row) => row.role), "assistant", "assistant",
       ]);
       const events = await pool.query<{ event_type: string }>(
         "SELECT event_type FROM chat_session_event WHERE session_id = $1 ORDER BY id",
@@ -814,15 +962,19 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       expect(events.rows.map((row) => row.event_type)).toEqual(
         expect.arrayContaining(["session_status", "message_completed", "ui_refresh"]),
       );
+      const activities = await pool.query<{ data: { phase: string; job_code?: string } }>(
+        "SELECT data FROM chat_session_event WHERE session_id=$1 AND event_type='activity' ORDER BY id", [run.session_id],
+      );
+      expect(activities.rows.at(-1)?.data).toMatchObject({ phase: "saving", job_code: "daily_plan_flow" });
       expect((await pool.query(
-        "SELECT session_id::text FROM agent_tool_audit WHERE tool_name = 'memory_query' ORDER BY id DESC LIMIT 1",
+        "SELECT session_id::text FROM agent_tool_audit WHERE tool_name = 'job_context_query' ORDER BY id DESC LIMIT 1",
       )).rows[0]!.session_id).toBe(run.session_id);
     } finally {
       setAiRuntimeForTests(null);
     }
   });
 
-  it("agent_flow 只把带结果标记的普通 stop 视为完成，进度文本或长度上限会受控续写", async () => {
+  it("agent_flow 接受正文开头的结果标记并统一置顶，进度文本或长度上限会受控续写", async () => {
     const faux = fauxProvider();
     const models = createModels();
     models.setProvider(faux.provider);
@@ -836,10 +988,17 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     });
     try {
       faux.setResponses([
-        fauxAssistantMessage([fauxText("工具数据已经齐全，我继续整理最终结果。")]),
+        (context) => {
+          expect(context.tools?.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+            "daily_plan_context_query", "swing_signal_query", "pool_attention_write",
+          ]));
+          return fauxAssistantMessage(dailyReadCalls(), { stopReason: "toolUse" });
+        },
+        dailyWriteResponse(),
+        fauxAssistantMessage([fauxText("> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。")]),
         fauxAssistantMessage([fauxText("")], { stopReason: "length" }),
         fauxAssistantMessage([
-          fauxText("> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。\n\n# 截断后完成"),
+          fauxText("# 截断后完成\n\n> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。\n\n正文"),
         ]),
       ]);
       const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
@@ -849,18 +1008,23 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         "SELECT role, content #>> '{content,0,text}' AS text FROM chat_message WHERE session_id = $1 ORDER BY seq",
         [run.session_id],
       );
-      expect(messages.rows.map((row) => row.role)).toEqual([
-        "user", "assistant", "user", "assistant", "user", "assistant", "assistant",
-      ]);
-      expect(messages.rows[2]!.text).toContain("已有的完整工具结果继续");
-      expect(messages.rows[4]!.text).toContain("已有的完整工具结果继续");
+      const userMessages = messages.rows.filter((row) => row.role === "user");
+      expect(userMessages).toHaveLength(3);
+      expect(userMessages[1]!.text).toContain("已有的完整工具结果继续");
+      expect(userMessages[2]!.text).toContain("已有的完整工具结果继续");
+      expect(userMessages[2]!.text).toContain("本次尚未成功完成的必需工具：无");
       expect(messages.rows.every((row) => !row.text?.includes("任务将在计划时间自动重试"))).toBe(true);
+      const output = (await pool.query<{ markdown: string }>(
+        "SELECT markdown FROM job_run_output WHERE run_id = $1",
+        [run.id],
+      )).rows[0]!.markdown;
+      expect(output).toBe("> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。\n\n# 截断后完成\n\n正文");
     } finally {
       setAiRuntimeForTests(null);
     }
   });
 
-  it("agent_flow 连续未生成合格最终结果时达到明确上限并进入任务重试", async () => {
+  it("agent_flow 只有完成横幅但漏做必需工具时有界续写并进入重试", async () => {
     const faux = fauxProvider();
     const models = createModels();
     models.setProvider(faux.provider);
@@ -874,7 +1038,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     });
     try {
       faux.setResponses(Array.from({ length: 4 }, () =>
-        fauxAssistantMessage([fauxText("仍在处理，尚未生成最终结果。")])));
+        fauxAssistantMessage([fauxText("> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。\n\n# 声称已完成")])));
       const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
       const finished = await executeJobRun({
         pool,
@@ -927,16 +1091,29 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       modelId: model.id,
     });
     try {
+      vi.spyOn(hithinkDatasets, "fetchHithinkDatasetAndStore").mockRejectedValue(new Error("测试上游数据未就绪"));
       faux.setResponses([
+        fauxAssistantMessage([
+          fauxToolCall("auction_context_query", { date: "2026-08-19" }),
+          fauxToolCall("strategy_document_query", { codes: ["limit_up_board"] }),
+        ], { stopReason: "toolUse" }),
+        fauxAssistantMessage(
+          [fauxToolCall("fetch_hithink_data", { requests: [
+            { capability: "auction_short_term_benchmark", date: "2026-08-19" },
+            { capability: "auction_snapshot", stage: "final", codes: ["990091.SZ"] },
+          ] })],
+          { stopReason: "toolUse" },
+        ),
         fauxAssistantMessage(
           [fauxToolCall("auction_assessment_write", {
             items: [{
               code: "990091.SZ",
-              conclusion: "observe",
-              metrics_summary: "竞价涨幅 2.1%，竞价量比 1.8",
-              assessment_summary: "原计划条件已由最终竞价数据确认，失效条件未触发",
-              benchmark_tags: ["情绪回暖"],
-              data_status: "ready",
+              conclusion: "unavailable",
+              review_type: "data_insufficient",
+              metrics_summary: "上游测试响应未就绪，无可用竞价字段",
+              assessment_summary: "竞价数据缺失，不能验证原计划",
+              benchmark_tags: ["测试缺数"],
+              data_status: "missing",
               data_time: "2026-08-19T01:30:05.000Z",
             }],
           })],
@@ -967,7 +1144,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       expect(assessment.rows).toEqual([{
         status: "active",
         output_id: output.rows[0]!.id,
-        conclusion: "observe",
+        conclusion: "unavailable",
       }]);
 
       const board = await api(server.baseUrl, "GET", "/api/plans/latest");
@@ -977,8 +1154,9 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
           code: "990091.SZ",
           auction_assessment: {
             output_id: output.rows[0]!.id,
-            conclusion: "observe",
-            benchmark_tags: ["情绪回暖"],
+            conclusion: "unavailable",
+            review_type: "data_insufficient",
+            benchmark_tags: ["测试缺数"],
           },
         }],
       });
@@ -990,6 +1168,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       );
       expect(refresh.rows[0]!.data.targets).toContain("dashboard");
     } finally {
+      vi.restoreAllMocks();
       setAiRuntimeForTests(null);
     }
   });

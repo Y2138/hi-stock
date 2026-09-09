@@ -267,6 +267,11 @@ export const chatRoutes = {
         | null;
       if (turn.aborted || lastAssistant?.stopReason === "aborted") {
         sendSse(res, "aborted", { run_id: turn.runId, message: "已中断" });
+      } else if (turn.toolLoopError) {
+        sendSse(res, "error", {
+          code: "AGENT_TOOL_LOOP",
+          message: turn.toolLoopError,
+        });
       } else if (turn.llmError || lastAssistant?.stopReason === "error") {
         sendSse(res, "error", {
           code: "LLM_ERROR",

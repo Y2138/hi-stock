@@ -65,37 +65,72 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
     name: "pool_attention_write",
     label: "批量维护每日计划近期关注",
     description:
-      "一次提交全部近期关注变更并在同一事务执行。只维护已在短线池或长线池中的标的；mark 必须区分已符合/即将符合、写明证据与起止日期，clear 只能清理由每日计划自动创建的关注。不得新增标的、改变池角色或研究属性。",
+      "一次提交本轮应保留的全部近期关注并在同一事务对账。items 中的 mark 是完整保留集合，遗漏的历史自动关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧自动关注；人工关注永不清除或覆盖。只维护已在短线池或长线池中的标的，不得新增标的、改变池角色或研究属性。",
     parameters: ScheduledPoolAttentionSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {
       try {
         if (signal?.aborted) throw new Error("每日计划关注维护已中断");
         const input = validateScheduledPoolAttentionInput(rawInput);
+        await associatedRunningJob(deps.pool, deps.sessionId, "daily_plan_flow");
         const outcome = await withAgentMutationLock(deps.pool, async (client) => {
           const items = [];
+          const kept = new Set<string>();
           for (const item of input.items) {
-            const current = await client.query<{ attention_reason: string | null }>(
-              `SELECT membership.attention_reason
+            const current = await client.query<{ attention_reason: string | null; quantity: number }>(
+              `SELECT membership.attention_reason, COALESCE(position.quantity, 0)::float8 AS quantity
                  FROM pool_membership membership
                  JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+                 LEFT JOIN portfolio_position position ON position.instrument_id = membership.instrument_id
                 WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL
                 FOR UPDATE OF membership`,
               [item.code, item.pool],
             );
             const existingReason = current.rows[0]?.attention_reason ?? null;
             if (!current.rows[0]) throw new Error(`标的 ${item.code} 不在当前策略池中，自动作业不得绕过完整入池评估`);
+            if (item.action === "mark" && current.rows[0].quantity > 0) {
+              if (existingReason?.startsWith(DAILY_PREFIX)) {
+                const write = await setPoolAttention(client, {
+                  code: item.code,
+                  pool: item.pool,
+                  attention_reason: null,
+                  attention_from: null,
+                  attention_until: null,
+                });
+                items.push({
+                  code: item.code,
+                  pool: item.pool,
+                  action: "clear",
+                  previous_attention_reason: write.before.attention_reason,
+                  attention_reason: null,
+                  attention_from: null,
+                  attention_until: null,
+                  suppressed_by: "existing_position",
+                });
+              } else {
+                items.push({
+                  code: item.code,
+                  pool: item.pool,
+                  action: "skip",
+                  previous_attention_reason: existingReason,
+                  attention_reason: existingReason,
+                  suppressed_by: "existing_position",
+                });
+              }
+              continue;
+            }
             if (item.action === "clear" && !existingReason?.startsWith(DAILY_PREFIX)) {
               throw new Error(`标的 ${item.code} 的关注不是每日计划自动创建，自动作业不得清除`);
             }
             if (item.action === "mark" && existingReason && !existingReason.startsWith(DAILY_PREFIX)) {
               throw new Error(`标的 ${item.code} 已有人工关注原因，自动作业不得覆盖`);
             }
+            if (item.action === "mark") kept.add(`${item.pool}:${item.code}`);
             const write = item.action === "mark"
               ? await setPoolAttention(client, {
                   code: item.code,
                   pool: item.pool,
-                  attention_reason: `${DAILY_PREFIX}${item.attention_status === "qualified" ? "已符合" : "即将符合"}：${item.attention_reason}`,
+                  attention_reason: `${DAILY_PREFIX}${item.attention_status === "qualified" ? "已符合" : "即将符合"}：${item.attention_reason!.replace(/^每日计划·(?:已符合|即将符合)：/, "")}`,
                   attention_from: item.attention_from!,
                   attention_until: item.attention_until!,
                 })
@@ -114,6 +149,36 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
               attention_reason: write.after.attention_reason,
               attention_from: write.after.attention_from,
               attention_until: write.after.attention_until,
+            });
+          }
+          const stale = await client.query<{ code: string; pool: "short" | "long" }>(
+            `SELECT instrument.code, membership.pool
+               FROM pool_membership membership
+               JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+              WHERE membership.effective_to IS NULL
+                AND membership.attention_reason LIKE $1
+                AND NOT ((membership.pool || ':' || instrument.code) = ANY($2::text[]))
+              ORDER BY membership.pool, instrument.code
+              FOR UPDATE OF membership`,
+            [`${DAILY_PREFIX}%`, [...kept]],
+          );
+          for (const item of stale.rows) {
+            const write = await setPoolAttention(client, {
+              code: item.code,
+              pool: item.pool,
+              attention_reason: null,
+              attention_from: null,
+              attention_until: null,
+            });
+            items.push({
+              code: item.code,
+              pool: item.pool,
+              action: "clear",
+              previous_attention_reason: write.before.attention_reason,
+              attention_reason: null,
+              attention_from: null,
+              attention_until: null,
+              reconciled: true,
             });
           }
           const summary = { total: items.length, items };
@@ -182,7 +247,7 @@ export function buildJobAuctionAssessmentTool(deps: {
     name: "auction_assessment_write",
     label: "更新打板机会竞价复核",
     description:
-      "一次性提交当前每日计划全部打板机会的 T+1 集合竞价复核。必须完整覆盖，不得增加或遗漏代码；前向验证期只允许继续观察、放弃或数据不足，任务成功后才在仪表盘“打板机会”中激活。",
+      "一次性提交当前每日计划全部打板机会的 T+1 集合竞价复核。必须完整覆盖并写明一字延续、换手晋级、分歧、放弃或数据不足分类；小额实盘验证期只允许信号通过、放弃或数据不足，任务成功后才在仪表盘“打板机会”中激活。",
     parameters: AuctionAssessmentWriteSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {

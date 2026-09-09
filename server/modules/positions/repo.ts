@@ -54,10 +54,30 @@ export interface PositionChangeRow {
   plan_output_id: string | null;
   plan_output_type: string | null;
   plan_target_date: string | null;
+  entry_auction_assessment_id: string | null;
+  entry_signal_date: string | null;
+  entry_assessment_date: string | null;
+  entry_signal_review_type: string | null;
+  entry_signal_grade: string | null;
+  entry_signal_headline: string | null;
   source_session_id: string | null;
   attribution_note: string | null;
   deviation_reason: string | null;
   created_at: string;
+}
+
+export interface PassedLimitUpSignalRow {
+  assessment_id: string;
+  code: string;
+  name: string;
+  signal_date: string;
+  assessment_date: string;
+  review_type: string;
+  grade: string | null;
+  priority: number;
+  headline: string;
+  plan_output_id: string;
+  assessment_output_id: string | null;
 }
 
 function round2(n: number): number {
@@ -116,16 +136,57 @@ export async function listPositionChanges(db: Db, limit = 100, codes?: string[])
             c.strategy_change_seq::text, c.strategy_snapshot_hash,
             c.plan_output_id::text, plan.output_type AS plan_output_type,
             plan.target_date::text AS plan_target_date,
+            c.entry_auction_assessment_id::text,
+            entry_item.target_date::text AS entry_signal_date,
+            entry_run.target_date::text AS entry_assessment_date,
+            entry_assessment.review_type AS entry_signal_review_type,
+            entry_item.grade AS entry_signal_grade,
+            entry_item.headline AS entry_signal_headline,
             c.source_session_id::text, c.attribution_note, c.deviation_reason, c.created_at
        FROM portfolio_position_change c
        JOIN market_instrument i ON i.id = c.instrument_id
        LEFT JOIN job_run_output plan ON plan.id = c.plan_output_id
+       LEFT JOIN daily_plan_auction_assessment entry_assessment
+         ON entry_assessment.id = c.entry_auction_assessment_id
+       LEFT JOIN daily_plan_playbook entry_item ON entry_item.id = entry_assessment.playbook_item_id
+       LEFT JOIN job_run entry_run ON entry_run.id = entry_assessment.source_job_run_id
       WHERE ($2::text[] IS NULL OR i.code = ANY($2::text[]))
       ORDER BY c.change_date DESC, c.id DESC
       LIMIT $1`,
     [limit, codes?.length ? codes : null],
   );
   return r.rows;
+}
+
+/** 按标的和可选成交日返回最近“信号通过”的打板复核，供 Agent 录入成交前确定归因。 */
+export async function listPassedLimitUpSignals(
+  db: Db,
+  codes: string[],
+  changeDate?: string,
+): Promise<PassedLimitUpSignalRow[]> {
+  if (codes.length === 0) return [];
+  const result = await db.query<PassedLimitUpSignalRow>(
+    `SELECT DISTINCT ON (assessment.code, auction_run.target_date)
+            assessment.id::text AS assessment_id,
+            assessment.code, instrument.name,
+            item.target_date::text AS signal_date,
+            auction_run.target_date::text AS assessment_date,
+            assessment.review_type, item.grade, item.priority,
+            item.headline, item.plan_output_id::text,
+            assessment.assessment_output_id::text
+       FROM daily_plan_auction_assessment assessment
+       JOIN daily_plan_playbook item ON item.id = assessment.playbook_item_id
+       JOIN job_run auction_run ON auction_run.id = assessment.source_job_run_id
+       JOIN market_instrument instrument ON instrument.code = assessment.code
+      WHERE assessment.code = ANY($1::text[])
+        AND assessment.conclusion = 'signal_passed'
+        AND assessment.status IN ('active','superseded')
+        AND ($2::date IS NULL OR auction_run.target_date = $2::date)
+      ORDER BY assessment.code, auction_run.target_date DESC, assessment.id DESC
+      LIMIT 20`,
+    [codes, changeDate ?? null],
+  );
+  return result.rows.map((row) => ({ ...row, priority: Number(row.priority) }));
 }
 
 export interface RealizedPnlSummaryRow {
@@ -191,6 +252,68 @@ interface PositionState {
   opened_at: string | null;
 }
 
+interface EntryAuctionSignal {
+  id: string;
+  plan_output_id: string;
+  assessment_output_id: string | null;
+  signal_date: string;
+  assessment_date: string;
+  review_type: string;
+  grade: string | null;
+  headline: string;
+}
+
+async function resolveEntryAuctionSignal(
+  client: pg.PoolClient,
+  instrumentId: string,
+  code: string,
+  input: RecordChangeInput,
+  existing: PositionState | null,
+): Promise<EntryAuctionSignal | null> {
+  if (input.kind === "buy" && input.decision_origin === "strategy_signal") {
+    const match = await client.query<EntryAuctionSignal>(
+      `SELECT assessment.id::text, item.plan_output_id::text,
+              assessment.assessment_output_id::text,
+              item.target_date::text AS signal_date,
+              auction_run.target_date::text AS assessment_date,
+              assessment.review_type, item.grade, item.headline
+         FROM daily_plan_auction_assessment assessment
+         JOIN daily_plan_playbook item ON item.id = assessment.playbook_item_id
+         JOIN job_run auction_run ON auction_run.id = assessment.source_job_run_id
+        WHERE assessment.code = $1
+          AND auction_run.target_date = $2::date
+          AND assessment.conclusion = 'signal_passed'
+          AND assessment.status IN ('active','superseded')
+        ORDER BY (assessment.status = 'active') DESC, assessment.id DESC
+        LIMIT 1`,
+      [code, input.change_date],
+    );
+    return match.rows[0] ?? null;
+  }
+  if (input.kind !== "sell" || !existing?.opened_at) return null;
+  const inherited = await client.query<EntryAuctionSignal>(
+    `SELECT min(assessment.id)::text AS id,
+            min(item.plan_output_id)::text AS plan_output_id,
+            min(assessment.assessment_output_id)::text AS assessment_output_id,
+            min(item.target_date)::text AS signal_date,
+            min(auction_run.target_date)::text AS assessment_date,
+            min(assessment.review_type) AS review_type,
+            min(item.grade) AS grade,
+            min(item.headline) AS headline
+       FROM portfolio_position_change change
+       JOIN daily_plan_auction_assessment assessment
+         ON assessment.id = change.entry_auction_assessment_id
+       JOIN daily_plan_playbook item ON item.id = assessment.playbook_item_id
+       JOIN job_run auction_run ON auction_run.id = assessment.source_job_run_id
+      WHERE change.instrument_id = $1
+        AND change.kind = 'buy'
+        AND change.change_date >= $2::date
+      HAVING count(DISTINCT assessment.id) = 1`,
+    [instrumentId, existing.opened_at],
+  );
+  return inherited.rows[0]?.id ? inherited.rows[0] : null;
+}
+
 /**
  * 记录成交：事务内固化事件级归因和当时策略快照，并重算/更新 position 行。
  * - buy：无持仓则建仓；已有持仓按加权平均成本合并
@@ -240,6 +363,16 @@ export async function recordPositionChange(
       }
     }
 
+    const entrySignal = await resolveEntryAuctionSignal(client, instrumentId, input.code, input, existing);
+    if (input.kind === "buy" && entrySignal && input.plan_output_id
+      && input.plan_output_id !== entrySignal.plan_output_id
+      && input.plan_output_id !== entrySignal.assessment_output_id) {
+      throw apiErrors.badRequest(`标的 ${input.code} 的关联结果与成交日打板信号不一致`);
+    }
+    const planOutputId = input.plan_output_id
+      ?? (input.kind === "buy" ? entrySignal?.plan_output_id : null)
+      ?? null;
+
     const amount =
       input.quantity !== undefined && input.price !== undefined
         ? round2(input.quantity * input.price)
@@ -252,15 +385,18 @@ export async function recordPositionChange(
       `INSERT INTO portfolio_position_change
          (instrument_id, change_date, kind, quantity, price, amount, reason, source,
           decision_origin, execution_compliance, strategy_change_seq, strategy_snapshot_hash,
-          plan_output_id, source_session_id, attribution_note, deviation_reason,
+          plan_output_id, entry_auction_assessment_id, source_session_id, attribution_note, deviation_reason,
           cost_price_before, realized_pnl)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
        RETURNING id::text, instrument_id::text, change_date::text, kind,
                  quantity::float, price::float, amount::float,
                  cost_price_before::float, realized_pnl::float, reason, source,
                  decision_origin, execution_compliance, strategy_change_seq::text,
                  strategy_snapshot_hash, plan_output_id::text, NULL::text AS plan_output_type,
-                 NULL::text AS plan_target_date, source_session_id::text,
+                 NULL::text AS plan_target_date, entry_auction_assessment_id::text,
+                 NULL::text AS entry_signal_date, NULL::text AS entry_assessment_date,
+                 NULL::text AS entry_signal_review_type, NULL::text AS entry_signal_grade,
+                 NULL::text AS entry_signal_headline, source_session_id::text,
                  attribution_note, deviation_reason, created_at`,
       [
         instrumentId,
@@ -271,7 +407,7 @@ export async function recordPositionChange(
         amount,
         input.reason ?? null, input.source, input.decision_origin, input.execution_compliance,
         strategy.rows[0].change_seq, strategy.rows[0].current_hash,
-        input.plan_output_id ?? null, input.source_session_id ?? null,
+        planOutputId, entrySignal?.id ?? null, input.source_session_id ?? null,
         input.attribution_note?.trim() || null, input.deviation_reason?.trim() || null,
         costPriceBefore, realizedPnl,
       ],
@@ -303,6 +439,14 @@ export async function recordPositionChange(
             [instrumentId, newQty, newCost],
           );
         }
+        // 每日计划自动关注用于等待入场，买入成交后已经完成使命；人工关注继续保留。
+        await client.query(
+          `UPDATE pool_membership
+              SET attention_reason = NULL, attention_from = NULL, attention_until = NULL
+            WHERE instrument_id = $1 AND effective_to IS NULL
+              AND attention_reason LIKE '每日计划·%'`,
+          [instrumentId],
+        );
       } else if (input.kind === "sell") {
         const oldQty = Number(existing!.quantity);
         const qty = input.quantity!;
@@ -334,6 +478,18 @@ export async function recordPositionChange(
       position = rows.find((p) => p.instrument_id === instrumentId) ?? null;
     }
 
-    return { change: { ...change.rows[0]!, code: input.code, name: inst.rows[0].name }, position };
+    return {
+      change: {
+        ...change.rows[0]!,
+        code: input.code,
+        name: inst.rows[0].name,
+        entry_signal_date: entrySignal?.signal_date ?? null,
+        entry_assessment_date: entrySignal?.assessment_date ?? null,
+        entry_signal_review_type: entrySignal?.review_type ?? null,
+        entry_signal_grade: entrySignal?.grade ?? null,
+        entry_signal_headline: entrySignal?.headline ?? null,
+      },
+      position,
+    };
   });
 }

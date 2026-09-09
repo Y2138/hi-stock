@@ -604,14 +604,14 @@ export function limitUpBenchmarkSha(value: Omit<LimitUpBenchmark, "sha256">): st
   return crypto.createHash("sha256").update(JSON.stringify(canonical(portableValue))).digest("hex");
 }
 
-export async function queryLimitUpSignals(db: Db, date: string): Promise<LimitUpSignalResult> {
-  const revision = await db.query<{ id: string }>(
+export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId?: string | null): Promise<LimitUpSignalResult> {
+  const revision = pinnedRevisionId === undefined ? await db.query<{ id: string }>(
     `SELECT revision.id::text AS id
        FROM strategy_document document
        JOIN strategy_document_revision revision ON revision.id = document.current_revision_id
       WHERE document.code = 'limit_up_board'`,
-  );
-  const revisionId = revision.rows[0]?.id ?? null;
+  ) : null;
+  const revisionId = pinnedRevisionId === undefined ? revision?.rows[0]?.id ?? null : pinnedRevisionId;
   const benchmarkRow = revisionId ? await db.query<{
     benchmark_code: string;
     document_revision_id: string;

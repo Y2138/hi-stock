@@ -1,4 +1,4 @@
-// Agent 数据库只读能力：渐进式 Schema 发现 + 带 schema_hash 的结构化查询。
+// Agent 数据库只读能力：渐进式 Schema 发现 + 基于当前结构实时校验的结构化查询。
 // 永不接收原始 SQL；标识符由服务端白名单校验，值只通过参数绑定进入 SQL。
 import type pg from "pg";
 import { sha256Json } from "./hash.js";
@@ -14,10 +14,8 @@ const MAX_QUERY_ROWS = 100;
 const MAX_BATCH_QUERIES = 5;
 const MAX_DESCRIBE_TABLES = 20;
 const MAX_RESULT_BYTES = 128 * 1024;
-// ponytail: 前 128 位足以识别 Schema 漂移，也避免模型抄错长哈希尾部；出现可测碰撞时再改服务端令牌。
-const SCHEMA_VERSION_HEX_LENGTH = 32;
 
-/** 通用查询只是末级排障能力；未列出的表即使位于 public 也不向模型开放。 */
+/** 通用查询是纵向工具未覆盖的内部只读探索与排障能力；未列出的表即使位于 public 也不向模型开放。 */
 const READABLE_TABLES = [
   "analysis_run",
   "agent_memory_artifact",
@@ -131,9 +129,9 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   },
   market_stock_character_metric: {
     domain: "股性指标",
-    description: "按指标运行和数据日版本化保存最近252日MA10护盘收回率、跌破事件数与收回数。",
+    description: "按指标运行、数据日和计算版本保存五维股性、阶段、评分及最近252日MA10护盘收回率。",
     write_policy: "只允许指标工作器随可信日线指标重算；Agent 只读。",
-    constraints: ["未走满三个后续交易日的跌破事件不进入分母；无成熟事件时比率为 null。"],
+    constraints: ["五维画像由固定公式生成；未走满三个后续交易日的跌破事件不进入护盘分母。"],
   },
   market_limit_event: {
     domain: "市场结构",
@@ -147,8 +145,8 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   },
   pool_membership: {
     domain: "标的池",
-    description: "短线/长线池带有效期的策略角色历史，包含完整研究属性、短线止损档位和近期关注；所属行业只读取同花顺官方关系，同一标的只有一个当前角色。",
-    write_policy: "只允许 pool_write 经标的池 service 关闭旧行并创建新行。",
+    description: "短线/长线池带有效期的策略角色历史，包含版本化入池画像和近期关注；所属行业只读取同花顺官方关系，同一标的只有一个当前角色。",
+    write_policy: "新增、迁池和角色变更只允许 pool_onboard；pool_write 仅维护关注、结束角色和板块排序。",
     constraints: ["角色变更保留历史；当前有效行以 effective_to IS NULL 判定。"],
   },
   agent_memory_artifact: {
@@ -596,37 +594,9 @@ async function loadSchemas(db: Db, requested?: string[]): Promise<InternalTableS
 
 export type DatabaseSchemaInput =
   | { operation: "list_tables"; domains?: string[]; tables?: string[] }
-  | { operation: "describe_tables"; tables: Array<{ table: string; schema_hash: string }> };
+  | { operation: "describe_tables"; tables: Array<{ table: string; schema_hash?: string }> };
 
-export class DatabaseSchemaChangedError extends Error {
-  readonly code = "DATABASE_SCHEMA_CHANGED";
-
-  constructor(tables: string[]) {
-    super(`数据库 Schema 已变化（${tables.join("、")}），本次操作未执行；请调用 database_schema.list_tables 并仅传 tables=${JSON.stringify(tables)}，再使用返回的新 hash 调用 describe_tables；不要复用旧 hash`);
-    this.name = "DatabaseSchemaChangedError";
-  }
-}
-
-function changedSchemaTables(
-  schemas: InternalTableSchema[],
-  expected: Array<{ table: string; schema_hash: string }>,
-): string[] {
-  const actual = new Map(schemas.map((schema) => [schema.table, schema.schema_hash]));
-  return [...new Set(expected.filter((item) =>
-    actual.get(item.table)?.slice(0, SCHEMA_VERSION_HEX_LENGTH) !==
-      item.schema_hash.slice(0, SCHEMA_VERSION_HEX_LENGTH),
-  ).map((item) => item.table))];
-}
-
-function assertSchemaHashes(
-  schemas: InternalTableSchema[],
-  expected: Array<{ table: string; schema_hash: string }>,
-): void {
-  const changed = changedSchemaTables(schemas, expected);
-  if (changed.length) throw new DatabaseSchemaChangedError([...new Set(changed)]);
-}
-
-/** 轻量索引或按需完整结构；describe 发现漂移时直接返回当前结构，数据查询仍严格校验 hash。 */
+/** 返回轻量索引或按表名读取当前完整结构。 */
 export async function discoverDatabaseSchema(db: Db, rawInput: unknown): Promise<unknown> {
   const input = validateDatabaseSchemaInput(rawInput);
   if (input.operation === "list_tables") {
@@ -649,14 +619,9 @@ export async function discoverDatabaseSchema(db: Db, rawInput: unknown): Promise
   const names = input.tables.map((item) => item.table);
   if (new Set(names).size !== names.length) throw new Error("describe_tables.tables 存在重复表");
   const schemas = await loadSchemas(db, names);
-  const refreshedTables = changedSchemaTables(schemas, input.tables);
   return {
     tables: schemas.map(({ all_columns: _all, indexes: _indexes, ...schema }) => schema),
     table_count: schemas.length,
-    ...(refreshedTables.length ? {
-      refreshed_tables: refreshedTables,
-      refresh_note: "调用方 hash 已过期；以上为当前完整结构，后续 database_query 必须使用其中的新 schema_hash。",
-    } : {}),
   };
 }
 
@@ -673,7 +638,7 @@ export interface DatabaseFilter {
 export interface DatabaseSelectRequest {
   name?: string;
   table: string;
-  schema_hash: string;
+  schema_hash?: string;
   columns?: string[];
   filters?: DatabaseFilter[];
   order_by?: { column: string; direction?: "asc" | "desc" }[];
@@ -764,7 +729,6 @@ function boundedInt(value: unknown, fallback: number, max: number, label: string
 interface RowsQueryResult {
   name?: string;
   table: string;
-  schema_hash: string;
   rows: unknown[];
   returned: number;
   limit: number;
@@ -791,7 +755,7 @@ function enforceResultBudget(results: unknown[], offsets: Array<number | null>, 
   }
 }
 
-/** 每项查询执行前重算并校验对应表的 schema_hash，然后构建参数化只读 SQL。 */
+/** 每项查询按当前表结构重新校验字段，然后构建参数化只读 SQL。 */
 export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown> {
   const input = validateDatabaseQueryInput(rawInput);
   if (!input.queries.length) throw new Error("database_query 至少需要一项查询");
@@ -800,7 +764,6 @@ export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown>
   }
   const tableNames = [...new Set(input.queries.map((request) => request.table))];
   const schemas = await loadSchemas(db, tableNames);
-  assertSchemaHashes(schemas, input.queries);
 
   const results: unknown[] = [];
   const offsets: Array<number | null> = [];
@@ -816,7 +779,7 @@ export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown>
         `SELECT count(*)::text AS count FROM ${quoteIdent(meta.table)}${where}`,
         params,
       );
-      results.push({ name: request.name, table: meta.table, schema_hash: meta.schema_hash, count: Number(result.rows[0]!.count) });
+      results.push({ name: request.name, table: meta.table, count: Number(result.rows[0]!.count) });
       offsets.push(null);
       continue;
     }
@@ -842,7 +805,6 @@ export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown>
     results.push({
       name: request.name,
       table: meta.table,
-      schema_hash: meta.schema_hash,
       rows: result.rows,
       returned: result.rows.length,
       limit,

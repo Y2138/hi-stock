@@ -3,7 +3,7 @@
 import pg from "pg";
 import { apiErrors } from "../../http/router.js";
 import {
-  getBacktestRunWithArtifacts,
+  getBacktestRunDetail,
   getVersionedBacktestSource,
   listBacktestRuns,
 } from "./repo.js";
@@ -21,9 +21,9 @@ export const backtestRoutes = {
     return { data: await listBacktestRuns(pool) };
   },
 
-  /** GET /api/backtests/:id：运行 + artifacts（join dataset） */
+  /** GET /api/backtests/:id：最终结果与历史比较。 */
   async getRun({ pool, params }: Ctx) {
-    const run = await getBacktestRunWithArtifacts(pool, params.id!);
+    const run = await getBacktestRunDetail(pool, params.id!);
     if (!run) throw apiErrors.notFound(`回测运行不存在：${params.id}`);
     return { data: run };
   },

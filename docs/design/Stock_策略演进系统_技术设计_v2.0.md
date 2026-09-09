@@ -35,12 +35,12 @@ E1–E38 全文见产品方案 §一，不再复制。技术层关键约束：Po
 | T9 | agent 三层 | `agent/ai/` 负责 pi-ai Provider/Models 与凭据适配，`agent/core/` 负责 pi-agent-core loop 和事件映射，`components/chat/` 负责 UI；HTTP/SSE、工具与确认制在三层边界之外编排 | 避免厂商、核心循环和展示状态混在单一 kernel |
 | T10 | LLM 配置源 | `llm_provider`、`llm_model`、`llm_setting` 是唯一事实源；`DatabaseCredentialStore` 不回退 `~/.pi/agent/auth.json` 或环境变量；API Key 查询永不回显 | 支持用户自助配置与多厂商切换，安全边界可审计 |
 | T11 | 系统级对话与选择器（展示形态已由 T34 重构） | 对话属于全局系统能力和旧 `/chat` 兼容继续有效；原悬浮按钮与抽屉仅作为第二阶段前的历史实现。选择控件继续统一封装 `@vueform/multiselect` | 当前目标布局以 T34 为准，既有消息/工具/确认组件继续复用 |
-| T12 | 渐进式数据库读取 | 新会话注册 `database_schema` 与 `database_query`。前者以 `list_tables` 返回轻量表索引，再以 `describe_tables` 按需返回字段、主外键、唯一键、枚举、关系、业务约束与写策略；后者只接受携带逐表 `schema_hash` 的结构化查询计划，不接受原始 SQL | 降低上下文负担，并在执行时防止 Schema 漂移 |
+| T12 | 渐进式数据库读取 | `database_schema` 与 `database_query` 保留在会话权限工具注册表中，通过 `tool_catalog` 成对加载，用于纵向工具未覆盖的内部只读探索或排障。前者以 `list_tables` 返回轻量表索引，再以 `describe_tables` 按表名返回当前结构；后者只接受结构化查询计划，不接受原始 SQL，并在执行时按当前结构重新校验表、字段与敏感列 | 降低上下文负担，避免普通业务绕过纵向工具，Schema 迭代不再导致无效重试 |
 | T13 | 领域表名前缀 | `0005_domain_table_names.sql` 只向前重命名：`data_*`、`market_*`、`portfolio_*`、`agent_*`；已有一致前缀的 task/backtest/pool/strategy/script/chat/llm/volume/schema 表不变。历史自选表已由 0029 删除 | 同领域表可发现、可批量操作，避免 generic 名称冲突 |
 | T14 | 批量动作与 UI 聚合 | `fetch_market_data.requests` 最多 200 项，服务端顺序执行并通过 tool_update 汇报进度；UI 对连续同名且无确认卡的调用分组折叠，单批结果优先展示汇总 | 减少模型调用轮次与工具卡噪声，确认内容仍完整可见 |
 | T15 | YOLO 与能力提示词（工具集合已由 T42 收敛） | `agent_setting` 持久化 `yolo_mode`；普通领域写入在确认制下写 pending，YOLO 直接事务执行，两条路径都经领域 service、状态指纹、写锁与审计。`finalize_backtest` 验证通过后始终直接事务执行；策略发布提案始终要求真人批准。系统提示词动态注入轻量表索引、轻量记忆索引与当前模式 | 保留 YOLO 安全语义，同时明确回测最终化和策略发布的独立门禁 |
 | T16 | 工具零信任与并发写协调 | pi loop 的 schema 校验不是信任边界；每个 execute/domain 入口再次严格校验并拒绝未知字段和语义歧义。所有 Agent 业务写工具共用按当前数据库区分的 PostgreSQL transaction advisory lock；确认批准锁定提案行并复核目标状态 SHA-256 | LLM 可输出错误参数；多会话与重复确认必须由数据库而非提示词保证一致性 |
-| T17 | M3 调度一致性与自动流程权限 | `croner` 只接受 5 段 cron并固定 Asia/Shanghai；`(job_id, scheduled_for)` 部分唯一索引去重，Runner 原子 claim；同一 `job_run` 最多两次尝试。当前只允许 datasource/analysis/agent_flow；agent_flow 与普通 Agent 使用同一工具目录及确认制/YOLO 设置，策略发布仍只能创建待真人审核提案；旧 script Runner 已退役 | 防重复 tick，并由领域 service、写锁、审计与真人发布门禁约束自动流程写入 |
+| T17 | M3 调度一致性与自动流程权限 | `croner` 只接受 5 段 cron并固定 Asia/Shanghai；`(job_id, scheduled_for)` 部分唯一索引去重，Runner 原子 claim；同一 `job_run` 最多两次尝试。当前只允许 datasource/analysis/agent_flow；agent_flow 与普通 Agent 共用权限工具注册表、按需工具目录及确认制/YOLO 设置，策略发布仍只能创建待真人审核提案；旧 script Runner 已退役 | 防重复 tick，并由领域 service、写锁、审计与真人发布门禁约束自动流程写入 |
 | T18 | 领域写工具（历史集合，现行以 T42 为准） | 删除通用 `database_change`。历史阶段曾注册自选与回测写工具；0029 后自选工具退役，0030 后由 `run_backtest` 产生工作运行、`finalize_backtest` 晋升最终结论，并新增记忆读写。策略调整只能使用 `strategy_publish_request` 创建待审核提案。领域参数不包含表、列或 SQL；确认与 YOLO 都经正式 service、审计、写锁和状态冲突检测 | 保留历史决策演进，同时以 T42 明确当前工具边界；策略发布始终排除在 YOLO 之外 |
 | T19 | 当前策略与冻结内容域 | `strategy_document` 保存现存策略稳定身份，`strategy_document_revision` 只追加内部技术修订，`strategy_state` 保存整体序号与哈希；“预期校对”和“数据获取规范”及其冻结内容副本均不存在。`content_*` 的其余旧策略/指引冻结，POST/PATCH 统一拒绝 | 页面和 Agent 只加载现存策略，同时保留并发一致性、恢复和审计能力 |
 | T20 | 作业提示词与结果 | `job_prompt` + `job_prompt_revision` 独立版本化；`job_definition.prompt_id` 引用稳定提示词，`job_run.prompt_revision_id` 固化实际版本。`job_write` 维护定义与提示词，`trigger_job` 只排队；Markdown 产物原子写 `job_run_output` 并关联运行/session，`job_run.result_md` 只兼容读取 | 计划与执行分离，历史运行和领域结果均可解释 |
@@ -48,7 +48,7 @@ E1–E38 全文见产品方案 §一，不再复制。技术层关键约束：Po
 | T22 | 数据交付双轨（由 T45 收敛） | 完整私有备份保留全库并 gitignore；可移植包只承担策略与定时任务固定资产交付，个人与运行数据不进入包 | 新机器可初始化，同时避免跨设备复制个人状态和敏感数据 |
 | T23 | 事实源切换 | legacy importer 只读旧文件并记录原路径/mtime/SHA；逐领域对账后才关闭旧读路径。切换后移除 `sync_now`、`read_repo_file`、`REPO_ROOT` 生产引用、Python Runner、旧 MVP 和一期 `/legacy/` | 独立性可由 clean-room 验收证明 |
 | T24 | 持仓领域写入 | `portfolio_write` 只接受 `record_position_change`，由持仓 service 原子维护买入、卖出、调整、备注事件与当前投影 | 保留确认、YOLO、事务、审计、写锁和状态冲突保护，不维护无权威数据源的账户指标 |
-| T25 | Agent Flow 数据库原生读取 | Runner 从 `job_prompt_revision` 取得并固化流程提示词，按任务会话注册普通 Agent 完整工具目录；运行前固化 `strategy_state.change_seq/current_hash`，从对应技术修订读取完整当前策略，历史任务结果按 `job_run_output` 查询，不再发现 `content_*`。旧导入器、文件读取和 `job_run.result_md` 新写入均已停止 | 保证任务与交互 Agent 使用同一策略事实、工具权限和安全门禁，并把计划结果归具体任务而非笼统内容库 |
+| T25 | Agent Flow 数据库原生读取 | Runner 从 `job_prompt_revision` 取得并固化流程提示词，按任务会话建立普通 Agent 同源权限工具注册表；模型初始只得到 `tool_catalog` 元信息，按需加载原工具完整定义。运行前固化策略状态，历史任务结果按 `job_run_output` 查询，不再发现 `content_*` | 保证任务与交互 Agent 使用同一策略事实、工具权限和安全门禁，同时避免完整工具 schema 占用固定上下文 |
 | T26 | 单一事实源与系统提示词路由 | `buildSystemPrompt` 注入单一事实源映射、数据库化任务路由、目标日计划边界、当前持仓与可信组合汇总；`portfolio_position_change` 继续支持历史归因查询。迁移证据表和三张退役快照表加入 Agent 隐藏列表 | 保持 Agent 持仓读写、归因和分析能力，同时阻止旧账户数据被误当作当前事实 |
 | T27 | 财务估值通道与独立出口 | `fetch_market_data.financial_requests` 直连扶摇估值与三张财务报表；按三表共同存在的最新报告期组装并幂等写 `valuation_snapshot` / `fundamental_snapshot`。最终初始化包携带样本；在全新目录与空数据库恢复后验证内容、作业、分析、回测、Agent 工具和页面路由，源码边界扫描排除旧文件/脚本运行依赖 | 长线估值不再因缺少财务事实而长期 partial，并以可复查恢复证据证明 M3.5 独立性 |
 | T28 | M4 页面解读与外观 | 页面通过单一 `stock:ask-ai` 事件把数据库记录 ID 和解读边界交给全局侧栏，仅预填、不自动发送；沿用现有会话、SSE 和 Agent 数据库工具。主色与明暗外观使用独立状态，支持浅色/深色/跟随系统，ECharts 监听主题事件重绘；动效开关与系统减少动态效果共同生效。外部 CLI 代码、探测和工具注册均不实施 | 复用已审计的对话链，避免复制业务正文或新建旁路 LLM 端点；用户保留发送前控制，主题变化覆盖 CSS 与 Canvas 图表 |
@@ -71,8 +71,10 @@ E1–E38 全文见产品方案 §一，不再复制。技术层关键约束：Po
 | T45 | 系统凭据与固定资产部署 | 0040 新增单例 `system_setting`，扶摇 Key 由设置 API 写入且 GET 只返回状态；旧 env 仅在首次启动且库中为空时一次性导入。固定资产包 v4 白名单只含 `strategy_*` 当前策略/演进摘要与版本化固定评分基准，以及 `job_definition`/`job_prompt*`；任务定义时间戳在目标机重建；恢复会清空持仓、账户、流水、池、行情和运行结果，保留目标机默认 LLM 目录与空系统设置 | 本仓库可独立恢复长期资产；凭据和个人运行态由每台电脑独立维护，调度器不会追记源电脑停机区间 |
 | T46 | 事件化累计已实现盈亏 | 0043 将退役账户状态中的 `closed_pnl` 一次性固化为历史基线，卖出事件保存成交前成本与本笔已实现毛盈亏；汇总只累加基线后的卖出事件并报告不可计算笔数 | 恢复累计收益能力但不恢复资金快照、现金台账或人工维护；费用无数据源时明确排除 |
 | T47 | 每日市场结构机会发现 | 每日计划比较最近可用市场结构；`resolveDailyUpdateScope` 不截断当日涨停和龙虎榜候选并补齐评分窗口。0062 把封单、成交额和候选资格提升为正式字段，以 `strategy_score_benchmark` 固化研究分布；`limit_up_signal_query` 和市场结构页共用确定性抱团/主升评分，只有两路线阈值与当日前 2 名同时成立的最多 4 只信号进入打板机会 | 完整候选和同源计算消除 Agent 手算、分页截断与页面/任务口径漂移，同时保持不自动入池、不替用户批准策略角色 |
-| T48 | 扶摇扩展数据能力 | 0046 增加 `hithink_dataset_snapshot`，`fetch_hithink_data` 以 34 个固定 capability 接入集合竞价、热榜/异动和基金研究端点；参数按端点白名单校验，响应先确认 `code == 0`、写 PostgreSQL 最新请求快照后再返回。ETF/LOF 行情继续复用 `fetch_market_data`，标的目录新增 `fund-reits` | 补齐官方新增能力，同时避免任意 URL、重复行情通道和数十张低复用表；基金披露数据与实时持仓保持明确边界 |
-| T49 | 集合竞价机会研判 | 0050 新增工作日 09:30 的 `auction_opportunity_assessment`，绑定独立版本化提示词并使用普通 Agent 完整工具目录。候选覆盖真实持仓、目标日有效近期关注和最近有效每日计划的结构化池外机会；先校验交易日历与计划时效，再获取最终竞价快照和短线风向标 | 把每日计划的条件预案与开盘竞价事实闭环；完整结果写 `job_run_output`，池外机会判断成功后激活到 `daily_plan_auction_assessment` 并刷新仪表盘，不自动交易、入池或修改关注，池外入场仍走完整评估与用户确认 |
+| T48 | 扶摇扩展数据能力 | `hithink-capabilities.ts` 注册扶摇 59 项固定端点及精确参数 Schema；`hithink_catalog` 按需发现能力，`hithink_query` 对 56 项普通 REST 能力执行不落库的临时查询并通过结果处理层返回显式覆盖。3 项全市场 Parquet 能力仅标记为受控同步，不返回预签名 URL。0046 的 `hithink_dataset_snapshot` 和 34 项 `fetch_hithink_data` 继续只服务明确的持久化请求 | 临时选股和个股研究不再制造低复用快照，同时避免任意 URL、无界工具结果和重复数据通道；定时任务、页面、回测所需事实仍通过受控服务持久化 |
+| T49 | 集合竞价机会研判 | 0050 新增工作日 09:30 的 `auction_opportunity_assessment`；0067 将复核分类结构化为一字延续、换手晋级、分歧验证、放弃和数据不足，通过分支统一输出 `signal_passed`；0072 取消交易日历缺行的硬阻断，缺行工作日继续以最终竞价数据核验。用户报告策略信号买入时，持仓 service 按代码和成交日匹配具体竞价复核，后续卖出继承单一入场信号 | 把 T 日计划、T+1 竞价、真实成交和持仓盈亏闭环；信号通过只进入用户自主的小额实盘验证，不自动交易、确定数量、入池或修改关注，未精确归因的成交不进入打板策略样本 |
+
+| T50 | 标的入池确定性初始化 | 0077 删除池成员止损字段；0078 扩展版本化五维画像和入池快照。`pool_onboard` 在一次领域调用内同步行情与 A 股财务估值、重算正式指标、生成唯一角色和预览，再进入一次确认或 YOLO 写入 | 入池与买入信号、每日止损评估解耦；固定公式和输入哈希消除 Agent 自由拼装多次工具造成的延迟、缺项与口径漂移 |
 
 ### 1.3 开放问题
 
@@ -183,15 +185,16 @@ CREATE TABLE pool_membership (
 -- 0029 后池关系继续使用带有效期的 pool_membership，并补齐完整研究属性。
 ALTER TABLE pool_membership
   ADD COLUMN stock_character text,
+  ADD COLUMN stock_character_profile jsonb NOT NULL DEFAULT '{}',
   ADD COLUMN stage text,
   ADD COLUMN evaluation_summary text,
+  ADD COLUMN profile_as_of date,
+  ADD COLUMN profile_calculation_version text,
+  ADD COLUMN profile_input_sha256 text,
   ADD COLUMN attention_reason text,
   ADD COLUMN attention_from date,
   ADD COLUMN attention_until date,
   ADD COLUMN evaluation_session_id bigint REFERENCES chat_session(id);
--- 0063 后，短线角色可显式选择 MA5、MA10 或买入价×0.90 止损档位；旧角色不推断。
-ALTER TABLE pool_membership
-  ADD COLUMN stop_loss_mode text CHECK (stop_loss_mode IS NULL OR stop_loss_mode IN ('ma5','ma10','fixed_90'));
 CREATE UNIQUE INDEX pool_membership_one_current_role
   ON pool_membership (instrument_id) WHERE effective_to IS NULL;
 CREATE TABLE pool_board_preference (
@@ -438,7 +441,6 @@ CREATE TABLE llm_setting (
 
 | 旧名 | 当前名 | 领域 |
 |------|--------|------|
-| `dataset` | `data_dataset` | 数据资产 |
 | `instrument` | `market_instrument` | 行情/标的 |
 | `fetch_run` | `market_fetch_run` | 行情获取 |
 | `position` | `portfolio_position` | 组合持仓 |
@@ -507,7 +509,7 @@ CREATE UNIQUE INDEX job_run_scheduled_once
 
 - `analysis_run` 保存 `analysis_type`、结构化 request、输入摘要、服务版本、状态、结果、缺口与时间戳；状态为 `queued | running | success | partial | failed`。
 - `fundamental_snapshot` / `valuation_snapshot` 以标的和 `as_of_date` 唯一，承载长线估值所需结构化事实；datasource 负责获取和校验，不读取 CSV。
-- `backtest_run` 只向前增加 `request_json`、`input_summary`、`service_version`、`metrics_json`、`conclusion_md`、`data_gaps`、`progress`；旧字段与 `backtest_artifact` 暂保留历史兼容但不再由新执行器写入，待对账后退役。
+- `backtest_run` 保存 `request_json`、`input_summary`、`service_version`、`metrics_json`、`conclusion_md`、`data_gaps` 和 `progress`；回测详情只返回结构化结果、最终结论、比较关系与固化源码，不保存文件地址登记。
 - 作业、分析和回测运行历史只允许状态机推进，不允许 Agent 任意更新或删除。
 
 ### 4.9 `0010`–`0014`（退役账户字段、数据库原生 Flow 与单一事实源）
@@ -621,13 +623,38 @@ CREATE UNIQUE INDEX job_run_scheduled_once
 - `0046` 以固定 capability 接入集合竞价、热榜/异动和基金研究数据，所有成功响应写入 `hithink_dataset_snapshot`；`0047` 将每日计划的持仓执行预案和最多 10 个池外机会结构化为 `daily_plan_playbook`，任务成功后激活并替代旧预案。
 - `0050` 新增 `auction_opportunity_assessment` Agent 作业，cron 为 `30 9 * * 1-5`。调度器仍使用五段 cron、固定 `Asia/Shanghai` 时区和 30 秒 tick，运行通常在 09:30 后 0–30 秒入队；接口未返回 `final/ready` 时明确报告缺口，不做秒级保证或猜测。
 - 作业首先确认目标日是开市日，且最新每日计划日期不早于前一开市日并早于目标日，再批量获取 `auction_short_term_benchmark(date=目标日)` 与 `auction_snapshot(stage=final)`；周末生成的下周一预案因此保持有效。候选只来自真实持仓、有效近期关注和该计划已激活的池外机会，不从全市场重新选股。
-- `daily_plan_auction_assessment` 保存当前每日计划全部池外机会的逐只结构化判断。`auction_assessment_write` 先按本次运行写 `draft`；Runner 只有在 Markdown、`job_run_output` 和任务成功终态同事务入账时才激活并绑定输出，失败、重试或中断清理草稿，成功后发布 `dashboard` 刷新事件。任务继续使用普通 Agent 完整工具目录和统一确认制/YOLO 设置；策略发布真人门禁不变，池外“值得入场”仍须完整入池评估与用户确认。
+- `daily_plan_auction_assessment` 保存当前每日计划全部池外机会的逐只结构化判断。`auction_assessment_write` 先按本次运行写 `draft`；Runner 只有在 Markdown、`job_run_output` 和任务成功终态同事务入账时才激活并绑定输出，失败、重试或中断清理草稿，成功后发布 `dashboard` 刷新事件。任务使用同一按需工具目录和统一确认制/YOLO 设置；策略发布真人门禁不变。
 
 ### 4.26 `0063_每日计划确定性上下文.sql`（每日计划数据闭环）
 
 - `sector_temperature` 使用当前全部 881 一级行业的等权日收益合成综合指数，完整覆盖后一次返回 MA5、MA20、ROC5 和牛市/震荡/熊市；全集缺数时状态与全市场温度保持不可用或部分状态，不以残缺均值替代。
-- `daily_plan_context_query` 始终注册，由服务层紧凑返回市场状态与温度、七类市场结构最新同日运行、短线池逐只右侧六条件、左侧反转基础条件/形态/正式质量分/ATR14、试盘启动分阶段证据与“右侧 > 左侧 > 试盘”唯一信号选择，以及持仓触发位和护盘收回率。左侧口径与 V26.5 正式引擎一致：前低接近阈值 1.005、ATR14 为真实波幅14日简单均值、质量分封顶100；`success + 0页 + 0行` 是合法空集，未命中与未核验必须区分。
-- `pool_membership.stop_loss_mode` 显式保存短线 MA5/MA10/买入价×0.90 档位；新增或迁入短线池必须配置，旧成员先识别明确标签，再在股性语义唯一时按“快拉→MA5、慢拉/温吞→MA10”回填，冲突或无法判定时保留缺口。`market_stock_character_metric` 按数据日与计算版本保存最近252日 MA10 跌破事件、三日收回事件和收回率，并随可信日线指标重算。
+- `daily_plan_context_query` 由服务层紧凑返回市场状态与温度、七类市场结构最新同日运行、短线池右侧六条件、左侧反转、试盘启动、唯一信号选择，以及持仓触发位和护盘收回率。左侧与试盘将已完成成员拆为命中、接近和筛除三组，连同缺口和覆盖计数可逐只对账；详细证据只保留给命中、接近和持仓相关项。`success + 0页 + 0行` 是合法空集，未命中与未核验必须区分。
+- 止损不写入 `pool_membership`，也不作为新增或迁池门禁；每日计划按届时生效的策略、股性、行情、指标和持仓成本重新计算，无法确定时只影响当日执行评估。`market_stock_character_metric` 按 4.30 的固定版本保存五维画像、阶段、评分、等级和护盘事件证据，并随可信日线指标重算。
+
+### 4.27 `0073_每日计划波段确定性扫描.sql`（波段垂类计算）
+
+- `swing_signal_query` 独立于 `daily_plan_context_query`：前者只扫描长线池“波段”角色，后者继续负责市场、短线三类信号和持仓执行位，避免单一工具继续扩大职责与返回体。
+- 服务按目标日一次读取 40 根可信日线、正式 RSI14 和同日护盘收回率，机械计算缩量、反转形态、超卖和预期盈亏比四条件，同时返回 T+1 突破价、确认价上限、已有持仓抑制、3/4 接近候选、覆盖数与逐只缺口。每日计划必须单独展示波段扫描，并把短线与波段关注合并为一次完整集合对账。
+
+### 4.28 `0075_重写集合竞价任务提示词.sql`（竞价任务紧凑上下文）
+
+- 集合竞价当前提示词是一份完整正文，不拼接历史规则或覆盖段。任务只按需加载 `auction_context_query`、`strategy_document_query`、`fetch_hithink_data` 和 `auction_assessment_write`。
+- `auction_context_query` 一次返回目标日门禁、前一开市日、每日计划有效性、全部持仓、有效近期关注、打板候选、去重代码全集、覆盖计数和逐项缺口；竞价任务不得调用每日计划扫描、完整标的池或通用数据库查询重复拼装。
+
+### 4.29 `0076_重写其余Agent任务提示词.sql`（内置任务提示词收敛）
+
+- 每日计划、周中检查和每周评分的当前提示词均为完整正文，不拼接历史规则、替代段或表级查询教程；旧 revision 只保留不可变审计。
+- 每日计划固定按需加载三类确定性扫描与两个结构化写工具；周中检查复用短线池摘要和每日计划确定性扫描；每周评分先以池摘要覆盖全集，只对变化项展开研究属性，并分别复用短线、波段和长线估值工具。
+- 任务结果保留全部成员或候选覆盖计数、互斥分类和逐项缺口，Markdown 对普通筛除项只汇总原因，避免重复展开工具已经给出的原始证据。
+
+### 4.30 `0077_移除标的池止损档位.sql`、`0078_标的入池确定性画像.sql`（入池初始化收敛）
+
+- `pool_membership` 不保存止损模式；止损只由每日评估按当日策略、行情、指标和持仓事实计算。
+- `market_stock_character_metric` 随可信正式日线重算保存“标的入池五维画像一版”。最多使用最近 252 条日线：洗盘为单日低点较前收跌幅不低于 3% 后当日至后三日恢复率，拉升由 20/60 日收益、收盘与 MA20、MA20 与 MA60 合成，假突破为突破前 20 日高点后当日至后三日未收回的比例，护盘为跌破 MA10 后三日收回率，波动为最近最多 120 个日收益的年化波动；未走满三个后续交易日的事件不进分母，无事件时维度分采用中性 50。
+- 综合分固定为洗盘 20%、拉升 25%、反假突破 20%、护盘 20%、波动稳定性 15%，限制在 0–100；A/B/C/D 阈值固定为 80/65/50。阶段由收盘、MA20、MA60、20 日收益和 60 日高点确定为主升、上升、调整、下行或震荡筑底。
+- 用户明确角色时直接采用；只明确短线池时角色为短线，只明确长线池时按基本面确定长线或波段。未指定时，净利润、经营现金流和 ROE 为正且波动分低于 60、综合分不低于 60 的标的推荐长线；主升/上升且拉升分不低于 60 的标的推荐短线；其余推荐长线池波段角色。该归属只决定后续扫描范围，不是买入信号。
+- `pool_onboard` 接收名称、简称或代码以及可选目标池/角色和原因；服务端先消歧为唯一 A 股或 ETF，再同步约 420 日行情，A 股同步最新财务与估值，执行正式指标重算。只有同步完整、指标状态为 success、画像样本不少于 120、档案字段完整且股票已有同花顺官方行业时才生成预览；ETF 不要求财务估值和行业。扶摇没有单标的所属行业反查契约，缺关系时明确失败并要求先完成板块成分同步，不扫描全部行业也不生成本地行业标签。
+- 确认 payload 固化画像数据日、计算版本和正式指标输入 SHA-256；批准时重新计算状态指纹并复核画像来源。跨日角色变化关闭旧行后新增历史，同一生效日重新初始化原地刷新当前行，避免唯一键冲突。
 
 ## 五、datasource 模块（E11，M1 核心）
 
@@ -674,9 +701,11 @@ M1 曾用受控适配器把历史 CSV 解析、校验并写入 `market_bar`，�
 
 ### 5.7 竞价、热榜/异动与基金研究数据
 
-`hithink-datasets.ts` 是扩展端点的唯一白名单：2 个集合竞价、6 个热榜/异动和 26 个非行情基金研究能力，共 34 个 capability。每项声明固定路径、允许参数和必填参数；股票/基金代码、日期、区间上限、基金类型、经理/公司 ID、游标和枚举均在出站前校验。调用继续复用 `hithinkGet` 的数据库凭据、限流、退避和 `code == 0` 信封门禁，不接受模型传入 URL 或供应商路径。
+`hithink-capabilities.ts` 是 Agent 临时研究的完整能力注册表：覆盖扶摇元信息、行情、财务、估值、交易日历、竞价、板块、基金、特色数据和全市场文件共 59 项能力。每项声明固定路径、精确参数 Schema、结果集合和执行模式；股票/基金代码、日期、区间、基金类型、经理/公司 ID、游标和枚举均在出站前校验。调用继续复用 `hithinkGet` 的数据库凭据、限流、退避和 `code == 0` 信封门禁，不接受模型传入 URL 或供应商路径。
 
-成功结果按规范化请求 SHA-256 幂等写入 `hithink_dataset_snapshot`，保留请求参数、数据日期、上游毫秒时间戳、状态、行数、完整 JSON payload 和抓取时间，并在 `market_fetch_run` 登记 capability。相同请求只覆盖最新快照；显式日期、历史区间或报告期构成不同请求。`fund-reits` 归入 `fund` 标的类型。基金持仓、配置与持有人数据均按官方披露口径保存，不推断为实时组合，也不与个人持仓表关联。
+`hithink_catalog` 只搜索或描述本地注册表。`hithink_query` 对 56 项普通 REST 能力执行一次临时请求，完整上游响应只存在于该调用内存中；`hithink-result-processor.ts` 在完整集合上确定性执行字段投影、过滤和排序，按对象边界把工具正文控制在 60 KiB 以内并返回 `scanned_count`、`matched_count`、`returned_count`、`complete` 与 `next_offset`，不得静默截断。处理后的紧凑结果在同一逻辑运行的受控续写段之间保留，运行结束后不持久化；工具审计只保存 capability、已校验参数、结果选项和结果哈希，会话消息与事件只保留 capability、覆盖计数和完整性。排队、退避、分页和在途 HTTP 请求共用 Agent 中断信号。3 项全市场 Parquet 能力不进入临时查询，也不向对话暴露预签名 URL。
+
+`hithink-datasets.ts` 保留 2 个集合竞价、6 个热榜/异动和 26 个非行情基金研究能力，共 34 个持久化 capability。只有用户明确要求保存、后续计划/页面/回测需要复用或定时任务执行同步时，`fetch_hithink_data` 才把成功结果按规范化请求 SHA-256 幂等写入 `hithink_dataset_snapshot`，并在 `market_fetch_run` 登记 capability。相同请求只覆盖最新快照；显式日期、历史区间或报告期构成不同请求。`fund-reits` 归入 `fund` 标的类型。基金持仓、配置与持有人数据均按官方披露口径保存，不推断为实时组合，也不与个人持仓表关联。
 
 ## 六、agent 集成（E6，M2/M4）
 
@@ -698,7 +727,7 @@ await agent.prompt(text, images);   // images: ImageContent[]（base64 + mimeTyp
 
 - AI 层（`server/agent/ai/`）：`repo.ts` 读写 `llm_*` 三表；`DatabaseCredentialStore` 实现 pi-ai `CredentialStore`，只访问 PostgreSQL；`runtime.ts` 根据 `api_protocol` 注册 OpenAI Completions / OpenAI Responses / Anthropic Messages Provider。
 - core 层（`server/agent/core/loop.ts`）：只负责注册工具、运行 `Agent.prompt`，把 pi 事件映射为 `run_started/assistant_start/text/tool_*/confirmation_pending` frame；不持久化数据库、不编码 HTTP。创建 Agent 后以 UUID `run_id` 注册，结束后按同一令牌安全注销。
-- session 层（`server/agent/session-runner.ts`）：交互和定时 `agent_flow` 的统一执行边界；解析会话模型、构造系统提示词、读取历史、串行化同 session turn、持久化完成消息/工具/状态事件，再交给 HTTP 或调度器。`aborted/error` 立即终止，`length/toolUse`、空文本或未通过业务结果门禁均有限续写；只有非空普通 `stop` 且通过门禁才成功，最多续写 3 次，超限失败。任务重试继续读取同一会话历史。
+- session 层（`server/agent/session-runner.ts`）：交互和定时 `agent_flow` 的统一执行边界；解析会话模型、构造系统提示词、读取历史、串行化同 session turn、持久化完成消息/工具/状态事件，再交给 HTTP 或调度器。`aborted/error` 立即终止，连续第 3 次请求相同工具与规范化参数时在执行前熔断并失败；`length/toolUse`、空文本或未通过业务结果门禁均有限续写，只有非空普通 `stop` 且通过门禁才成功，最多续写 3 次，超限失败。任务重试继续读取同一会话历史。
 - UI 层：布局内 `AgentWorkspace` 复用消息、图片、工具卡与确认卡；同一用户轮次内连续 assistant 消息聚合为一张执行轨迹卡，内部区分思考进展、工具调用和最终回答。运行中输入框保持可编辑，可选择干预、排到下一轮或停止。任务会话显示来源/状态标签但不使用另一套 UI。
 - 会话持久化：`agent.state.messages` 为纯 JSON，序列化存入 `chat_message.content`。完成消息入库后写 `message_completed` 事件，逐 token `text` 仅实时推送、不入事件表；任务重试次数只查 `job_run.attempt_count`。
 - 会话模型：`chat_session.model_id` 是当前会话的模型事实；设置页 `llm_setting.active_model_id` 仅作为新会话默认值和空会话模型的回退。PATCH 会话模型时先验证模型、厂商启用状态与厂商密钥，发送时再次按会话值解析运行时。
@@ -711,23 +740,30 @@ await agent.prompt(text, images);   // images: ImageContent[]（base64 + mimeTyp
 
 ### 6.2 工具注册（T12、T14、T16、T18、T24、T43）
 
-纵向业务 Tool 固定注册，不按用户意图动态装卸或切换上下文包；原有市场领域实验开关保持独立。模型优先使用一次聚合业务事实的纵向 Tool，横向数据库能力只作末级排障：
+服务端先构造当前会话有权使用的工具注册表；交互会话初始只暴露 `tool_catalog` 及名称、标签元信息，四类内置定时任务预加载其固定领域工具。模型每次最多选择 8 个工具，下一轮注入所选原工具的完整描述和参数 schema；加载过程不改变权限、执行函数、二次校验、确认、写锁或审计边界。市场研究与 Web 能力常驻授权目录，横向数据库能力用于纵向工具未覆盖的只读探索或排障；未知任务采用交互工具目录，不获得任务专属写入。任务验收及研究路由见[智能助手工具设计与验收](../智能助手工具设计与验收.md)。
 
 | 工具 | 契约 |
 |------|------|
+| `tool_catalog` | 返回当前会话可用工具元信息，并把所选工具完整定义注入下一轮；未知、重复或单次超过 8 个名称均拒绝。 |
+| `hithink_catalog` | 搜索或描述扶摇 59 项能力，按需返回精确参数 Schema、结果集合和执行模式；不请求外部数据。 |
+| `hithink_query` | 临时查询 56 项普通扶摇 REST 能力，完整响应在内存结果层处理后返回紧凑结构；同一逻辑运行内可续写，支持中断，不写业务表或快照表。 |
 | `portfolio_context_query` | 一次返回真实当前持仓、最新收盘、组合盈亏汇总、累计已实现盈亏和可按代码筛选的近期持仓事件。 |
-| `pool_context_query` | 一次返回短线池/长线池当前角色、完整研究属性、最新收盘和官方行业，可批量按代码筛选。 |
-| `job_context_query` | 一次返回作业定义、近期运行、结果元信息和提示词版本；结果正文与提示词正文仅在显式请求时返回。 |
+| `pool_context_query` | 不传代码时返回短线池/长线池成员全集摘要；传入代码时才返回对应成员完整研究属性，避免池全集重复携带大字段。 |
+| `job_context_query` | 按目标日读取定义、运行、结果与策略版本。正文按需读取；历史每日计划可同时读取绑定结果 ID 的结构化预案，保留已替代历史，每份 100 行并提供续页偏移。 |
+| `stock_research_query` | 批量读取最多 20 个任意本地标的的日线、最新正式股性/阶段、财报与估值；不要求入池，不同步；保留各自日期、版本和缺口，待重算画像不能称为当前正式阶段。 |
+| `auction_context_query` | 按目标日一次返回交易日门禁、前一开市日、每日计划有效性、全部持仓、有效近期关注、打板候选、候选代码全集、覆盖计数和逐项缺口。 |
 | `strategy_document_query` | 按系统提示词目录中的 code 批量读取本轮策略快照正文；定时任务及重试固定读取会话锁定的历史策略快照。 |
-| `database_schema` | 低优先级排障工具；只发现服务端正面清单。`list_tables` 返回表名、领域、业务说明与逐表 `schema_hash`；`describe_tables` 单次最多 20 张表。 |
-| `database_query` | 低优先级排障工具；一次最多 5 项、每项最多 100 行，普通行查询必须显式选择字段，总返回不超过 128 KiB 并提供续页偏移；执行前重算 `schema_hash`。 |
+| `database_schema` | 内部只读探索与排障工具；只发现服务端正面清单。`list_tables` 返回表名、领域与业务说明；`describe_tables` 按表名读取当前结构，单次最多 20 张表。 |
+| `database_query` | 内部只读探索与排障工具；一次最多 5 项、每项最多 100 行，普通行查询必须显式选择字段，总返回不超过 128 KiB 并提供续页偏移；执行前按当前结构校验表、字段与敏感列。 |
 | `memory_query` | 按关键词、类型、标签和状态检索记忆；默认状态为 active，正文只在工具查询时返回，不全量进入系统提示词。 |
 | `web_search` | 通过 `WebResearchProvider` 搜索当前外部资料；首期使用 DeepSeek 原生服务端搜索，只保留白名单域名，返回标题、URL、来源域名、发布时间或缺失标记、抓取时间和摘要。结果为不可信外部资料，不得覆盖库内事实或触发业务写入；不提供 `web_fetch`。 |
-| `daily_plan_context_query` | 始终注册的只读确定性上下文工具；只接受目标日，由服务层返回市场状态/温度、七类同步、短线池逐只右侧、左侧和试盘分析、唯一信号选择，以及持仓触发位和护盘收回率；左侧包含基础条件、形态、正式质量分、ATR14和次日确认窗口，试盘包含逐只失败阶段与接近候选，只返回结论、覆盖计数与必要数值证据。 |
-| `limit_up_signal_query` | 始终注册的只读确定性评分工具；只接受目标交易日，一次性返回完整候选、正式评分输入、固定基准版本/哈希、抱团分、主升分、路线名次、信号等级、风险和缺口，不受市场领域工具开关、分页或输出截断影响。 |
-| `portfolio_write` | 一次批量记录 buy/sell/adjust/note，共用一张确认卡和一个事务，逐项固化归因与策略快照并原子维护事件流与当前持仓。 |
-| `pool_write` | 一次批量执行 add/update/remove/set_board_order，共用一张确认卡和一个事务；完整研究属性、止损档位、官方行业和唯一当前角色仍由 service 校验。 |
-| `pool_attention_write` | 一次批量维护每日计划生成的近期关注，不覆盖或清除人工关注。 |
+| `daily_plan_context_query` | 只接受目标日，由服务层返回市场状态/温度、七类同步、短线右侧/左侧/试盘扫描、唯一信号选择，以及持仓执行位；左侧和试盘按命中、接近、筛除、缺口分组，保留覆盖计数与必要证据。 |
+| `swing_signal_query` | 逐只扫描长线池“波段”角色，按正式信号、3/4 接近候选、持仓或价格上限抑制、筛除、缺口分组，分组总数可与完整覆盖计数对账。 |
+| `limit_up_signal_query` | 返回涨停候选全集的紧凑评分摘要，并仅对正式信号保留完整评分证据；固定基准、路线名次、风险和缺口继续完整返回，不分页、不截断。 |
+| `portfolio_write` | 一次批量记录 buy/sell/adjust/note，共用一张确认卡和一个事务，逐项固化归因与策略快照并原子维护事件流与当前持仓；买入不创建关注，并在同事务清除该标的每日计划自动关注，人工关注保持不变。 |
+| `pool_onboard` | 接收单只 A 股或 ETF 的名称、简称或代码及可选池别/角色；服务端消歧后一次完成数据同步、正式指标重算、版本化画像、官方行业校验和入池预览。确认制只生成一张确认卡，批准时复核画像输入哈希和目标状态；YOLO 直接写入。 |
+| `pool_write` | 一次批量维护已有成员的近期关注、结束角色或板块排序；不接收新增、迁池、角色或研究档案字段。 |
+| `pool_attention_write` | 一次提交每日计划本轮应保留的完整近期关注集合；空集合合法，服务端在同一事务清理遗漏的旧自动信号，不覆盖或清除人工关注。 |
 | `job_write` | 创建或修改受控作业与版本化提示词；不允许修改运行历史。 |
 | `finalize_backtest` | 只允许当前会话的 success/partial 工作运行直接晋升为 final 并固化候选源码，不要求真人批准；同会话旧 final 原子改为 superseded。 |
 | `memory_write` | create/update/supersede/deprecate 记忆；必须绑定来源会话、证据和最后验证时间，并通过可复用内容门禁。 |
@@ -736,7 +772,7 @@ await agent.prompt(text, images);   // images: ImageContent[]（base64 + mimeTyp
 | `read_backtest_source` | 按运行 ID 读取 final/superseded 的固化源码，仅供当前 Agent 轮次改造；工具结果在消息、SSE、事件和审计持久化前脱敏。 |
 | `run_backtest` | 在隔离的临时 TypeScript 工作区同步验证策略思路；支持显式代码或从 PostgreSQL 区间涨停事件解析候选，并注入涨停/跌停/炸板与 `market_bar` 日线。成功源码作为候选短期暂存，返回 working 运行摘要并保存历史对比及源码继承关系，不自动进入回测历史。 |
 | `fetch_market_data` | `requests` 一次最多 200 项，顺序调用 datasource；`tool_update` 汇报 total/completed/succeeded/failed/rows_written，默认单项失败后继续。 |
-| `fetch_hithink_data` | `requests` 一次最多 20 项，按固定 capability 补拉竞价、热榜/异动与基金研究数据；先写 PostgreSQL 快照再返回，默认单项失败后继续。 |
+| `fetch_hithink_data` | 仅用于明确持久化；`requests` 一次最多 20 项，按固定 capability 补拉竞价、热榜/异动与基金研究数据；先写 PostgreSQL 快照再返回，默认单项失败后继续。 |
 | `trigger_job` | 只按现有 `job_definition.code` 排队受控作业；queued 不等于完成。 |
 
 数据库读取不接受原始 SQL。`database-tools.ts` 从 `pg_catalog` 动态读取列、约束、索引和关系，以稳定 JSON 计算逐表 SHA-256；查询执行时再次读取并比对。标识符必须来自当前表结构并满足小写字母数字下划线，所有值只通过 PostgreSQL 参数绑定进入服务端构建的 SELECT。敏感列既不进入描述结果，也不能进入查询列或过滤条件。
@@ -842,7 +878,7 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 
 - `service.ts`：每 30 秒用 `croner` 解析 enabled 作业；只接受传统 5 段 cron，固定时区 `Asia/Shanghai`。cron 扫描只负责幂等入队，不等待 Runner 完成；长任务运行期间仍持续扫描后续计划时刻。`job_run_scheduled_once` 保证多 tick/多进程对同一计划时刻只插入一次，Runner 以 `UPDATE ... WHERE status='queued'` 原子 claim。
 - 启动补偿：从每个作业最后 `scheduled_for`（初次为定义创建/更新时间）扫描到启动时刻，插入 `missed` 记录；不补跑，页面提示可手动触发。暂停区间不追记。
-- `runner.ts`：`datasource` → 数据库动态解析真实/模拟持仓、待执行模拟信号、有效标的池、同花顺一、二级官方行业、八个核心指数和期货范围 → `dailyMarketUpdate`（含 MA）→ 执行目标日模拟信号 → scheduled 数据卷导出；`analysis` → 严格校验三类结构化请求并复用 `analysis/`；`agent_flow` → 固化 `job_prompt_revision`，按任务会话注册与普通 Agent 相同的完整工具目录并同步市场工具开关，每日计划另注册池关注和模拟信号流程工具；集合竞价任务复用 `fetch_hithink_data` 并注册 `auction_assessment_write`，Markdown 写 `job_run_output`，结构化判断成功激活后发布仪表盘刷新事件。
+- `runner.ts`：`datasource` → 数据库动态解析真实/模拟持仓、待执行模拟信号、有效标的池、同花顺一、二级官方行业、八个核心指数和期货范围 → `dailyMarketUpdate`（含 MA）→ 执行目标日模拟信号 → scheduled 数据卷导出；`analysis` → 严格校验三类结构化请求并复用 `analysis/`；`agent_flow` → 固化 `job_prompt_revision`，构造与普通 Agent 同源的权限工具注册表并通过 `tool_catalog` 按需注入 schema；集合竞价任务使用 `auction_context_query`、`fetch_hithink_data` 和 `auction_assessment_write`，Markdown 写 `job_run_output`，结构化判断成功激活后发布仪表盘刷新事件。
 - 并发：同一 server 固定 3 个独立异步执行槽，每个运行只占自己的槽，不占用 cron 扫描；datasource 最多同时 1 个并继续使用独立 PostgreSQL 市场写锁，其余名额由 analysis/agent_flow 并行使用。Agent 领域写仍由原有 Agent 写锁保护。
 - 失败：日志入 `job_run.log`；第一次失败把同一行恢复 queued 并设置 `next_retry_at=now()+5min`，第二次失败标 failed。`partial` 为有数据缺口的终态，不重试。
 - 生命周期：scheduler 随 server 启动；SIGINT/SIGTERM 先停止新 tick，等待当前 Runner 安全落终态/重试态，再关闭 HTTP 与连接池。
@@ -930,7 +966,7 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 ### 12.3 第三阶段验收结果（2026-08-18）
 
 - `strategy_document` 与 `strategy_state` 的完整哈希必须重算一致；已删除文档不得继续出现在当前策略、Agent 上下文或冻结内容副本中。
-- 19 份历史每日计划已归 `daily_plan_flow` 的 `job_run_output`。三份 Agent Flow 当前提示词均为 v3，包含 `job_run_output` 且不再包含 `content_document`；新运行的结果与 `job_run` 终态同事务写入输出表。
+- 19 份历史每日计划已归 `daily_plan_flow` 的 `job_run_output`。四份内置 Agent Flow 当前提示词均为整体版本正文，按需加载任务专用工具且不再包含历史追加规则；新运行的结果与 `job_run` 终态同事务写入输出表。
 - 隔离库在 YOLO 开启状态下验证待审摘要、逐文档 diff 和真人按钮；一次性页面令牌批准后策略序号从 0 变 1、提案正文清除、演进标记已采纳。无令牌、错误主体/来源、基线冲突和拒绝清理均有永久测试。
 - 1280×720 下左侧菜单与右侧 Agent 工作区独立收放，任务中心显示并预览 19 份历史结果，水平溢出为 0，干净页面控制台 0 warning/error。
 - 发布前必须通过服务端/前端类型检查、构建、全量测试与差异检查；安全初始化包在空库恢复后需逐表及逐哈希对账一致，API Key、session 和运行时业务数据均不得进入包内。
@@ -956,7 +992,7 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 |------|------|
 | pi 内核 API 漂移 | pin 0.84.2 精确版本；厂商适配集中 `agent/ai/`，loop 集中 `agent/core/`，跨层只传稳定运行时与 frame 契约 |
 | LLM 数据库凭据泄露 | 查询 API 永不返回 key；响应/日志/构建产物做泄漏检查；数据库与数据卷仅限本机和自有介质 |
-| 数据库工具越权/大范围误改 | 读取不开放原始 SQL且强制逐表 schema_hash；普通写入不开放表/列，只开放持仓、标的池、作业、回测晋升和记忆固定命令并强制经过 service；策略只能创建待真人审核提案。确认制、YOLO 和直接回测最终化都受事务、写锁、状态指纹和审计保护 |
+| 数据库工具越权/大范围误改 | 读取不开放原始 SQL，只开放正面清单并按当前结构校验表、字段、敏感列、参数和结果限额；普通写入不开放表/列，只开放持仓、标的池、作业、回测晋升和记忆固定命令并强制经过 service；策略只能创建待真人审核提案。确认制、YOLO 和直接回测最终化都受事务、写锁、状态指纹和审计保护 |
 | 回测试验污染历史或源码泄漏 | `run_backtest` 只产生 working 和限时候选源码；默认 API 只返回 final，源码 API 只返回 final/superseded；统一脱敏阻止正文进入消息、事件、审计和可移植包 |
 | Agent 记忆过期或夹带敏感事实 | 记忆写入检查敏感模式和禁止副本；默认检索 active，页面展示来源与验证时间，冲突时以当前领域事实为准 |
 | LLM 伪造/畸形工具参数 | pi schema 之外在 execute 与 domain 入口再次严格校验；未知字段、语义矛盾、非真实唯一键与超大载荷直接拒绝，错误审计只留参数哈希 |

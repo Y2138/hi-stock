@@ -135,26 +135,17 @@ export async function listBacktestRuns(db: Db): Promise<BacktestRunListItem[]> {
   }));
 }
 
-/** 运行详情：run + artifacts（join dataset，含路径/哈希/角色） */
-export async function getBacktestRunWithArtifacts(
+/** 运行详情只返回最终结果与历史比较。 */
+export async function getBacktestRunDetail(
   db: Db,
   id: string,
-): Promise<(BacktestRunListItem & { artifacts: unknown[]; comparisons: BacktestComparison[] }) | null> {
+): Promise<(BacktestRunListItem & { comparisons: BacktestComparison[] }) | null> {
   const r = await db.query<BacktestRunRow>(
     `SELECT ${RUN_SELECT} FROM backtest_run r WHERE r.id = $1 AND r.conclusion_status = 'final'`,
     [id],
   );
   const run = r.rows[0];
   if (!run) return null;
-  const artifacts = await db.query(
-    `SELECT a.role, a.id AS artifact_id, d.id AS dataset_id, d.dataset_id AS dataset_key,
-            d.source_path, d.source_sha256, d.source_type
-       FROM backtest_artifact a
-       JOIN data_dataset d ON d.id = a.dataset_id
-      WHERE a.backtest_run_id = $1
-      ORDER BY a.role, d.source_path`,
-    [id],
-  );
   const comparisons = await db.query<BacktestComparison>(
     `SELECT prior.id::text, prior.name, prior.kind, prior.execution_status,
             prior.strategy_change_seq::text, prior.strategy_snapshot_hash,
@@ -169,7 +160,6 @@ export async function getBacktestRunWithArtifacts(
   return {
     ...run,
     is_active_anchor: run.kind === "formal" && run.status === "active",
-    artifacts: artifacts.rows,
     comparisons: comparisons.rows,
   };
 }

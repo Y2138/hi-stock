@@ -58,11 +58,18 @@ export function redactEphemeralCode(value: unknown, depth = 0): unknown {
  * 一并收敛为固定提示，避免模型把源码同时复制进自然语言消息。
  */
 export function redactAgentMessage(message: AgentMessage): AgentMessage {
-  const ephemeralResult = message.role === "toolResult"
+  const ephemeralCodeResult = message.role === "toolResult"
     && Boolean((message as AgentMessage & { details?: { ephemeral_code_result?: boolean } }).details?.ephemeral_code_result);
+  const ephemeralDataResult = message.role === "toolResult"
+    && Boolean((message as AgentMessage & { details?: { ephemeral_data_result?: boolean } }).details?.ephemeral_data_result);
   const copy = redactEphemeralCode(message) as AgentMessage;
-  if (ephemeralResult && copy.role === "toolResult" && Array.isArray(copy.content)) {
-    copy.content = [{ type: "text", text: "已向 Agent 提供固化回测源码；源码不会保存到会话。" }];
+  if ((ephemeralCodeResult || ephemeralDataResult) && copy.role === "toolResult" && Array.isArray(copy.content)) {
+    copy.content = [{
+      type: "text",
+      text: ephemeralCodeResult
+        ? "已向 Agent 提供固化回测源码；源码不会保存到会话。"
+        : "已向 Agent 提供扶摇临时查询结果；数据明细不会保存到会话。",
+    }];
     return copy;
   }
   if (copy.role !== "assistant") return copy;
@@ -95,15 +102,20 @@ export function redactAgentMessages(messages: AgentMessage[]): AgentMessage[] {
   return messages.map(redactAgentMessage);
 }
 
-/** SSE 和低频事件只公开源码元数据，当前模型仍使用工具返回的原始内容。 */
+/** SSE 和低频事件只保留临时工具结果元数据，当前模型仍使用工具返回的原始内容。 */
 export function redactEphemeralToolResult(value: unknown): unknown {
   const details = value && typeof value === "object"
-    ? (value as { details?: { ephemeral_code_result?: boolean } }).details
+    ? (value as { details?: { ephemeral_code_result?: boolean; ephemeral_data_result?: boolean } }).details
     : null;
-  if (!details?.ephemeral_code_result) return redactEphemeralCode(value);
+  if (!details?.ephemeral_code_result && !details?.ephemeral_data_result) return redactEphemeralCode(value);
   const redacted = redactEphemeralCode(value) as Record<string, unknown>;
   return {
     ...redacted,
-    content: [{ type: "text", text: "已向 Agent 提供固化回测源码；源码不会保存到会话。" }],
+    content: [{
+      type: "text",
+      text: details.ephemeral_code_result
+        ? "已向 Agent 提供固化回测源码；源码不会保存到会话。"
+        : "已向 Agent 提供扶摇临时查询结果；数据明细不会保存到会话。",
+    }],
   };
 }

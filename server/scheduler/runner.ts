@@ -7,6 +7,7 @@ import { persistAndPublishSessionEvent } from "../agent/events.js";
 import { buildSystemPrompt } from "../agent/prompt.js";
 import { appendMessage, nextMessageSeq, updateSessionStatus } from "../agent/repo.js";
 import { runAgentSessionTurn } from "../agent/session-runner.js";
+import { createJobCompletionGate } from "../agent/job-workflow.js";
 import {
   activateAuctionAssessmentsForRun,
   activatePlaybookForRun,
@@ -49,8 +50,19 @@ import type {
 const MAX_LOG_CHARS = 100_000;
 const RESULT_BANNER = "> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。";
 const AGENT_FLOW_FINALIZE_PROMPT =
-  `上一执行段达到输出上限或尚未产生合格最终正文。请优先基于本对话已有的完整工具结果继续，只有上下文已经压缩且摘要明确缺少完成任务所需字段时才补查缺失部分；结构化写入尚未完成时先完成，已经完成时不要重复调用。最后输出完整 Markdown，首行必须是：${RESULT_BANNER}`;
+  `上一执行段达到输出上限或尚未产生合格最终正文。请优先基于本对话已有的完整工具结果继续，只有上下文已经压缩且摘要明确缺少完成任务所需字段时才补查缺失部分；结构化写入尚未完成时先完成，已经完成时不要重复调用。最后输出完整 Markdown，正文开头必须包含独立一行完成标记：${RESULT_BANNER}`;
 export const DEFAULT_RETRY_DELAY_MS = 5 * 60_000;
+
+function normalizeAgentFlowMarkdown(text: string): string | null {
+  const lines = text.trim().split(/\r?\n/);
+  const bannerIndex = lines.findIndex((line) => line.trim() === RESULT_BANNER);
+  if (bannerIndex < 0 || bannerIndex > 4) return null;
+  const body = [
+    lines.slice(0, bannerIndex).join("\n").trim(),
+    lines.slice(bannerIndex + 1).join("\n").trim(),
+  ].filter(Boolean).join("\n\n");
+  return body ? `${RESULT_BANNER}\n\n${body}` : null;
+}
 
 class AgentRunAbortedError extends Error {
   constructor() {
@@ -228,15 +240,15 @@ function buildAgentJobPrompt(
     return [
       `系统正在重试作业 ${definition.code}（目标日 ${run.target_date}，第 ${run.attempt_count} 次尝试）。`,
       "请结合本对话第一条任务要求和已有执行记录重新完成任务，并直接输出完整 Markdown。",
-      `首行必须是：${RESULT_BANNER}`,
+      `正文开头必须包含独立一行完成标记：${RESULT_BANNER}`,
     ].join("\n\n");
   }
-  const capability = "本任务与普通对话、续写和用户干预使用同一完整工具集及当前确认制/YOLO 设置；Agent 按任务需要自行选择工具，策略发布仍只能创建待真人审核提案。";
+  const capability = "本任务使用受控工具目录及当前确认制/YOLO 设置；已在工具列表中的能力直接调用，缺少定义时才通过 tool_catalog 加载。策略发布仍只能创建待真人审核提案。";
   return [
     `执行系统作业 ${definition.code}（目标日 ${run.target_date}）。`,
     capability,
-    "数据库查询须遵循 schema_hash 渐进发现协议，数据缺失必须列入缺口。",
-    `请直接输出完整 Markdown。首行必须是：${RESULT_BANNER}`,
+    "数据库查询按表名和当前字段执行服务端实时校验，数据缺失必须列入缺口。",
+    `请直接输出完整 Markdown。正文开头必须包含独立一行完成标记：${RESULT_BANNER}`,
     "以下是数据库内固化的流程提示词；遵循其读取范围和输出结构：",
     template,
   ].join("\n\n");
@@ -299,28 +311,34 @@ async function runAgentFlow(
   prompt: string,
   sessionId: string,
   strategy: StrategyBundle,
+  jobCode: string,
+  targetDate: string,
 ): Promise<string> {
   const systemPrompt = await buildSystemPrompt(pool, strategy);
+  const completion = createJobCompletionGate(jobCode, targetDate);
   const turn = await runAgentSessionTurn({
     pool,
     sessionId,
     historyMode: "session",
     systemPrompt,
     systemPromptSuffix:
-      "自动作业与普通 Agent 使用相同工具权限和当前确认制/YOLO 设置；策略发布仍只能创建待真人审核提案。任务结果由 Runner 关联本次运行保存。",
+      "内置任务的固定领域工具已预加载，直接调用即可，无需重复 tool_catalog；其他能力以当前目录为准按需加载。任务只有本次执行的必需读取和条件写入均完成且输出完整正文后才完成；历史成功记录不能代替本次运行。取数缺口必须如实报告，不能称为有效信号。策略发布仍只能创建待真人审核提案。任务结果由 Runner 关联本次运行保存。",
     manageSessionStatus: false,
+    toolScope: { kind: "job", jobCode },
     text: prompt,
-    continuationPrompt: AGENT_FLOW_FINALIZE_PROMPT,
-    isCompleteAssistantText: (text) => text.startsWith(RESULT_BANNER),
+    onFrame: (frame) => completion.observe(frame),
+    continuationPrompt: () => `${AGENT_FLOW_FINALIZE_PROMPT}\n本次尚未成功完成的必需工具：${completion.missing().join("、") || "无"}。日期查询必须使用任务目标日。`,
+    isCompleteAssistantText: (text) => normalizeAgentFlowMarkdown(text) !== null && completion.missing().length === 0,
   });
   if (turn.aborted) throw new AgentRunAbortedError();
+  if (turn.toolLoopError) throw new Error(turn.toolLoopError);
   if (turn.llmError) throw new Error(turn.llmError);
   const stopReason = turn.lastAssistant?.role === "assistant" ? turn.lastAssistant.stopReason : undefined;
   if (stopReason === "error") {
     throw new Error(turn.lastAssistant?.role === "assistant" ? turn.lastAssistant.errorMessage ?? "LLM 调用失败" : "LLM 调用失败");
   }
-  const markdown = textOfAssistant(turn.lastAssistant);
-  if (!markdown.startsWith(RESULT_BANNER)) throw new Error("agent_flow 未产生带完成标记的最终 Markdown");
+  const markdown = normalizeAgentFlowMarkdown(textOfAssistant(turn.lastAssistant));
+  if (!markdown) throw new Error("agent_flow 未产生带完成标记的最终 Markdown");
   return markdown;
 }
 
@@ -517,7 +535,7 @@ async function executeAgentFlow(
     markdown = markdown.startsWith(RESULT_BANNER) ? markdown : `${RESULT_BANNER}\n\n${markdown}`;
     await appendConversationMessage(deps.pool, run.session_id, "assistant", markdown);
   } else {
-    markdown = await runAgentFlow(deps.pool, prompt, run.session_id, strategy);
+    markdown = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, definition.code, run.target_date);
   }
   return {
     status: "success",
@@ -694,6 +712,13 @@ export async function executeJobRun(deps: RunnerDeps, runId: string): Promise<Jo
       result = await executeAgentFlow(deps, run, detail.job, config as AgentFlowJobConfig);
     }
     const finishedAt = deps.now?.() ?? new Date();
+    if (run.session_id) {
+      await persistAndPublishSessionEvent(deps.pool, {
+        session_id: run.session_id,
+        event_type: "activity",
+        data: { phase: "saving", at: Date.now(), job_code: detail.job.code },
+      });
+    }
     const finished = await finishRun(deps.pool, run, result, finishedAt);
     if (finished.run.session_id && finished.outputId) {
       await appendConversationMessage(

@@ -14,6 +14,7 @@ interface QueueItem<T> {
   operation: () => Promise<T>;
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
+  signal?: AbortSignal;
 }
 
 export interface HithinkSchedulerSnapshot {
@@ -41,15 +42,33 @@ export class HithinkRequestScheduler {
     private readonly now: () => number = Date.now,
   ) {}
 
-  schedule<T>(priority: HithinkPriority, operation: () => Promise<T>): Promise<T> {
+  schedule<T>(priority: HithinkPriority, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      this.queues.get(priority)!.push({
+      signal?.throwIfAborted();
+      let onAbort: (() => void) | undefined;
+      const cleanup = () => signal?.removeEventListener("abort", onAbort!);
+      const item: QueueItem<unknown> = {
         priority,
         enqueuedAt: this.now(),
         operation,
-        resolve,
-        reject,
-      } as QueueItem<unknown>);
+        resolve: (value) => {
+          cleanup();
+          resolve(value as T);
+        },
+        reject: (error) => {
+          cleanup();
+          reject(error);
+        },
+        signal,
+      };
+      onAbort = () => {
+        const queue = this.queues.get(priority)!;
+        const index = queue.indexOf(item);
+        if (index >= 0) queue.splice(index, 1);
+        item.reject(signal!.reason);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.queues.get(priority)!.push(item);
       void this.pump();
     });
   }
@@ -89,16 +108,19 @@ export class HithinkRequestScheduler {
       for (;;) {
         const item = this.next();
         if (!item) return;
-        const wait = this.minIntervalMs - (this.now() - this.lastRelease);
-        if (wait > 0) await this.sleep(wait);
-        this.lastRelease = this.now();
-        this.lastQueuedDelayMs = Math.max(0, this.lastRelease - item.enqueuedAt);
         try {
+          item.signal?.throwIfAborted();
+          const wait = this.minIntervalMs - (this.now() - this.lastRelease);
+          if (wait > 0) await this.sleep(wait, item.signal);
+          item.signal?.throwIfAborted();
+          this.lastRelease = this.now();
+          this.lastQueuedDelayMs = Math.max(0, this.lastRelease - item.enqueuedAt);
           const value = await item.operation();
+          item.signal?.throwIfAborted();
           this.completed += 1;
           item.resolve(value);
         } catch (error) {
-          this.failed += 1;
+          if (!item.signal?.aborted) this.failed += 1;
           item.reject(error);
         }
       }

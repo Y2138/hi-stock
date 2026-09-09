@@ -4,8 +4,6 @@ import { inServiceTransaction, type TransactionDb } from "../../db/transaction.j
 
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
 export type PoolKind = "short" | "long";
-export type StopLossMode = "ma5" | "ma10" | "fixed_90";
-
 export interface PoolMemberRow {
   id: string;
   pool: PoolKind;
@@ -14,9 +12,12 @@ export interface PoolMemberRow {
   score: number | null;
   tags: string[];
   stock_character: string | null;
-  stop_loss_mode: StopLossMode | null;
+  stock_character_profile: Record<string, unknown>;
   stage: string | null;
   evaluation_summary: string | null;
+  profile_as_of: string | null;
+  profile_calculation_version: string | null;
+  profile_input_sha256: string | null;
   effective_from: string;
   effective_to: string | null;
   note: string | null;
@@ -58,7 +59,8 @@ export interface PoolViewData {
 
 const MEMBER_SELECT = `SELECT membership.id::text, membership.pool, membership.role,
   membership.grade, membership.score::float8, membership.tags,
-  membership.stock_character, membership.stop_loss_mode, membership.stage, membership.evaluation_summary,
+  membership.stock_character, membership.stock_character_profile, membership.stage, membership.evaluation_summary,
+  membership.profile_as_of::text, membership.profile_calculation_version, membership.profile_input_sha256,
   membership.effective_from::text, membership.effective_to::text, membership.note,
   membership.attention_reason, membership.attention_from::text, membership.attention_until::text,
   instrument.code, instrument.name, instrument.kind,
@@ -155,9 +157,12 @@ export interface PoolChangeInput {
   score?: number;
   tags?: string[];
   stock_character?: string;
-  stop_loss_mode?: StopLossMode;
+  stock_character_profile?: Record<string, unknown>;
   stage?: string;
   evaluation_summary?: string;
+  profile_as_of?: string;
+  profile_calculation_version?: string;
+  profile_input_sha256?: string;
   attention_reason?: string | null;
   attention_from?: string | null;
   attention_until?: string | null;
@@ -217,7 +222,7 @@ export async function setPoolAttention(
   });
 }
 
-/** add/update 均生成完整新角色行；update 可原子完成短线池与长线池之间的角色迁移。 */
+/** 跨日角色变化保留历史；同日重新初始化原地刷新当前行。 */
 export async function applyPoolChange(
   db: TransactionDb,
   input: PoolChangeInput,
@@ -246,7 +251,7 @@ export async function applyPoolChange(
     }
 
     const attentionOnly = input.action === "update" && before?.pool === input.pool &&
-      [input.role, input.grade, input.score, input.tags, input.stock_character, input.stop_loss_mode, input.stage,
+      [input.role, input.grade, input.score, input.tags, input.stock_character, input.stock_character_profile, input.stage,
        input.evaluation_summary, input.note].every((value) => value === undefined) &&
       [input.attention_reason, input.attention_from, input.attention_until].some((value) => value !== undefined);
     if (attentionOnly) {
@@ -264,11 +269,12 @@ export async function applyPoolChange(
     const stockCharacter = requiredText(input.stock_character ?? before?.stock_character, "stock_character");
     const stage = requiredText(input.stage ?? before?.stage, "stage");
     const evaluationSummary = requiredText(input.evaluation_summary ?? before?.evaluation_summary, "evaluation_summary");
-    if (input.pool === "long" && input.stop_loss_mode !== undefined) throw new Error("长线池角色不使用短线止损档位");
-    const stopLossMode = input.pool === "short" ? input.stop_loss_mode ?? before?.stop_loss_mode ?? null : null;
-    if (input.pool === "short" && (input.action === "add" || before?.pool !== "short") && stopLossMode === null) {
-      throw new Error("新增或迁入短线池必须配置 stop_loss_mode");
-    }
+    const stockCharacterProfile = input.stock_character_profile ?? before?.stock_character_profile ?? {};
+    const profileAsOf = input.profile_as_of ?? before?.profile_as_of ?? null;
+    const profileCalculationVersion = input.profile_calculation_version ?? before?.profile_calculation_version ?? null;
+    const profileInputSha256 = input.profile_input_sha256 ?? before?.profile_input_sha256 ?? null;
+    if (profileAsOf && !validDate(profileAsOf)) throw new Error("profile_as_of 必须是有效日期");
+    if (profileInputSha256 && !/^[a-f0-9]{64}$/.test(profileInputSha256)) throw new Error("profile_input_sha256 非法");
     const score = input.score ?? before?.score;
     if (score === null || score === undefined || !Number.isFinite(score)) throw new Error("score 必须是有限数值");
     const tags = (input.tags ?? before?.tags)?.map((tag) => String(tag).trim());
@@ -295,21 +301,38 @@ export async function applyPoolChange(
     if (attentionUntil && !validDate(attentionUntil)) throw new Error("attention_until 必须是有效日期");
     if (attentionFrom && attentionUntil && attentionUntil < attentionFrom) throw new Error("attention_until 不得早于 attention_from");
 
+    const values = [
+      input.pool, role, grade, score, JSON.stringify(tags), stockCharacter,
+      JSON.stringify(stockCharacterProfile), stage, evaluationSummary,
+      profileAsOf, profileCalculationVersion, profileInputSha256,
+      input.attention_reason === undefined ? before?.attention_reason ?? null : input.attention_reason,
+      attentionFrom, attentionUntil, input.evaluation_session_id ?? null,
+      input.effective_from, input.note ?? before?.note ?? null,
+    ];
+    // 同一生效日再次初始化属于当日档案刷新，原行更新可避免唯一键冲突和零时长历史。
+    if (before?.effective_from === input.effective_from) {
+      await client.query(
+        `UPDATE pool_membership SET
+           pool=$2, role=$3, grade=$4, score=$5, tags=$6, stock_character=$7,
+           stock_character_profile=$8, stage=$9, evaluation_summary=$10, profile_as_of=$11,
+           profile_calculation_version=$12, profile_input_sha256=$13, attention_reason=$14,
+           attention_from=$15, attention_until=$16, evaluation_session_id=$17, note=$18
+         WHERE id=$1`,
+        [before.id, ...values.slice(0, 16), values[17]],
+      );
+      const afterRows = await client.query<PoolMemberRow>(`${MEMBER_SELECT} WHERE membership.id = $1`, [before.id]);
+      return { before, after: afterRows.rows[0]! };
+    }
+
     if (before) await client.query("UPDATE pool_membership SET effective_to = $2 WHERE id = $1", [before.id, input.effective_from]);
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO pool_membership
-         (instrument_id, pool, role, grade, score, tags, stock_character, stop_loss_mode, stage,
-          evaluation_summary, attention_reason,
+         (instrument_id, pool, role, grade, score, tags, stock_character, stock_character_profile, stage,
+          evaluation_summary, profile_as_of, profile_calculation_version, profile_input_sha256, attention_reason,
           attention_from, attention_until, evaluation_session_id, effective_from, note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
        RETURNING id::text`,
-      [
-        instrumentId, input.pool, role, grade, score, JSON.stringify(tags), stockCharacter, stopLossMode,
-        stage, evaluationSummary,
-        input.attention_reason === undefined ? before?.attention_reason ?? null : input.attention_reason,
-        attentionFrom, attentionUntil, input.evaluation_session_id ?? null,
-        input.effective_from, input.note ?? before?.note ?? null,
-      ],
+      [instrumentId, ...values],
     );
     const afterRows = await client.query<PoolMemberRow>(
       `${MEMBER_SELECT} WHERE membership.id = $1`,

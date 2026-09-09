@@ -6,6 +6,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { apiClient, postSseStream, uploadFile } from "../api/client";
 import type {
   AgentControlResult,
+  AgentActivity,
   ChatAttachment,
   ChatMessageRow,
   ChatSession,
@@ -21,6 +22,7 @@ import type {
 import MarkdownView from "../components/MarkdownView.vue";
 import StateBlock from "../components/StateBlock.vue";
 import ToolGroupCard from "../components/chat/ToolGroupCard.vue";
+import AgentActivityBar from "../components/chat/AgentActivityBar.vue";
 import UiSelect, { type SelectOption } from "../components/ui/UiSelect.vue";
 import { useResource } from "../composables/useResource";
 import { useStreamTypewriter } from "../composables/useStreamTypewriter";
@@ -368,6 +370,14 @@ let eventsSessionId: string | null = null;
 const activeRunIds = new Map<string, string>();
 const eventCursors = new Map<string, bigint>();
 const primedSessions = new Set<string>();
+const activities = ref<Record<string, AgentActivity | undefined>>({});
+const eventsConnected = ref(false);
+function receiveActivity(sessionId: string, activity: AgentActivity): void {
+  if (!Number.isFinite(activity.at)) return;
+  const previous = activities.value[sessionId];
+  if (previous && previous.at > activity.at) return;
+  activities.value[sessionId] = activity;
+}
 let replayingEvents = true;
 let connectionStartedAt = 0;
 let pendingRefreshes: UiRefreshRequest[] = [];
@@ -404,6 +414,12 @@ function openEvents(sessionId: string): void {
   pendingConversationRefresh = false;
   const after = eventCursors.get(sessionId) ?? 0n;
   evtSource = new EventSource(`/api/chat/${sessionId}/events?after=${after.toString()}`);
+  evtSource.addEventListener("error", () => { eventsConnected.value = false; });
+  evtSource.addEventListener("activity", (ev) => {
+    const data = readEventData<AgentActivity & { cursor?: string }>(ev);
+    if (!data || !acceptCursor(sessionId, data) || sending.value) return;
+    receiveActivity(sessionId, data);
+  });
   evtSource.addEventListener("ready", () => {
     replayingEvents = true;
     connectionStartedAt = Date.now();
@@ -419,6 +435,7 @@ function openEvents(sessionId: string): void {
     const data = readEventData<{ run_id?: string; cursor?: string }>(ev);
     if (!data || typeof data.run_id !== "string" || !acceptCursor(sessionId, data)) return;
     activeRunIds.set(sessionId, data.run_id);
+    if (!sending.value) activities.value[sessionId] = undefined;
     if (activeId.value === sessionId) activeRunId.value = data.run_id;
   });
   evtSource.addEventListener("session_status", (ev) => {
@@ -468,6 +485,7 @@ function openEvents(sessionId: string): void {
     }
     pendingRefreshes = [];
     primedSessions.add(sessionId);
+    eventsConnected.value = true;
     replayingEvents = false;
     if (pendingConversationRefresh) {
       pendingConversationRefresh = false;
@@ -478,6 +496,7 @@ function openEvents(sessionId: string): void {
 }
 
 function closeEvents(): void {
+  eventsConnected.value = false;
   evtSource?.close();
   evtSource = null;
   eventsSessionId = null;
@@ -618,7 +637,11 @@ watch(
 function handleFrame(frame: ChatSseFrame, state: TurnStreamState): void {
   const ui = state.currentAssistant;
   switch (frame.type) {
+    case "activity":
+      receiveActivity(state.sessionId, frame.data);
+      break;
     case "run_started":
+      activities.value[state.sessionId] = undefined;
       state.runId = frame.data.run_id;
       activeRunIds.set(state.sessionId, frame.data.run_id);
       activeRunId.value = frame.data.run_id;
@@ -1231,6 +1254,14 @@ onBeforeUnmount(() => {
         </button>
 
         <!-- 输入区 -->
+        <AgentActivityBar
+          v-if="activeId && (isAgentRunning || activeSession?.session_status === 'queued')"
+          :key="activeId"
+          :activity="activities[activeId] ?? null"
+          :is-job="activeSession?.session_type === 'job'"
+          :connected="sending || eventsConnected"
+          :queued="!sending && activeSession?.session_status === 'queued'"
+        />
         <div class="composer">
           <p v-if="draftContextLabel" class="context-prefill">
             <span>✦ 已带入：{{ draftContextLabel }}</span>

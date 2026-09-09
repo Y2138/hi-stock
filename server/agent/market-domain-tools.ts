@@ -1,4 +1,4 @@
-// 默认关闭的市场领域只读工具：只经领域 service 读取，不接收 SQL、表名、URL 或 datasource 端点。
+// 市场领域只读工具：只经领域 service 读取 PostgreSQL 事实，不接收 SQL、表名、URL 或 datasource 端点。
 import { Type, type Static, type TSchema } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
@@ -19,8 +19,10 @@ import {
 } from "../modules/market/structure.js";
 import { queryLimitUpSignals } from "../modules/market/limit-up-signals.js";
 import { queryDailyPlanContext } from "../modules/plans/daily-context.js";
+import { querySwingSignals } from "../modules/plans/swing-signals.js";
+import { queryStockResearch } from "../modules/market/research.js";
+import { strategyForSession } from "./business-context-tools.js";
 import { insertToolAudit } from "./repo.js";
-import { getAgentSettings } from "./settings.js";
 import { sha256Json } from "./hash.js";
 import { validateToolInput } from "./tool-validation.js";
 
@@ -40,6 +42,7 @@ const InstrumentSearchSchema = strict({
 const SnapshotSchema = strict({
   codes: Type.Array(Code, { minItems: 1, maxItems: 200 }),
 });
+const StockResearchSchema = strict({ codes: Type.Array(Code, { minItems: 1, maxItems: 20, uniqueItems: true }) });
 const BoardSchema = strict({
   mode: Type.Union([Type.Literal("list"), Type.Literal("constituents")]),
   type: Type.Optional(Type.Union([
@@ -57,6 +60,7 @@ const MarketEventSchema = strict({
 });
 const LimitUpSignalSchema = strict({ date: DateString });
 const DailyPlanContextSchema = strict({ date: DateString });
+const SwingSignalSchema = strict({ date: DateString });
 const IndicatorSchema = strict({
   codes: Type.Array(Code, { minItems: 1, maxItems: 20 }),
   freq: Type.Optional(Type.Union([Type.Literal("day"), Type.Literal("30m"), Type.Literal("futures_day")])),
@@ -69,10 +73,21 @@ function toolResult(value: unknown): AgentToolResult<unknown> {
   return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
 }
 
-async function assertEnabled(pool: pg.Pool): Promise<void> {
-  if (!(await getAgentSettings(pool)).market_domain_tools_enabled) {
-    throw new Error("市场领域工具开关已关闭；请使用 database_schema/database_query");
-  }
+async function audited(
+  deps: { pool: pg.Pool; sessionId: string | null },
+  name: string,
+  args: unknown,
+  operation: () => Promise<unknown>,
+): Promise<AgentToolResult<unknown>> {
+  const value = stripSourcePayload(await operation());
+  await insertToolAudit(deps.pool, {
+    session_id: deps.sessionId,
+    tool_name: name,
+    args,
+    result_sha256: sha256Json(value),
+    status: "ok",
+  });
+  return toolResult(value);
 }
 
 function stripSourcePayload(value: unknown): unknown {
@@ -87,26 +102,7 @@ function stripSourcePayload(value: unknown): unknown {
   return value;
 }
 
-async function audited(
-  deps: { pool: pg.Pool; sessionId: string | null },
-  name: string,
-  args: unknown,
-  operation: () => Promise<unknown>,
-  requireMarketSwitch = true,
-): Promise<AgentToolResult<unknown>> {
-  if (requireMarketSwitch) await assertEnabled(deps.pool);
-  const value = stripSourcePayload(await operation());
-  await insertToolAudit(deps.pool, {
-    session_id: deps.sessionId,
-    tool_name: name,
-    args,
-    result_sha256: sha256Json(value),
-    status: "ok",
-  });
-  return toolResult(value);
-}
-
-/** 打板评分是当前策略的正式只读执行能力，不受可选市场领域工具开关影响。 */
+/** 打板评分是当前策略的正式只读执行能力。 */
 export function buildLimitUpSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
   return {
     name: "limit_up_signal_query",
@@ -115,12 +111,33 @@ export function buildLimitUpSignalTool(deps: { pool: pg.Pool; sessionId: string 
     parameters: LimitUpSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof LimitUpSignalSchema>>("limit_up_signal_query", LimitUpSignalSchema, raw);
-      return audited(deps, "limit_up_signal_query", input, () => queryLimitUpSignals(deps.pool, input.date), false);
+      return audited(deps, "limit_up_signal_query", input, async () => {
+        const strategy = await strategyForSession(deps);
+        const revisionId = strategy.documents.find((document) => document.code === "limit_up_board")?.current_revision_id ?? null;
+        const value = await queryLimitUpSignals(deps.pool, input.date, revisionId);
+        return {
+          ...value,
+          candidates: value.candidates.map((candidate) => ({
+            code: candidate.code,
+            name: candidate.name,
+            main_theme: candidate.main_theme,
+            streak_count: candidate.streak_count,
+            cluster_score: candidate.cluster_score,
+            momentum_score: candidate.momentum_score,
+            cluster_rank: candidate.cluster_rank,
+            momentum_rank: candidate.momentum_rank,
+            signal_grade: candidate.signal_grade,
+            data_status: candidate.data_status,
+            missing_inputs: candidate.missing_inputs,
+            risk_flags: candidate.risk_flags,
+          })),
+        };
+      });
     },
   };
 }
 
-/** 每日计划的机械计算与覆盖门禁始终可用，不受可选市场领域工具开关影响。 */
+/** 每日计划的机械计算与覆盖门禁读取器。 */
 export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
   return {
     name: "daily_plan_context_query",
@@ -129,7 +146,21 @@ export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: stri
     parameters: DailyPlanContextSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof DailyPlanContextSchema>>("daily_plan_context_query", DailyPlanContextSchema, raw);
-      return audited(deps, "daily_plan_context_query", input, () => queryDailyPlanContext(deps.pool, input.date), false);
+      return audited(deps, "daily_plan_context_query", input, () => queryDailyPlanContext(deps.pool, input.date));
+    },
+  };
+}
+
+/** 波段四条件扫描始终可用，由每日计划单独调用，避免扩大通用上下文。 */
+export function buildSwingSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+  return {
+    name: "swing_signal_query",
+    label: "查询波段确定性信号",
+    description: "按目标日逐只扫描长线池中的波段角色，返回40日箱体、缩量/反转形态/RSI14/预期盈亏比四条件、T+1突破与价格上限、已有持仓抑制、正式信号、接近候选和逐只数据缺口；不得再用通用查询手算。",
+    parameters: SwingSignalSchema,
+    execute: async (_id, raw) => {
+      const input = validateToolInput<Static<typeof SwingSignalSchema>>("swing_signal_query", SwingSignalSchema, raw);
+      return audited(deps, "swing_signal_query", input, () => querySwingSignals(deps.pool, input.date));
     },
   };
 }
@@ -148,6 +179,17 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
           kind: input.kind as InstrumentKind | undefined,
           limit: input.limit ?? 20,
         }));
+      },
+    },
+    {
+      name: "stock_research_query",
+      label: "查询标的研究证据",
+      description: "一次读取最多20个任意本地标的的日线快照、最新正式五维股性与阶段、财报和估值；不要求在池内，不同步、不入池、不写分析。回答股性、当前阶段和多标的对比时优先使用；返回每项日期、计算版本和缺口，池内档案快照另用 pool_context_query。本地缺失用扶摇临时查询补证，新闻用 web_search。",
+      parameters: StockResearchSchema,
+      execute: async (_id, raw) => {
+        const input = validateToolInput<Static<typeof StockResearchSchema>>("stock_research_query", StockResearchSchema, raw);
+        const codes = [...new Set(input.codes.map((code) => code.toUpperCase()))];
+        return audited(deps, "stock_research_query", { codes }, () => queryStockResearch(deps.pool, codes));
       },
     },
     {

@@ -2,9 +2,20 @@
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §5.2
 // 批量请求串行且间隔不小于 3 秒；仅瞬时错误按调用方判定执行有界指数退避。
 
-export type SleepFn = (ms: number) => Promise<void>;
+export type SleepFn = (ms: number, signal?: AbortSignal) => Promise<void>;
 
-export const defaultSleep: SleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const defaultSleep: SleepFn = (ms, signal) => new Promise((resolve, reject) => {
+  signal?.throwIfAborted();
+  const timer = setTimeout(() => {
+    signal?.removeEventListener("abort", onAbort);
+    resolve();
+  }, ms);
+  const onAbort = () => {
+    clearTimeout(timer);
+    reject(signal!.reason);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+});
 
 /**
  * 串行间隔限流器：相邻两次放行的间隔不小于 minIntervalMs。
@@ -21,10 +32,12 @@ export class RateLimiter {
   ) {}
 
   /** 获取一个令牌；返回的 Promise 在放行后 resolve */
-  acquire(): Promise<void> {
+  acquire(signal?: AbortSignal): Promise<void> {
     const turn = this.chain.then(async () => {
+      signal?.throwIfAborted();
       const wait = this.minIntervalMs - (Date.now() - this.lastRelease);
-      if (wait > 0) await this.sleep(wait);
+      if (wait > 0) await this.sleep(wait, signal);
+      signal?.throwIfAborted();
       this.lastRelease = Date.now();
     });
     // 排队链本身不因单个等待失败而中断
@@ -44,6 +57,7 @@ export interface BackoffOptions {
   shouldRetry?: (err: unknown) => boolean;
   /** 从错误中提取服务端要求的等待毫秒（如 Retry-After），优先于指数退避 */
   retryAfterMs?: (err: unknown) => number | null;
+  signal?: AbortSignal;
 }
 
 /** 指数退避重试包装：仅对 shouldRetry 判为可重试的错误退避，其余直接抛出 */
@@ -55,6 +69,7 @@ export async function withBackoff<T>(fn: () => Promise<T>, opts: BackoffOptions 
   let attempt = 0;
   for (;;) {
     try {
+      opts.signal?.throwIfAborted();
       return await fn();
     } catch (err) {
       if (attempt >= maxRetries || !(opts.shouldRetry ? opts.shouldRetry(err) : true)) {
@@ -63,7 +78,7 @@ export async function withBackoff<T>(fn: () => Promise<T>, opts: BackoffOptions 
       attempt += 1;
       const hint = opts.retryAfterMs?.(err);
       const delay = hint != null && hint > 0 ? hint : Math.min(base * 2 ** (attempt - 1), cap);
-      await sleep(delay);
+      await sleep(delay, opts.signal);
     }
   }
 }

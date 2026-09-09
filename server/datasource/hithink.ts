@@ -57,6 +57,7 @@ export interface HithinkDeps {
   priority?: HithinkPriority;
   sleep?: SleepFn;
   timeoutMs?: number;
+  signal?: AbortSignal;
   /** 生产由业务 service 传数据库；apiKey 仅供无数据库的纯 HTTP 单测注入。 */
   db?: SystemSettingsDb;
   apiKey?: string;
@@ -79,6 +80,7 @@ async function requestOnce(
   params: Record<string, string | number>,
   timeoutMs: number,
   apiKey: string,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const url = new URL(BASE_URL + path);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
@@ -88,7 +90,9 @@ async function requestOnce(
       Accept: "application/json",
       "User-Agent": "stock-workspace/1.0",
     },
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+      : AbortSignal.timeout(timeoutMs),
   });
   if (res.status === 429) {
     const ra = res.headers.get("Retry-After");
@@ -113,16 +117,19 @@ export async function hithinkGet(
   deps: HithinkDeps = {},
 ): Promise<unknown> {
   const timeoutMs = deps.timeoutMs ?? 30_000;
+  deps.signal?.throwIfAborted();
   const apiKey = await resolveApiKey(deps);
+  deps.signal?.throwIfAborted();
   return withBackoff(
     async () => {
       if (deps.limiter) {
-        await deps.limiter.acquire();
-        return requestOnce(path, params, timeoutMs, apiKey);
+        await deps.limiter.acquire(deps.signal);
+        return requestOnce(path, params, timeoutMs, apiKey, deps.signal);
       }
       return (deps.scheduler ?? sharedHithinkRequestScheduler).schedule(
         deps.priority ?? "scheduled-medium",
-        () => requestOnce(path, params, timeoutMs, apiKey),
+        () => requestOnce(path, params, timeoutMs, apiKey, deps.signal),
+        deps.signal,
       );
     },
     {
@@ -130,6 +137,7 @@ export async function hithinkGet(
       sleep: deps.sleep,
       shouldRetry: isHithinkRateLimited,
       retryAfterMs: (err) => (err instanceof HithinkHttpError ? err.retryAfterMs : null),
+      signal: deps.signal,
     },
   );
 }

@@ -54,9 +54,18 @@ const GRADE_LABELS: Record<string, string> = {
 };
 const AUCTION_LABELS: Record<string, string> = {
   worth_entering: "超出当前策略",
-  observe: "继续观察",
+  signal_passed: "信号通过",
+  observe: "历史继续观察",
   give_up: "放弃",
   unavailable: "数据不足",
+};
+const AUCTION_REVIEW_LABELS: Record<string, string> = {
+  one_word_continue: "一字延续",
+  turnover_advance: "换手晋级",
+  divergence: "分歧验证",
+  give_up: "失效",
+  data_insufficient: "数据不足",
+  legacy_observe: "历史观察",
 };
 const auctionAssessmentCount = computed(() =>
   opportunities.value.filter((item) => item.auction_assessment !== null).length,
@@ -436,7 +445,7 @@ onMounted(reloadAll);
       </div>
       <p class="strategy-scope-note">
         <template v-if="isLegacyOpportunitySet">当前展示的是旧计划口径；按最新《打板策略》生成的新计划每日最多 4 只。</template>
-        <template v-else>T 日收盘按当前《打板策略》筛选；前向验证期只展示继续观察、放弃或数据不足。</template>
+        <template v-else>T 日收盘按当前《打板策略》筛选；小额实盘验证期展示信号通过、放弃或数据不足，是否成交及数量由用户自主决定。</template>
       </p>
       <StateBlock
         :loading="planLoading"
@@ -482,7 +491,7 @@ onMounted(reloadAll);
                 <td class="auction-result-cell">
                   <template v-if="item.auction_assessment">
                     <span class="auction-badge" :class="`auction-${item.auction_assessment.conclusion}`">
-                      {{ AUCTION_LABELS[item.auction_assessment.conclusion] }}
+                      {{ AUCTION_LABELS[item.auction_assessment.conclusion] }} · {{ AUCTION_REVIEW_LABELS[item.auction_assessment.review_type] }}
                     </span>
                     <small>{{ item.auction_assessment.metrics_summary }}</small>
                     <small v-if="item.auction_assessment.benchmark_tags.length > 0" class="auction-tags">
@@ -1139,6 +1148,11 @@ onMounted(reloadAll);
 .auction-observe {
   background: color-mix(in srgb, var(--warn) 18%, transparent);
   color: var(--warn);
+}
+
+.auction-signal_passed {
+  background: color-mix(in srgb, var(--good) 16%, transparent);
+  color: var(--good);
 }
 
 .auction-give_up {

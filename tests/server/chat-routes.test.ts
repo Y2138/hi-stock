@@ -6,6 +6,7 @@
 // - 附件上传（multipart）与确认结果事件通道（GET .../events 长连 SSE）
 // 无 LLM 真实调用：pi-ai fauxProvider 脚本化响应（设计 §十二）。
 import {
+  Type,
   createModels,
   fauxAssistantMessage,
   fauxProvider,
@@ -26,9 +27,10 @@ import {
 } from "../../server/agent/events.js";
 import { appendMessage, createSession, getSession } from "../../server/agent/repo.js";
 import { getActiveAgentRun } from "../../server/agent/run-control.js";
-import { recoverInterruptedAgentSessions } from "../../server/agent/session-runner.js";
+import { recoverInterruptedAgentSessions, runAgentSessionTurn } from "../../server/agent/session-runner.js";
 import { UPLOADS_DIR } from "../../server/agent/routes.js";
 import { groupMessagesIntoTurns, rowsToMessages } from "../../web/src/utils/chat.js";
+import { activityLabel } from "../../web/src/utils/agent-activity.js";
 import { parseResultRef, resultRefFromHref, resultRefsOfTool } from "../../web/src/utils/results.js";
 import { api, prepareTestDb, resetSchema, seedTestStrategy, startTestServer, type TestServer } from "./helpers.js";
 
@@ -53,6 +55,11 @@ describe("落库结果引用", () => {
       status: "done",
       resultText: JSON.stringify({ mode: "yolo", result: { change: { id: "12" } } }),
     })).toEqual([{ type: "position-change", id: "12" }]);
+    expect(resultRefsOfTool({
+      name: "pool_onboard",
+      status: "done",
+      confirmation: { status: "approved", result: { after: { pool: "short", code: "600000.SH" } } },
+    })).toEqual([{ type: "pool-member", id: "short:600000.SH" }]);
   });
 });
 
@@ -359,7 +366,7 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     }
   }, 15_000);
 
-  it("未触发上下文压缩时向后续对话保留完整工具结果与共享工具目录", async () => {
+  it("未触发上下文压缩时保留历史工具结果且新轮次只注入按需目录", async () => {
     const session = await createSession(pool, "完整上下文测试");
     const fullResult = `完整工具结果开始\n${"A".repeat(70_000)}\n完整工具结果结束`;
     await appendMessage(pool, {
@@ -397,11 +404,7 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
         const toolResult = context.messages.find((message) => message.role === "toolResult");
         expect(toolResult?.role === "toolResult" ? toolResult.content[0] : null)
           .toMatchObject({ type: "text", text: fullResult });
-        expect(context.tools?.map((tool) => tool.name)).toEqual(expect.arrayContaining([
-          "pool_attention_write",
-          "daily_plan_write",
-          "auction_assessment_write",
-        ]));
+        expect(context.tools?.map((tool) => tool.name)).toEqual(["tool_catalog"]);
         return fauxAssistantMessage([fauxText("已基于完整工具结果继续回答")]);
       },
     ]);
@@ -418,6 +421,11 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     const types = frames.map((f) => f.type);
     expect(types).toContain("text");
     expect(types).toContain("done");
+    expect(frames.filter((frame) => frame.type === "activity").map((frame) => (frame.data as { phase: string }).phase))
+      .toEqual(expect.arrayContaining(["thinking", "writing"]));
+    const activityEvents = (await listChatSessionEvents(pool, session.id)).filter((event) => event.event_type === "activity");
+    expect(activityEvents.length).toBeGreaterThan(0);
+    expect(JSON.stringify(activityEvents)).not.toContain("你好，我是工作台助手");
     const deltas = frames.filter((f) => f.type === "text").map((f) => (f.data as { delta: string }).delta);
     expect(deltas.join("")).toContain("你好");
 
@@ -465,6 +473,98 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     expect(messages.rows.map((row) => row.role)).toEqual(["user", "assistant", "user", "assistant"]);
     expect(messages.rows[2]!.text).toContain("已有结果继续完成");
     expect(messages.rows[3]!.text).toBe("已在同一轮补齐最终结果。");
+  });
+
+  it("长工具执行期间持续交付进度，活动摘要不包含工具参数或结果正文", async () => {
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("tool_catalog", { names: ["progress_probe"] })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("progress_probe", {})], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已完成")]),
+    ]);
+    const session = await createSession(pool, "长工具进度");
+    let release!: () => void;
+    let progressed!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const update = new Promise<void>((resolve) => { progressed = resolve; });
+    const frames: Array<{ type: string; data: Record<string, unknown> }> = [];
+    const execution = runAgentSessionTurn({
+      pool, sessionId: session.id, text: "验证工具运行中可见的进度",
+      tools: [{ name: "progress_probe", label: "进度探针", description: "长工具进度验证", parameters: Type.Object({}),
+        execute: async (_id, _args, _signal, onUpdate) => {
+          onUpdate?.({ content: [{ type: "text", text: "仅用于工具明细" }], details: { summary: { completed: 1, total: 2 } } });
+          await hold;
+          return { content: [{ type: "text", text: "完成" }], details: {} };
+        },
+      }],
+      onFrame: (frame) => { frames.push(frame); if (frame.type === "tool_update") progressed(); },
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([update, new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("工具未结束前没有收到进度")), 4_000);
+      })]);
+      expect(frames.some((frame) => frame.type === "tool_end" && frame.data.name === "progress_probe")).toBe(false);
+      const activities = frames.filter((frame) => frame.type === "activity");
+      expect(activities.some((frame) => frame.data.phase === "preparing_tool" && frame.data.tool_name === "progress_probe")).toBe(true);
+      expect(JSON.stringify(activities)).not.toContain("仅用于工具明细");
+    } finally {
+      clearTimeout(timeout);
+      release();
+      await execution;
+    }
+  });
+
+  it("活动标签区分生成内容、同步关注与最终结果发布", () => {
+    expect(activityLabel({ phase: "writing", at: 1 }, true)).toBe("正在生成任务文档");
+    expect(activityLabel({ phase: "preparing_tool", tool_name: "daily_plan_write", at: 1 }, true)).toContain("正在准备每日计划");
+    expect(activityLabel({ phase: "executing_tool", tool_name: "pool_attention_write", at: 1 }, true)).toContain("正在同步结果到标的池");
+    expect(activityLabel({ phase: "saving", job_code: "daily_plan_flow", at: 1 }, true)).toContain("保存每日计划并更新打板机会");
+  });
+
+  it("受控续写在内存中保留临时工具结果且持久化仍脱敏", async () => {
+    const sentinel = "仅限本次运行的扶摇明细";
+    faux.setResponses([
+      fauxAssistantMessage(
+        [fauxToolCall("tool_catalog", { names: ["ephemeral_probe"] })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
+        [fauxToolCall("ephemeral_probe", {})],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxText("")], { stopReason: "length" }),
+      async (context) => {
+        const transient = context.messages.find((message) =>
+          message.role === "toolResult" && message.toolName === "ephemeral_probe");
+        expect(transient?.role === "toolResult" ? transient.content[0] : null)
+          .toMatchObject({ type: "text", text: sentinel });
+        return fauxAssistantMessage([fauxText("已基于临时结果完成续写。")]);
+      },
+    ]);
+    const session = await createSession(pool, "临时结果续写测试");
+    const turn = await runAgentSessionTurn({
+      pool,
+      sessionId: session.id,
+      text: "查询并分析临时数据",
+      tools: [{
+        name: "ephemeral_probe",
+        label: "临时结果探针",
+        description: "测试临时结果在同一逻辑运行内的生命周期。",
+        parameters: Type.Object({}, { additionalProperties: false }),
+        execute: async () => ({
+          content: [{ type: "text", text: sentinel }],
+          details: { ephemeral_data_result: true },
+        }),
+      }],
+    });
+    expect(turn.lastAssistant?.role === "assistant" ? turn.lastAssistant.content[0] : null)
+      .toMatchObject({ type: "text", text: "已基于临时结果完成续写。" });
+    const persisted = await pool.query<{ content: string }>(
+      "SELECT content::text FROM chat_message WHERE session_id=$1 ORDER BY seq",
+      [session.id],
+    );
+    expect(persisted.rows.map((row) => row.content).join("\n")).not.toContain(sentinel);
+    expect(persisted.rows.map((row) => row.content).join("\n")).toContain("数据明细不会保存到会话");
   });
 
   it("历史恢复把主动中断显示为已中断，不泄露 Responses 缺少终态的适配器错误", () => {
@@ -547,6 +647,10 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
   it("SSE 消息流：工具调用帧 + confirmation_pending（写类工具不直接写库）", async () => {
     faux.setResponses([
       fauxAssistantMessage(
+        [fauxToolCall("tool_catalog", { names: ["portfolio_write"] })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
         [
           fauxToolCall("portfolio_write", {
             reason: "登记用户要求的买入",
@@ -591,127 +695,178 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     expect(positions.rows[0]!.n).toBe(0);
   });
 
+  it("连续三次请求相同工具与参数时熔断且不执行第三次", async () => {
+    const args = { operation: "list_tables", tables: ["market_instrument"] };
+    faux.setResponses([
+      fauxAssistantMessage(
+        [fauxToolCall("tool_catalog", { names: ["database_schema"] }, { id: "loop-catalog" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
+        [fauxToolCall("database_schema", args, { id: "loop-schema-1" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
+        [fauxToolCall("database_schema", args, { id: "loop-schema-2" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
+        [fauxToolCall("database_schema", args, { id: "loop-schema-3" })],
+        { stopReason: "toolUse" },
+      ),
+    ]);
+    const session = await createSession(pool, "工具循环熔断测试");
+    const result = await postSse(session.id, { text: "重复查询" });
+    const error = result.frames.find((frame) => frame.type === "error");
+    expect(error?.data).toMatchObject({
+      code: "AGENT_TOOL_LOOP",
+      message: expect.stringContaining("连续 3 次请求相同工具与参数"),
+    });
+    expect(result.frames.map((frame) => frame.type)).not.toContain("done");
+    const schemaEnds = result.frames
+      .filter((frame) => frame.type === "tool_end" && (frame.data as { name?: string }).name === "database_schema")
+      .map((frame) => (frame.data as { isError?: boolean }).isError);
+    expect(schemaEnds).toEqual([false, false, true]);
+    const audits = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM agent_tool_audit
+        WHERE session_id=$1 AND tool_name='database_schema'`,
+      [session.id],
+    );
+    expect(audits.rows[0]!.count).toBe(2);
+    expect(await getSession(pool, session.id)).toMatchObject({
+      session_status: "failed",
+      last_error_summary: expect.stringContaining("连续 3 次请求相同工具与参数"),
+    });
+  });
+
   it("多轮领域工具只记录 usage、时延、大小和状态，不把提示词或工具正文写入遥测", async () => {
     const promptSentinel = "METRIC_PROMPT_BODY_MUST_NOT_PERSIST";
     const toolSentinel = "METRIC_TOOL_BODY_MUST_NOT_PERSIST";
-    await pool.query("UPDATE agent_setting SET market_domain_tools_enabled=true WHERE singleton=true");
-    try {
-      faux.setResponses([
-        fauxAssistantMessage(
-          [fauxToolCall("instrument_search", { q: toolSentinel, limit: 3 }, { id: "metric-tool-1" })],
-          { stopReason: "toolUse" },
-        ),
-        fauxAssistantMessage(
-          [fauxToolCall("market_snapshot_query", { codes: ["990003.SZ"] }, { id: "metric-tool-2" })],
-          { stopReason: "toolUse" },
-        ),
-        fauxAssistantMessage([fauxText("遥测测试完成")]),
-      ]);
-      const session = await createSession(pool, "遥测测试");
-      const result = await postSse(session.id, { text: promptSentinel });
-      expect(result.frames.filter((frame) => frame.type === "tool_start")).toHaveLength(2);
+    faux.setResponses([
+      fauxAssistantMessage(
+        [fauxToolCall("tool_catalog", {
+          names: ["instrument_search", "market_snapshot_query"],
+        })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
+        [fauxToolCall("instrument_search", { q: toolSentinel, limit: 3 }, { id: "metric-tool-1" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
+        [fauxToolCall("market_snapshot_query", { codes: ["990003.SZ"] }, { id: "metric-tool-2" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxText("遥测测试完成")]),
+    ]);
+    const session = await createSession(pool, "遥测测试");
+    const result = await postSse(session.id, { text: promptSentinel });
+    expect(result.frames.filter((frame) => frame.type === "tool_start")).toHaveLength(3);
 
-      const messages = await pool.query<{ content: {
-        role?: string;
-        usage?: {
-          input: number;
-          output: number;
-          cacheRead: number;
-          cacheWrite: number;
-          reasoning?: number;
-          cost: { total: number };
-        };
-      } }>("SELECT content FROM chat_message WHERE session_id=$1", [session.id]);
-      const expected = messages.rows.reduce((sum, row) => {
-        const usage = row.content.role === "assistant" ? row.content.usage : undefined;
-        if (!usage) return sum;
-        sum.input += usage.input;
-        sum.output += usage.output;
-        sum.cacheRead += usage.cacheRead;
-        sum.cacheWrite += usage.cacheWrite;
-        sum.reasoning += usage.reasoning ?? 0;
-        sum.cost += usage.cost.total;
-        return sum;
-      }, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: 0 });
-      const run = await pool.query<{
-        id: string;
-        input_tokens: number;
-        output_tokens: number;
-        cache_read_tokens: number;
-        cache_write_tokens: number;
-        reasoning_tokens: number;
-        cost_amount: number;
-        first_text_ms: number;
-        total_ms: number;
-        status: string;
-        estimated_system_tokens: number;
-        estimated_history_tokens: number;
-        estimated_tool_definition_tokens: number;
-      }>(
-        `SELECT id::text, input_tokens::float8, output_tokens::float8,
-                cache_read_tokens::float8, cache_write_tokens::float8,
-                reasoning_tokens::float8, cost_amount::float8,
-                first_text_ms, total_ms, status,
-                estimated_system_tokens::float8, estimated_history_tokens::float8,
-                estimated_tool_definition_tokens::float8
-           FROM agent_run_metric WHERE session_id=$1 ORDER BY id DESC LIMIT 1`,
-        [session.id],
-      );
-      expect(run.rows[0]).toMatchObject({
-        input_tokens: expected.input,
-        output_tokens: expected.output,
-        cache_read_tokens: expected.cacheRead,
-        cache_write_tokens: expected.cacheWrite,
-        reasoning_tokens: expected.reasoning,
-        cost_amount: expected.cost,
-        status: "complete",
-      });
-      expect(run.rows[0]!.first_text_ms).toBeGreaterThanOrEqual(0);
-      expect(run.rows[0]!.total_ms).toBeGreaterThanOrEqual(run.rows[0]!.first_text_ms);
-      expect(run.rows[0]!.estimated_system_tokens).toBeGreaterThan(0);
-      expect(run.rows[0]!.estimated_history_tokens).toBeGreaterThanOrEqual(0);
-      expect(run.rows[0]!.estimated_tool_definition_tokens).toBeGreaterThan(0);
+    const messages = await pool.query<{ content: {
+      role?: string;
+      usage?: {
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+        reasoning?: number;
+        cost: { total: number };
+      };
+    } }>("SELECT content FROM chat_message WHERE session_id=$1", [session.id]);
+    const expected = messages.rows.reduce((sum, row) => {
+      const usage = row.content.role === "assistant" ? row.content.usage : undefined;
+      if (!usage) return sum;
+      sum.input += usage.input;
+      sum.output += usage.output;
+      sum.cacheRead += usage.cacheRead;
+      sum.cacheWrite += usage.cacheWrite;
+      sum.reasoning += usage.reasoning ?? 0;
+      sum.cost += usage.cost.total;
+      return sum;
+    }, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: 0 });
+    const run = await pool.query<{
+      id: string;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+      reasoning_tokens: number;
+      cost_amount: number;
+      first_text_ms: number;
+      total_ms: number;
+      status: string;
+      estimated_system_tokens: number;
+      estimated_history_tokens: number;
+      estimated_tool_definition_tokens: number;
+    }>(
+      `SELECT id::text, input_tokens::float8, output_tokens::float8,
+              cache_read_tokens::float8, cache_write_tokens::float8,
+              reasoning_tokens::float8, cost_amount::float8,
+              first_text_ms, total_ms, status,
+              estimated_system_tokens::float8, estimated_history_tokens::float8,
+              estimated_tool_definition_tokens::float8
+         FROM agent_run_metric WHERE session_id=$1 ORDER BY id DESC LIMIT 1`,
+      [session.id],
+    );
+    expect(run.rows[0]).toMatchObject({
+      input_tokens: expected.input,
+      output_tokens: expected.output,
+      cache_read_tokens: expected.cacheRead,
+      cache_write_tokens: expected.cacheWrite,
+      reasoning_tokens: expected.reasoning,
+      cost_amount: expected.cost,
+      status: "complete",
+    });
+    expect(run.rows[0]!.first_text_ms).toBeGreaterThanOrEqual(0);
+    expect(run.rows[0]!.total_ms).toBeGreaterThanOrEqual(run.rows[0]!.first_text_ms);
+    expect(run.rows[0]!.estimated_system_tokens).toBeGreaterThan(0);
+    expect(run.rows[0]!.estimated_history_tokens).toBeGreaterThanOrEqual(0);
+    expect(run.rows[0]!.estimated_tool_definition_tokens).toBeGreaterThan(0);
+    expect(run.rows[0]!.estimated_tool_definition_tokens).toBeLessThan(5_000);
 
-      const tools = await pool.query<{
-        tool_call_id: string;
-        tool_name: string;
-        sequence_no: number;
-        args_bytes: number;
-        result_bytes: number;
-        duration_ms: number;
-        status: string;
-      }>(
-        `SELECT tool_call_id, tool_name, sequence_no, args_bytes, result_bytes, duration_ms, status
-           FROM agent_tool_metric WHERE run_metric_id=$1 ORDER BY sequence_no`,
-        [run.rows[0]!.id],
-      );
-      expect(tools.rows).toHaveLength(2);
-      expect(tools.rows.map((row) => row.tool_name)).toEqual([
-        "instrument_search",
-        "market_snapshot_query",
-      ]);
-      expect(tools.rows.every((row) =>
-        row.args_bytes > 0 && row.result_bytes > 0 && row.duration_ms >= 0 && row.status === "ok"
-      )).toBe(true);
+    const tools = await pool.query<{
+      tool_call_id: string;
+      tool_name: string;
+      sequence_no: number;
+      args_bytes: number;
+      result_bytes: number;
+      duration_ms: number;
+      status: string;
+    }>(
+      `SELECT tool_call_id, tool_name, sequence_no, args_bytes, result_bytes, duration_ms, status
+         FROM agent_tool_metric WHERE run_metric_id=$1 ORDER BY sequence_no`,
+      [run.rows[0]!.id],
+    );
+    expect(tools.rows).toHaveLength(3);
+    expect(tools.rows.map((row) => row.tool_name)).toEqual([
+      "tool_catalog",
+      "instrument_search",
+      "market_snapshot_query",
+    ]);
+    expect(tools.rows.every((row) =>
+      row.args_bytes > 0 && row.result_bytes > 0 && row.duration_ms >= 0 && row.status === "ok"
+    )).toBe(true);
 
-      const metricStorage = JSON.stringify({ run: run.rows, tools: tools.rows });
-      expect(metricStorage).not.toContain(promptSentinel);
-      expect(metricStorage).not.toContain(toolSentinel);
-      const summary = await api(server.baseUrl, "GET", "/api/agent/metrics/summary");
-      expect(summary.status).toBe(200);
-      expect((summary.json as unknown as { runs: { total: number }; tools: { total: number } }).runs.total)
-        .toBeGreaterThan(0);
-      expect(JSON.stringify(summary.json)).not.toContain(promptSentinel);
-      expect(JSON.stringify(summary.json)).not.toContain(toolSentinel);
-    } finally {
-      await pool.query("UPDATE agent_setting SET market_domain_tools_enabled=false WHERE singleton=true");
-    }
+    const metricStorage = JSON.stringify({ run: run.rows, tools: tools.rows });
+    expect(metricStorage).not.toContain(promptSentinel);
+    expect(metricStorage).not.toContain(toolSentinel);
+    const summary = await api(server.baseUrl, "GET", "/api/agent/metrics/summary");
+    expect(summary.status).toBe(200);
+    expect((summary.json as unknown as { runs: { total: number }; tools: { total: number } }).runs.total)
+      .toBeGreaterThan(0);
+    expect(JSON.stringify(summary.json)).not.toContain(promptSentinel);
+    expect(JSON.stringify(summary.json)).not.toContain(toolSentinel);
   });
 
   it("YOLO SSE：数据库变更直接执行且不发送 confirmation_pending", async () => {
     await pool.query("UPDATE agent_setting SET yolo_mode = true WHERE singleton = true");
     try {
       faux.setResponses([
+        fauxAssistantMessage(
+          [fauxToolCall("tool_catalog", { names: ["memory_write"] })],
+          { stopReason: "toolUse" },
+        ),
         fauxAssistantMessage(
           [
             fauxToolCall("memory_write", {
@@ -755,25 +910,20 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     }
   });
 
-  it("Agent 设置 API：默认关闭、可切换且拒绝非法值", async () => {
+  it("Agent 设置 API：YOLO 默认关闭、可切换且拒绝已退役设置", async () => {
     const initial = await api(server.baseUrl, "GET", "/api/agent/settings");
     expect(initial.status).toBe(200);
     expect(initial.json).toMatchObject({
       yolo_mode: false,
-      market_domain_tools_enabled: false,
-      web_research_enabled: false,
     });
+    expect(initial.json).not.toHaveProperty("web_research_enabled");
 
     const enabled = await api(server.baseUrl, "PATCH", "/api/agent/settings", {
       yolo_mode: true,
-      market_domain_tools_enabled: true,
-      web_research_enabled: true,
     });
     expect(enabled.status).toBe(200);
     expect(enabled.json).toMatchObject({
       yolo_mode: true,
-      market_domain_tools_enabled: true,
-      web_research_enabled: true,
     });
 
     expect(
@@ -782,11 +932,13 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     expect(
       (await api(server.baseUrl, "PATCH", "/api/agent/settings", { unknown_switch: true })).status,
     ).toBe(400);
-    await api(server.baseUrl, "PATCH", "/api/agent/settings", {
-      yolo_mode: false,
-      market_domain_tools_enabled: false,
-      web_research_enabled: false,
-    });
+    expect(
+      (await api(server.baseUrl, "PATCH", "/api/agent/settings", { market_domain_tools_enabled: true })).status,
+    ).toBe(400);
+    expect(
+      (await api(server.baseUrl, "PATCH", "/api/agent/settings", { web_research_enabled: false })).status,
+    ).toBe(400);
+    await api(server.baseUrl, "PATCH", "/api/agent/settings", { yolo_mode: false });
   });
 
   it("系统设置 API：扶摇密钥入库但只回显配置状态", async () => {

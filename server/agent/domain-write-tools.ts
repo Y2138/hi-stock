@@ -3,6 +3,7 @@
 // 重新锁定目标状态并校验指纹，防止旧提案覆盖新事实。
 import type pg from "pg";
 import { applyPoolChange, setPoolBoardOrder } from "../modules/pools/repo.js";
+import { resolvePoolOnboarding } from "../modules/pools/onboarding.js";
 import { recordPositionChange } from "../modules/positions/repo.js";
 import { finalizeBacktest } from "../modules/backtests/repo.js";
 import { applyMemoryChange } from "../modules/memory/repo.js";
@@ -17,11 +18,13 @@ import {
   validateJobWriteInput,
   validateFinalizeBacktestInput,
   validateMemoryWriteInput,
+  validatePoolOnboardCommitInput,
   validatePoolWriteInput,
   validatePortfolioWriteInput,
   type JobWriteInput,
   type FinalizeBacktestInput,
   type MemoryWriteInput,
+  type PoolOnboardCommitInput,
   type PoolWriteOperation,
   type PoolWriteInput,
   type PortfolioWriteInput,
@@ -31,6 +34,7 @@ import { sameTimestampVersion } from "../db/timestamp.js";
 
 export type DomainWriteToolName =
   | "portfolio_write"
+  | "pool_onboard"
   | "pool_write"
   | "job_write"
   | "finalize_backtest"
@@ -38,6 +42,7 @@ export type DomainWriteToolName =
 
 export type DomainWriteInput =
   | PortfolioWriteInput
+  | PoolOnboardCommitInput
   | PoolWriteInput
   | JobWriteInput
   | FinalizeBacktestInput
@@ -46,6 +51,7 @@ export type DomainWriteInput =
 function validateDomainInput(toolName: DomainWriteToolName, input: unknown): DomainWriteInput {
   switch (toolName) {
     case "portfolio_write": return validatePortfolioWriteInput(input);
+    case "pool_onboard": return validatePoolOnboardCommitInput(input);
     case "pool_write": return validatePoolWriteInput(input);
     case "job_write": return validateJobWriteInput(input);
     case "finalize_backtest": return validateFinalizeBacktestInput(input);
@@ -62,7 +68,12 @@ async function oneRow(
   return result.rows[0] ?? null;
 }
 
-async function portfolioState(client: pg.PoolClient, code: string, lock: boolean): Promise<unknown> {
+async function portfolioState(
+  client: pg.PoolClient,
+  code: string,
+  changeDates: string[],
+  lock: boolean,
+): Promise<unknown> {
   const instrument = await oneRow(
     client,
     `SELECT id::text, code, name, kind FROM market_instrument WHERE code = $1${lock ? " FOR UPDATE" : ""}`,
@@ -83,7 +94,21 @@ async function portfolioState(client: pg.PoolClient, code: string, lock: boolean
       ORDER BY id DESC LIMIT 1${lock ? " FOR UPDATE" : ""}`,
     [instrument.id],
   );
-  return { instrument, position, latest_change: latestChange };
+  const passedSignals = await client.query(
+    `SELECT assessment.id::text, assessment.conclusion, assessment.review_type,
+            assessment.status, auction_run.target_date::text AS assessment_date,
+            item.plan_output_id::text
+       FROM daily_plan_auction_assessment assessment
+       JOIN daily_plan_playbook item ON item.id = assessment.playbook_item_id
+       JOIN job_run auction_run ON auction_run.id = assessment.source_job_run_id
+      WHERE assessment.code = $1
+        AND auction_run.target_date = ANY($2::date[])
+        AND assessment.conclusion = 'signal_passed'
+        AND assessment.status IN ('active','superseded')
+      ORDER BY auction_run.target_date, assessment.id`,
+    [code, changeDates],
+  );
+  return { instrument, position, latest_change: latestChange, passed_signals: passedSignals.rows };
 }
 
 async function poolState(client: pg.PoolClient, input: PoolWriteOperation, lock: boolean): Promise<unknown> {
@@ -105,22 +130,20 @@ async function poolState(client: pg.PoolClient, input: PoolWriteOperation, lock:
   if (!instrument) throw new Error(`未知标的代码：${input.code}`);
   const current = await oneRow(
     client,
-    `SELECT id::text, pool, role, grade, score::text, tags, stock_character, stop_loss_mode, stage,
-            evaluation_summary, attention_reason,
+    `SELECT id::text, pool, role, grade, score::text, tags, stock_character,
+            stock_character_profile, stage, evaluation_summary, profile_as_of::text,
+            profile_calculation_version, profile_input_sha256, attention_reason,
             attention_from::text, attention_until::text, effective_from::text, effective_to::text, note
        FROM pool_membership
       WHERE instrument_id = $1 AND effective_to IS NULL
       ORDER BY id DESC LIMIT 1${lock ? " FOR UPDATE" : ""}`,
     [instrument.id],
   );
-  if (input.action === "add" && current) {
-    throw new Error(`标的 ${input.code} 已有当前角色，请用 update`);
-  }
   if ((input.action === "update" || input.action === "remove") && !current) {
     throw new Error(`标的 ${input.code} 在 ${input.pool} 池没有当前角色行`);
   }
-  if (input.action !== "remove" && input.pool === "short" && current?.pool !== "short" && !input.stop_loss_mode) {
-    throw new Error("新增或迁入短线池必须配置 stop_loss_mode");
+  if (input.action === "update" && current?.pool !== input.pool) {
+    throw new Error("pool_write 不负责迁池；请使用 pool_onboard");
   }
   return { instrument, current };
 }
@@ -230,10 +253,14 @@ async function targetState(
       const value = input as PortfolioWriteInput;
       const states = [];
       for (const code of [...new Set(value.changes.map((change) => change.code))].sort()) {
-        states.push(await portfolioState(client, code, lock));
+        const changeDates = value.changes
+          .filter((change) => change.code === code)
+          .map((change) => change.change_date);
+        states.push(await portfolioState(client, code, changeDates, lock));
       }
       return states;
     }
+    case "pool_onboard": return resolvePoolOnboarding(client, input as PoolOnboardCommitInput, lock);
     case "pool_write": {
       const value = input as PoolWriteInput;
       const operations = [...value.operations].sort((left, right) => {
@@ -262,13 +289,14 @@ export interface DomainWritePreview {
 
 const DOMAIN_LABELS: Record<DomainWriteToolName, string> = {
   portfolio_write: "持仓",
+  pool_onboard: "标的入池初始化",
   pool_write: "标的池",
   job_write: "作业",
   finalize_backtest: "回测最终结论",
   memory_write: "Agent 记忆",
 };
 
-function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput): Record<string, unknown> {
+function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput, state: unknown): Record<string, unknown> {
   if (toolName === "portfolio_write") {
     const value = input as PortfolioWriteInput;
     return {
@@ -282,6 +310,9 @@ function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput): 
       })),
     };
   }
+  if (toolName === "pool_onboard") {
+    return (state as Awaited<ReturnType<typeof resolvePoolOnboarding>>).preview;
+  }
   if (toolName === "pool_write") {
     const value = input as PoolWriteInput;
     return {
@@ -293,11 +324,6 @@ function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput): 
             code: operation.code,
             pool: operation.pool,
             effective_from: operation.effective_from,
-            role: operation.role,
-            grade: operation.grade,
-            score: operation.score,
-            stop_loss_mode: operation.stop_loss_mode,
-            stage: operation.stage,
           }),
     };
   }
@@ -351,7 +377,7 @@ async function buildDomainWritePreview(
     domain: DOMAIN_LABELS[toolName],
     action,
     reason: input.reason,
-    target: targetSummary(toolName, input),
+    target: targetSummary(toolName, input, state),
     _state_hash: sha256Json({ tool_name: toolName, input, state }),
   };
 }
@@ -405,6 +431,13 @@ export async function executeDomainWriteInTransaction(
       }
       return { total: items.length, items };
     }
+    case "pool_onboard": {
+      const resolved = await resolvePoolOnboarding(client, input as PoolOnboardCommitInput, true);
+      return applyPoolChange(client, {
+        ...resolved.change,
+        evaluation_session_id: options.sessionId,
+      });
+    }
     case "pool_write": {
       const value = input as PoolWriteInput;
       const items = [];
@@ -417,14 +450,6 @@ export async function executeDomainWriteInTransaction(
           action: operation.action,
           code: operation.code!,
           pool: operation.pool,
-          role: operation.role,
-          grade: operation.grade,
-          score: operation.score,
-          tags: operation.tags,
-          stock_character: operation.stock_character,
-          stop_loss_mode: operation.stop_loss_mode,
-          stage: operation.stage,
-          evaluation_summary: operation.evaluation_summary,
           attention_reason: operation.attention_reason,
           attention_from: operation.attention_from,
           attention_until: operation.attention_until,

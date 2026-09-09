@@ -40,6 +40,12 @@ const ACTION_LABELS: Record<DailyPlanPlaybookItem["action"], string> = {
   hold: "持有",
   observe: "观察",
 };
+const ENTRY_SIGNAL_LABELS: Record<string, string> = {
+  one_word_continue: "一字延续",
+  turnover_advance: "换手晋级",
+  divergence: "分歧验证",
+  legacy_observe: "历史观察",
+};
 function triggerLabel(item: DailyPlanPlaybookItem): string {
   if (item.trigger_kind === "open") return "开盘直接执行（时间型）";
   const range = item.price_lower !== null && item.price_upper !== null
@@ -428,6 +434,9 @@ onMounted(reloadPositionsData);
                 </td>
                 <td class="num">
                   <div>策略序号 {{ c.strategy_change_seq ?? "—" }}</div>
+                  <div v-if="c.entry_auction_assessment_id">
+                    打板信号 {{ fmtDate(c.entry_signal_date) }} · {{ ENTRY_SIGNAL_LABELS[c.entry_signal_review_type ?? ""] ?? c.entry_signal_review_type }}
+                  </div>
                   <div v-if="c.plan_output_id">计划 #{{ c.plan_output_id }} · {{ fmtDate(c.plan_target_date) }}</div>
                   <div v-else>未关联计划</div>
                 </td>

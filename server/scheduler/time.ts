@@ -29,6 +29,12 @@ export function shanghaiDate(date: Date): string {
   return shanghaiDateFormatter.format(date);
 }
 
+/** 交易日历缺行时仅用于降级：周一至周五继续取实际行情，周末直接跳过。 */
+export function isWeekdayDate(date: string): boolean {
+  const day = new Date(`${date}T00:00:00Z`).getUTCDay();
+  return day >= 1 && day <= 5;
+}
+
 function shanghaiMinuteOfDay(date: Date): number {
   const parts = Object.fromEntries(
     shanghaiClockFormatter.formatToParts(date).map((part) => [part.type, part.value]),
@@ -46,10 +52,8 @@ export async function dailyMarketGate(db: Db, targetDate: string, now: Date): Pr
     "SELECT is_open FROM market_trading_day WHERE trade_date = $1",
     [targetDate],
   );
-  if (!calendar.rows[0]) {
-    return { action: "reject", reason: `目标日 ${targetDate} 缺少交易日历，请先运行市场目录同步` };
-  }
-  if (!calendar.rows[0].is_open) {
+  const isOpen = calendar.rows[0]?.is_open ?? isWeekdayDate(targetDate);
+  if (!isOpen) {
     return { action: "skip", reason: `目标日 ${targetDate} 为非交易日` };
   }
   if (targetDate === today && shanghaiMinuteOfDay(now) < 15 * 60 + 30) {

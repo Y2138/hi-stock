@@ -4,6 +4,7 @@ import type pg from "pg";
 import {
   calculateDefenseRecovery,
   calculateIndicators,
+  calculateStockCharacterProfile,
   INDICATOR_CALCULATION_VERSION,
   STOCK_CHARACTER_CALCULATION_VERSION,
 } from "./formulas.js";
@@ -23,6 +24,7 @@ interface InputBar {
   high: number;
   low: number;
   close: number;
+  volume: number | null;
   adjustment: string | null;
   kind: string;
 }
@@ -56,6 +58,11 @@ function validateInput(rows: InputBar[], freq: IndicatorFreq): Array<{ reason: s
     const expected = rows[0]!.kind === "stock" ? "forward" : ["index", "board", "etf"].includes(rows[0]!.kind) ? "none" : null;
     if (expected && rows.some((row) => row.adjustment !== expected)) {
       gaps.push({ reason: `${rows[0]!.kind} 日线复权口径应为 ${expected}，实际存在缺失或混用` });
+    }
+    if (["stock", "etf"].includes(rows[0]!.kind)) {
+      const invalid = rows.slice(-252).find((row) =>
+        [row.open, row.high, row.low, row.close].some((value) => !Number.isFinite(value) || value <= 0));
+      if (invalid) gaps.push({ reason: `${invalid.bar_date} 五维股性 OHLC 包含非有限或非正数值` });
     }
   }
   return gaps;
@@ -113,6 +120,7 @@ export async function recomputeIndicatorSeries(
     const bars = await client.query<InputBar>(
       `SELECT bar.bar_date::text, bar.bar_time::text,
               bar.open::float8, bar.high::float8, bar.low::float8, bar.close::float8,
+              bar.volume::float8,
               bar.adjustment, instrument.kind
          FROM market_bar bar JOIN market_instrument instrument ON instrument.id = bar.instrument_id
         WHERE bar.instrument_id = $1 AND bar.freq = $2
@@ -196,22 +204,39 @@ export async function recomputeIndicatorSeries(
            FROM incoming`,
         [dirty.instrument_id, dirty.freq, run.rows[0]!.id, JSON.stringify(payload), status === "untrusted" ? "untrusted" : "ready"],
       );
-      if (dirty.freq === "day" && bars.rows[0]!.kind === "stock") {
+      if (status === "success" && dirty.freq === "day" && ["stock", "etf"].includes(bars.rows[0]!.kind)) {
         const metric = calculateDefenseRecovery(bars.rows.map((bar, index) => ({
           close: bar.close,
           ma10: values[index]!.ma10,
         })));
+        const profile = calculateStockCharacterProfile(bars.rows.map((bar, index) => ({
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          volume: bar.volume,
+          ma10: values[index]!.ma10,
+          ma20: values[index]!.ma20,
+          ma60: values[index]!.ma60,
+        })));
         await client.query(
           `INSERT INTO market_stock_character_metric
              (instrument_id, as_of_date, calculation_version, indicator_run_id,
-              input_row_count, defense_break_count, defense_recovered_count, defense_recovery_ma10)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+              input_row_count, defense_break_count, defense_recovered_count, defense_recovery_ma10,
+              stock_character_profile, stage, research_score, grade, stock_character, tags)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
            ON CONFLICT (instrument_id, as_of_date, calculation_version) DO UPDATE SET
              indicator_run_id = EXCLUDED.indicator_run_id,
              input_row_count = EXCLUDED.input_row_count,
              defense_break_count = EXCLUDED.defense_break_count,
              defense_recovered_count = EXCLUDED.defense_recovered_count,
              defense_recovery_ma10 = EXCLUDED.defense_recovery_ma10,
+             stock_character_profile = EXCLUDED.stock_character_profile,
+             stage = EXCLUDED.stage,
+             research_score = EXCLUDED.research_score,
+             grade = EXCLUDED.grade,
+             stock_character = EXCLUDED.stock_character,
+             tags = EXCLUDED.tags,
              computed_at = now()`,
           [
             dirty.instrument_id,
@@ -222,6 +247,12 @@ export async function recomputeIndicatorSeries(
             metric.eventCount,
             metric.recoveredCount,
             metric.recoveryRate,
+            JSON.stringify(profile),
+            profile.stage,
+            profile.score,
+            profile.grade,
+            profile.stock_character,
+            JSON.stringify(profile.tags),
           ],
         );
       }

@@ -523,6 +523,17 @@ export async function dailyMarketUpdate(
     fetchRunIds: [],
   };
   const maDirty = new Map<string, string>();
+  const previousOpen = scope.dayMode === "historical" ? null : await db.query<{ date: string | null }>(
+    `SELECT max(trade_date)::text AS date
+       FROM market_trading_day
+      WHERE is_open AND trade_date < $1
+        AND EXISTS (
+          SELECT 1 FROM market_trading_day target
+           WHERE target.trade_date = $1 AND target.is_open
+        )`,
+    [scope.date],
+  );
+  const previousOpenDate = previousOpen?.rows[0]?.date ?? null;
 
   // 第 1 步：股票、指数/板块、ETF 按类型批量快照；坏标的显式记缺口并跳过。
   for (const group of await groupSnapshotCodes(db, scope.codes)) {
@@ -574,7 +585,7 @@ export async function dailyMarketUpdate(
       }
       try {
         const instrumentId = await ensureInstrument(db, quote.code, undefined, "day");
-        // 缺口/除权跳空检测：上一条日线距快照日 >3 个自然日，或快照前收与库内前收偏差 >11%
+        // 缺口/除权跳空检测：上一条日线不是前一开市日，或快照前收与库内前收偏差 >11%。
         const prev = await db.query<{ bar_date: string; close: string }>(
           `SELECT to_char(bar_date, 'YYYY-MM-DD') AS bar_date, close::float8 AS close
            FROM market_bar WHERE instrument_id = $1 AND freq = 'day' AND bar_date < $2
@@ -584,6 +595,7 @@ export async function dailyMarketUpdate(
         const prevRow = prev.rows[0];
         const needRefetch =
           prevRow == null ||
+          (previousOpenDate !== null && prevRow.bar_date !== previousOpenDate) ||
           (quote.prevClose != null && Math.abs(quote.prevClose - Number(prevRow.close)) / Number(prevRow.close) > 0.11) ||
           dayDiff(barDate, prevRow.bar_date) > 3;
         if (needRefetch) {

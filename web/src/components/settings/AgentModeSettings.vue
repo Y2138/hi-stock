@@ -52,29 +52,6 @@ async function changeMode(event: Event): Promise<void> {
   window.dispatchEvent(new CustomEvent("stock:agent-settings-changed"));
 }
 
-async function changeCapability(
-  key: "market_domain_tools_enabled" | "web_research_enabled",
-  event: Event,
-): Promise<void> {
-  const input = event.target as HTMLInputElement;
-  const previous = settings.value?.[key] ?? false;
-  saving.value = true;
-  error.value = null;
-  const response = await apiClient.patch<AgentSettings>("/api/agent/settings", { [key]: input.checked });
-  saving.value = false;
-  if (!response.ok) {
-    input.checked = previous;
-    error.value = `${response.code}：${response.message}`;
-    return;
-  }
-  settings.value = response.data;
-  message.value = key === "market_domain_tools_enabled"
-    ? (input.checked ? "候选市场领域工具已允许注册；执行时仍会重验开关" : "市场领域工具已关闭")
-    : (input.checked ? "Web 研究首层开关已开启，但供应商未批准，仍不会注册 Web 工具" : "Web 研究开关已关闭");
-  appMessage.success(message.value, { title: "Agent 能力设置已更新" });
-  window.dispatchEvent(new CustomEvent("stock:agent-settings-changed"));
-}
-
 onMounted(load);
 </script>
 
@@ -111,32 +88,6 @@ onMounted(load);
       <p v-if="settings.yolo_mode" class="yolo-warning">
         ⚠ 当前为直接写库模式。只有在你希望 agent 自主执行数据库变更时保持开启。
       </p>
-      <div class="capability-grid">
-        <label class="mode-toggle capability-toggle">
-          <input
-            type="checkbox"
-            :checked="settings.market_domain_tools_enabled"
-            :disabled="saving"
-            @change="changeCapability('market_domain_tools_enabled', $event)"
-          />
-          <span>
-            <strong>候选市场领域只读工具</strong>
-            <small>允许会话注册标的检索、快照、板块、市场结构和指标 5 个快捷工具；默认关闭，通用数据库只读工具继续保留。</small>
-          </span>
-        </label>
-        <label class="mode-toggle capability-toggle">
-          <input
-            type="checkbox"
-            :checked="settings.web_research_enabled"
-            :disabled="saving"
-            @change="changeCapability('web_research_enabled', $event)"
-          />
-          <span>
-            <strong>Web 研究预留开关</strong>
-            <small>目前只有白名单 Provider 契约。供应商和安全评审未完成前，即使开启也不会注册 Web 工具或保存凭据。</small>
-          </span>
-        </label>
-      </div>
       <p v-if="message" class="mode-state ok-text">{{ message }}</p>
     </template>
   </div>
@@ -169,7 +120,4 @@ onMounted(load);
   background: color-mix(in srgb, var(--bad) 7%, var(--paper));
 }
 .mode-state { margin: 10px 0 0; font-size: 12.5px; }
-.capability-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; margin-top: 10px; }
-.capability-toggle { margin-top: 0; }
-.capability-toggle input { accent-color: var(--accent); }
 </style>

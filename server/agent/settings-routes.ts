@@ -22,7 +22,7 @@ export const agentSettingsRoutes = {
       throw apiErrors.badRequest("请求体必须是对象");
     }
     const value = body as Record<string, unknown>;
-    const allowed = ["yolo_mode", "market_domain_tools_enabled", "web_research_enabled"];
+    const allowed = ["yolo_mode"];
     const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
     if (unknown.length > 0) throw apiErrors.badRequest(`包含未知字段：${unknown.join(",")}`);
     if (Object.keys(value).length === 0) throw apiErrors.badRequest("至少提供一个设置字段");
@@ -33,12 +33,6 @@ export const agentSettingsRoutes = {
     }
     const patch = {
       ...(typeof value.yolo_mode === "boolean" ? { yolo_mode: value.yolo_mode } : {}),
-      ...(typeof value.market_domain_tools_enabled === "boolean"
-        ? { market_domain_tools_enabled: value.market_domain_tools_enabled }
-        : {}),
-      ...(typeof value.web_research_enabled === "boolean"
-        ? { web_research_enabled: value.web_research_enabled }
-        : {}),
     };
     return { data: await updateAgentSettings(pool, patch) };
   },

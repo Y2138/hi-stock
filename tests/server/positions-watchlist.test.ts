@@ -236,8 +236,8 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     );
     await pool.query(
       `INSERT INTO pool_membership
-         (instrument_id, pool, role, grade, score, tags, stock_character, stop_loss_mode, stage, evaluation_summary, effective_from)
-       SELECT id, 'short', '短线', 'A', 5.5, '["CPO"]', '高波动', 'ma5', '右侧确认', '完整短线评估', '2026-08-18'
+         (instrument_id, pool, role, grade, score, tags, stock_character, stage, evaluation_summary, effective_from)
+       SELECT id, 'short', '短线', 'A', 5.5, '["CPO"]', '高波动', '右侧确认', '完整短线评估', '2026-08-18'
          FROM market_instrument WHERE code = '600487.SH'`,
     );
     await pool.query(
@@ -252,7 +252,7 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     const short = await api(server!.baseUrl, "GET", "/api/pools/short");
     expect(short.json).toMatchObject({
       pool: "short",
-      members: [{ code: "600487.SH", stock_character: "高波动", stop_loss_mode: "ma5" }],
+      members: [{ code: "600487.SH", stock_character: "高波动" }],
     });
     const shortView = short.json as unknown as {
       members: Array<{ boards: Array<{ code: string; name: string; board_type: string; level: string }> }>;
@@ -268,6 +268,37 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     expect(long.json).toMatchObject({ pool: "long", members: [{ code: "510500.SH" }] });
     const boards = await api(server!.baseUrl, "GET", "/api/boards?type=concept");
     expect(boards.json).toMatchObject([{ code: "885001.TI", pool_intersection: 2 }]);
+  });
+
+  it("同一生效日重新初始化时更新原角色行而不制造冲突历史", async () => {
+    const before = (await pool.query(
+      `SELECT membership.id::text
+         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+        WHERE instrument.code = '510500.SH' AND membership.effective_to IS NULL`,
+    )).rows[0]!.id;
+    await applyPoolChange(pool, {
+      action: "update",
+      code: "510500.SH",
+      pool: "long",
+      role: "波段",
+      grade: "B",
+      score: 60,
+      tags: ["画像版本：标的入池五维画像一版"],
+      stock_character: "洗盘恢复中·拉升中·假突破风险低·护盘中·波动中",
+      stock_character_profile: { dimensions: {} },
+      stage: "上升",
+      evaluation_summary: "同日重新初始化后的确定性档案",
+      profile_as_of: "2026-08-18",
+      profile_calculation_version: "标的入池五维画像一版",
+      profile_input_sha256: "a".repeat(64),
+      effective_from: "2026-08-18",
+    });
+    const after = (await pool.query(
+      `SELECT membership.id::text, membership.profile_calculation_version
+         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+        WHERE instrument.code = '510500.SH' AND membership.effective_to IS NULL`,
+    )).rows[0];
+    expect(after).toEqual({ id: before, profile_calculation_version: "标的入池五维画像一版" });
   });
 
   it("近期关注只更新当前角色状态并由标的池查询返回", async () => {
@@ -288,6 +319,55 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
       code: "600487.SH", attention_reason: "等待右侧量价确认",
       attention_from: "2026-08-18", attention_until: "2026-08-25",
     }] });
+    await applyPoolChange(pool, {
+      action: "update",
+      code: "600487.SH",
+      pool: "short",
+      effective_from: "2026-08-18",
+      attention_reason: null,
+      attention_from: null,
+      attention_until: null,
+    });
+    expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{
+      code: "600487.SH", attention_reason: null, attention_from: null, attention_until: null,
+    }] });
+  });
+
+  it("买入成交只清除每日计划自动关注并保留人工关注", async () => {
+    await pool.query(
+      `UPDATE pool_membership membership
+          SET attention_reason = '每日计划·已符合：等待买入',
+              attention_from = '2026-08-18', attention_until = '2026-08-19'
+         FROM market_instrument instrument
+        WHERE instrument.id = membership.instrument_id
+          AND instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
+    );
+    await recordPositionChange(pool, {
+      code: "600487.SH", kind: "buy", quantity: 100, price: 60, change_date: "2026-08-18",
+      source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
+      execution_compliance: "matched",
+    });
+    expect((await pool.query(
+      `SELECT attention_reason, attention_from::text, attention_until::text
+         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+        WHERE instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
+    )).rows[0]).toEqual({ attention_reason: null, attention_from: null, attention_until: null });
+
+    await pool.query(
+      `UPDATE pool_membership membership SET attention_reason = '人工持续跟踪'
+         FROM market_instrument instrument
+        WHERE instrument.id = membership.instrument_id
+          AND instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
+    );
+    await recordPositionChange(pool, {
+      code: "600487.SH", kind: "buy", quantity: 100, price: 61, change_date: "2026-08-19",
+      source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
+      execution_compliance: "matched",
+    });
+    expect((await pool.query(
+      `SELECT attention_reason FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+        WHERE instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
+    )).rows[0]!.attention_reason).toBe("人工持续跟踪");
   });
 
   it("旧账户快照和资金摘要 API 已退役", async () => {

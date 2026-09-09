@@ -119,18 +119,7 @@ export interface BacktestListItem extends BacktestRun {
   is_active_anchor: boolean;
 }
 
-export interface BacktestArtifact {
-  role: string;
-  artifact_id: string;
-  dataset_id: string;
-  dataset_key: string;
-  source_path: string;
-  source_sha256: string;
-  source_type: string;
-}
-
 export interface BacktestDetail extends BacktestListItem {
-  artifacts: BacktestArtifact[];
   comparisons: Array<{
     id: string;
     name: string;
@@ -466,7 +455,8 @@ export interface DailyPlanPlaybookItem {
     id: string;
     output_id: string | null;
     code: string;
-    conclusion: "worth_entering" | "observe" | "give_up" | "unavailable";
+    conclusion: "worth_entering" | "signal_passed" | "observe" | "give_up" | "unavailable";
+    review_type: "one_word_continue" | "turnover_advance" | "divergence" | "give_up" | "data_insufficient" | "legacy_observe";
     metrics_summary: string;
     assessment_summary: string;
     benchmark_tags: string[];
@@ -503,6 +493,12 @@ export interface PositionChange {
   plan_output_id: string | null;
   plan_output_type: string | null;
   plan_target_date: string | null;
+  entry_auction_assessment_id: string | null;
+  entry_signal_date: string | null;
+  entry_assessment_date: string | null;
+  entry_signal_review_type: string | null;
+  entry_signal_grade: string | null;
+  entry_signal_headline: string | null;
   source_session_id: string | null;
   attribution_note: string | null;
   deviation_reason: string | null;
@@ -543,9 +539,12 @@ export interface PoolMember {
   score: number | null;
   tags: string[];
   stock_character: string | null;
-  stop_loss_mode: "ma5" | "ma10" | "fixed_90" | null;
+  stock_character_profile: Record<string, unknown>;
   stage: string | null;
   evaluation_summary: string | null;
+  profile_as_of: string | null;
+  profile_calculation_version: string | null;
+  profile_input_sha256: string | null;
   effective_from: string;
   effective_to: string | null;
   note: string | null;
@@ -681,8 +680,6 @@ export interface LlmStatus {
 
 export interface AgentSettings {
   yolo_mode: boolean;
-  market_domain_tools_enabled: boolean;
-  web_research_enabled: boolean;
   updated_at: string;
 }
 
@@ -821,6 +818,7 @@ export interface Confirmation {
 
 /** POST /api/chat/:sessionId/messages SSE 帧（设计 §6.4） */
 export type ChatSseFrame =
+  | { type: "activity"; data: AgentActivity }
   | { type: "run_started"; data: { run_id: string } }
   | { type: "assistant_start"; data: { timestamp?: number } }
   | { type: "context_compacted"; data: { through_seq: number; estimated_tokens: number } }
@@ -839,6 +837,16 @@ export type ChatSseFrame =
   | { type: "aborted"; data: { run_id: string; message: string } }
   | { type: "error"; data: { code: string; message: string } };
 
+export interface AgentActivity {
+  phase: "thinking" | "writing" | "preparing_tool" | "executing_tool" | "tool_finished" | "tool_failed" | "saving";
+  at: number;
+  started_at?: number;
+  tool_name?: string;
+  job_code?: string;
+  completed?: number;
+  total?: number;
+}
+
 export interface AgentControlResult {
   accepted: true;
   action: "abort" | "steer" | "follow_up";
@@ -856,16 +864,28 @@ export interface ConfirmationResultEvent {
 
 /** 工具名中文标签（与 server/agent/tools.ts 的 label 对齐） */
 export const TOOL_LABELS: Record<string, string> = {
+  tool_catalog: "加载所需工具",
+  portfolio_context_query: "查询组合与持仓",
+  pool_context_query: "查询标的池",
+  job_context_query: "查询任务与历史结果",
+  strategy_document_query: "读取策略文档",
+  auction_context_query: "读取竞价候选与预案",
+  pool_attention_write: "同步标的池近期关注",
+  daily_plan_write: "写入每日计划与打板机会草稿",
+  auction_assessment_write: "写入打板机会竞价复核草稿",
   database_schema: "发现数据库结构",
   database_query: "查询数据库",
   instrument_search: "检索标的目录",
   market_snapshot_query: "查询最新行情快照",
+  stock_research_query: "查询标的研究证据",
   board_query: "查询板块与成分",
   market_event_query: "查询市场结构",
   daily_plan_context_query: "查询每日计划确定性上下文",
+  swing_signal_query: "查询波段确定性信号",
   limit_up_signal_query: "查询打板确定性评分",
   indicator_query: "查询可信行情指标",
   portfolio_write: "维护持仓",
+  pool_onboard: "标的入池初始化",
   pool_write: "维护标的池",
   finalize_backtest: "固化回测结论",
   memory_query: "查询 Agent 记忆",
@@ -880,6 +900,9 @@ export const TOOL_LABELS: Record<string, string> = {
   list_backtests: "回测台账列表",
   get_backtest_detail: "回测详情",
   fetch_market_data: "批量补拉数据",
+  fetch_hithink_data: "同步扶摇研究数据",
+  hithink_catalog: "发现扶摇数据能力",
+  hithink_query: "临时查询扶摇数据",
   trigger_job: "触发系统作业",
   ui_refresh: "刷新页面数据",
 };

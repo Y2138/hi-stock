@@ -1,23 +1,32 @@
 // 面向模型的纵向业务读取：一次返回完成业务任务所需的受控上下文。
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
-import { getRealizedPnlSummary, listPositionChanges, listPositions } from "../modules/positions/repo.js";
+import {
+  getRealizedPnlSummary,
+  listPassedLimitUpSignals,
+  listPositionChanges,
+  listPositions,
+} from "../modules/positions/repo.js";
 import { listPoolView } from "../modules/pools/repo.js";
 import { getCurrentStrategy, getStrategySnapshot } from "../modules/strategy/repo.js";
 import { findJobPrompt, listJobPrompts } from "../modules/job-prompts/repo.js";
 import { listJobDefinitions, listJobOutputs, listJobRuns } from "../scheduler/repo.js";
+import { queryAuctionAssessmentContext, queryHistoricalPlanItems } from "../modules/plans/repo.js";
 import { sha256Json } from "./hash.js";
 import { insertToolAudit } from "./repo.js";
 import {
   JobContextQuerySchema,
+  AuctionContextQuerySchema,
   PoolContextQuerySchema,
   PortfolioContextQuerySchema,
   StrategyDocumentQuerySchema,
   validateJobContextQueryInput,
+  validateAuctionContextQueryInput,
   validatePoolContextQueryInput,
   validatePortfolioContextQueryInput,
   validateStrategyDocumentQueryInput,
   type JobContextQueryInput,
+  type AuctionContextQueryInput,
   type PoolContextQueryInput,
   type PortfolioContextQueryInput,
   type StrategyDocumentQueryInput,
@@ -72,7 +81,7 @@ export function strategyDocumentPurpose(document: { role: string; title: string 
   return `需要执行“${document.title}”对应专项判断时读取`;
 }
 
-async function strategyForSession(deps: { pool: pg.Pool; sessionId: string | null }) {
+export async function strategyForSession(deps: { pool: pg.Pool; sessionId: string | null }) {
   if (!deps.sessionId) return getCurrentStrategy(deps.pool);
   const session = await deps.pool.query<{ strategy_state_revision: string | null }>(
     "SELECT strategy_state_revision::text FROM chat_session WHERE id = $1",
@@ -103,14 +112,17 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "portfolio_context_query",
       label: "查询组合业务上下文",
       description:
-        "一次返回真实当前持仓、最新收盘与浮动盈亏、累计已实现盈亏，以及可按代码筛选的近期持仓事件。回答组合、持仓和成交归因问题优先使用本工具，不要用通用数据库查询拼接。",
+        "一次返回真实当前持仓、最新收盘与浮动盈亏、累计已实现盈亏、近期持仓事件；按代码查询时还返回可按成交日匹配的近期打板通过信号。回答组合、持仓、成交归因或录入持仓变化前优先使用本工具，不要用通用数据库查询拼接。",
       parameters: PortfolioContextQuerySchema,
       execute: async (_id, raw) => audited<PortfolioContextQueryInput>(
         deps, "portfolio_context_query", raw, validatePortfolioContextQueryInput, async (input) => {
-          const [allPositions, realized_pnl, recent_changes] = await Promise.all([
+          const [allPositions, realized_pnl, recent_changes, matching_limit_up_signals] = await Promise.all([
             listPositions(deps.pool),
             getRealizedPnlSummary(deps.pool),
             listPositionChanges(deps.pool, input.recent_change_limit ?? 20, input.codes),
+            input.codes?.length
+              ? listPassedLimitUpSignals(deps.pool, input.codes, input.change_date)
+              : Promise.resolve([]),
           ]);
           const positions = input.codes?.length
             ? allPositions.filter((position) => input.codes!.includes(position.code))
@@ -125,6 +137,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
             positions,
             realized_pnl,
             recent_changes,
+            matching_limit_up_signals,
           };
         },
       ),
@@ -133,7 +146,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "pool_context_query",
       label: "查询标的池业务上下文",
       description:
-        "一次返回短线池、长线池当前角色与研究属性、最新收盘和官方行业关系；可批量按代码筛选，只有需要板块总览时才返回完整板块列表。回答池成员、角色和入池现状优先使用本工具。",
+        "返回短线池、长线池当前成员全集。未传 codes 时每只成员只返回角色、评分、阶段、关注、行情和一级行业摘要；传 codes 时才返回对应标的完整研究属性。只有需要板块总览时才开启 include_boards。",
       parameters: PoolContextQuerySchema,
       execute: async (_id, raw) => audited<PoolContextQueryInput>(
         deps, "pool_context_query", raw, validatePoolContextQueryInput, async (input) => {
@@ -143,11 +156,33 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
             const members = input.codes?.length
               ? view.members.filter((member) => input.codes!.includes(member.code))
               : view.members;
+            const memberRows = input.codes?.length
+              ? members
+              : members.map((member) => ({
+                  code: member.code,
+                  name: member.name,
+                  kind: member.kind,
+                  role: member.role,
+                  grade: member.grade,
+                  score: member.score,
+                  stage: member.stage,
+                  attention_reason: member.attention_reason,
+                  attention_from: member.attention_from,
+                  attention_until: member.attention_until,
+                  last: member.last,
+                  change_pct: member.change_pct,
+                  quote_time: member.quote_time,
+                  primary_boards: member.boards
+                    .filter((board) => board.level === "primary")
+                    .map((board) => ({ code: board.code, name: board.name })),
+                  detail_available: true,
+                }));
             return {
               pool,
               member_count: members.length,
               attention_count: members.filter((member) => member.attention_reason !== null).length,
-              members,
+              detail_level: input.codes?.length ? "full" : "summary",
+              members: memberRows,
               ...(input.include_boards ? { boards: view.boards } : {}),
             };
           }));
@@ -159,7 +194,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "job_context_query",
       label: "查询作业业务上下文",
       description:
-        "一次查询作业定义、近期运行、结果元信息和提示词版本；可批量按作业或提示词 code 筛选。只有确实需要阅读结果或编辑提示词时才开启对应正文开关，查询任务状态不得再轮询通用数据库表。",
+        "一次查询作业定义、近期运行、结果元信息和提示词版本；可按目标日筛选。回答昨日/历史计划信号质量时指定 daily_plan_flow、target_date，开启 include_output_content 与 include_plan_items，读取当时正文、结构化预案和策略版本，不用当前扫描替代历史。预案每份100行，按 next_offset 设置 plan_item_offset 续读；普通状态查询不开正文。",
       parameters: JobContextQuerySchema,
       execute: async (_id, raw) => audited<JobContextQueryInput>(
         deps, "job_context_query", raw, validateJobContextQueryInput, async (input) => {
@@ -178,7 +213,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
             return {
               definition: job,
               runs: runs.map(summarizeRun),
-              outputs: outputs.map((output) => ({
+              outputs: await Promise.all(outputs.map(async (output) => ({
                 id: output.id,
                 run_id: output.run_id,
                 output_type: output.output_type,
@@ -186,9 +221,14 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
                 status: output.status,
                 source: output.source,
                 sha256: output.sha256,
+                strategy_change_seq: output.strategy_change_seq,
+                strategy_snapshot_hash: output.strategy_snapshot_hash,
                 created_at: output.created_at,
                 ...(input.include_output_content ? { markdown: output.markdown } : {}),
-              })),
+                ...(input.include_plan_items && job.code === "daily_plan_flow"
+                  ? { plan_items: await queryHistoricalPlanItems(deps.pool, output.id, input.plan_item_offset) }
+                  : {}),
+              }))),
             };
           }));
           const boundPromptIds = new Set(jobs.map((job) => job.prompt_id).filter(Boolean));
@@ -213,6 +253,17 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
           }));
           return { jobs: jobRows, prompts: promptRows };
         },
+      ),
+    },
+    {
+      name: "auction_context_query",
+      label: "查询集合竞价任务上下文",
+      description:
+        "按目标日一次返回交易日门禁、前一开市日、最新每日计划有效性，以及全部持仓、有效近期关注、打板候选、候选代码、覆盖计数和逐项缺口。集合竞价任务只用本工具取得候选全集，不得调用完整标的池、每日计划扫描或通用数据库工具重复拼装。",
+      parameters: AuctionContextQuerySchema,
+      execute: async (_id, raw) => audited<AuctionContextQueryInput>(
+        deps, "auction_context_query", raw, validateAuctionContextQueryInput,
+        (input) => queryAuctionAssessmentContext(deps.pool, input.date),
       ),
     },
     {

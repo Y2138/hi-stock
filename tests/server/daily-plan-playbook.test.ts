@@ -1,6 +1,7 @@
 // 每日计划盯防预案测试（迁移 0047）：draft 写入/替换、激活与替代、看板读取、HTTP 路由。
 // 领域规则：position_action 仅限真实持仓，off_pool_opportunity 是池外打板机会且只接受 A/B 兼容评级。
 import crypto from "node:crypto";
+import { buildChatTools } from "../../server/agent/tools.js";
 import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../server/db/migrate.js";
@@ -8,14 +9,21 @@ import {
   activateAuctionAssessmentsForRun,
   activatePlaybookForRun,
   getLatestDailyPlanBoard,
+  queryAuctionAssessmentContext,
+  queryHistoricalPlanItems,
   replaceDraftAuctionAssessments,
   replaceDraftPlaybook,
 } from "../../server/modules/plans/repo.js";
 import {
+  listPassedLimitUpSignals,
+  listPositionChanges,
+  recordPositionChange,
+} from "../../server/modules/positions/repo.js";
+import {
   validateAuctionAssessmentWriteInput,
   validateDailyPlanWriteInput,
 } from "../../server/agent/tool-validation.js";
-import { api, prepareTestDb, resetSchema, startTestServer, type TestServer } from "./helpers";
+import { api, prepareTestDb, resetSchema, seedTestStrategy, startTestServer, type TestServer } from "./helpers";
 
 const prepared = await prepareTestDb();
 
@@ -55,6 +63,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     pool = prepared!.pool;
     await resetSchema(pool);
     await runMigrations(pool);
+    await seedTestStrategy(pool);
 
     // 三只标的：持仓 / 池内 / 纯池外
     for (const [code, name] of [["600000.SH", "持仓银行"], ["600519.SH", "池内白酒"], ["300750.SZ", "池外电池"]] as const) {
@@ -72,7 +81,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
   });
 
   afterAll(async () => {
-    await server.close();
+    await server?.close();
     await pool.end();
   });
 
@@ -173,6 +182,23 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     const board = await getLatestDailyPlanBoard(pool);
     expect(board.plan.output_id).toBe(second.outputId);
     expect(board.position_actions[0]!.headline).toBe("新计划减半");
+    const history = await queryHistoricalPlanItems(pool, first.outputId);
+    expect(history).toMatchObject({ total_count: 1, complete: true, next_offset: null });
+    expect(history.items[0]).toMatchObject({ headline: "旧计划预案", action: "hold", auction_assessment: null });
+    expect((await queryHistoricalPlanItems(pool, first.outputId, 1)).items).toEqual([]);
+    const tool = buildChatTools({ pool, sessionId: null }).find((item) => item.name === "job_context_query")!;
+    const response = await tool.execute("history", {
+      job_codes: ["daily_plan_flow"], target_date: "2026-08-27", recent_runs_per_job: 2,
+      include_output_content: true, include_plan_items: true,
+    });
+    const data = JSON.parse(response.content[0]!.type === "text" ? response.content[0]!.text : "{}");
+    expect(data.jobs[0].outputs.map((output: { id: string }) => output.id)).toEqual([second.outputId, first.outputId]);
+    expect(data.jobs[0].outputs[1].plan_items.items[0].headline).toBe("旧计划预案");
+    expect(data.jobs[0].outputs[1].markdown).toContain("预案正文");
+    const missing = await tool.execute("history-missing", {
+      job_codes: ["daily_plan_flow"], target_date: "2020-01-01", include_plan_items: true,
+    });
+    expect(JSON.parse(missing.content[0]!.type === "text" ? missing.content[0]!.text : "{}").jobs[0].outputs).toEqual([]);
   });
 
   it("HTTP 路由返回最新预案形状", async () => {
@@ -203,8 +229,17 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     });
     await activatePlaybookForRun(pool, plan.jobRunId, plan.outputId);
     await pool.query(
-      "INSERT INTO market_trading_day (trade_date, is_open, source) VALUES ('2026-08-28', true, 'test') ON CONFLICT (trade_date) DO UPDATE SET is_open = true",
+      `INSERT INTO market_trading_day (trade_date, is_open, source)
+       VALUES ('2026-08-27', true, 'test'), ('2026-08-28', true, 'test')
+       ON CONFLICT (trade_date) DO UPDATE SET is_open = EXCLUDED.is_open`,
     );
+    const context = await queryAuctionAssessmentContext(pool, "2026-08-28");
+    expect(context.market_day).toMatchObject({ should_run: true, previous_open_date: "2026-08-27" });
+    expect(context.plan).toMatchObject({ target_date: "2026-08-27", validity: "valid" });
+    expect(context.coverage.opportunity_count).toBe(1);
+    expect(context.coverage.candidate_count).toBe(context.candidate_codes.length);
+    expect(context.candidate_codes).toContain("300750.SZ");
+    expect(Buffer.byteLength(JSON.stringify(context), "utf8")).toBeLessThan(16 * 1024);
     const auctionRun = await pool.query<{ id: string }>(
       `INSERT INTO job_run (job_id, target_date, trigger_kind, status)
        SELECT id, '2026-08-28', 'manual', 'running'
@@ -216,7 +251,8 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
       source_job_run_id: runId,
       items: [{
         code: "300750.SZ",
-        conclusion: "observe",
+        conclusion: "signal_passed",
+        review_type: "turnover_advance",
         metrics_summary: "竞价涨幅 +2.1%，竞价量比 1.8",
         assessment_summary: "原计划缺失的量能条件已补齐，失效条件未触发",
         benchmark_tags: ["强于短线基准"],
@@ -226,7 +262,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     });
     expect((await getLatestDailyPlanBoard(pool)).opportunities[0]!.auction_assessment).toBeNull();
 
-    const markdown = "# 集合竞价机会研判\n\n继续观察。";
+    const markdown = "# 集合竞价机会研判\n\n信号通过。";
     const output = await pool.query<{ id: string }>(
       `INSERT INTO job_run_output
          (job_id, run_id, output_type, target_date, markdown, sha256, status, source)
@@ -239,11 +275,44 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
 
     expect((await getLatestDailyPlanBoard(pool)).opportunities[0]!.auction_assessment).toMatchObject({
       output_id: output.rows[0]!.id,
-      conclusion: "observe",
+      conclusion: "signal_passed",
+      review_type: "turnover_advance",
       metrics_summary: "竞价涨幅 +2.1%，竞价量比 1.8",
       benchmark_tags: ["强于短线基准"],
       data_status: "ready",
     });
+
+    expect(await listPassedLimitUpSignals(pool, ["300750.SZ"], "2026-08-28")).toMatchObject([{
+      assessment_id: expect.any(String),
+      code: "300750.SZ",
+      signal_date: "2026-08-27",
+      assessment_date: "2026-08-28",
+      review_type: "turnover_advance",
+      plan_output_id: plan.outputId,
+    }]);
+    const sessionId = (await pool.query<{ id: string }>(
+      "INSERT INTO chat_session (title) VALUES ('打板归因测试') RETURNING id::text",
+    )).rows[0]!.id;
+    const bought = await recordPositionChange(pool, {
+      code: "300750.SZ", kind: "buy", quantity: 100, price: 101,
+      change_date: "2026-08-28", source: "chat", source_session_id: sessionId,
+      decision_origin: "strategy_signal", execution_compliance: "matched",
+    });
+    expect(bought.change).toMatchObject({
+      plan_output_id: plan.outputId,
+      entry_auction_assessment_id: expect.any(String),
+    });
+    const exitPlan = await seedDailyPlanRun(pool, "daily_plan");
+    await recordPositionChange(pool, {
+      code: "300750.SZ", kind: "sell", quantity: 100, price: 103,
+      change_date: "2026-08-29", source: "chat", source_session_id: sessionId,
+      decision_origin: "strategy_signal", execution_compliance: "matched",
+      plan_output_id: exitPlan.outputId,
+    });
+    expect((await listPositionChanges(pool, 2, ["300750.SZ"]))).toMatchObject([
+      { kind: "sell", plan_output_id: exitPlan.outputId, entry_signal_date: "2026-08-27", entry_assessment_date: "2026-08-28", entry_signal_review_type: "turnover_advance" },
+      { kind: "buy", entry_signal_date: "2026-08-27", entry_assessment_date: "2026-08-28", entry_signal_review_type: "turnover_advance" },
+    ]);
   });
 
   it("输入校验：评级缺失、priority 规则与触发区间倒挂被拒绝", () => {
@@ -315,7 +384,8 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     expect(() => validateAuctionAssessmentWriteInput({
       items: [{
         code: "300750.SZ",
-        conclusion: "observe",
+        conclusion: "signal_passed",
+        review_type: "turnover_advance",
         metrics_summary: "竞价数据缺失",
         assessment_summary: "无法判断",
         data_status: "missing",

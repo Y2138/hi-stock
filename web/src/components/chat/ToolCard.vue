@@ -51,6 +51,13 @@ const resultData = computed<Record<string, unknown> | null>(() => {
 const resultSummary = computed(() => {
   const data = resultData.value;
   if (!data) return null;
+  if (["daily_plan_write", "auction_assessment_write"].includes(props.tool.name) && typeof data.replaced === "number") {
+    return `已暂存 ${data.replaced} 条${props.tool.name === "daily_plan_write" ? "计划预案" : "竞价复核"}，任务完成后发布到工作台`;
+  }
+  if (props.tool.name === "pool_attention_write" && Array.isArray(data.items)) {
+    const items = data.items as Array<{ action?: string }>;
+    return `近期关注已同步 · 标记 ${items.filter((item) => item.action === "mark").length} · 清除 ${items.filter((item) => item.action === "clear").length} · 跳过 ${items.filter((item) => item.action === "skip").length}`;
+  }
   if (data.mode === "yolo") {
     const preview = data.preview as Record<string, unknown> | undefined;
     return `YOLO 已通过${preview?.domain ?? "领域"} service 执行 · ${preview?.action ?? "写入"}`;

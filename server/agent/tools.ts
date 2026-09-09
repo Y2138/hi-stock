@@ -17,6 +17,8 @@ import {
 import { queueManualJob } from "../scheduler/repo.js";
 import { wakeScheduler } from "../scheduler/service.js";
 import { executeAnalysis } from "../analysis/service.js";
+import { queryStrategyScreen } from "../modules/plans/strategy-screen.js";
+import { initializePoolOnboarding } from "../modules/pools/onboarding.js";
 import { runAgentBacktest } from "../backtest/agent-workspace.js";
 import { AGENT_BACKTEST_SDK_VERSION } from "../backtest/agent-contract.js";
 import type { AgentBacktestRunSummary } from "../backtest/agent-contract.js";
@@ -43,6 +45,7 @@ import {
   buildDailyPlanContextTool,
   buildLimitUpSignalTool,
   buildMarketDomainTools,
+  buildSwingSignalTool,
 } from "./market-domain-tools.js";
 import { buildBusinessContextTools } from "./business-context-tools.js";
 import {
@@ -53,6 +56,7 @@ import {
 import { withAgentMutationLock } from "./mutation-lock.js";
 import { insertToolAudit } from "./repo.js";
 import { getAgentSettings } from "./settings.js";
+import { buildHithinkTools, type HithinkTransientQuery } from "./hithink-tools.js";
 import {
   createDeepSeekWebResearchProvider,
   WEB_RESEARCH_ALLOWED_DOMAINS,
@@ -71,8 +75,10 @@ import {
   MemoryQuerySchema,
   MemoryWriteSchema,
   PoolWriteSchema,
+  PoolOnboardSchema,
   PortfolioWriteSchema,
   ReadBacktestSourceSchema,
+  StrategyScreenSchema,
   TriggerJobSchema,
   WebSearchSchema,
   validateAnalysisRunInput,
@@ -87,17 +93,21 @@ import {
   validateMemoryQueryInput,
   validateMemoryWriteInput,
   validatePoolWriteInput,
+  validatePoolOnboardInput,
   validatePortfolioWriteInput,
   validateReadBacktestSourceInput,
+  validateStrategyScreenInput,
   validateTriggerJobInput,
   validateWebSearchInput,
   type FetchMarketDataInput,
   type FetchHithinkDataInput,
   type MemoryQueryInput,
+  type PoolOnboardInput,
   type AnalysisRunInput,
   type RunBacktestInput,
   type ReadBacktestSourceInput,
   type StrategyPublishRequestInput,
+  type StrategyScreenInput,
   type TriggerJobInput,
   type WebSearchInput,
 } from "./tool-validation.js";
@@ -105,8 +115,6 @@ import {
 export interface ChatToolDeps {
   pool: pg.Pool;
   sessionId: string | null;
-  /** 会话创建时的注册快照；候选工具 execute 时仍会重新读取数据库开关。 */
-  marketDomainToolsEnabled?: boolean;
   /** 永久测试注入；生产缺省走 datasource service。 */
   fetchMarket?: (
     request: { code: string; freq: "day" | "30m" | "futures_day"; start: string; end: string },
@@ -116,6 +124,8 @@ export interface ChatToolDeps {
   fetchFinancial?: (request: { code: string }) => Promise<FinancialStoreOutcome>;
   /** 永久测试注入；生产缺省走扶摇扩展数据白名单与 PostgreSQL 快照 service。 */
   fetchHithinkData?: (request: HithinkDatasetRequest) => Promise<HithinkDatasetStoreOutcome>;
+  /** 永久测试注入；生产缺省走扶摇临时查询，不写业务数据。 */
+  queryHithink?: HithinkTransientQuery;
   /** 永久测试注入；生产缺省走 Docker 隔离工作器。 */
   runAgentBacktest?: (
     sessionId: string,
@@ -205,8 +215,75 @@ function guard<P>(
   };
 }
 
-/** 构建绑定到会话的工具集：渐进式只读 + 领域写入 + 受控系统动作。 */
-export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
+/** 会话工具装配范围：交互对话全量；agent_flow 任务会话按提示词声明集和永久 Web 能力裁剪。 */
+export type ToolScope = { kind: "chat" } | { kind: "job"; jobCode: string };
+
+/**
+ * 各 agent_flow 任务可用的领域工具子集，与任务提示词（0075/0076 迁移）第 1 步声明的加载清单一致；
+ * web_search 是所有 Agent 会话永久具备的通用只读能力。
+ * 提示词明令禁止的工具（如竞价任务禁用 daily_plan_context_query、database_*）不得加入。
+ * 任务提示词迭代新增工具引用时必须同步加宽此表。
+ */
+export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
+  auction_opportunity_assessment: [
+    "auction_context_query",
+    "strategy_document_query",
+    "fetch_hithink_data",
+    "auction_assessment_write",
+  ],
+  daily_plan_flow: [
+    "strategy_document_query",
+    "job_context_query",
+    "daily_plan_context_query",
+    "swing_signal_query",
+    "limit_up_signal_query",
+    "pool_attention_write",
+    "daily_plan_write",
+  ],
+  midweek_check: [
+    "strategy_document_query",
+    "pool_context_query",
+    "job_context_query",
+    "daily_plan_context_query",
+  ],
+  weekly_review: [
+    "strategy_document_query",
+    "pool_context_query",
+    "portfolio_context_query",
+    "daily_plan_context_query",
+    "swing_signal_query",
+    "analysis_run",
+  ],
+};
+
+/** 任务流程工具只挂到绑定任务会话；交互会话中它们本就无法通过运行期守卫。 */
+const JOB_FLOW_ONLY_TOOLS = new Set([
+  "auction_context_query",
+  "pool_attention_write",
+  "daily_plan_write",
+  "auction_assessment_write",
+]);
+
+function toolsForScope(tools: AgentTool[], scope: ToolScope): AgentTool[] {
+  if (scope.kind === "job") {
+    const bundle = Object.hasOwn(JOB_FLOW_TOOL_BUNDLES, scope.jobCode) ? JOB_FLOW_TOOL_BUNDLES[scope.jobCode] : undefined;
+    if (!bundle) {
+      console.warn(`agent_flow 任务 ${scope.jobCode} 未定义工具子集，回退交互工具目录`);
+      return tools.filter((tool) => !JOB_FLOW_ONLY_TOOLS.has(tool.name));
+    }
+    const allowed = new Set([...bundle, "web_search"]);
+    const filtered = tools.filter((tool) => allowed.has(tool.name));
+    const missing = [...allowed].filter((name) => !filtered.some((tool) => tool.name === name));
+    if (missing.length) {
+      throw new Error(`任务 ${scope.jobCode} 工具子集引用了未注册工具：${missing.join("、")}`);
+    }
+    return filtered;
+  }
+  return tools.filter((tool) => !JOB_FLOW_ONLY_TOOLS.has(tool.name));
+}
+
+/** 构建绑定到会话的工具集：渐进式只读 + 领域写入 + 受控系统动作；按会话范围裁剪任务流程工具。 */
+export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "chat" }): AgentTool[] {
   const { pool } = deps;
   const fetchMarket =
     deps.fetchMarket ??
@@ -226,14 +303,14 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
     {
       name: "portfolio_write",
       label: "批量维护持仓",
-      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。服务端统一经过持仓 service；不能直接指定表或字段。",
+      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。持仓与近期关注独立，买入不会创建关注，只会消费同标的已有的每日计划自动关注并保留人工关注。服务端统一经过持仓 service；不能直接指定表或字段。",
       parameters: PortfolioWriteSchema,
       validate: validatePortfolioWriteInput,
     },
     {
       name: "pool_write",
       label: "批量维护标的池",
-      description: "一次提交一批新增、更新、迁移、结束角色或板块排序操作并在同一事务执行。新增、迁池或改变策略角色前必须先按系统提示词的“标的入池评估指引”同时评估短线、波段和长线，形成唯一策略归属；关键数据不足时不得调用。新增必须完成角色、分级、评分、股性、阶段、标签和评估摘要；新增或迁入短线池还必须明确 stop_loss_mode（ma5/ma10/fixed_90），不得猜测。股票必须已有同花顺官方行业关系，不接受本地板块标签或自行指定行业字段。服务端保留历史角色行，同一标的只能有一个当前角色。",
+      description: "维护已有池成员的近期关注、结束角色或板块排序。新增、迁池和角色变更必须改用 pool_onboard，由服务端生成确定性档案。",
       parameters: PoolWriteSchema,
       validate: validatePoolWriteInput,
     },
@@ -327,6 +404,7 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
       if (deps.sessionId && (details?.auto_approved || details?.direct)) {
         const targets: Record<DomainWriteToolName, string[]> = {
           portfolio_write: ["positions", "dashboard", "status"],
+          pool_onboard: ["pools", "dashboard"],
           pool_write: ["pools", "dashboard"],
           job_write: ["jobs", "dashboard", "status"],
           finalize_backtest: ["backtests"],
@@ -338,12 +416,82 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
     }),
   }));
 
-  return [
+  const poolOnboardTool: AgentTool = {
+    name: "pool_onboard",
+    label: "标的入池初始化",
+    description:
+      "输入A股或ETF的名称、简称或代码及可选池别/角色；服务端一次完成标的消歧、约420日行情与A股财务估值同步、正式指标重算、版本化五维股性/阶段/评分、官方行业校验和入池预览。当前买入信号不参与入池。成功后确认制直接生成一张入池确认卡，YOLO直接写入；不要再调用行情、分析或pool_write拼装入池流程。",
+    parameters: PoolOnboardSchema,
+    executionMode: "sequential",
+    execute: guard<PoolOnboardInput>(deps, "pool_onboard", validatePoolOnboardInput, async (params, context) => {
+      context.onUpdate?.(textResult({ status: "initializing", message: "正在同步数据并重算确定性入池画像" }));
+      const onboarding = await withAgentMutationLock(pool, async () => initializePoolOnboarding(pool, params, {
+        fetchMarket: (request) => fetchMarket(request),
+        fetchFinancial,
+      }));
+      context.onUpdate?.(textResult({ status: "previewing", message: "初始化完成，正在生成入池预览" }));
+      const response = await withAgentMutationLock(pool, async (client) => {
+        const preview = await previewDomainWrite(client, "pool_onboard", onboarding.commit, { sessionId: deps.sessionId });
+        const publicPreview = publicDomainWritePreview(preview);
+        const settings = await getAgentSettings(client);
+        if (settings.yolo_mode) {
+          const result = await executeDomainWriteInTransaction(client, "pool_onboard", onboarding.commit, {
+            expectedStateHash: preview._state_hash,
+            sessionId: deps.sessionId,
+          });
+          await insertToolAudit(client, {
+            session_id: deps.sessionId,
+            tool_name: "pool_onboard",
+            args: params,
+            result_sha256: sha256Json(result),
+            status: "ok",
+          });
+          return textResult({
+            message: "入池初始化完成，YOLO模式已写入推荐标的池",
+            mode: "yolo",
+            initialization: onboarding.initialization,
+            preview: publicPreview,
+            result,
+          }, { auto_approved: true, yolo_mode: true, payload: onboarding.commit, result });
+        }
+        const row = await createConfirmation(client, {
+          session_id: deps.sessionId,
+          tool_name: "pool_onboard",
+          payload: onboarding.commit,
+          expected_state_hash: preview._state_hash,
+        });
+        const proposal = {
+          confirmation_id: row.id,
+          tool_name: "pool_onboard",
+          payload: onboarding.commit,
+          preview: publicPreview,
+        };
+        await insertToolAudit(client, {
+          session_id: deps.sessionId,
+          tool_name: "pool_onboard",
+          args: params,
+          result_sha256: sha256Json(proposal),
+          status: "pending",
+        });
+        return textResult({
+          message: `标的数据初始化完成，已生成入池提案，等待用户确认（confirmation_id=${row.id}）`,
+          initialization: onboarding.initialization,
+          preview: publicPreview,
+        }, proposal);
+      });
+      if ((response.details as { auto_approved?: boolean } | undefined)?.auto_approved) {
+        await publishRefresh(deps, ["pools", "dashboard", "market", "datasync"], "pool_onboard 已执行");
+      }
+      return response;
+    }),
+  };
+
+  const tools: AgentTool[] = [
     ...buildBusinessContextTools({ pool, sessionId: deps.sessionId }),
-    ...(deps.marketDomainToolsEnabled
-      ? buildMarketDomainTools({ pool, sessionId: deps.sessionId })
-      : []),
+    ...buildHithinkTools({ pool, sessionId: deps.sessionId, query: deps.queryHithink }),
+    ...buildMarketDomainTools({ pool, sessionId: deps.sessionId }),
     buildDailyPlanContextTool({ pool, sessionId: deps.sessionId }),
+    buildSwingSignalTool({ pool, sessionId: deps.sessionId }),
     buildLimitUpSignalTool({ pool, sessionId: deps.sessionId }),
     {
       name: "memory_query",
@@ -383,6 +531,7 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
         }, "ok", result);
       }),
     },
+    poolOnboardTool,
     ...domainWriteTools,
     buildJobPoolAttentionTool({ pool, sessionId: deps.sessionId }),
     buildJobDailyPlanTool({ pool, sessionId: deps.sessionId }),
@@ -446,7 +595,7 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
     {
       name: "analysis_run",
       label: "运行复合分析",
-      description: "批量运行板块温度、关键位或长线估值分析。全部能力由服务读取数据库执行，结果和缺口写入 analysis_run；不调用外部 Python。",
+      description: "批量运行板块温度、关键位或长线估值分析。全部能力由服务读取数据库执行，结果和缺口写入 analysis_run；不调用外部 Python。板块温度的正式口径仅覆盖 881/884 本地日更的行业板块；概念/地域/特色板块走势用 hithink index_history 原始 K 线解读，不包装为温度结论。",
       parameters: AnalysisRunSchema,
       executionMode: "sequential",
       execute: guard<AnalysisRunInput>(deps, "analysis_run", validateAnalysisRunInput, async (params, context) => {
@@ -461,6 +610,18 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
         const auditedResult = await withAudit(deps, "analysis_run", params, "ok", result);
         await publishRefresh(deps, ["market", "dashboard"], "复合分析已完成");
         return auditedResult;
+      }),
+    },
+    {
+      name: "strategy_screen_query",
+      label: "策略条件参考筛选",
+      description:
+        "对任意 1–50 只 A 股个股按当前策略确定性规则做参考口径筛选：short_right 右侧六条件、short_left 左侧反转、trial 试盘启动、swing 波段四条件，逐只返回条件布尔、必要数值证据和数据缺口。评估前会对指标过期标的同步重算正式指标；缺日线返回缺口并应先用 fetch_market_data 批量补拉后重跑。不产生 signal_grade、不做“右侧>左侧>试盘”唯一信号合并，也不评估大盘环境门禁；候选转正式口径走 pool_onboard 入池，由每日计划产出。",
+      parameters: StrategyScreenSchema,
+      executionMode: "sequential",
+      execute: guard<StrategyScreenInput>(deps, "strategy_screen_query", validateStrategyScreenInput, async (params) => {
+        const result = textResult(await queryStrategyScreen(pool, params));
+        return withAudit(deps, "strategy_screen_query", params, "ok", result);
       }),
     },
     {
@@ -722,7 +883,7 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
       name: "database_schema",
       label: "低优先级·排查数据库结构",
       description:
-        "仅在纵向业务工具无法解释数据缺口或运行异常时使用。只发现服务端正面清单中的只读表；先 list_tables，再按相关表 describe_tables。不得用于普通业务事实查询。",
+        "优先使用纵向业务工具；仅在其尚未覆盖的内部统计、跨领域探索或排障时使用，并与 database_query 成对加载。只发现服务端正面清单中的只读表；先 list_tables，再按相关表 describe_tables。不用于重复拼装已有纵向业务工具的结果。",
       parameters: DatabaseSchemaSchema,
       execute: guard<DatabaseSchemaInput>(deps, "database_schema", validateDatabaseSchemaInput, async (params) => {
         const result = textResult(await discoverDatabaseSchema(pool, params));
@@ -733,7 +894,7 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
       name: "database_query",
       label: "低优先级·排查数据库数据",
       description:
-        "仅在纵向业务工具失败、返回矛盾或需要定位运行异常时使用。只能查询服务端正面清单中的只读表；每项必须携带 schema_hash，普通行查询必须显式选择 columns。最多 5 项、每项 100 行，不接受原始 SQL。",
+        "优先使用纵向业务工具；仅在其尚未覆盖的内部统计、跨领域探索或排障时使用，并与 database_schema 成对加载。只能查询服务端正面清单中的只读表；服务端按当前表结构实时校验字段，普通行查询必须显式选择 columns。最多 5 项、每项 100 行，不接受原始 SQL。",
       parameters: DatabaseQuerySchema,
       execute: guard<DatabaseQueryInput>(deps, "database_query", validateDatabaseQueryInput, async (params) => {
         const result = textResult(await queryDatabase(pool, params));
@@ -741,4 +902,5 @@ export function buildChatTools(deps: ChatToolDeps): AgentTool[] {
       }),
     },
   ];
+  return toolsForScope(tools, scope);
 }

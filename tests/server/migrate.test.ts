@@ -23,10 +23,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
 
   it("连续执行两次幂等：第二次不重复应用", async () => {
     const first = await runMigrations(pool);
-    expect(first.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]);
+    expect(first.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]);
     const second = await runMigrations(pool);
     expect(second.applied).toEqual([]);
-    expect(second.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]);
+    expect(second.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]);
     // 表结构真实存在，0005 已按领域重命名非前缀表
     const tables = await pool.query(
       "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
@@ -41,7 +41,6 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "agent_tool_audit",
       "agent_tool_metric",
       "analysis_run",
-      "backtest_artifact",
       "backtest_run",
       "backtest_run_comparison",
       "backtest_run_source",
@@ -54,7 +53,6 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "content_revision",
       "daily_plan_auction_assessment",
       "daily_plan_playbook",
-      "data_dataset",
       "fundamental_snapshot",
       "hithink_dataset_snapshot",
       "job_definition",
@@ -107,6 +105,32 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "valuation_snapshot",
       "volume_snapshot",
     ]);
+    const undocumented = await pool.query<{ object_name: string }>(
+      `SELECT current_database() AS object_name
+         WHERE NULLIF(btrim(shobj_description(
+           (SELECT oid FROM pg_database WHERE datname = current_database()),
+           'pg_database'
+         )), '') IS NULL
+       UNION ALL
+       SELECT relation.relname
+         FROM pg_class relation
+         JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'public'
+          AND relation.relkind IN ('r', 'p')
+          AND NULLIF(btrim(obj_description(relation.oid, 'pg_class')), '') IS NULL
+       UNION ALL
+       SELECT relation.relname || '.' || attribute.attname
+         FROM pg_class relation
+         JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         JOIN pg_attribute attribute
+           ON attribute.attrelid = relation.oid
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+        WHERE namespace.nspname = 'public'
+          AND relation.relkind IN ('r', 'p')
+          AND NULLIF(btrim(col_description(relation.oid, attribute.attnum)), '') IS NULL`,
+    );
+    expect(undocumented.rows).toEqual([]);
 
     const session = await pool.query<{
       session_type: string;
@@ -132,44 +156,48 @@ describe.skipIf(!prepared)("迁移运行器", () => {
         WHERE table_schema = 'public' AND table_name = 'pool_membership'
           AND column_name = 'primary_board_instrument_id'`,
     )).rows[0]!.count).toBe(0);
-    const dailyPlan = (await pool.query<{ content: string }>(
-      `SELECT revision.content
+    const prompts = await pool.query<{ code: string; content: string }>(
+      `SELECT prompt.code, revision.content
          FROM job_prompt prompt
          JOIN job_prompt_revision revision ON revision.id = prompt.current_revision_id
-        WHERE prompt.code = 'daily_plan_flow'`,
-    )).rows[0]!.content;
-    expect(dailyPlan).toContain("当前持仓读 `portfolio_position`，持仓变化读 `portfolio_position_change`");
-    expect(dailyPlan).toContain("组合持仓结构和风险");
-    expect(dailyPlan).not.toContain("当前持仓与账户读 `portfolio_*`");
-    expect(dailyPlan).not.toContain("资金组合和风险");
-    expect(dailyPlan).toContain("## 市场结构与打板机会");
-    expect(dailyPlan).toContain("短线候选集合不得局限于当前短线池");
-    expect(dailyPlan).toContain("## 打板机会最终输出口径");
+        WHERE prompt.code IN ('daily_plan_flow', 'midweek_check', 'weekly_review')
+        ORDER BY prompt.code`,
+    );
+    const promptByCode = new Map(prompts.rows.map((row) => [row.code, row.content]));
+    const dailyPlan = promptByCode.get("daily_plan_flow")!;
+    expect(dailyPlan).toContain("用 `tool_catalog` 一次加载");
+    expect(dailyPlan).toContain("daily_plan_context_query(date=目标日)");
+    expect(dailyPlan).toContain("swing_signal_query(date=目标日)");
+    expect(dailyPlan).toContain("limit_up_signal_query(date=实际市场结构数据日)");
     expect(dailyPlan).toContain("每日最多 4 只");
-    expect(dailyPlan).toContain("## 每日计划确定性完成门禁");
-    expect(dailyPlan).toContain("首先调用一次 `daily_plan_context_query");
-    expect(dailyPlan).toContain("success` 且 0 页、0 行是合法空集");
-    expect(dailyPlan).toContain("## 每日计划垂类计算门禁");
-    expect(dailyPlan).toContain("短线池右侧六条件重算与持仓触发位计算");
-    expect(dailyPlan).toContain("## 左侧反转与试盘启动完成门禁");
     expect(dailyPlan).toContain("右侧 > 左侧 > 试盘");
-    expect(dailyPlan).toContain("不得把“未命中”写成“未核验”");
-    expect(dailyPlan).not.toContain("市场结构池外机会");
+    expect(dailyPlan).toContain("当日无新增波段信号");
+    expect(dailyPlan).toContain("无候选也提交空数组");
+    expect(dailyPlan).toContain("不得加入持仓、池外标的或覆盖人工关注");
+    expect(dailyPlan).toContain("全部 `position_action`");
+    expect(dailyPlan).toContain("系统保存到 `job_run_output`");
+    expect(dailyPlan.length).toBeLessThan(4_000);
+    expect(dailyPlan).not.toContain("本节替代前文");
+    expect(dailyPlan).not.toContain("database_schema");
+    expect(dailyPlan).not.toContain("database_query");
     expect(dailyPlan).not.toContain("## 策略模拟账户信号");
     expect(dailyPlan).not.toContain("paper_trade_signal_write");
-    expect(dailyPlan).toContain("## 执行纪律与预案结构化输出");
-    expect(dailyPlan).toContain("## 打板确定性评分");
-    expect(dailyPlan).toContain("`limit_up_signal_query`");
-    expect(dailyPlan).not.toContain("0.2bp 即 0.002%");
-    expect(dailyPlan).not.toContain("按本次计划需要，可参考");
     expect(dailyPlan).not.toContain("预期校对");
-    const activePrompts = await pool.query<{ content: string }>(
-      `SELECT revision.content
-         FROM job_prompt prompt
-         JOIN job_prompt_revision revision ON revision.id = prompt.current_revision_id
-        WHERE prompt.code IN ('daily_plan_flow', 'midweek_check', 'weekly_review')`,
-    );
-    expect(activePrompts.rows.every((row) => !row.content.includes("数据获取规范"))).toBe(true);
+    const midweek = promptByCode.get("midweek_check")!;
+    expect(midweek).toContain("pool_context_query(pools=[\"short\"])");
+    expect(midweek).toContain("daily_plan_context_query(date=目标日)");
+    expect(midweek).toContain("最近一份成功的 `job_run_output`");
+    expect(midweek.length).toBeLessThan(1_200);
+    expect(midweek).not.toContain("indicator_query");
+    expect(midweek).not.toContain("database_query");
+    const weekly = promptByCode.get("weekly_review")!;
+    expect(weekly).toContain("portfolio_context_query");
+    expect(weekly).toContain("swing_signal_query(date=目标日)");
+    expect(weekly).toContain("analysis_run(long_valuation)");
+    expect(weekly.length).toBeLessThan(1_200);
+    expect(weekly).not.toContain("database_query");
+    expect(prompts.rows.every((row) => !row.content.includes("本节替代前文"))).toBe(true);
+    expect(prompts.rows.every((row) => !row.content.includes("数据获取规范"))).toBe(true);
     const benchmark = (await pool.query<{
       benchmark_code: string;
       training_start: string;
@@ -177,16 +205,19 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       seal_samples: number;
       sha256: string;
     }>(
-      `SELECT benchmark_code, training_start::text, training_end::text,
-              (sample_counts ->> 'seal_turnover_ratio')::int AS seal_samples, sha256
-         FROM strategy_score_benchmark`,
+      `SELECT benchmark.benchmark_code, benchmark.training_start::text, benchmark.training_end::text,
+              (benchmark.sample_counts ->> 'seal_turnover_ratio')::int AS seal_samples, benchmark.sha256
+         FROM strategy_score_benchmark benchmark
+         JOIN strategy_document document
+           ON document.current_revision_id = benchmark.document_revision_id
+        WHERE document.code = 'limit_up_board'`,
     )).rows[0]!;
     expect(benchmark).toEqual({
-      benchmark_code: "daban_v1_3_fixed_20250901_20260122",
+      benchmark_code: "daban_v1_4_fixed_20250901_20260122",
       training_start: "2025-09-01",
       training_end: "2026-01-22",
       seal_samples: 5177,
-      sha256: "95e2fec5477da81a4e952b195b64b7ae262d92687cc726e6657077db3f764ea2",
+      sha256: "b3a53d2308bf56e977fd5a89c7f2305b32db352ac760521e9988bfc2a34de3f1",
     });
     const auction = (await pool.query<{ code: string; cron: string; job_type: string; config: Record<string, unknown>; content: string }>(
       `SELECT definition.code, definition.cron, definition.job_type, definition.config, revision.content
@@ -203,10 +234,13 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     });
     expect(auction.content).toContain("auction_short_term_benchmark");
     expect(auction.content).toContain("auction_snapshot");
-    expect(auction.content).toContain("延续确认·换手晋级观察");
-    expect(auction.content).toContain("不得对打板候选使用 `worth_entering`");
-    expect(auction.content).toContain("精确信号等级、抱团分、主升分、两条路线名次");
-    expect(auction.content).toContain("## 打板机会页面回写口径");
+    expect(auction.content).toContain("tool_catalog");
+    expect(auction.content).toContain("auction_context_query");
+    expect(auction.content).toContain("signal_passed");
+    expect(auction.content).not.toContain("本节替代前文");
+    expect(auction.content).not.toContain("worth_entering");
+    expect(auction.content).not.toContain("## 交易日历缺行降级口径");
+    expect(auction.content.length).toBeLessThan(4_000);
     expect(auction.content).not.toContain("今日池外机会");
     expect(auction.content).not.toContain("S 日一字");
     expect(auction.content).not.toContain("E 日候选");

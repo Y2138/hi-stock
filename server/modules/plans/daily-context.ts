@@ -1,10 +1,10 @@
 // 每日计划确定性上下文：服务层完成机械计算，只向 Agent 返回紧凑结论与覆盖计数。
 import type pg from "pg";
 import { querySectorTemperature } from "../../analysis/service.js";
-import type { StopLossMode } from "../pools/repo.js";
 import { MARKET_STRUCTURE_DATASETS, type MarketStructureDataset } from "../market/structure.js";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
+type StopLossMode = "ma5" | "ma10" | "fixed_90";
 
 interface SyncRunRow {
   id: string;
@@ -136,7 +136,6 @@ interface PositionContextRow {
   role: string | null;
   tags: string[];
   stock_character: string | null;
-  stop_loss_mode: StopLossMode | null;
   indicator_date: string | null;
   ma5: number | null;
   ma10: number | null;
@@ -235,7 +234,7 @@ function stockCharacterText(stockCharacter: string | null, tags: string[]): stri
   return [stockCharacter ?? "", ...tags].join("·");
 }
 
-/** 显式档位优先；旧数据只在股性语义唯一时按“快拉→MA5、慢拉/温吞→MA10”兜底。 */
+/** 每日按当前策略可识别的股性语义选择止损档位。 */
 export function inferStopLossMode(stockCharacter: string | null, tags: string[]): StopLossMode | null {
   const text = stockCharacterText(stockCharacter, tags);
   if (/止损[:：]?MA5/i.test(text)) return "ma5";
@@ -759,7 +758,6 @@ async function queryPositionContext(
     `SELECT instrument.code, instrument.name, instrument.kind,
             position.quantity::float8, position.cost_price::float8, position.opened_at::text,
             membership.pool, membership.role, membership.tags, membership.stock_character,
-            membership.stop_loss_mode,
             indicator.bar_date::text AS indicator_date,
             indicator.ma5::float8, indicator.ma10::float8, indicator.status AS indicator_status,
             metric.as_of_date::text AS metric_date, metric.calculation_version,
@@ -802,14 +800,9 @@ async function queryPositionContext(
   const items = rows.rows.map((row) => {
     if (row.pool === null) gaps.push({ code: row.code, reason: "持仓缺少当前策略角色" });
     const stopRequired = row.pool === "short";
-    const inferredStopLossMode = row.stop_loss_mode === null
-      ? inferStopLossMode(row.stock_character, row.tags)
-      : null;
-    const stopLossMode = row.stop_loss_mode ?? inferredStopLossMode;
-    const stopLossModeSource = row.stop_loss_mode !== null
-      ? "configured" as const
-      : inferredStopLossMode !== null ? "inferred" as const : "missing" as const;
-    if (stopRequired && stopLossMode === null) gaps.push({ code: row.code, reason: "短线止损档位无法从配置或股性确定" });
+    const stopLossMode = inferStopLossMode(row.stock_character, row.tags);
+    const stopLossModeSource = stopLossMode === null ? "missing" as const : "strategy" as const;
+    if (stopRequired && stopLossMode === null) gaps.push({ code: row.code, reason: "每日评估无法按当前策略与股性确定止损档位" });
     let stopReference: number | null = null;
     const indicatorReady = row.indicator_status === "ready" && (!expectedDataDate || row.indicator_date === expectedDataDate);
     if (stopLossMode === "fixed_90") stopReference = row.cost_price * 0.9;
@@ -911,12 +904,11 @@ async function queryPositionContext(
     status: gaps.length === 0 ? "success" as const : "partial" as const,
     position_count: rows.rows.length,
     stop_loss_required_count: requiredStops.length,
-    stop_loss_configured_count: requiredStops.filter((row) => row.stop_loss_mode !== null).length,
-    stop_loss_inferred_count: requiredStops.filter((row) =>
-      row.stop_loss_mode === null && inferStopLossMode(row.stock_character, row.tags) !== null,
+    stop_loss_strategy_count: requiredStops.filter((row) =>
+      inferStopLossMode(row.stock_character, row.tags) !== null,
     ).length,
     stop_loss_resolved_count: requiredStops.filter((row) =>
-      row.stop_loss_mode !== null || inferStopLossMode(row.stock_character, row.tags) !== null,
+      inferStopLossMode(row.stock_character, row.tags) !== null,
     ).length,
     defense_metric_required_count: requiredMetrics.length,
     defense_metric_resolved_count: requiredMetrics.filter((row) =>
@@ -1046,6 +1038,8 @@ export async function queryDailyPlanContext(db: Db, date: string) {
   const leftNearCandidates = finalizedLeftItems.filter((item) =>
     !item.price_signal && (item.stage === "reversal_pattern" || item.failed_conditions.length <= 1),
   );
+  const leftMatches = finalizedLeftItems.filter((item) => item.signal === true);
+  const leftDetailedCodes = new Set([...leftMatches, ...leftNearCandidates].map((item) => item.code));
   const compactLeftSide = {
     status: leftSide.status === "success" && finalizedLeftItems.every((item) => item.signal !== null)
       ? "success" as const : "partial" as const,
@@ -1063,7 +1057,7 @@ export async function queryDailyPlanContext(db: Db, date: string) {
         finalizedLeftItems.filter((item) => item.stage === stage).length,
       ]),
     ),
-    matches: finalizedLeftItems.filter((item) => item.signal === true),
+    matches: leftMatches,
     near_candidates: leftNearCandidates.map((item) => ({
       code: item.code,
       name: item.name,
@@ -1072,12 +1066,22 @@ export async function queryDailyPlanContext(db: Db, date: string) {
       pattern: item.pattern,
       quality_score: item.quality_score,
     })),
-    items: finalizedLeftItems,
+    screened_out: finalizedLeftItems
+      .filter((item) => !leftDetailedCodes.has(item.code))
+      .map((item) => ({
+        code: item.code,
+        name: item.name,
+        stage: item.stage,
+        failed_conditions: item.failed_conditions,
+        quality_score: item.quality_score,
+      })),
     gaps: leftSide.gaps,
   };
   const trialNearCandidates = finalizedTrialItems.filter((item) =>
     !item.price_signal && item.conditions.trial_day_found && item.failed_conditions.length <= 2,
   );
+  const trialMatches = finalizedTrialItems.filter((item) => item.signal === true);
+  const trialDetailedCodes = new Set([...trialMatches, ...trialNearCandidates].map((item) => item.code));
   const compactTrial = {
     status: trial.status === "success" && environmentPassed !== null &&
       finalizedTrialItems.every((item) => item.signal !== null)
@@ -1096,7 +1100,7 @@ export async function queryDailyPlanContext(db: Db, date: string) {
         finalizedTrialItems.filter((item) => item.stage === stage).length,
       ]),
     ),
-    matches: finalizedTrialItems.filter((item) => item.signal === true),
+    matches: trialMatches,
     near_candidates: trialNearCandidates.map((item) => ({
       code: item.code,
       name: item.name,
@@ -1105,7 +1109,15 @@ export async function queryDailyPlanContext(db: Db, date: string) {
       score: item.score,
       trial_date: item.evidence.trial_date,
     })),
-    items: finalizedTrialItems,
+    screened_out: finalizedTrialItems
+      .filter((item) => !trialDetailedCodes.has(item.code))
+      .map((item) => ({
+        code: item.code,
+        name: item.name,
+        stage: item.stage,
+        failed_conditions: item.failed_conditions,
+        score: item.score,
+      })),
     gaps: trial.gaps,
   };
   const selectedSignals = [

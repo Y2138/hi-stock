@@ -23,9 +23,15 @@ import {
   fetchHithinkDatasetAndStore,
   normalizeHithinkDatasetRequest,
 } from "../../server/datasource/hithink-datasets.js";
+import { executeHithinkCapability, HITHINK_CAPABILITIES } from "../../server/datasource/hithink-capabilities.js";
 import { syncAllBoardMemberships, syncBoardMembership, upsertTickerIdentities } from "../../server/datasource/catalog-service.js";
 import { syncLimitDataset, syncLimitLadder } from "../../server/datasource/special-service.js";
-import { calculateDefenseRecovery, calculateIndicators } from "../../server/indicators/formulas.js";
+import {
+  calculateDefenseRecovery,
+  calculateIndicators,
+  calculateStockCharacterProfile,
+  STOCK_CHARACTER_CALCULATION_VERSION,
+} from "../../server/indicators/formulas.js";
 import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
 import { buildOnDemandBars } from "../../server/modules/market/routes.js";
 import { queryMarketStructure } from "../../server/modules/market/structure.js";
@@ -238,6 +244,33 @@ describe("datasource 限流与重试", () => {
     expect(flat[14]!.rsi14).toBe(50);
   });
 
+  it("五维股性、阶段和评分对相同输入稳定且只输出有限数", () => {
+    const closes = Array.from({ length: 160 }, (_, index) => 10 + index * 0.02 + Math.sin(index / 6) * 0.4);
+    const indicators = calculateIndicators(closes);
+    const bars = closes.map((close, index) => ({
+      open: close - 0.05,
+      high: close + 0.2,
+      low: close - 0.2,
+      close,
+      volume: 1_000 + index,
+      ma10: indicators[index]!.ma10,
+      ma20: indicators[index]!.ma20,
+      ma60: indicators[index]!.ma60,
+    }));
+    const first = calculateStockCharacterProfile(bars);
+    expect(calculateStockCharacterProfile(bars)).toEqual(first);
+    expect(STOCK_CHARACTER_CALCULATION_VERSION).toBe("标的入池五维画像一版");
+    expect(Object.keys(first.dimensions)).toEqual(["washout", "markup", "false_breakout", "defense", "volatility"]);
+    expect(first.stage).toBeTypeOf("string");
+    expect(first.grade).toMatch(/^[A-D]$/);
+    expect(first.score).not.toBeNull();
+    expect(Number.isFinite(first.score)).toBe(true);
+    for (const dimension of Object.values(first.dimensions)) {
+      expect(Number.isFinite(dimension.score)).toBe(true);
+      expect(Object.values(dimension.evidence).every((value) => value === null || Number.isFinite(value))).toBe(true);
+    }
+  });
+
   it("护盘收回率只统计跌破MA10且已走满三个后续交易日的事件", () => {
     const rows = [
       11, 9, 9, 10.1, 11, 9, 9, 9, 9, 11, 9,
@@ -269,6 +302,44 @@ describe("datasource 限流与重试", () => {
     await Promise.all(tasks);
     expect(order).toEqual(["first", "high-1", "high-2", "high-3", "high-4", "low", "high-5"]);
     expect(scheduler.snapshot()).toMatchObject({ running: false, completed: 7, failed: 0 });
+  });
+
+  it("扶摇排队和在途 HTTP 请求都响应中断信号", async () => {
+    const scheduler = new HithinkRequestScheduler(0, noopSleep);
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const first = scheduler.schedule("interactive", () => firstGate);
+    let queuedRan = false;
+    const queuedController = new AbortController();
+    const queued = scheduler.schedule("interactive", async () => {
+      queuedRan = true;
+    }, queuedController.signal);
+    queuedController.abort();
+    await expect(queued).rejects.toMatchObject({ name: "AbortError" });
+    releaseFirst();
+    await first;
+    expect(queuedRan).toBe(false);
+
+    let markFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => { markFetchStarted = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init?: RequestInit) => {
+      markFetchStarted();
+      return await new Promise<Response>((_resolve, reject) => {
+        const signal = init!.signal!;
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }));
+    const requestController = new AbortController();
+    const pending = fetchKline({
+      code: "000636.SZ",
+      freq: "day",
+      start: "2026-08-13",
+      end: "2026-08-14",
+    }, { ...noWait, signal: requestController.signal });
+    await fetchStarted;
+    requestController.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    vi.unstubAllGlobals();
   });
 
   it("限流器相邻放行间隔 ≥3 秒（注入 sleep 记录等待时长）", async () => {
@@ -455,6 +526,20 @@ describe("datasource 限流与重试", () => {
     expect(await fetchTradingDays(noWait)).toEqual([{ date: "2026-08-18", sourceUpdatedAt: new Date(timestamp).toISOString() }]);
     expect(await fetchBoardCatalog("concept", noWait)).toMatchObject([{ code: "885001.TI", boardType: "concept" }]);
     expect(await fetchBoardConstituents("885001.TI", noWait)).toMatchObject([{ code: "600000.SH" }]);
+    expect(HITHINK_CAPABILITIES).toHaveLength(59);
+    expect(await executeHithinkCapability("board_constituents", {
+      board: "测试概念",
+      type: "concept",
+    }, noWait)).toMatchObject({
+      board_code: "885001.TI",
+      board_name: "测试概念",
+      item: [{ thscode: "600000.SH" }],
+    });
+    await expect(executeHithinkCapability("adjustment_factors", {
+      code: "600000.SH",
+      from: "2026-08-19",
+      to: "2026-08-18",
+    }, noWait)).rejects.toThrow("to 不能早于 from");
     expect(await fetchLimitPoolPage("up", { tradeDate: "2026-08-18", page: 1 }, noWait)).toMatchObject({ page: 1, pages: 1, total: 1 });
     expect(await fetchDragonTiger("all", "2026-08-18", noWait)).toMatchObject({ boardType: "all", tradeDate: "2026-08-18" });
     vi.unstubAllGlobals();
@@ -936,6 +1021,75 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     expect(Number(day.rows[0]!.ma5)).toBeCloseTo(12, 9);
   });
 
+  it("dailyMarketUpdate 按交易日历回补中间缺口且不把周末当缺口", async () => {
+    const targetDate = "2026-09-07";
+    const missingCode = "600093.SH";
+    const continuousCode = "600094.SH";
+    await pool.query(
+      `INSERT INTO market_trading_day (trade_date, is_open, source) VALUES
+         ('2026-09-03', true, 'test'),
+         ('2026-09-04', true, 'test'),
+         ($1, true, 'test')
+       ON CONFLICT (trade_date) DO UPDATE SET is_open = EXCLUDED.is_open`,
+      [targetDate],
+    );
+    for (const [code, previousDate] of [[missingCode, "2026-09-03"], [continuousCode, "2026-09-04"]] as const) {
+      const instrument = await pool.query<{ id: string }>(
+        `INSERT INTO market_instrument (code, name, kind) VALUES ($1, $1, 'stock')
+         ON CONFLICT (code) DO UPDATE SET kind = 'stock' RETURNING id::text`,
+        [code],
+      );
+      await pool.query(
+        `INSERT INTO market_bar
+           (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, channel)
+         VALUES ($1, 'day', $2, $3, 10, 11, 9, 10, 1000, 'test')`,
+        [instrument.rows[0]!.id, previousDate, `${previousDate}T00:00:00Z`],
+      );
+    }
+    const fetchMock = vi.fn(async (url: unknown) => {
+      const parsed = new URL(String(url));
+      if (parsed.pathname === "/api/a-share/prices/snapshot") {
+        return jsonResponse({
+          code: 0,
+          message: "success",
+          data: {
+            timestamp: Date.parse(`${targetDate}T15:05:00+08:00`),
+            item: [missingCode, continuousCode].map((code) => ({
+              thscode: code,
+              open_price: 10,
+              high_price: 12,
+              low_price: 9,
+              last_price: 11,
+              prev_price: code === missingCode ? 10.5 : 10,
+              volume: 1000,
+            })),
+          },
+        });
+      }
+      if (parsed.pathname === "/api/a-share/prices/historical") {
+        expect(parsed.searchParams.get("thscode")).toBe(missingCode);
+        return jsonResponse(klinePayload(["2026-09-04", targetDate], [10.5, 11]));
+      }
+      throw new Error(`未预期的 URL: ${parsed}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const summary = await dailyMarketUpdate(
+      pool,
+      { codes: [missingCode, continuousCode], date: targetDate },
+      { hithinkDeps: noWait },
+    );
+
+    expect(summary.gaps).toEqual([]);
+    expect(summary.refetched).toEqual([missingCode]);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/historical"))).toHaveLength(1);
+    expect(Number((await pool.query(
+      `SELECT count(*) FROM market_bar bar JOIN market_instrument instrument ON instrument.id = bar.instrument_id
+        WHERE instrument.code = $1 AND bar.freq = 'day' AND bar.bar_date = '2026-09-04'`,
+      [missingCode],
+    )).rows[0]!.count)).toBe(1);
+  });
+
   it("dailyMarketUpdate 历史目标日跳过快照并只补目标日缺口", async () => {
     const targetDate = "2026-08-20";
     const fetchMock = vi.fn(async (url: unknown) => {
@@ -1400,17 +1554,56 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       [instrumentId],
     )).rows[0]!.rsi14)).toBeGreaterThanOrEqual(0);
     expect((await pool.query(
-      `SELECT calculation_version, input_row_count, defense_break_count, defense_recovered_count
+      `SELECT calculation_version, input_row_count, defense_break_count, defense_recovered_count,
+              stock_character_profile, stage, research_score::float8, grade, stock_character, tags
          FROM market_stock_character_metric WHERE instrument_id = $1`,
       [instrumentId],
-    )).rows[0]).toEqual({
-      calculation_version: "最近252日股性指标一版",
+    )).rows[0]).toMatchObject({
+      calculation_version: "标的入池五维画像一版",
       input_row_count: indicatorFixture.input.length,
       defense_break_count: expect.any(Number),
       defense_recovered_count: expect.any(Number),
+      stock_character_profile: {
+        dimensions: {
+          washout: { score: expect.any(Number) },
+          markup: { score: expect.any(Number) },
+          false_breakout: { score: expect.any(Number) },
+          defense: { score: expect.any(Number) },
+          volatility: { score: expect.any(Number) },
+        },
+      },
+      stage: expect.any(String),
+      research_score: expect.any(Number),
+      grade: expect.stringMatching(/^[A-D]$/),
+      stock_character: expect.any(String),
+      tags: expect.arrayContaining(["画像版本：标的入池五维画像一版"]),
     });
     expect(Number((await pool.query(
       "SELECT count(*) FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
+      [instrumentId],
+    )).rows[0]!.count)).toBe(0);
+  });
+
+  it("历史零价日线标为不可信且不阻塞指标队列", async () => {
+    const instrumentId = await ensureInstrument(pool, "600487.SH", "零价测试股票", "day");
+    await storeBars(pool, instrumentId, "day", [{
+      date: "2026-08-21", open: 0, high: 0, low: 0, close: 0, volume: 0, adjustment: "forward",
+    }], "legacy_test");
+    const dirty = await pool.query<{ instrument_id: string; freq: "day"; generation: string }>(
+      "SELECT instrument_id::text, freq, generation::text FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
+      [instrumentId],
+    );
+
+    expect(await recomputeIndicatorSeries(pool, dirty.rows[0]!)).toMatchObject({
+      status: "untrusted",
+      gaps: [{ reason: "2026-08-21 五维股性 OHLC 包含非有限或非正数值" }],
+    });
+    expect(Number((await pool.query(
+      "SELECT count(*) FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
+      [instrumentId],
+    )).rows[0]!.count)).toBe(0);
+    expect(Number((await pool.query(
+      "SELECT count(*) FROM market_stock_character_metric WHERE instrument_id = $1",
       [instrumentId],
     )).rows[0]!.count)).toBe(0);
   });

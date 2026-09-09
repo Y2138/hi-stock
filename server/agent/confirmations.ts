@@ -23,6 +23,7 @@ export const CONFIRMATION_TTL_HOURS = 24;
 
 export const DOMAIN_WRITE_TOOLS = new Set<DomainWriteToolName>([
   "portfolio_write",
+  "pool_onboard",
   "pool_write",
   "job_write",
 ]);
@@ -211,6 +212,7 @@ export async function approveConfirmation(pool: pg.Pool, id: string): Promise<Co
     });
     const targets: Record<string, string[]> = {
       portfolio_write: ["positions", "dashboard", "status"],
+      pool_onboard: ["pools", "dashboard", "market", "datasync"],
       pool_write: ["pools", "dashboard"],
       job_write: ["jobs", "dashboard", "status"],
       finalize_backtest: ["backtests"],

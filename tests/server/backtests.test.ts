@@ -499,6 +499,7 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
       source_retention_status: "versioned",
       comparisons: [expect.objectContaining({ id: prior.rows[0]!.id, hypothesis: "旧假设" })],
     });
+    expect(detailResponse.json).not.toHaveProperty("artifacts");
     const sourceResponse = await api(server.baseUrl, "GET", `/api/backtests/${run.id}/source`);
     expect(sourceResponse.status).toBe(200);
     expect(sourceResponse.json).toMatchObject({

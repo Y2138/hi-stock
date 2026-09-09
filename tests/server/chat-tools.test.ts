@@ -1,5 +1,6 @@
-// 渐进式数据库发现、哈希查询、领域写边界与批量行情测试
+// 渐进式数据库发现、实时结构校验、领域写边界与批量行情测试
 // - fetch_market_data 一次调用顺序处理多项并汇报聚合进度
+import type { AgentContext } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../server/db/migrate.js";
@@ -7,6 +8,10 @@ import { buildChatTools } from "../../server/agent/tools.js";
 import { acquireAgentMutationLock } from "../../server/agent/mutation-lock.js";
 import { appendMessage, createSession } from "../../server/agent/repo.js";
 import { buildSystemPrompt } from "../../server/agent/prompt.js";
+import { createOnDemandToolSet } from "../../server/agent/tool-catalog.js";
+import { HITHINK_CAPABILITIES } from "../../server/datasource/hithink-capabilities.js";
+import { processHithinkResult } from "../../server/agent/hithink-result-processor.js";
+import { queryLimitUpSignals } from "../../server/modules/market/limit-up-signals.js";
 import { persistAndPublishSessionEvent } from "../../server/agent/events.js";
 import { createDeepSeekWebResearchProvider } from "../../server/agent/web-research-provider.js";
 import { storeBars } from "../../server/datasource/service.js";
@@ -18,9 +23,24 @@ import {
   findTrialStartMatch,
   inferStopLossMode,
 } from "../../server/modules/plans/daily-context.js";
+import { evaluateSwingSignal } from "../../server/modules/plans/swing-signals.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
 
 const prepared = await prepareTestDb();
+
+it("扶摇研究筛选不把未披露估值视为低估，并区分上游响应与全量覆盖", () => {
+  const definition = HITHINK_CAPABILITIES.find((item) => item.name === "stock_valuation_snapshot")!;
+  const payload = { total: 5000, item: [{ pe: null }, { pe: 8 }, { pe: -3 }, { pe: 20 }] };
+  const filtered = processHithinkResult(definition, payload, { where: [{ field: "pe", op: "lt", value: 10 }] });
+  expect(filtered.items).toEqual([{ pe: 8 }, { pe: -3 }]);
+  expect(filtered).toMatchObject({ complete: true, complete_scope: "current_response", scanned_count: 4 });
+  expect(processHithinkResult(definition, payload, { order_by: [{ field: "pe", direction: "asc" }] }).items)
+    .toEqual([{ pe: -3 }, { pe: 8 }, { pe: 20 }, { pe: null }]);
+  const nested = { item: [{ metrics: { roe: null } }, { metrics: { roe: 15 } }] };
+  expect(() => processHithinkResult(definition, nested, { select: ["metrics.roee"] })).toThrow("不存在字段");
+  const sparse = { item: [...Array.from({ length: 100 }, () => ({ pe: null })), { pe: 8, roe: 15 }] };
+  expect(processHithinkResult(definition, sparse, { where: [{ field: "roe", op: "gt", value: 10 }] }).matched_count).toBe(1);
+});
 
 describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test 真实库）", () => {
   let pool: pg.Pool;
@@ -50,14 +70,39 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     return JSON.parse(result.content[0]!.text!);
   }
 
-  async function schemaIndex(tables?: string[]): Promise<Array<{ table: string; schema_hash: string }>> {
-    const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "database_schema")!;
-    const result = await tool.execute("tc-schema-index", {
-      operation: "list_tables",
-      ...(tables ? { tables } : {}),
-    });
-    return (textOf(result) as { tables: Array<{ table: string; schema_hash: string }> }).tables;
-  }
+  it("任意标的研究一次返回最新正式画像、财报、估值与缺口，不要求入池且识别待重算", async () => {
+    const id = (await pool.query<{ id: string }>(
+      "INSERT INTO market_instrument (code,name,kind) VALUES ('990071.SZ','池外研究测试','stock') RETURNING id::text",
+    )).rows[0]!.id;
+    const bars = Array.from({ length: 80 }, (_, index) => ({
+      date: new Date(Date.UTC(2026, 3, 1 + index)).toISOString().slice(0, 10),
+      open: 10 + index / 100, high: 10.2 + index / 100, low: 9.8 + index / 100,
+      close: 10.1 + index / 100, volume: 100, adjustment: "forward" as const,
+    }));
+    await storeBars(pool, id, "day", bars, "test");
+    const dirty = (await pool.query<{ instrument_id: string; freq: "day"; generation: string }>(
+      "SELECT instrument_id::text, freq, generation::text FROM market_indicator_dirty WHERE instrument_id=$1", [id],
+    )).rows[0]!;
+    await recomputeIndicatorSeries(pool, dirty);
+    await pool.query(
+      `INSERT INTO fundamental_snapshot (instrument_id,as_of_date,report_period,roe,source,raw_summary)
+       VALUES ($1,'2026-06-19','2026-03-31',12,'test','{"private_payload":"excluded"}')`, [id],
+    );
+    await pool.query(
+      "INSERT INTO valuation_snapshot (instrument_id,as_of_date,pe_ttm,source) VALUES ($1,'2026-06-19',NULL,'test')", [id],
+    );
+    const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "stock_research_query")!;
+    const data = textOf(await tool.execute("research", { codes: ["990071.SZ", "123456.SZ"] })) as { items: Record<string, unknown>[] };
+    expect(data.items[0]).toMatchObject({ code: "990071.SZ", status: "ready", profile_status: "ready",
+      fundamental: { roe: 12, report_period: "2026-03-31" }, valuation: { pe_ttm: null } });
+    expect(data.items[1]).toMatchObject({ code: "123456.SZ", status: "missing" });
+    expect(JSON.stringify(data)).not.toContain("private_payload");
+    expect((await pool.query("SELECT count(*)::int AS count FROM pool_membership WHERE instrument_id=$1", [id])).rows[0].count).toBe(0);
+    await storeBars(pool, id, "day", [{ ...bars.at(-1)!, close: 11 }], "test");
+    const stale = textOf(await tool.execute("research-stale", { codes: ["990071.SZ"] })) as { items: Record<string, unknown>[] };
+    expect(stale.items[0]).toMatchObject({ status: "partial", profile_status: "stale" });
+    await expect(tool.execute("research-invalid", { codes: ["990071.SZ"], sql: "select 1" } as never)).rejects.toThrow("参数校验失败");
+  });
 
   it("试盘启动按近10日试盘、缩量回调和放量突破逐只确定性匹配", () => {
     const rows = Array.from({ length: 15 }, (_, index) => ({
@@ -161,6 +206,100 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(inferStopLossMode("快拉·慢拉", [])).toBeNull();
   });
 
+  it("波段四条件由独立工具全量扫描并排除已有持仓", async () => {
+    const code = "990003.SZ";
+    try {
+      const rows = Array.from({ length: 40 }, (_, index) => {
+        const close = index === 39 ? 11 : 20 - index * 0.25;
+        return {
+          bar_date: new Date(Date.UTC(2026, 6, 10 + index)).toISOString().slice(0, 10),
+          open: index === 39 ? 10.8 : close,
+          high: index === 39 ? 11.2 : close + 0.2,
+          low: index === 39 ? 10.7 : close - 0.2,
+          close,
+          volume: index === 39 ? 50 : 100,
+          rsi14: index === 39 ? 30 : null,
+          indicator_status: "ready" as const,
+        };
+      });
+      expect(evaluateSwingSignal(rows, "stock", 0.4)).toMatchObject({
+        passed_count: 4,
+        price_signal: true,
+        conditions: {
+          volume_contracted: true,
+          reversal_candle: true,
+          rsi_oversold: true,
+          reward_risk_acceptable: true,
+        },
+        evidence: { confirmation_window_available: true },
+      });
+
+      const instrument = await pool.query<{ id: string }>(
+        `INSERT INTO market_instrument (code, name, kind)
+         VALUES ($1, '波段扫描测试股份', 'stock') RETURNING id::text`,
+        [code],
+      );
+      const instrumentId = instrument.rows[0]!.id;
+      await pool.query(
+        `INSERT INTO pool_membership (instrument_id, pool, role, effective_from)
+         VALUES ($1, 'long', '波段', '2026-07-01')`,
+        [instrumentId],
+      );
+      await storeBars(pool, instrumentId, "day", rows.map((row) => ({
+        date: row.bar_date,
+        open: row.open,
+        high: row.high,
+        low: row.low,
+        close: row.close,
+        volume: row.volume!,
+        adjustment: "forward",
+      })), "test");
+      const dirty = await pool.query<{ instrument_id: string; freq: "day"; generation: string }>(
+        "SELECT instrument_id::text, freq, generation::text FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
+        [instrumentId],
+      );
+      expect(await recomputeIndicatorSeries(pool, dirty.rows[0]!)).toMatchObject({ status: "success", rowCount: 40 });
+      await pool.query(
+        "UPDATE market_stock_character_metric SET defense_recovery_ma10 = 0.4 WHERE instrument_id = $1",
+        [instrumentId],
+      );
+
+      const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "swing_signal_query")!;
+      const signal = textOf(await tool.execute("tc-swing-signal", { date: "2026-08-18" })) as {
+        status: string;
+        member_count: number;
+        completed_count: number;
+        signal_count: number;
+        signals: Array<{ code: string; passed_count: number }>;
+      };
+      expect(signal).toMatchObject({ status: "success", member_count: 1, completed_count: 1, signal_count: 1 });
+      expect(signal.signals).toContainEqual(expect.objectContaining({ code, passed_count: 4 }));
+
+      await pool.query(
+        "INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at) VALUES ($1, 100, 11, '2026-08-18')",
+        [instrumentId],
+      );
+      const held = textOf(await tool.execute("tc-swing-held", { date: "2026-08-18" })) as {
+        signal_count: number;
+        held_matched_count: number;
+        suppressed_matches: Array<{ code: string; suppressed_by: string | null }>;
+      };
+      expect(held).toMatchObject({ signal_count: 0, held_matched_count: 1 });
+      expect(held.suppressed_matches).toContainEqual(expect.objectContaining({ code, suppressed_by: "existing_position" }));
+      await expect(tool.execute("tc-swing-strict", { date: "2026-08-18", sql: "select 1" } as never))
+        .rejects.toThrow("参数校验失败");
+    } finally {
+      await pool.query(
+        "DELETE FROM portfolio_position WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = $1)",
+        [code],
+      );
+      await pool.query(
+        "DELETE FROM pool_membership WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = $1)",
+        [code],
+      );
+    }
+  });
+
   it("工具集以纵向业务能力为先、数据库排障能力置后", () => {
     const tools = buildChatTools({ pool, sessionId });
     expect(tools.map((tool) => tool.name)).toEqual([
@@ -168,20 +307,28 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "pool_context_query",
       "job_context_query",
       "strategy_document_query",
+      "hithink_catalog",
+      "hithink_query",
+      "instrument_search",
+      "stock_research_query",
+      "market_snapshot_query",
+      "board_query",
+      "market_event_query",
+      "indicator_query",
       "daily_plan_context_query",
+      "swing_signal_query",
       "limit_up_signal_query",
       "memory_query",
       "web_search",
+      "pool_onboard",
       "portfolio_write",
       "pool_write",
       "job_write",
       "finalize_backtest",
       "memory_write",
-      "pool_attention_write",
-      "daily_plan_write",
-      "auction_assessment_write",
       "strategy_publish_request",
       "analysis_run",
+      "strategy_screen_query",
       "read_backtest_source",
       "run_backtest",
       "fetch_market_data",
@@ -213,7 +360,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(portfolioSchema.required).toEqual(["reason", "changes"]);
     expect(
       tools
-        .filter((tool) => ["portfolio_write", "pool_write", "job_write", "finalize_backtest", "memory_write", "pool_attention_write", "daily_plan_write", "auction_assessment_write", "strategy_publish_request", "analysis_run", "run_backtest", "fetch_market_data", "fetch_hithink_data", "trigger_job"].includes(tool.name))
+        .filter((tool) => ["pool_onboard", "portfolio_write", "pool_write", "job_write", "finalize_backtest", "memory_write", "pool_attention_write", "daily_plan_write", "auction_assessment_write", "strategy_publish_request", "analysis_run", "strategy_screen_query", "run_backtest", "fetch_market_data", "fetch_hithink_data", "hithink_query", "trigger_job"].includes(tool.name))
         .every((tool) => tool.executionMode === "sequential"),
     ).toBe(true);
     const runBacktest = tools.find((tool) => tool.name === "run_backtest")!;
@@ -225,19 +372,291 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       .toEqual(expect.arrayContaining(["market_event_types", "limit_up_universe"]));
     expect((runBacktest.parameters as { properties?: { source_code?: { description?: string } } })
       .properties?.source_code?.description).toContain("必须返回非空 daily_returns");
-    expect(tools.find((tool) => tool.name === "pool_write")!.description)
-      .toContain("标的入池评估指引");
+    expect(tools.find((tool) => tool.name === "pool_onboard")!.description)
+      .toContain("当前买入信号不参与入池");
+    const poolWriteFields = Object.keys((tools.find((tool) => tool.name === "pool_write")!.parameters as {
+      properties?: { operations?: { items?: { properties?: Record<string, unknown> } } };
+    }).properties?.operations?.items?.properties ?? {});
+    expect(poolWriteFields).toEqual([
+      "action", "code", "pool", "attention_reason", "attention_from", "attention_until",
+      "effective_from", "note", "board_codes",
+    ]);
     const databaseQuery = tools.find((tool) => tool.name === "database_query")!;
-    const filterSchema = (databaseQuery.parameters as {
+    const queryItem = (databaseQuery.parameters as {
       properties?: {
-        queries?: { items?: { properties?: { filters?: { items?: { anyOf?: unknown[]; description?: string } } } } };
+        queries?: { items?: {
+          properties?: {
+            schema_hash?: { description?: string };
+            filters?: { items?: { anyOf?: unknown[]; description?: string } };
+          };
+          required?: string[];
+        } };
       };
-    }).properties?.queries?.items?.properties?.filters?.items;
+    }).properties?.queries?.items;
+    const filterSchema = queryItem?.properties?.filters?.items;
     expect(filterSchema?.anyOf).toHaveLength(2);
     expect(filterSchema?.description).toContain("过滤器二选一");
+    expect(queryItem?.required).not.toContain("schema_hash");
+    expect(queryItem?.properties?.schema_hash?.description).toContain("兼容旧调用");
     expect(databaseQuery.label).toContain("低优先级");
     expect(databaseQuery.description).toContain("最多 5 项、每项 100 行");
     expect(tools.at(-1)?.name).toBe("database_query");
+  });
+
+  it("任务会话按提示词声明集裁剪并保留 Web，未知任务不获得专属写入", () => {
+    const full = buildChatTools({ pool, sessionId });
+    const auction = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "auction_opportunity_assessment" });
+    expect(auction.map((tool) => tool.name)).toEqual([
+      "auction_context_query",
+      "strategy_document_query",
+      "web_search",
+      "auction_assessment_write",
+      "fetch_hithink_data",
+    ]);
+    expect(auction.map((tool) => tool.name)).not.toContain("daily_plan_context_query");
+    const dailyPlan = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "daily_plan_flow" });
+    expect(dailyPlan.map((tool) => tool.name)).toEqual([
+      "job_context_query",
+      "strategy_document_query",
+      "daily_plan_context_query",
+      "swing_signal_query",
+      "limit_up_signal_query",
+      "web_search",
+      "pool_attention_write",
+      "daily_plan_write",
+    ]);
+    const midweek = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "midweek_check" });
+    expect(midweek.map((tool) => tool.name)).toEqual([
+      "pool_context_query",
+      "job_context_query",
+      "strategy_document_query",
+      "daily_plan_context_query",
+      "web_search",
+    ]);
+    const weekly = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "weekly_review" });
+    expect(weekly.map((tool) => tool.name)).toEqual([
+      "portfolio_context_query",
+      "pool_context_query",
+      "strategy_document_query",
+      "daily_plan_context_query",
+      "swing_signal_query",
+      "web_search",
+      "analysis_run",
+    ]);
+    const fallback = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "unknown_flow" });
+    expect(fallback.map((tool) => tool.name)).toEqual(full.map((tool) => tool.name));
+    expect(fallback.map((tool) => tool.name)).not.toContain("daily_plan_write");
+    expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "constructor" }).map((tool) => tool.name))
+      .toEqual(full.map((tool) => tool.name));
+    const preloaded = createOnDemandToolSet(dailyPlan, dailyPlan.map((tool) => tool.name));
+    expect(preloaded.initialTools.map((tool) => tool.name)).toEqual([
+      "tool_catalog", ...dailyPlan.map((tool) => tool.name),
+    ]);
+    expect(() => createOnDemandToolSet(auction, ["daily_plan_write"]))
+      .toThrow("预加载工具不在当前授权目录");
+  });
+
+  it("按需工具目录初始只暴露元信息并仅加载当前会话授权工具", async () => {
+    const tools = buildChatTools({ pool, sessionId });
+    const toolSet = createOnDemandToolSet(tools);
+    expect(toolSet.initialTools.map((tool) => tool.name)).toEqual(["tool_catalog"]);
+    const catalog = toolSet.initialTools[0]!;
+    expect(catalog.description).toContain("portfolio_context_query");
+    await expect(catalog.execute("tc-catalog-unknown", { names: ["auction_context_query"] }))
+      .rejects.toThrow("当前会话没有这些工具");
+    await expect(catalog.execute("tc-catalog-duplicate", {
+      names: ["portfolio_context_query", "portfolio_context_query"],
+    })).rejects.toThrow("不得重复");
+    await expect(catalog.execute("tc-catalog-too-many", {
+      names: tools.slice(0, 9).map((tool) => tool.name),
+    })).rejects.toThrow("1-8");
+
+    expect(textOf(await catalog.execute("tc-catalog-load", {
+      names: ["pool_context_query", "strategy_document_query"],
+    }))).toMatchObject({ loaded_count: 2, available_count: tools.length });
+    const next = toolSet.syncContext({ tools: toolSet.initialTools } as AgentContext)!;
+    expect(next.tools?.map((tool) => tool.name)).toEqual([
+      "tool_catalog",
+      "pool_context_query",
+      "strategy_document_query",
+    ]);
+    expect(toolSet.syncContext(next)).toBeUndefined();
+
+    for (const requested of ["database_schema", "database_query"]) {
+      const databaseToolSet = createOnDemandToolSet(tools);
+      const loaded = textOf(await databaseToolSet.initialTools[0]!.execute(
+        `tc-catalog-${requested}`,
+        { names: [requested] },
+      ));
+      expect(loaded).toMatchObject({
+        loaded: expect.arrayContaining(["database_schema", "database_query"]),
+        newly_loaded: expect.arrayContaining(["database_schema", "database_query"]),
+        loaded_count: 2,
+      });
+      expect(databaseToolSet.syncContext({ tools: databaseToolSet.initialTools } as AgentContext)!
+        .tools?.map((tool) => tool.name)).toEqual([
+          "tool_catalog",
+          "database_schema",
+          "database_query",
+        ]);
+    }
+  });
+
+  it("扶摇目录覆盖59项能力，临时查询处理完整响应且不写快照", async () => {
+    const calls: Array<{ capability: string; parameters: Record<string, unknown> }> = [];
+    const tools = buildChatTools({
+      pool,
+      sessionId,
+      queryHithink: async (capability, parameters) => {
+        calls.push({ capability, parameters });
+        return {
+          timestamp: 1_786_265_600_000,
+          board_code: "885001.TI",
+          board_name: "机器人概念",
+          item: [
+            { thscode: "000001.SZ", ticker: "000001", name: "甲公司", score: 1 },
+            { thscode: "000002.SZ", ticker: "000002", name: "乙公司", score: 3 },
+            { thscode: "600001.SH", ticker: "600001", name: "丙公司", score: 2 },
+          ],
+        };
+      },
+    });
+    expect(HITHINK_CAPABILITIES).toHaveLength(59);
+    const catalog = tools.find((tool) => tool.name === "hithink_catalog")!;
+    const searched = textOf(await catalog.execute("tc-hithink-search", {
+      action: "search",
+      query: "概念板块成分",
+    })) as { total_capabilities: number; capabilities: Array<{ name: string }> };
+    expect(searched.total_capabilities).toBe(59);
+    expect(searched.capabilities.map((item) => item.name)).toContain("board_constituents");
+    const described = textOf(await catalog.execute("tc-hithink-describe", {
+      action: "describe",
+      names: ["board_constituents"],
+    })) as { capabilities: Array<{ persistable: boolean; parameters_schema: { properties: Record<string, unknown> } }>; instruction: string };
+    expect(described.capabilities[0]!.persistable).toBe(false);
+    expect(described.instruction).toContain("fetch_hithink_data");
+    const auctionDescribed = textOf(await catalog.execute("tc-hithink-describe", {
+      action: "describe",
+      names: ["auction_snapshot"],
+    })) as { capabilities: Array<{ persistable: boolean }> };
+    expect(auctionDescribed.capabilities[0]!.persistable).toBe(true);
+    expect(described.capabilities[0]!.parameters_schema.properties).toHaveProperty("board");
+
+    const before = await pool.query<{ count: string }>("SELECT count(*)::text AS count FROM hithink_dataset_snapshot");
+    const query = tools.find((tool) => tool.name === "hithink_query")!;
+    const queryResponse = await query.execute("tc-hithink-query", {
+      capability: "board_constituents",
+      parameters: { board: "机器人概念", type: "concept" },
+      result: {
+        select: ["thscode", "name", "score"],
+        where: [{ field: "score", op: "gte", value: 2 }],
+        order_by: [{ field: "score", direction: "desc" }],
+        limit: 1,
+      },
+    });
+    const result = textOf(queryResponse) as {
+      transient: boolean;
+      persisted: boolean;
+      scanned_count: number;
+      matched_count: number;
+      returned_count: number;
+      complete: boolean;
+      next_offset: number;
+      items: Array<Record<string, unknown>>;
+    };
+    expect(queryResponse.details).toMatchObject({
+      ephemeral_data_result: true,
+      capability: "board_constituents",
+      scanned_count: 3,
+      returned_count: 1,
+    });
+    expect(result).toMatchObject({
+      transient: true,
+      persisted: false,
+      scanned_count: 3,
+      matched_count: 2,
+      returned_count: 1,
+      complete: false,
+      next_offset: 1,
+      items: [{ thscode: "000002.SZ", name: "乙公司", score: 3 }],
+    });
+    expect(calls).toEqual([{
+      capability: "board_constituents",
+      parameters: { board: "机器人概念", type: "concept" },
+    }]);
+    await expect(query.execute("tc-hithink-invalid", {
+      capability: "board_constituents",
+      parameters: { board: "机器人概念", path: "/api/private" },
+    })).rejects.toThrow("参数校验失败");
+    expect(calls).toHaveLength(1);
+
+    await expect(query.execute("tc-hithink-sync-only", {
+      capability: "market_dump_daily_k",
+      parameters: {},
+    })).rejects.toThrow("只能通过显式后台同步使用");
+    expect(calls).toHaveLength(1);
+
+    const largeQuery = buildChatTools({
+      pool,
+      sessionId,
+      queryHithink: async () => ({
+        timestamp: 1_786_265_600_000,
+        item: Array.from({ length: 200 }, (_, index) => ({
+          thscode: `${String(index).padStart(6, "0")}.SZ`,
+          name: `样本${index}`,
+          summary: "x".repeat(1000),
+        })),
+      }),
+    }).find((tool) => tool.name === "hithink_query")!;
+    const largeResponse = await largeQuery.execute("tc-hithink-large", {
+      capability: "board_constituents",
+      parameters: { board: "大型概念", type: "concept" },
+      result: { limit: 100 },
+    });
+    const largeResult = textOf(largeResponse) as {
+      matched_count: number;
+      returned_count: number;
+      complete: boolean;
+      next_offset: number;
+      remaining_count: number;
+      truncation_reason: string;
+    };
+    expect(Buffer.byteLength(JSON.stringify(largeResult), "utf8")).toBeLessThan(64 * 1024);
+    expect(largeResult.matched_count).toBe(200);
+    expect(largeResult.returned_count).toBeLessThan(100);
+    expect(largeResult.complete).toBe(false);
+    expect(largeResult.next_offset).toBe(largeResult.returned_count);
+    expect(largeResult.remaining_count).toBe(200 - largeResult.returned_count);
+    expect(largeResult.truncation_reason).toContain("对象边界缩减");
+
+    await appendMessage(pool, {
+      session_id: sessionId,
+      seq: 98,
+      role: "tool",
+      json: {
+        role: "toolResult",
+        toolCallId: "tc-hithink-large",
+        toolName: "hithink_query",
+        isError: false,
+        content: largeResponse.content,
+        details: largeResponse.details,
+        timestamp: Date.now(),
+      },
+    });
+    const persisted = await pool.query<{ content: string }>(
+      "SELECT content::text FROM chat_message WHERE session_id=$1 AND seq=98",
+      [sessionId],
+    );
+    expect(persisted.rows[0]!.content).not.toContain("样本0");
+    expect(persisted.rows[0]!.content).not.toContain("summary");
+    expect(persisted.rows[0]!.content).toContain("数据明细不会保存到会话");
+    const audits = await pool.query<{ args: unknown }>(
+      "SELECT args FROM agent_tool_audit WHERE tool_name='hithink_query' ORDER BY id",
+    );
+    expect(JSON.stringify(audits.rows)).not.toContain("样本0");
+    expect(JSON.stringify(audits.rows)).not.toContain("summary");
+    const after = await pool.query<{ count: string }>("SELECT count(*)::text AS count FROM hithink_dataset_snapshot");
+    expect(after.rows[0]!.count).toBe(before.rows[0]!.count);
   });
 
   it("纵向上下文一次返回组合、标的池、作业与按需策略正文", async () => {
@@ -259,6 +678,14 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       };
     expect(pools.pools[0]!.members).toContainEqual(expect.objectContaining({ code: "990002.SZ" }));
 
+    const poolSummary = textOf(await tools.find((tool) => tool.name === "pool_context_query")!
+      .execute("tc-pool-context-summary", { pools: ["short"] })) as {
+        pools: Array<{ detail_level: string; members: Array<Record<string, unknown>> }>;
+      };
+    expect(poolSummary.pools[0]!.detail_level).toBe("summary");
+    expect(poolSummary.pools[0]!.members[0]).toMatchObject({ detail_available: true });
+    expect(poolSummary.pools[0]!.members[0]).not.toHaveProperty("evaluation_summary");
+
     const jobs = textOf(await tools.find((tool) => tool.name === "job_context_query")!
       .execute("tc-job-context", { job_codes: ["daily_plan_flow"], recent_runs_per_job: 2 })) as {
         jobs: Array<{ definition: { code: string } }>;
@@ -271,6 +698,13 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       };
     expect(strategy.documents[0]).toMatchObject({ code: "test_strategy" });
     expect(strategy.documents[0]!.current_content).toContain("# 测试当前策略");
+    const currentSignal = textOf(await tools.find((tool) => tool.name === "limit_up_signal_query")!
+      .execute("tc-limit-snapshot", { date: "2026-08-18" })) as { strategy_revision_id: string };
+    const currentRevision = (await pool.query("SELECT current_revision_id::text FROM strategy_document WHERE code='limit_up_board'")).rows[0]!.current_revision_id;
+    expect(currentSignal.strategy_revision_id).toBe(currentRevision);
+    expect(await queryLimitUpSignals(pool, "2026-08-18", null)).toMatchObject({
+      status: "unavailable", strategy_revision_id: null, signals: [],
+    });
   });
 
   it("database_query 超过总字节预算时返回可续页的明确截断", async () => {
@@ -282,12 +716,10 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
            FROM generate_series(1, 100) value`,
         [prefix],
       );
-      const [entry] = await schemaIndex(["market_instrument"]);
       const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "database_query")!;
       const result = await tool.execute("tc-full-query-result", {
         queries: [{
           table: "market_instrument",
-          schema_hash: entry!.schema_hash,
           columns: ["code", "name"],
           filters: [{ column: "code", op: "like", value: `${prefix}%` }],
           order_by: [{ column: "code", direction: "asc" }],
@@ -372,20 +804,22 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     } as never)).rejects.toThrow("参数校验失败");
   });
 
-  it("市场领域工具默认不注册，开启后仍按执行时开关和严格参数约束", async () => {
+  it("市场领域工具始终注册并按严格参数约束执行", async () => {
     const candidateNames = [
       "instrument_search",
+      "stock_research_query",
       "market_snapshot_query",
       "board_query",
       "market_event_query",
       "indicator_query",
     ];
-    const defaults = buildChatTools({ pool, sessionId });
-    expect(defaults.map((tool) => tool.name)).not.toEqual(expect.arrayContaining(candidateNames));
-    expect(defaults.map((tool) => tool.name)).not.toContain("web_research");
-    expect(defaults.map((tool) => tool.name)).toContain("daily_plan_context_query");
-    expect(defaults.map((tool) => tool.name)).toContain("limit_up_signal_query");
-    const limitScore = defaults.find((tool) => tool.name === "limit_up_signal_query")!;
+    const tools = buildChatTools({ pool, sessionId });
+    expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(candidateNames));
+    expect(tools.map((tool) => tool.name)).not.toContain("web_research");
+    expect(tools.map((tool) => tool.name)).toContain("daily_plan_context_query");
+    expect(tools.map((tool) => tool.name)).toContain("swing_signal_query");
+    expect(tools.map((tool) => tool.name)).toContain("limit_up_signal_query");
+    const limitScore = tools.find((tool) => tool.name === "limit_up_signal_query")!;
     expect(textOf(await limitScore.execute("tc-limit-score", { date: "2026-08-17" }))).toMatchObject({
       date: "2026-08-17",
       status: "success",
@@ -396,7 +830,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     await expect(limitScore.execute("tc-limit-score-strict", { date: "2026-08-17", page: 1 } as never))
       .rejects.toThrow("参数校验失败");
 
-    const schema = defaults.find((tool) => tool.name === "database_schema")!;
+    const schema = tools.find((tool) => tool.name === "database_schema")!;
     const schemaResult = await schema.execute("tc-pool-memory-schema", { operation: "list_tables" });
     const tableNames = (textOf(schemaResult) as { tables: Array<{ table: string }> }).tables
       .map((table) => table.table);
@@ -409,121 +843,130 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "portfolio_account_state",
     ]));
 
-    await pool.query("UPDATE agent_setting SET market_domain_tools_enabled=true WHERE singleton=true");
-    try {
-      const tools = buildChatTools({ pool, sessionId, marketDomainToolsEnabled: true });
-      expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(candidateNames));
-      expect(tools.map((tool) => tool.name)).not.toContain("web_research");
+    const search = tools.find((tool) => tool.name === "instrument_search")!;
+    expect(textOf(await search.execute("tc-market-search", { q: "990002", limit: 5 })))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "990002.SZ" })]));
+    await expect(search.execute("tc-market-strict", {
+      q: "990002",
+      sql: "SELECT * FROM market_instrument",
+      url: "https://example.invalid",
+    } as never)).rejects.toThrow("参数校验失败");
 
-      const search = tools.find((tool) => tool.name === "instrument_search")!;
-      expect(textOf(await search.execute("tc-market-search", { q: "990002", limit: 5 })))
-        .toEqual(expect.arrayContaining([expect.objectContaining({ code: "990002.SZ" })]));
-      await expect(search.execute("tc-market-strict", {
-        q: "990002",
-        sql: "SELECT * FROM market_instrument",
-        url: "https://example.invalid",
-      } as never)).rejects.toThrow("参数校验失败");
+    const instrument = await pool.query<{ id: string }>(
+      "SELECT id::text FROM market_instrument WHERE code = '990002.SZ'",
+    );
+    const instrumentId = instrument.rows[0]!.id;
+    await storeBars(pool, instrumentId, "day", Array.from({ length: 21 }, (_, index) => {
+      const date = new Date(Date.UTC(2026, 6, index + 26)).toISOString().slice(0, 10);
+      const close = index + 10;
+      return { date, open: close, high: close + 1, low: close - 1, close, volume: 1000 + index, adjustment: "forward" };
+    }), "test");
+    const dirty = await pool.query<{ instrument_id: string; freq: "day"; generation: string }>(
+      "SELECT instrument_id::text, freq, generation::text FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
+      [instrumentId],
+    );
+    expect(await recomputeIndicatorSeries(pool, dirty.rows[0]!)).toMatchObject({ status: "success", rowCount: 21 });
+    const indicator = tools.find((tool) => tool.name === "indicator_query")!;
+    const indicatorResult = textOf(await indicator.execute("tc-market-indicator", {
+      codes: ["990002.SZ"],
+      freq: "day",
+      end: "2026-08-15",
+      limit: 10,
+    })) as Array<{ status: string; values: Array<{ close: number; volume: number; rsi14: number | null }> }>;
+    expect(indicatorResult[0]!.status).toBe("success");
+    expect(indicatorResult[0]!.values).toHaveLength(10);
+    expect(indicatorResult[0]!.values.at(-1)).toMatchObject({ close: 30, volume: 1020, rsi14: 100 });
 
-      const instrument = await pool.query<{ id: string }>(
-        "SELECT id::text FROM market_instrument WHERE code = '990002.SZ'",
-      );
-      const instrumentId = instrument.rows[0]!.id;
-      await storeBars(pool, instrumentId, "day", Array.from({ length: 21 }, (_, index) => {
-        const date = new Date(Date.UTC(2026, 6, index + 26)).toISOString().slice(0, 10);
-        const close = index + 10;
-        return { date, open: close, high: close + 1, low: close - 1, close, volume: 1000 + index, adjustment: "forward" };
-      }), "test");
-      const dirty = await pool.query<{ instrument_id: string; freq: "day"; generation: string }>(
-        "SELECT instrument_id::text, freq, generation::text FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
-        [instrumentId],
-      );
-      expect(await recomputeIndicatorSeries(pool, dirty.rows[0]!)).toMatchObject({ status: "success", rowCount: 21 });
-      const indicator = tools.find((tool) => tool.name === "indicator_query")!;
-      const indicatorResult = textOf(await indicator.execute("tc-market-indicator", {
-        codes: ["990002.SZ"],
-        freq: "day",
-        end: "2026-08-15",
-        limit: 10,
-      })) as Array<{ status: string; values: Array<{ close: number; volume: number; rsi14: number | null }> }>;
-      expect(indicatorResult[0]!.status).toBe("success");
-      expect(indicatorResult[0]!.values).toHaveLength(10);
-      expect(indicatorResult[0]!.values.at(-1)).toMatchObject({ close: 30, volume: 1020, rsi14: 100 });
-
-      await pool.query(
-        `INSERT INTO market_special_sync_run
-           (dataset, target_date, status, completed_pages, total_pages, row_count, gaps, finished_at)
-         VALUES ('limit_up', '2026-08-18', 'success', 1, 1, 1, '[]', now());
-         INSERT INTO market_special_sync_run
-           (dataset, target_date, status, completed_pages, total_pages, row_count, gaps, finished_at)
-         VALUES ('limit_down', '2026-08-18', 'success', 0, 0, 0, '[]', now());
-         INSERT INTO market_limit_event
-           (trade_date, event_type, instrument_id, event_price, source_payload, source_row_sha256)
-         SELECT '2026-08-18', 'up', id, 12.34,
-                '{"provider_secret":"MARKET_PAYLOAD_MUST_NOT_ESCAPE"}'::jsonb,
-                'market-tool-test'
-           FROM market_instrument WHERE code='990002.SZ'
-         ON CONFLICT (trade_date, event_type, instrument_id) DO UPDATE
-           SET source_payload=EXCLUDED.source_payload`,
-      );
-      const dailyContext = tools.find((tool) => tool.name === "daily_plan_context_query")!;
-      await pool.query(
-        `UPDATE pool_membership
-            SET stock_character = '凶狠·快拉·护盘中', tags = '["股性：快拉"]', stop_loss_mode = NULL
-          WHERE instrument_id = $1 AND effective_to IS NULL`,
-        [instrumentId],
-      );
-      await pool.query(
-        `INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at)
-         VALUES ($1, 10, 20, '2026-08-01')
-         ON CONFLICT (instrument_id) DO UPDATE SET quantity = 10, cost_price = 20, opened_at = '2026-08-01'`,
-        [instrumentId],
-      );
-      const dailyContextResult = textOf(await dailyContext.execute("tc-daily-context", { date: "2026-08-18" })) as {
-        trial_start_scan: { stock_member_count: number; completed_count: number; items: Array<{ stage: string }> };
-        right_side_signal_scan: { stock_member_count: number; completed_count: number };
-        left_reversal_scan: { stock_member_count: number; completed_count: number; gaps: Array<{ code: string }> };
-        signal_selection: { priority: string[]; selected_count: number };
-        positions: {
-          stop_loss_inferred_count: number;
-          items: Array<{ code: string; stop_loss_mode: string; stop_loss_mode_source: string }>;
-        };
-        market_structure_sync: { datasets: Array<{ dataset: string; valid_empty: boolean }> };
+    await pool.query(
+      `INSERT INTO market_special_sync_run
+         (dataset, target_date, status, completed_pages, total_pages, row_count, gaps, finished_at)
+       VALUES ('limit_up', '2026-08-18', 'success', 1, 1, 1, '[]', now());
+       INSERT INTO market_special_sync_run
+         (dataset, target_date, status, completed_pages, total_pages, row_count, gaps, finished_at)
+       VALUES ('limit_down', '2026-08-18', 'success', 0, 0, 0, '[]', now());
+       INSERT INTO market_limit_event
+         (trade_date, event_type, instrument_id, event_price, source_payload, source_row_sha256)
+       SELECT '2026-08-18', 'up', id, 12.34,
+              '{"provider_secret":"MARKET_PAYLOAD_MUST_NOT_ESCAPE"}'::jsonb,
+              'market-tool-test'
+         FROM market_instrument WHERE code='990002.SZ'
+       ON CONFLICT (trade_date, event_type, instrument_id) DO UPDATE
+         SET source_payload=EXCLUDED.source_payload`,
+    );
+    const dailyContext = tools.find((tool) => tool.name === "daily_plan_context_query")!;
+    await pool.query(
+      `UPDATE pool_membership
+          SET stock_character = '凶狠·快拉·护盘中', tags = '["股性：快拉"]'
+        WHERE instrument_id = $1 AND effective_to IS NULL`,
+      [instrumentId],
+    );
+    await pool.query(
+      `INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at)
+       VALUES ($1, 10, 20, '2026-08-01')
+       ON CONFLICT (instrument_id) DO UPDATE SET quantity = 10, cost_price = 20, opened_at = '2026-08-01'`,
+      [instrumentId],
+    );
+    const dailyContextResult = textOf(await dailyContext.execute("tc-daily-context", { date: "2026-08-18" })) as {
+      trial_start_scan: {
+        stock_member_count: number;
+        completed_count: number;
+        matches: unknown[];
+        near_candidates: unknown[];
+        screened_out: unknown[];
       };
-      expect(dailyContextResult.trial_start_scan).toMatchObject({ stock_member_count: 1, completed_count: 1 });
-      expect(dailyContextResult.trial_start_scan.items).toHaveLength(1);
-      expect(dailyContextResult.right_side_signal_scan).toMatchObject({ stock_member_count: 1, completed_count: 0 });
-      expect(dailyContextResult.left_reversal_scan).toMatchObject({ stock_member_count: 1, completed_count: 1 });
-      expect(dailyContextResult.left_reversal_scan.gaps).toEqual([]);
-      expect(dailyContextResult.signal_selection.priority).toEqual(["right_side", "left_reversal", "trial_start"]);
-      expect(dailyContextResult.signal_selection.selected_count).toBe(0);
-      expect(dailyContextResult.positions.stop_loss_inferred_count).toBe(1);
-      expect(dailyContextResult.positions.items).toContainEqual(expect.objectContaining({
-        code: "990002.SZ",
-        stop_loss_mode: "ma5",
-        stop_loss_mode_source: "inferred",
-      }));
-      expect(dailyContextResult.market_structure_sync.datasets).toContainEqual(expect.objectContaining({
-        dataset: "limit_down",
-        valid_empty: true,
-      }));
-      await expect(dailyContext.execute("tc-daily-context-strict", { date: "2026-08-18", sql: "select 1" } as never))
-        .rejects.toThrow("参数校验失败");
-      const event = tools.find((tool) => tool.name === "market_event_query")!;
-      const eventResult = await event.execute("tc-market-event", {
-        date: "2026-08-18",
-        dataset: "limit_up",
-        page: 1,
-        size: 20,
-      });
-      expect(JSON.stringify(eventResult)).not.toContain("source_payload");
-      expect(JSON.stringify(eventResult)).not.toContain("MARKET_PAYLOAD_MUST_NOT_ESCAPE");
-
-      await pool.query("UPDATE agent_setting SET market_domain_tools_enabled=false WHERE singleton=true");
-      await expect(search.execute("tc-market-disabled", { q: "990002" }))
-        .rejects.toThrow("市场领域工具开关已关闭");
-    } finally {
-      await pool.query("UPDATE agent_setting SET market_domain_tools_enabled=false WHERE singleton=true");
-    }
+      right_side_signal_scan: { stock_member_count: number; completed_count: number };
+      left_reversal_scan: {
+        stock_member_count: number;
+        completed_count: number;
+        matches: unknown[];
+        near_candidates: unknown[];
+        screened_out: unknown[];
+        gaps: Array<{ code: string }>;
+      };
+      signal_selection: { priority: string[]; selected_count: number };
+      positions: {
+        stop_loss_strategy_count: number;
+        items: Array<{ code: string; stop_loss_mode: string; stop_loss_mode_source: string }>;
+      };
+      market_structure_sync: { datasets: Array<{ dataset: string; valid_empty: boolean }> };
+    };
+    expect(dailyContextResult.trial_start_scan).toMatchObject({ stock_member_count: 1, completed_count: 1 });
+    expect([
+      ...dailyContextResult.trial_start_scan.matches,
+      ...dailyContextResult.trial_start_scan.near_candidates,
+      ...dailyContextResult.trial_start_scan.screened_out,
+    ]).toHaveLength(dailyContextResult.trial_start_scan.completed_count);
+    expect(dailyContextResult.right_side_signal_scan).toMatchObject({ stock_member_count: 1, completed_count: 0 });
+    expect(dailyContextResult.left_reversal_scan).toMatchObject({ stock_member_count: 1, completed_count: 1 });
+    expect([
+      ...dailyContextResult.left_reversal_scan.matches,
+      ...dailyContextResult.left_reversal_scan.near_candidates,
+      ...dailyContextResult.left_reversal_scan.screened_out,
+    ]).toHaveLength(dailyContextResult.left_reversal_scan.completed_count);
+    expect(dailyContextResult.left_reversal_scan.gaps).toEqual([]);
+    expect(dailyContextResult.signal_selection.priority).toEqual(["right_side", "left_reversal", "trial_start"]);
+    expect(dailyContextResult.signal_selection.selected_count).toBe(0);
+    expect(dailyContextResult.positions.stop_loss_strategy_count).toBe(1);
+    expect(dailyContextResult.positions.items).toContainEqual(expect.objectContaining({
+      code: "990002.SZ",
+      stop_loss_mode: "ma5",
+      stop_loss_mode_source: "strategy",
+    }));
+    expect(dailyContextResult.market_structure_sync.datasets).toContainEqual(expect.objectContaining({
+      dataset: "limit_down",
+      valid_empty: true,
+    }));
+    await expect(dailyContext.execute("tc-daily-context-strict", { date: "2026-08-18", sql: "select 1" } as never))
+      .rejects.toThrow("参数校验失败");
+    const event = tools.find((tool) => tool.name === "market_event_query")!;
+    const eventResult = await event.execute("tc-market-event", {
+      date: "2026-08-18",
+      dataset: "limit_up",
+      page: 1,
+      size: 20,
+    });
+    expect(JSON.stringify(eventResult)).not.toContain("source_payload");
+    expect(JSON.stringify(eventResult)).not.toContain("MARKET_PAYLOAD_MUST_NOT_ESCAPE");
   });
 
   it("execute 入口独立拒绝未知字段、歧义操作和无效日期", async () => {
@@ -669,7 +1112,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(index.find((table) => table.table === "portfolio_position")?.domain).toBe("持仓");
     const result = await tool.execute("tc-q1-describe", {
       operation: "describe_tables",
-      tables: index.map((table) => ({ table: table.table, schema_hash: table.schema_hash })),
+      tables: index.map((table) => ({ table: table.table })),
     });
     const data = textOf(result) as {
       tables: {
@@ -694,14 +1137,11 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     const membership = data.tables.find((table) => table.table === "pool_membership")!;
     expect(membership.foreign_keys.map((key) => key.referenced_table)).toContain("market_instrument");
 
-    const refreshed = textOf(await tool.execute("tc-q1-refresh", {
+    const legacyHash = textOf(await tool.execute("tc-q1-legacy-hash", {
       operation: "describe_tables",
       tables: [{ table: "portfolio_position", schema_hash: "0".repeat(64) }],
-    })) as { refreshed_tables: string[]; tables: Array<{ table: string; schema_hash: string }> };
-    expect(refreshed.refreshed_tables).toEqual(["portfolio_position"]);
-    expect(refreshed.tables[0]!.schema_hash).toBe(
-      index.find((table) => table.table === "portfolio_position")!.schema_hash,
-    );
+    })) as { tables: Array<{ table: string }> };
+    expect(legacyHash.tables[0]!.table).toBe("portfolio_position");
   });
 
   it("database_query 一次批量查询多个领域", async () => {
@@ -709,22 +1149,17 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     await pool.query(
       "UPDATE job_definition SET updated_at = '2026-08-20T07:22:56.044952Z' WHERE code = 'daily_market_structure'",
     );
-    const index = await schemaIndex(["market_instrument", "pool_membership", "job_definition"]);
-    const hash = (table: string) => index.find((item) => item.table === table)!.schema_hash;
-    const jobDefinitionHash = hash("job_definition");
     const result = await tool.execute("tc-q2", {
       queries: [
         {
           name: "标的",
           table: "market_instrument",
-          schema_hash: hash("market_instrument"),
           columns: ["code", "name"],
           filters: [{ column: "code", op: "eq", value: "990002.SZ" }],
         },
         {
           name: "池角色",
           table: "pool_membership",
-          schema_hash: hash("pool_membership"),
           filters: [{ column: "effective_to", op: "is_null", value: null }],
           mode: "count",
         },
@@ -733,8 +1168,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
           table: "job_definition",
           columns: ["code", "updated_at"],
           filters: [{ column: "code", op: "eq", value: "daily_market_structure" }],
-          // 长不透明值的尾部可能被模型抄错；前 128 位一致仍代表同一 Schema 版本。
-          schema_hash: `${jobDefinitionHash.slice(0, 32)}${"0".repeat(32)}`,
         },
       ],
     });
@@ -749,13 +1182,12 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     await expect(tool.execute("tc-q2-invalid-null-filter", {
       queries: [{
         table: "pool_membership",
-        schema_hash: hash("pool_membership"),
         filters: [{ column: "effective_to", op: "is_null", value: "unexpected" }],
       }],
     })).rejects.toThrow("参数校验失败");
   });
 
-  it("系统提示词说明全部工具、主要数据领域与当前执行模式", async () => {
+  it("系统提示词说明分层读取路由、主要数据领域与当前执行模式", async () => {
     await pool.query(
       `INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at)
        SELECT id, 10, 10, '2026-08-01' FROM market_instrument WHERE code = '990002.SZ'
@@ -767,13 +1199,15 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     );
     const normal = await buildSystemPrompt(pool);
     for (const tool of [
+      "tool_catalog",
       "portfolio_context_query",
       "pool_context_query",
       "job_context_query",
+      "auction_context_query",
       "strategy_document_query",
       "database_schema",
       "database_query",
-      "memory_query",
+      "pool_onboard",
       "portfolio_write",
       "pool_write",
       "job_write",
@@ -782,13 +1216,19 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "strategy_publish_request",
       "analysis_run",
       "read_backtest_source",
-      "run_backtest",
       "fetch_market_data",
       "fetch_hithink_data",
-      "trigger_job",
+      "hithink_catalog",
+      "hithink_query",
+      "indicator_query",
+      "daily_plan_context_query",
+      "swing_signal_query",
+      "limit_up_signal_query",
     ]) {
       expect(normal).toContain(tool);
     }
+    expect(normal).toContain("分层原则：先纵向聚合工具，一次取齐必要事实");
+    expect(normal).toContain("具体参数与用法以工具自身描述为准");
     for (const domain of [
       "market_*",
       "portfolio_position",
@@ -804,14 +1244,17 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(normal).toContain("不可信输入");
     expect(normal).toContain("数据库级写锁");
     expect(normal).toContain("不得自动盲重试");
-    expect(normal).toContain("低优先级数据库排障索引");
-    expect(normal).toContain("schema_hash=");
+    expect(normal).toContain("内部只读探索索引");
+    expect(normal).not.toContain("schema_hash=");
     expect(normal).toContain("单一事实源");
     expect(normal).toContain("目标日交易计划只对它标注的交易日有效");
-    expect(normal).toContain("标的入池评估指引");
-    expect(normal).toContain("当前页面只能作为待验证假设");
-    expect(normal).toContain("只有数据库无法提供故事性、催化剂、产业变化、公告或外部风险证据时才使用 web_search");
-    expect(normal).toContain("短线池·短线、长线池·波段、长线池·长线，或暂不入池");
+    expect(normal).toContain("标的入池初始化指引");
+    expect(normal).toContain("当前无右侧、左侧、试盘或波段信号不得阻止入池");
+    expect(normal).toContain("已明确的可选池别/角色");
+    expect(normal).toContain("用 tool_catalog 只加载 pool_onboard，然后调用一次");
+    expect(normal).toContain("不得再用行情、指标、分析或 pool_write 拼装入池流程");
+    expect(normal).toContain("database_schema/database_query 是受控只读兜底");
+    expect(normal).toContain("止损也不是入池字段");
     expect(normal).toContain("content_* 是迁移后冻结的旧内容审计");
     expect(normal).toContain("本轮策略文档轻量目录");
     expect(normal).toContain("测试当前策略｜code=test_strategy");
@@ -990,7 +1433,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
   it("database_query 非法表写 error 审计", async () => {
     const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "database_query")!;
     await expect(
-      tool.execute("tc-q3", { queries: [{ table: "missing_table", schema_hash: "a".repeat(64) }] }),
+      tool.execute("tc-q3", { queries: [{ table: "missing_table" }] }),
     ).rejects.toThrow("不在 Agent 排障读取清单");
     const audit = await pool.query(
       "SELECT status FROM agent_tool_audit WHERE tool_name = 'database_query'",
@@ -998,14 +1441,22 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(audit.rows.map((r) => r.status)).toContain("error");
   });
 
-  it("database_query 在执行前拒绝已漂移的 schema_hash", async () => {
-    const [entry] = await schemaIndex(["market_instrument"]);
+  it("database_query 兼容旧 hash，但始终按当前结构实时校验", async () => {
     await pool.query("ALTER TABLE market_instrument ADD COLUMN schema_drift_probe text");
     try {
       const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "database_query")!;
-      await expect(tool.execute("tc-schema-drift", {
-        queries: [{ table: "market_instrument", schema_hash: entry!.schema_hash, columns: ["code"] }],
-      })).rejects.toThrow("Schema 已变化");
+      const result = textOf(await tool.execute("tc-schema-drift", {
+        queries: [{
+          table: "market_instrument",
+          schema_hash: "已过期的旧值",
+          columns: ["code", "schema_drift_probe"],
+          filters: [{ column: "code", op: "eq", value: "990002.SZ" }],
+        }],
+      })) as { queries: Array<{ rows: Array<{ code: string; schema_drift_probe: null }> }> };
+      expect(result.queries[0]!.rows[0]).toMatchObject({
+        code: "990002.SZ",
+        schema_drift_probe: null,
+      });
     } finally {
       await pool.query("ALTER TABLE market_instrument DROP COLUMN schema_drift_probe");
     }

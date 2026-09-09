@@ -138,7 +138,7 @@ export function resultRefsOfTool(tool: ToolResultLike): ResultRef[] {
     const change = record(result.change);
     if (typeof change?.id === "string") return [{ type: "position-change", id: change.id }];
   }
-  if (tool.name === "pool_write") {
+  if (tool.name === "pool_onboard" || tool.name === "pool_write") {
     const member = record(result.after) ?? record(result.before);
     if (typeof member?.pool === "string" && typeof member.code === "string") {
       return [{ type: "pool-member", id: `${member.pool}:${member.code}` }];

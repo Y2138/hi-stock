@@ -11,6 +11,7 @@ import {
 import { subscribeSessionEvents, type SessionEventFrame } from "../../server/agent/events.js";
 import { createSession } from "../../server/agent/repo.js";
 import { buildChatTools } from "../../server/agent/tools.js";
+import { storeBars } from "../../server/datasource/service.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
 
 const prepared = await prepareTestDb();
@@ -153,7 +154,7 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
     }
   });
 
-  it("pool_write、job_write 均通过领域 service 执行", async () => {
+  it("pool_onboard 初始化后经一次确认入池，pool_write 只维护板块排序", async () => {
     const board = await pool.query<{ id: string }>(
       "INSERT INTO market_instrument (code,name,kind) VALUES ('881999.TI','确认测试行业','board') RETURNING id::text",
     );
@@ -163,47 +164,100 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
        SELECT $1,id,'2026-08-17' FROM market_instrument WHERE code='990001.SZ'`,
       [board.rows[0]!.id],
     );
-    await expect(findTool("pool_write").execute("tc-pool-missing-stop", {
-      reason: "短线止损档位缺失必须拒绝",
-      operations: [{
-        action: "add",
-        code: "990001.SZ",
-        pool: "short",
-        role: "观察",
-        grade: "A",
-        score: 5,
-        tags: ["确认测试"],
-        stock_character: "中波动",
-        stage: "观察",
-        evaluation_summary: "已完成确认制永久测试所需评估",
-        effective_from: "2026-08-17",
-      }],
-    })).rejects.toThrow("必须提供 stop_loss_mode");
-    const poolProposal = await findTool("pool_write").execute("tc-pool", {
-      reason: "登记标的池角色",
-      operations: [
-        {
-          action: "add",
-          code: "990001.SZ",
-          pool: "short",
-          role: "观察",
-          grade: "A",
-          score: 5,
-          tags: ["确认测试"],
-          stock_character: "中波动",
-          stop_loss_mode: "ma10",
-          stage: "观察",
-          evaluation_summary: "已完成确认制永久测试所需评估",
-          effective_from: "2026-08-17",
-        },
-        { action: "set_board_order", pool: "short", board_codes: ["881999.TI"] },
-      ],
+    const instrumentId = (await pool.query<{ id: string }>(
+      "SELECT id::text FROM market_instrument WHERE code = '990001.SZ'",
+    )).rows[0]!.id;
+    const bars = Array.from({ length: 140 }, (_, index) => {
+      const close = 10 + index * 0.02 + Math.sin(index / 5) * 0.25;
+      return {
+        date: new Date(Date.UTC(2026, 0, 1 + index)).toISOString().slice(0, 10),
+        open: close - 0.05,
+        high: close + 0.2,
+        low: close - 0.2,
+        close,
+        volume: 1_000 + index,
+        adjustment: "forward" as const,
+      };
     });
+    await storeBars(pool, instrumentId, "day", bars, "test");
+    await pool.query(
+      `INSERT INTO fundamental_snapshot
+         (instrument_id, as_of_date, report_period, revenue, net_profit, operating_cashflow, roe, source)
+       VALUES ($1, $2, $2, 1000, 100, 120, 12, 'hithink')`,
+      [instrumentId, bars.at(-1)!.date],
+    );
+    await pool.query(
+      `INSERT INTO valuation_snapshot (instrument_id, as_of_date, pe_ttm, pb, ps_ttm, source)
+       VALUES ($1, $2, 15, 2, 3, 'hithink')`,
+      [instrumentId, bars.at(-1)!.date],
+    );
+    const poolOnboard = buildChatTools({
+      pool,
+      sessionId,
+      fetchMarket: async (request) => ({
+        code: request.code,
+        freq: request.freq,
+        channel: "test",
+        rowsWritten: bars.length,
+        fetchRunId: "1",
+        firstDate: bars[0]!.date,
+        lastDate: bars.at(-1)!.date,
+      }),
+      fetchFinancial: async (request) => ({
+        code: request.code,
+        status: "success",
+        valuationRows: 1,
+        fundamentalRows: 1,
+        rowsWritten: 2,
+        fetchRunId: "2",
+        gaps: [],
+      }),
+    }).find((tool) => tool.name === "pool_onboard")!;
+    const poolProposal = await poolOnboard.execute("tc-pool", {
+      instrument: "确认测试股份",
+      requested_role: "短线",
+      reason: "初始化完整档案并登记标的池角色",
+    });
+    expect(poolProposal.details).toMatchObject({ tool_name: "pool_onboard" });
     await approveConfirmation(pool, (poolProposal.details as { confirmation_id: string }).confirmation_id);
-    expect((await pool.query("SELECT role, stop_loss_mode FROM pool_membership WHERE effective_to IS NULL")).rows[0]).toEqual({
-      role: "观察",
-      stop_loss_mode: "ma10",
+    expect((await pool.query(
+      `SELECT role, grade, score::float8, stock_character_profile, profile_as_of::text,
+              profile_calculation_version, profile_input_sha256
+         FROM pool_membership WHERE effective_to IS NULL`,
+    )).rows[0]).toMatchObject({
+      role: "短线",
+      grade: expect.stringMatching(/^[A-D]$/),
+      score: expect.any(Number),
+      stock_character_profile: { dimensions: { washout: {}, markup: {}, false_breakout: {}, defense: {}, volatility: {} } },
+      profile_as_of: bars.at(-1)!.date,
+      profile_calculation_version: "标的入池五维画像一版",
+      profile_input_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
+
+    const confirmationCount = Number((await pool.query("SELECT count(*) FROM agent_confirmation")).rows[0]!.count);
+    const incompleteOnboard = buildChatTools({
+      pool,
+      sessionId,
+      fetchMarket: async (request) => ({
+        code: request.code, freq: request.freq, channel: "test", rowsWritten: bars.length,
+        fetchRunId: "3", firstDate: bars[0]!.date, lastDate: bars.at(-1)!.date,
+      }),
+      fetchFinancial: async (request) => ({
+        code: request.code, status: "partial", valuationRows: 1, fundamentalRows: 0,
+        rowsWritten: 1, fetchRunId: "4", gaps: [{ domain: "fundamental", reason: "测试缺口" }],
+      }),
+    }).find((tool) => tool.name === "pool_onboard")!;
+    await expect(incompleteOnboard.execute("tc-pool-incomplete", {
+      instrument: "990001.SZ",
+      reason: "财务缺口不得生成入池确认",
+    })).rejects.toThrow("财务与估值同步不完整");
+    expect(Number((await pool.query("SELECT count(*) FROM agent_confirmation")).rows[0]!.count)).toBe(confirmationCount);
+
+    const orderProposal = await findTool("pool_write").execute("tc-pool-order", {
+      reason: "维护短线池板块顺序",
+      operations: [{ action: "set_board_order", pool: "short", board_codes: ["881999.TI"] }],
+    });
+    await approveConfirmation(pool, (orderProposal.details as { confirmation_id: string }).confirmation_id);
 
     const promptProposal = await findTool("job_write").execute("tc-prompt", {
       reason: "创建测试作业提示词",
