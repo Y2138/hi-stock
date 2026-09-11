@@ -101,7 +101,7 @@ describe("打板固定基准评分", () => {
       "theme_pre5_return", "theme_width", "stock_pre5_return",
     ].map((key) => [key, [0, 1]])) as LimitUpBenchmark["distributions"];
     const candidates = scoreLimitUpFeatureRows(rows, {
-      code: "test", revision_id: "1", training_start: "2025-01-01", training_end: "2025-06-30",
+      code: "test", document_id: "1", training_start: "2025-01-01", training_end: "2025-06-30",
       methodology: "test", distributions, sample_counts: {}, source_summary: {}, sha256: "0".repeat(64),
     });
     expect(candidates.filter((item) => item.signal_grade === "A").map((item) => item.code))

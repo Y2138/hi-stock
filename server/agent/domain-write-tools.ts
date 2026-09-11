@@ -4,7 +4,7 @@
 import type pg from "pg";
 import { applyPoolChange, setPoolBoardOrder } from "../modules/pools/repo.js";
 import { resolvePoolOnboarding } from "../modules/pools/onboarding.js";
-import { recordPositionChange } from "../modules/positions/repo.js";
+import { recordPositionChange, updatePositionEntrySignalType } from "../modules/positions/repo.js";
 import { finalizeBacktest } from "../modules/backtests/repo.js";
 import { applyMemoryChange } from "../modules/memory/repo.js";
 import { createJobDefinition, updateJobDefinition } from "../scheduler/repo.js";
@@ -21,6 +21,7 @@ import {
   validatePoolOnboardCommitInput,
   validatePoolWriteInput,
   validatePortfolioWriteInput,
+  validatePositionEntrySignalWriteInput,
   type JobWriteInput,
   type FinalizeBacktestInput,
   type MemoryWriteInput,
@@ -28,12 +29,14 @@ import {
   type PoolWriteOperation,
   type PoolWriteInput,
   type PortfolioWriteInput,
+  type PositionEntrySignalWriteInput,
 } from "./tool-validation.js";
 import { sha256Json } from "./hash.js";
 import { sameTimestampVersion } from "../db/timestamp.js";
 
 export type DomainWriteToolName =
   | "portfolio_write"
+  | "position_entry_signal_write"
   | "pool_onboard"
   | "pool_write"
   | "job_write"
@@ -42,6 +45,7 @@ export type DomainWriteToolName =
 
 export type DomainWriteInput =
   | PortfolioWriteInput
+  | PositionEntrySignalWriteInput
   | PoolOnboardCommitInput
   | PoolWriteInput
   | JobWriteInput
@@ -51,6 +55,7 @@ export type DomainWriteInput =
 function validateDomainInput(toolName: DomainWriteToolName, input: unknown): DomainWriteInput {
   switch (toolName) {
     case "portfolio_write": return validatePortfolioWriteInput(input);
+    case "position_entry_signal_write": return validatePositionEntrySignalWriteInput(input);
     case "pool_onboard": return validatePoolOnboardCommitInput(input);
     case "pool_write": return validatePoolWriteInput(input);
     case "job_write": return validateJobWriteInput(input);
@@ -111,6 +116,27 @@ async function portfolioState(
   return { instrument, position, latest_change: latestChange, passed_signals: passedSignals.rows };
 }
 
+async function positionEntrySignalState(
+  client: pg.PoolClient,
+  input: PositionEntrySignalWriteInput,
+  lock: boolean,
+): Promise<unknown> {
+  const instrument = await oneRow(
+    client,
+    `SELECT id::text, code, name FROM market_instrument WHERE code = $1${lock ? " FOR UPDATE" : ""}`,
+    [input.code],
+  );
+  if (!instrument) throw new Error(`未知标的代码：${input.code}`);
+  const position = await oneRow(
+    client,
+    `SELECT instrument_id::text, quantity::text, opened_at::text, entry_signal_type
+       FROM portfolio_position WHERE instrument_id = $1 AND quantity > 0${lock ? " FOR UPDATE" : ""}`,
+    [instrument.id],
+  );
+  if (!position) throw new Error(`标的 ${input.code} 当前无持仓，不能修正买入信号类型`);
+  return { instrument, position };
+}
+
 async function poolState(client: pg.PoolClient, input: PoolWriteOperation, lock: boolean): Promise<unknown> {
   if (input.action === "set_board_order") {
     const rows = await client.query(
@@ -132,7 +158,7 @@ async function poolState(client: pg.PoolClient, input: PoolWriteOperation, lock:
     client,
     `SELECT id::text, pool, role, grade, score::text, tags, stock_character,
             stock_character_profile, stage, evaluation_summary, profile_as_of::text,
-            profile_calculation_version, profile_input_sha256, attention_reason,
+            profile_calculation_version, profile_input_sha256, attention_signal, attention_reason,
             attention_from::text, attention_until::text, effective_from::text, effective_to::text, note
        FROM pool_membership
       WHERE instrument_id = $1 AND effective_to IS NULL
@@ -203,7 +229,7 @@ async function jobState(client: pg.PoolClient, input: JobWriteInput, lock: boole
   if (input.action === "update_job") {
     const job = await oneRow(
       client,
-      `SELECT id::text, code, name, cron, job_type, config, prompt_id::text, enabled,
+      `SELECT id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, enabled,
               to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
          FROM job_definition WHERE code = $1${lock ? " FOR UPDATE" : ""}`,
       [input.code],
@@ -260,6 +286,8 @@ async function targetState(
       }
       return states;
     }
+    case "position_entry_signal_write":
+      return positionEntrySignalState(client, input as PositionEntrySignalWriteInput, lock);
     case "pool_onboard": return resolvePoolOnboarding(client, input as PoolOnboardCommitInput, lock);
     case "pool_write": {
       const value = input as PoolWriteInput;
@@ -289,6 +317,7 @@ export interface DomainWritePreview {
 
 const DOMAIN_LABELS: Record<DomainWriteToolName, string> = {
   portfolio_write: "持仓",
+  position_entry_signal_write: "持仓信号归因",
   pool_onboard: "标的入池初始化",
   pool_write: "标的池",
   job_write: "作业",
@@ -308,6 +337,15 @@ function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput, s
         quantity: change.quantity,
         price: change.price,
       })),
+    };
+  }
+  if (toolName === "position_entry_signal_write") {
+    const value = input as PositionEntrySignalWriteInput;
+    const position = (state as { position: { entry_signal_type: string | null } | null }).position;
+    return {
+      code: value.code,
+      previous_entry_signal_type: position?.entry_signal_type ?? null,
+      entry_signal_type: value.entry_signal_type,
     };
   }
   if (toolName === "pool_onboard") {
@@ -424,12 +462,23 @@ export async function executeDomainWriteInTransaction(
           source_session_id: options.sessionId,
           decision_origin: change.decision_origin,
           execution_compliance: change.execution_compliance,
+          entry_signal_type: change.entry_signal_type,
           plan_output_id: change.plan_output_id,
           attribution_note: change.attribution_note,
           deviation_reason: change.deviation_reason,
         }));
       }
       return { total: items.length, items };
+    }
+    case "position_entry_signal_write": {
+      const value = input as PositionEntrySignalWriteInput;
+      return updatePositionEntrySignalType(client, {
+        code: value.code,
+        entry_signal_type: value.entry_signal_type,
+        reason: value.reason,
+        source: "chat",
+        source_session_id: options.sessionId,
+      });
     }
     case "pool_onboard": {
       const resolved = await resolvePoolOnboarding(client, input as PoolOnboardCommitInput, true);
@@ -470,6 +519,7 @@ export async function executeDomainWriteInTransaction(
           job_type: value.job_type,
           config: value.config,
           prompt_id: value.prompt_id,
+          model_id: value.model_id,
           enabled: value.enabled,
         });
       }

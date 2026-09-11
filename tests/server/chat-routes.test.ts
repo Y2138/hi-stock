@@ -457,6 +457,34 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     expect((after.json as unknown as unknown[]).length).toBe(4);
   });
 
+  it("会话后续轮次自动恢复已加载工具且模型请求启用通用重试", async () => {
+    faux.setResponses([
+      fauxAssistantMessage(
+        [fauxToolCall("tool_catalog", { names: ["web_search"] })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxText("已完成首轮工具装载")]),
+    ]);
+    const session = await createSession(pool, "工具跨轮复用测试");
+    const first = await postSse(session.id, { text: "加载网页搜索工具" });
+    expect(first.frames.map((frame) => frame.type)).toContain("done");
+
+    faux.setResponses([async (context, options) => {
+      expect(context.tools?.map((tool) => tool.name)).toEqual(["tool_catalog", "web_search"]);
+      expect(context.tools?.find((tool) => tool.name === "tool_catalog")?.description)
+        .toContain("当前会话已加载：web_search");
+      expect(options).toMatchObject({ maxRetries: 2, maxRetryDelayMs: 30_000 });
+      return fauxAssistantMessage([fauxText("第二轮直接复用网页搜索工具")]);
+    }]);
+    const second = await postSse(session.id, { text: "继续分析" });
+    expect(second.frames.map((frame) => frame.type)).toContain("done");
+
+    const catalogStarts = (await listChatSessionEvents(pool, session.id))
+      .filter((event) => event.event_type === "tool_start")
+      .filter((event) => (event.data as { name?: string }).name === "tool_catalog");
+    expect(catalogStarts).toHaveLength(1);
+  });
+
   it("交互对话达到输出上限时自动续写，不要求用户再次发送继续", async () => {
     faux.setResponses([
       fauxAssistantMessage([fauxText("")], { stopReason: "length" }),
@@ -660,6 +688,7 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
               quantity: 10,
               price: 12,
               change_date: "2026-08-17",
+              entry_signal_type: "discretionary",
               decision_origin: "strategy_signal",
               execution_compliance: "matched",
             }],
@@ -1201,7 +1230,7 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     const conf = await createConfirmation(pool, {
       session_id: session.id,
       tool_name: "portfolio_write",
-      payload: { reason: "事件通道测试", code: "990003.SZ", kind: "buy", quantity: 1, price: 1, change_date: "2026-08-14", decision_origin: "strategy_signal", execution_compliance: "matched" },
+      payload: { reason: "事件通道测试", code: "990003.SZ", kind: "buy", quantity: 1, price: 1, change_date: "2026-08-14", entry_signal_type: "discretionary", decision_origin: "strategy_signal", execution_compliance: "matched" },
     });
     const approved = await api(
       server.baseUrl,

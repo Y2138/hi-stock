@@ -1,0 +1,10 @@
+ALTER TABLE notification_setting ADD COLUMN job_codes text[];
+COMMENT ON COLUMN notification_setting.job_codes IS '推送的Agent任务编码；空值代表全部，空数组代表不订阅任何任务';
+COMMENT ON COLUMN notification_setting.enabled IS 'Agent任务成功结论自动推送总开关';
+ALTER TABLE notification_delivery DROP CONSTRAINT notification_delivery_kind_check;
+ALTER TABLE notification_delivery DROP CONSTRAINT notification_delivery_check;
+ALTER TABLE notification_delivery ADD CONSTRAINT notification_delivery_kind_check CHECK (kind IN ('daily_plan','agent_result','test'));
+ALTER TABLE notification_delivery ADD CONSTRAINT notification_delivery_output_check CHECK ((kind IN ('daily_plan','agent_result')) = (output_id IS NOT NULL));
+COMMENT ON COLUMN notification_delivery.kind IS 'Agent任务结果、兼容历史每日计划通知或连接测试';
+COMMENT ON COLUMN notification_delivery.output_id IS 'Agent任务结果编号，测试通知为空';
+CREATE INDEX notification_delivery_status_page ON notification_delivery(status, id DESC);

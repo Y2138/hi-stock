@@ -9,6 +9,7 @@ import {
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
 import { ApiError } from "../../http/router.js";
 import { DatabaseCredentialStore } from "./credentials.js";
@@ -26,6 +27,21 @@ export interface ResolvedChatModel {
 }
 
 let injectedRuntime: ResolvedChatModel | null = null;
+
+export const DEFAULT_LLM_MAX_RETRIES = 2;
+export const DEFAULT_LLM_MAX_RETRY_DELAY_MS = 30_000;
+
+/**
+ * 统一模型流入口：仅重试供应商适配器判定为可恢复的连接、超时、限流和服务端错误。
+ * 已收到响应并开始流式输出后的中断不会重放，避免重复文本或工具调用。
+ */
+export function resilientChatStream(runtime: ResolvedChatModel): StreamFn {
+  return (model, context, options) => runtime.models.streamSimple(model, context, {
+    ...options,
+    maxRetries: options?.maxRetries ?? DEFAULT_LLM_MAX_RETRIES,
+    maxRetryDelayMs: options?.maxRetryDelayMs ?? DEFAULT_LLM_MAX_RETRY_DELAY_MS,
+  });
+}
 
 /** 永久测试使用 faux provider 注入；生产路径始终从数据库组装。 */
 export function setAiRuntimeForTests(runtime: ResolvedChatModel | null): void {

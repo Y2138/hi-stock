@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { enqueueJobConclusion } from "../modules/notifications/service.js";
 import path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
@@ -14,6 +15,7 @@ import {
   discardDraftAuctionAssessmentsForRun,
 } from "../modules/plans/repo.js";
 import { PROJECT_ROOT } from "../config.js";
+import { inServiceTransaction } from "../db/transaction.js";
 import {
   dailyMarketUpdate,
   type DailyUpdateScope,
@@ -31,7 +33,6 @@ import {
 } from "../datasource/special-service.js";
 import {
   getCurrentStrategy,
-  getStrategySnapshot,
   type StrategyBundle,
 } from "../modules/strategy/repo.js";
 import { exportVolume, type VolumeExportResult } from "../volume/export.js";
@@ -47,6 +48,7 @@ import type {
   JobStatus,
 } from "./types.js";
 
+const CONCLUSION_INSTRUCTION = "最终正文末尾增加二级标题‘结论摘要’，用 3～6 条、总计不超过 600 字概括本次最终判断，保留前提、触发条件、风险和数据缺口；不要重复推理过程。确实没有结论时仅写‘暂无结论’，不得把执行进度冒充结论。";
 const MAX_LOG_CHARS = 100_000;
 const RESULT_BANNER = "> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。";
 const AGENT_FLOW_FINALIZE_PROMPT =
@@ -241,6 +243,7 @@ function buildAgentJobPrompt(
       `系统正在重试作业 ${definition.code}（目标日 ${run.target_date}，第 ${run.attempt_count} 次尝试）。`,
       "请结合本对话第一条任务要求和已有执行记录重新完成任务，并直接输出完整 Markdown。",
       `正文开头必须包含独立一行完成标记：${RESULT_BANNER}`,
+      CONCLUSION_INSTRUCTION,
     ].join("\n\n");
   }
   const capability = "本任务使用受控工具目录及当前确认制/YOLO 设置；已在工具列表中的能力直接调用，缺少定义时才通过 tool_catalog 加载。策略发布仍只能创建待真人审核提案。";
@@ -251,6 +254,7 @@ function buildAgentJobPrompt(
     `请直接输出完整 Markdown。正文开头必须包含独立一行完成标记：${RESULT_BANNER}`,
     "以下是数据库内固化的流程提示词；遵循其读取范围和输出结构：",
     template,
+    CONCLUSION_INSTRUCTION,
   ].join("\n\n");
 }
 
@@ -342,28 +346,18 @@ async function runAgentFlow(
   return markdown;
 }
 
+/**
+ * 作业运行只固化当前策略作为归因标签，不保存也不重建历史正文；重试时始终使用当前策略。
+ */
 async function pinJobStrategySnapshot(pool: pg.Pool, run: JobRunRow): Promise<StrategyBundle> {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
-    const pinned = await client.query<{
-      strategy_change_seq: string | null;
-      strategy_snapshot_hash: string | null;
-      session_id: string | null;
-    }>(
-      `SELECT strategy_change_seq::text, strategy_snapshot_hash, session_id::text
-         FROM job_run WHERE id = $1 FOR UPDATE`,
+  return inServiceTransaction(pool, async (client) => {
+    const strategy = await getCurrentStrategy(client);
+    const pinned = await client.query<{ strategy_change_seq: string | null }>(
+      `SELECT strategy_change_seq::text FROM job_run WHERE id = $1 FOR UPDATE`,
       [run.id],
     );
-    const row = pinned.rows[0];
-    if (!row) throw new Error(`作业运行不存在：${run.id}`);
-    const strategy = row.strategy_change_seq === null
-      ? await getCurrentStrategy(client)
-      : await getStrategySnapshot(client, row.strategy_change_seq);
-    if (row.strategy_snapshot_hash && row.strategy_snapshot_hash !== strategy.state.current_hash) {
-      throw new Error(`作业固化策略快照哈希不一致：change_seq=${row.strategy_change_seq}`);
-    }
-    if (row.strategy_change_seq === null) {
+    if (!pinned.rows[0]) throw new Error(`作业运行不存在：${run.id}`);
+    if (pinned.rows[0].strategy_change_seq === null) {
       await client.query(
         `UPDATE job_run
             SET strategy_change_seq = $2, strategy_snapshot_hash = $3
@@ -371,24 +365,10 @@ async function pinJobStrategySnapshot(pool: pg.Pool, run: JobRunRow): Promise<St
         [run.id, strategy.state.change_seq, strategy.state.current_hash],
       );
     }
-    if (row.session_id) {
-      await client.query(
-        `UPDATE chat_session
-            SET strategy_state_revision = $2, strategy_state_sha256 = $3, updated_at = now()
-          WHERE id = $1`,
-        [row.session_id, strategy.state.change_seq, strategy.state.current_hash],
-      );
-    }
-    await client.query("COMMIT");
     run.strategy_change_seq = strategy.state.change_seq;
     run.strategy_snapshot_hash = strategy.state.current_hash;
     return strategy;
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw error;
-  } finally {
-    client.release();
-  }
+  });
 }
 
 async function pinJobPromptRevision(
@@ -617,6 +597,7 @@ async function finishRun(
       ).rows[0]?.id ?? null;
       await activatePlaybookForRun(client, run.id, outputId);
       await activateAuctionAssessmentsForRun(client, run.id, outputId);
+      if (outputId && status === "success") await enqueueJobConclusion(client, outputId);
     }
     await client.query("COMMIT");
     return { run: finished, outputId };
@@ -731,10 +712,10 @@ export async function executeJobRun(deps: RunnerDeps, runId: string): Promise<Jo
     await setJobSessionStatus(deps.pool, finished.run.session_id, result.status, finishedAt)
       .catch((error) => logConversationSyncError(finished.run.id, error));
     const refreshTargets = detail.job.code === "daily_plan_flow"
-      ? ["jobs", "status", "dashboard", "positions", "pools"]
+      ? ["jobs", "status", "dashboard", "positions", "pools", "market"]
       : detail.job.code === "auction_opportunity_assessment"
-        ? ["jobs", "status", "dashboard"]
-      : ["jobs", "status"];
+        ? ["jobs", "status", "dashboard", "market"]
+        : ["jobs", "status"];
     await publishJobRefresh(deps.pool, finished.run.session_id, "任务运行与结果已更新", refreshTargets)
       .catch((error) => logConversationSyncError(finished.run.id, error));
     return finished.run;

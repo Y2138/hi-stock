@@ -3,12 +3,28 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { runMigrations } from "../../server/db/migrate.js";
 import { createPool } from "../../server/db/client.js";
-import { applyPoolChange, setPoolBoardOrder } from "../../server/modules/pools/repo.js";
-import { recordPositionChange } from "../../server/modules/positions/repo.js";
+import { applyPoolChange, setPoolAttention, setPoolBoardOrder } from "../../server/modules/pools/repo.js";
+import { attentionSignalLabel, compareAttentionQuality } from "../../web/src/utils/poolAttention.js";
+import { recordPositionChange, updatePositionEntrySignalType } from "../../server/modules/positions/repo.js";
 import { marketRoutes } from "../../server/modules/market/routes.js";
 import { api, prepareTestDb, resetSchema, seedTestStrategy, startTestServer, type TestServer } from "./helpers.js";
 
 const prepared = await prepareTestDb();
+
+it("近期关注按信号完整度分档，同档不使用研究评分或缺口条数", () => {
+  const members = [
+    { code: "000003.SZ", attention_signal: { status: "approaching" as const, missing_signals: ["放量"] } },
+    { code: "000001.SZ", attention_signal: null },
+    { code: "000004.SZ", attention_signal: { status: "qualified" as const, missing_signals: [] } },
+    { code: "000002.SZ", attention_signal: { status: "approaching" as const, missing_signals: ["放量", "突破"] } },
+    { code: "000005.SZ", attention_signal: { status: "approaching" as const, missing_signals: [] } },
+  ];
+  expect([...members].sort(compareAttentionQuality).map((member) => member.code))
+    .toEqual(["000004.SZ", "000002.SZ", "000003.SZ", "000005.SZ", "000001.SZ"]);
+  expect(attentionSignalLabel(members[0]!)).toBe("待补信号 · 次日观察");
+  expect(attentionSignalLabel(members[1]!)).toBe("信号状态未明确");
+  expect(attentionSignalLabel(members[2]!)).toBe("信号已成立");
+});
 
 describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真实库）", () => {
   let pool: pg.Pool;
@@ -157,7 +173,7 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await recordPositionChange(pool, {
       code: "600487.SH", kind: "buy", quantity: 600, price: 60, change_date: "2026-08-14",
       source: "chat", source_session_id: sessionId, decision_origin: "strategy_signal",
-      execution_compliance: "matched", attribution_note: "按当日已确认信号记录",
+      execution_compliance: "matched", entry_signal_type: "right_side", attribution_note: "按当日已确认信号记录",
     });
     const partialSell = await recordPositionChange(pool, {
       code: "600487.SH", kind: "sell", quantity: 200, price: 65, change_date: "2026-08-15",
@@ -201,9 +217,67 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await expect(recordPositionChange(pool, {
       code: "000021.SZ", kind: "buy", quantity: 100, price: 40, change_date: "2026-08-14",
       source: "chat", source_session_id: sessionId, decision_origin: "unplanned_exception",
-      execution_compliance: "deviated",
+      execution_compliance: "deviated", entry_signal_type: "discretionary",
     })).rejects.toThrow("deviation_reason");
     expect(Number((await pool.query("SELECT count(*) FROM portfolio_position_change WHERE decision_origin = 'unplanned_exception'")).rows[0]!.count)).toBe(0);
+  });
+
+  it("买入必须声明信号类型，事件与持仓行同步维护口径，修正走留痕事件", async () => {
+    await expect(recordPositionChange(pool, {
+      code: "000021.SZ", kind: "buy", quantity: 100, price: 40, change_date: "2026-08-14",
+      source: "chat", source_session_id: sessionId, decision_origin: "unplanned_exception",
+      execution_compliance: "matched", deviation_reason: "盘中临时决策",
+    })).rejects.toThrow("entry_signal_type");
+
+    const buy = await recordPositionChange(pool, {
+      code: "000021.SZ", kind: "buy", quantity: 100, price: 40, change_date: "2026-08-14",
+      source: "chat", source_session_id: sessionId, decision_origin: "unplanned_exception",
+      execution_compliance: "matched", deviation_reason: "盘中临时决策",
+      entry_signal_type: "discretionary",
+    });
+    expect(buy.change).toMatchObject({ kind: "buy", entry_signal_type: "discretionary" });
+    expect((await pool.query<{ entry_signal_type: string | null }>(
+      "SELECT entry_signal_type FROM portfolio_position WHERE instrument_id = $1",
+      [buy.change.instrument_id],
+    )).rows[0]).toEqual({ entry_signal_type: "discretionary" });
+
+    // 加仓携带新类型时，当前管理口径切换为最近一笔买入的类型。
+    await recordPositionChange(pool, {
+      code: "000021.SZ", kind: "buy", quantity: 100, price: 42, change_date: "2026-08-15",
+      source: "chat", source_session_id: sessionId, decision_origin: "strategy_signal",
+      execution_compliance: "matched", entry_signal_type: "swing",
+    });
+    expect((await pool.query<{ entry_signal_type: string | null }>(
+      "SELECT entry_signal_type FROM portfolio_position WHERE instrument_id = $1",
+      [buy.change.instrument_id],
+    )).rows[0]).toEqual({ entry_signal_type: "swing" });
+
+    // 卖出事件不允许携带信号类型。
+    await expect(recordPositionChange(pool, {
+      code: "000021.SZ", kind: "sell", quantity: 50, price: 44, change_date: "2026-08-16",
+      source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
+      execution_compliance: "matched", entry_signal_type: "swing",
+    })).rejects.toThrow("entry_signal_type");
+
+    const corrected = await updatePositionEntrySignalType(pool, {
+      code: "000021.SZ", entry_signal_type: "swing", reason: "核对当日波段四条件证据后修正",
+      source: "chat", source_session_id: sessionId,
+    });
+    expect(corrected.previous_type).toBe("swing");
+    expect(corrected.position).toMatchObject({ code: "000021.SZ", entry_signal_type: "swing" });
+    const buys = await pool.query<{ entry_signal_type: string | null }>(
+      `SELECT entry_signal_type FROM portfolio_position_change
+        WHERE instrument_id = $1 AND kind = 'buy' ORDER BY change_date, id`,
+      [buy.change.instrument_id],
+    );
+    expect(buys.rows.map((row) => row.entry_signal_type)).toEqual(["discretionary", "swing"]);
+    const note = await pool.query<{ decision_origin: string; attribution_note: string }>(
+      `SELECT decision_origin, attribution_note FROM portfolio_position_change
+        WHERE instrument_id = $1 AND kind = 'note'`,
+      [buy.change.instrument_id],
+    );
+    expect(note.rows[0]).toMatchObject({ decision_origin: "fact_correction" });
+    expect(note.rows[0]!.attribution_note).toContain("swing");
   });
 
   it("短线池/长线池只按官方行业投影完整研究属性", async () => {
@@ -319,24 +393,47 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
       code: "600487.SH", attention_reason: "等待右侧量价确认",
       attention_from: "2026-08-18", attention_until: "2026-08-25",
     }] });
-    await applyPoolChange(pool, {
-      action: "update",
-      code: "600487.SH",
-      pool: "short",
-      effective_from: "2026-08-18",
-      attention_reason: null,
-      attention_from: null,
-      attention_until: null,
+    const removed = await api(server!.baseUrl, "DELETE", "/api/pools/short/600487.SH/attention");
+    expect(removed).toMatchObject({ status: 200, json: {
+      code: "600487.SH", pool: "short", role: "短线", grade: "A",
+      stock_character: "高波动", stage: "右侧确认", evaluation_summary: "完整短线评估",
+      attention_signal: null, attention_reason: null, attention_from: null, attention_until: null,
+    } });
+    expect(Number((await pool.query("SELECT count(*) FROM pool_membership WHERE effective_to IS NULL")).rows[0]!.count)).toBe(before);
+    expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{
+      code: "600487.SH", attention_signal: null,
+      attention_reason: null, attention_from: null, attention_until: null,
+    }] });
+    expect(await api(server!.baseUrl, "DELETE", "/api/pools/short/999999.SH/attention"))
+      .toMatchObject({ status: 404, json: { error: { code: "NOT_FOUND" } } });
+  });
+
+  it("信号缺口落库后由池接口返回，人工改写原因会清除旧信号状态", async () => {
+    await setPoolAttention(pool, {
+      code: "600487.SH", pool: "short", attention_reason: "每日计划·即将符合：等待确认",
+      attention_from: "2026-08-18", attention_until: "2026-08-25",
+      attention_signal: { status: "approaching", missing_signals: ["右侧：放量站稳关键位"] },
     });
     expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{
-      code: "600487.SH", attention_reason: null, attention_from: null, attention_until: null,
+      code: "600487.SH", attention_signal: { status: "approaching", missing_signals: ["右侧：放量站稳关键位"] },
     }] });
+    await applyPoolChange(pool, {
+      action: "update", code: "600487.SH", pool: "short", effective_from: "2026-08-18", attention_until: "2026-08-26",
+    });
+    expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{
+      attention_signal: { status: "approaching", missing_signals: ["右侧：放量站稳关键位"] },
+    }] });
+    await applyPoolChange(pool, {
+      action: "update", code: "600487.SH", pool: "short", effective_from: "2026-08-18", attention_reason: "人工持续跟踪",
+    });
+    expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{ attention_signal: null }] });
   });
 
   it("买入成交只清除每日计划自动关注并保留人工关注", async () => {
     await pool.query(
       `UPDATE pool_membership membership
           SET attention_reason = '每日计划·已符合：等待买入',
+              attention_signal = '{"status":"qualified","missing_signals":[]}',
               attention_from = '2026-08-18', attention_until = '2026-08-19'
          FROM market_instrument instrument
         WHERE instrument.id = membership.instrument_id
@@ -345,13 +442,13 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await recordPositionChange(pool, {
       code: "600487.SH", kind: "buy", quantity: 100, price: 60, change_date: "2026-08-18",
       source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
-      execution_compliance: "matched",
+      execution_compliance: "matched", entry_signal_type: "right_side",
     });
     expect((await pool.query(
-      `SELECT attention_reason, attention_from::text, attention_until::text
+      `SELECT attention_signal, attention_reason, attention_from::text, attention_until::text
          FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
         WHERE instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
-    )).rows[0]).toEqual({ attention_reason: null, attention_from: null, attention_until: null });
+    )).rows[0]).toEqual({ attention_signal: null, attention_reason: null, attention_from: null, attention_until: null });
 
     await pool.query(
       `UPDATE pool_membership membership SET attention_reason = '人工持续跟踪'
@@ -362,7 +459,7 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await recordPositionChange(pool, {
       code: "600487.SH", kind: "buy", quantity: 100, price: 61, change_date: "2026-08-19",
       source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
-      execution_compliance: "matched",
+      execution_compliance: "matched", entry_signal_type: "right_side",
     });
     expect((await pool.query(
       `SELECT attention_reason FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id

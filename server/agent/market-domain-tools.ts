@@ -107,14 +107,14 @@ export function buildLimitUpSignalTool(deps: { pool: pg.Pool; sessionId: string 
   return {
     name: "limit_up_signal_query",
     label: "查询打板确定性评分",
-    description: "按目标交易日完整读取涨停事件、真实封单与成交额、历史日线和当前打板策略的版本化固定研究基准，由服务端一次性计算全部候选的抱团分、主升分、路线名次、有效信号、风险与数据缺口；结果不分页、不截断，不要再用通用查询手算分位或分数。",
+    description: "按目标交易日完整读取涨停事件、真实封单与成交额、历史日线和打板策略的评分基准，由服务端一次性计算全部候选的抱团分、主升分、路线名次、有效信号、风险与数据缺口；结果不分页、不截断，不要再用通用查询手算分位或分数。",
     parameters: LimitUpSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof LimitUpSignalSchema>>("limit_up_signal_query", LimitUpSignalSchema, raw);
       return audited(deps, "limit_up_signal_query", input, async () => {
         const strategy = await strategyForSession(deps);
-        const revisionId = strategy.documents.find((document) => document.code === "limit_up_board")?.current_revision_id ?? null;
-        const value = await queryLimitUpSignals(deps.pool, input.date, revisionId);
+        const documentId = strategy.documents.find((document) => document.code === "limit_up_board")?.id ?? null;
+        const value = await queryLimitUpSignals(deps.pool, input.date, documentId);
         return {
           ...value,
           candidates: value.candidates.map((candidate) => ({
@@ -142,7 +142,7 @@ export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: stri
   return {
     name: "daily_plan_context_query",
     label: "查询每日计划确定性上下文",
-    description: "按目标日一次性返回完整881一级行业市场状态与温度、七类市场结构同步、短线池逐只右侧六条件、左侧反转质量分与ATR止损、试盘启动分阶段证据，以及右侧>左侧>试盘的唯一信号选择；同时返回持仓止损档位、冷却期、止盈/止损位、退出候选与MA10护盘收回率。只返回结论和必要数值证据，不返回原始行情序列；每日计划不得再用通用数据库工具手算。",
+    description: "按目标日一次性返回完整881一级行业市场状态与温度、七类市场结构同步、短线池逐只右侧六条件、左侧反转质量分与ATR止损、试盘启动分阶段证据，以及右侧>左侧>试盘的唯一信号选择；同时返回每笔持仓的 entry_signal_type 与 evaluation_basis：波段持仓的 swing_triggers（观察期、灾难止损、常规止损、箱顶目标、60日到期）、左侧反转持仓的 left_reversal_triggers（初始止损、6%/16%分批、10日到期）、右侧/试盘持仓的止损档位、冷却期、止盈/止损位、退出候选，以及 MA10 护盘收回率。只返回结论和必要数值证据，不返回原始行情序列；每日计划不得再用通用数据库工具手算。",
     parameters: DailyPlanContextSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof DailyPlanContextSchema>>("daily_plan_context_query", DailyPlanContextSchema, raw);

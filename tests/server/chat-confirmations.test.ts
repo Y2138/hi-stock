@@ -52,6 +52,7 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
           quantity: 10,
           price: 12.5,
           change_date: "2026-08-17",
+          entry_signal_type: "discretionary",
           decision_origin: "strategy_signal",
           execution_compliance: "matched",
         },
@@ -287,6 +288,57 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
       cron: "10 17 * * 1-5",
       config: { pipeline: "daily_market_structure", export_volume: false },
     });
+
+    const modelId = (await pool.query<{ id: string }>(
+      `SELECT model.id::text AS id
+         FROM llm_model model
+         JOIN llm_provider provider ON provider.id = model.provider_id
+        WHERE provider.provider_key = 'deepseek' AND model.model_key = 'deepseek-v4-pro'`,
+    )).rows[0]!.id;
+    const jobVersion = async (code: string) => (await pool.query<{ updated_at: string }>(
+      `SELECT to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
+         FROM job_definition WHERE code = $1`,
+      [code],
+    )).rows[0]!.updated_at;
+    const modelProposal = await findTool("job_write").execute("tc-job-model", {
+      reason: "验证 Agent 任务可以绑定固定模型",
+      action: "update_job",
+      code: "daily_plan_flow",
+      base_updated_at: await jobVersion("daily_plan_flow"),
+      model_id: modelId,
+    });
+    await approveConfirmation(pool, (modelProposal.details as { confirmation_id: string }).confirmation_id);
+    expect((await pool.query<{ model_id: string | null }>(
+      "SELECT model_id::text FROM job_definition WHERE code = 'daily_plan_flow'",
+    )).rows[0]!.model_id).toBe(modelId);
+
+    const clearModelProposal = await findTool("job_write").execute("tc-job-model-clear", {
+      reason: "验证 Agent 任务可以恢复跟随系统默认模型",
+      action: "update_job",
+      code: "daily_plan_flow",
+      base_updated_at: await jobVersion("daily_plan_flow"),
+      model_id: null,
+    });
+    await approveConfirmation(pool, (clearModelProposal.details as { confirmation_id: string }).confirmation_id);
+    expect((await pool.query<{ model_id: string | null }>(
+      "SELECT model_id::text FROM job_definition WHERE code = 'daily_plan_flow'",
+    )).rows[0]!.model_id).toBeNull();
+
+    const datasourceModelProposal = await findTool("job_write").execute("tc-job-model-datasource", {
+      reason: "验证数据同步任务不能绑定模型",
+      action: "update_job",
+      code: "daily_market_structure",
+      base_updated_at: await jobVersion("daily_market_structure"),
+      model_id: modelId,
+    });
+    await expect(approveConfirmation(
+      pool,
+      (datasourceModelProposal.details as { confirmation_id: string }).confirmation_id,
+    )).rejects.toThrow("不能指定模型");
+    expect((await pool.query<{ model_id: string | null }>(
+      "SELECT model_id::text FROM job_definition WHERE code = 'daily_market_structure'",
+    )).rows[0]!.model_id).toBeNull();
+
     await pool.query(
       "UPDATE job_definition SET updated_at = '2026-08-20T07:22:56.044953Z' WHERE code = 'daily_market_structure'",
     );

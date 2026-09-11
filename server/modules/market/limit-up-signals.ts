@@ -54,7 +54,7 @@ export interface LimitUpRawFeatures extends Record<LimitUpRankedFeature, number 
 
 export interface LimitUpBenchmark {
   code: string;
-  revision_id: string;
+  document_id: string;
   training_start: string;
   training_end: string;
   methodology: string;
@@ -89,7 +89,7 @@ export interface LimitUpSignalCandidate {
 
 export interface LimitUpSignalResult {
   date: string;
-  strategy_revision_id: string | null;
+  strategy_document_id: string | null;
   benchmark: Omit<LimitUpBenchmark, "distributions"> | null;
   status: "success" | "partial" | "unavailable";
   gaps: string[];
@@ -594,7 +594,7 @@ function shiftDate(date: string, days: number): string {
 }
 
 export function limitUpBenchmarkSha(value: Omit<LimitUpBenchmark, "sha256">): string {
-  const { revision_id: _revisionId, ...portableValue } = value;
+  const { document_id: _documentId, ...portableValue } = value;
   const canonical = (input: unknown): unknown => Array.isArray(input)
     ? input.map(canonical)
     : input && typeof input === "object"
@@ -606,15 +606,29 @@ export function limitUpBenchmarkSha(value: Omit<LimitUpBenchmark, "sha256">): st
 
 export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId?: string | null): Promise<LimitUpSignalResult> {
   const revision = pinnedRevisionId === undefined ? await db.query<{ id: string }>(
-    `SELECT revision.id::text AS id
+    `SELECT document.id::text AS id
        FROM strategy_document document
-       JOIN strategy_document_revision revision ON revision.id = document.current_revision_id
       WHERE document.code = 'limit_up_board'`,
   ) : null;
-  const revisionId = pinnedRevisionId === undefined ? revision?.rows[0]?.id ?? null : pinnedRevisionId;
-  const benchmarkRow = revisionId ? await db.query<{
+  const documentId = pinnedRevisionId === undefined ? revision?.rows[0]?.id ?? null : pinnedRevisionId;
+  // 策略未发布（找不到打板策略文档）时不存在可评分的事实。
+  if (!documentId) {
+    return {
+      date,
+      strategy_document_id: null,
+      benchmark: null,
+      status: "unavailable",
+      gaps: ["当前打板策略未发布"],
+      candidate_count: 0,
+      signal_count: 0,
+      signals: [],
+      candidates: [],
+    };
+  }
+  // 评分基准直接绑定策略文档；正文修订沿用同一份基准，不再按修订逐份挂载。
+  const benchmarkRow = await db.query<{
     benchmark_code: string;
-    document_revision_id: string;
+    document_id: string;
     training_start: string;
     training_end: string;
     methodology: string;
@@ -623,19 +637,24 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
     source_summary: Record<string, unknown>;
     sha256: string;
   }>(
-    `SELECT benchmark_code, document_revision_id::text, training_start::text, training_end::text,
-            methodology, distributions, sample_counts, source_summary, sha256
-       FROM strategy_score_benchmark WHERE document_revision_id = $1`,
-    [revisionId],
-  ) : null;
-  const stored = benchmarkRow?.rows[0];
-  if (!revisionId || !stored) {
+    `SELECT benchmark.benchmark_code, benchmark.document_id::text,
+            benchmark.training_start::text, benchmark.training_end::text,
+            benchmark.methodology, benchmark.distributions, benchmark.sample_counts,
+            benchmark.source_summary, benchmark.sha256
+       FROM strategy_score_benchmark benchmark
+       JOIN strategy_document document ON document.id = benchmark.document_id
+      WHERE document.code = 'limit_up_board'
+      ORDER BY benchmark.id DESC
+      LIMIT 1`,
+  );
+  const stored = benchmarkRow.rows[0];
+  if (!stored) {
     return {
       date,
-      strategy_revision_id: revisionId,
+      strategy_document_id: documentId,
       benchmark: null,
       status: "unavailable",
-      gaps: [revisionId ? "当前打板策略修订没有固定研究基准" : "当前打板策略未发布"],
+      gaps: ["当前打板策略没有可用的评分基准"],
       candidate_count: 0,
       signal_count: 0,
       signals: [],
@@ -644,7 +663,7 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
   }
   const benchmark: LimitUpBenchmark = {
     code: stored.benchmark_code,
-    revision_id: stored.document_revision_id,
+    document_id: stored.document_id,
     training_start: stored.training_start,
     training_end: stored.training_end,
     methodology: stored.methodology,
@@ -696,10 +715,10 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
   const signals = candidates.filter((candidate) => candidate.signal_grade !== null).slice(0, 4);
   const { distributions: _distributions, ...publicBenchmark } = benchmark;
   const { sha256: _sha256, ...benchmarkPayload } = benchmark;
-  if (limitUpBenchmarkSha(benchmarkPayload) !== benchmark.sha256) gaps.push("固定研究基准哈希校验失败");
+  if (limitUpBenchmarkSha(benchmarkPayload) !== benchmark.sha256) gaps.push("评分基准哈希校验失败");
   return {
     date,
-    strategy_revision_id: revisionId,
+    strategy_document_id: documentId,
     benchmark: publicBenchmark,
     status: gaps.length ? "partial" : "success",
     gaps,

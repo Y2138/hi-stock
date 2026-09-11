@@ -10,6 +10,7 @@ import MarketStructureView from "./views/MarketStructureView.vue";
 import BacktestsView from "./views/BacktestsView.vue";
 import JobsView from "./views/JobsView.vue";
 import DataSyncView from "./views/DataSyncView.vue";
+import NotificationHistoryView from "./views/NotificationHistoryView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import MemoryView from "./views/MemoryView.vue";
 
@@ -44,6 +45,7 @@ export const router = createRouter({
       component: DataSyncView,
       meta: { title: "数据与备份" },
     },
+    { path: "/settings/notifications/history", name: "notification-history", component: NotificationHistoryView, meta: { title: "通知记录" } },
     { path: "/settings", name: "settings", component: SettingsView, meta: { title: "设置" } },
   ],
 });

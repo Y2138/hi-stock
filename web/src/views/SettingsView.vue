@@ -1,5 +1,14 @@
 <script setup lang="ts">
-// 设置（/settings）：系统配置 + M4 外观、主题与动效偏好。
+// 分区显示设置，切换分区保留未保存的表单内容。
+import { computed } from "vue";
+import { useRoute } from "vue-router";
+const route = useRoute();
+const sections = [
+  { key: "models", label: "模型" }, { key: "agent", label: "Agent" },
+  { key: "datasource", label: "数据源" }, { key: "notifications", label: "消息推送" },
+  { key: "appearance", label: "外观" },
+];
+const section = computed(() => sections.some((s) => s.key === route.query.section) ? route.query.section : "models");
 import {
   colorSchemePreference,
   currentTheme,
@@ -11,6 +20,7 @@ import {
 import LlmProviderSettings from "../components/settings/LlmProviderSettings.vue";
 import AgentModeSettings from "../components/settings/AgentModeSettings.vue";
 import AgentMetricsSummary from "../components/settings/AgentMetricsSummary.vue";
+import NotificationSettings from "../components/settings/NotificationSettings.vue";
 import DatasourceSettings from "../components/settings/DatasourceSettings.vue";
 </script>
 
@@ -21,7 +31,13 @@ import DatasourceSettings from "../components/settings/DatasourceSettings.vue";
       <div class="sub">系统配置 · 密钥只显示「已配置/未配置」，不展示本体</div>
     </div>
 
-    <div class="card" style="margin-bottom: 16px">
+    <nav class="settings-nav" aria-label="设置分区">
+      <RouterLink v-for="item in sections" :key="item.key"
+        :to="{ path: '/settings', query: { ...route.query, section: item.key } }"
+        :aria-current="section === item.key ? 'page' : undefined"
+        :class="{ selected: section === item.key }">{{ item.label }}</RouterLink>
+    </nav>
+    <div v-show="section === 'appearance'" class="card">
       <div class="card-title">🎨 外观与动效</div>
       <p class="card-desc">
         明暗外观与强调色分别设置，选择会立即全站生效并在本机持久化。
@@ -64,17 +80,19 @@ import DatasourceSettings from "../components/settings/DatasourceSettings.vue";
       </div>
     </div>
 
-    <AgentModeSettings />
-
-    <AgentMetricsSummary />
-
-    <DatasourceSettings />
-
-    <LlmProviderSettings />
+    <div v-show="section === 'agent'"><AgentModeSettings /><AgentMetricsSummary /></div>
+    <DatasourceSettings v-show="section === 'datasource'" />
+    <NotificationSettings v-show="section === 'notifications'" />
+    <LlmProviderSettings v-show="section === 'models'" />
   </section>
 </template>
 
 <style scoped>
+.settings-nav { display: flex; gap: 4px; overflow-x: auto; margin-bottom: 20px; border-bottom: 1px solid var(--line); }
+.settings-nav a { flex: none; padding: 12px 16px; color: var(--ink-soft); text-decoration: none; border-bottom: 2px solid transparent; }
+.settings-nav a.selected { color: var(--accent-ink); border-bottom-color: var(--accent); font-weight: 600; }
+.settings-nav a:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+
 .preference-row {
   display: flex;
   align-items: center;

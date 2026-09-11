@@ -13,7 +13,8 @@ import {
   type HithinkDatasetRequest,
 } from "../datasource/hithink-datasets.js";
 import { STRATEGY_SCREEN_RULES } from "../modules/plans/strategy-screen-rules.js";
-import { WEB_RESEARCH_ALLOWED_DOMAINS, WEB_RESEARCH_CONTRACT_LIMITS } from "./web-research-provider.js";
+import { WEB_RESEARCH_CONTRACT_LIMITS } from "./web-research-provider.js";
+import { WEB_FETCH_CONTRACT_LIMITS } from "./web-fetch-provider.js";
 
 const IDENTIFIER_PATTERN = "^[a-z][a-z0-9_]{0,62}$";
 const DATE_PATTERN = "^\\d{4}-\\d{2}-\\d{2}$";
@@ -155,14 +156,18 @@ export const DatabaseQuerySchema = strictObject({
   queries: Type.Array(SelectSchema, { minItems: 1, maxItems: 5 }),
 });
 
-const WebResearchDomainSchema = Type.Union(
-  WEB_RESEARCH_ALLOWED_DOMAINS.map((domain) => Type.Literal(domain)),
-);
+const WEB_RESEARCH_DOMAIN_PATTERN = "^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$";
+const WebResearchDomainSchema = Type.String({
+  minLength: 1,
+  maxLength: 253,
+  pattern: WEB_RESEARCH_DOMAIN_PATTERN,
+  description: "可选搜索范围，只接受主机名，不接受协议、路径、端口或通配符。",
+});
 export const WebSearchSchema = strictObject({
   query: Type.String({ minLength: 1, maxLength: 500 }),
   domains: Type.Optional(Type.Array(WebResearchDomainSchema, {
     minItems: 1,
-    maxItems: WEB_RESEARCH_ALLOWED_DOMAINS.length,
+    maxItems: 20,
   })),
   recency_days: Type.Optional(Type.Integer({ minimum: 1, maximum: 3650 })),
   max_results: Type.Optional(Type.Integer({
@@ -171,6 +176,20 @@ export const WebSearchSchema = strictObject({
   })),
 });
 export type WebSearchInput = Static<typeof WebSearchSchema>;
+
+export const WebFetchSchema = strictObject({
+  url: Type.String({
+    minLength: 1,
+    maxLength: WEB_FETCH_CONTRACT_LIMITS.maxUrlChars,
+    description: "需要核验正文的明确 HTTP(S) URL。不得包含凭据或敏感查询参数。",
+  }),
+  max_chars: Type.Optional(Type.Integer({
+    minimum: WEB_FETCH_CONTRACT_LIMITS.minTextChars,
+    maximum: WEB_FETCH_CONTRACT_LIMITS.maxTextChars,
+    description: "返回正文最大字符数。",
+  })),
+});
+export type WebFetchInput = Static<typeof WebFetchSchema>;
 
 const ReasonSchema = Type.String({ minLength: 1, maxLength: 500, description: "用户要求本次变更的原因" });
 const CodeSchema = Type.String({ pattern: CODE_PATTERN });
@@ -183,6 +202,10 @@ const DecisionOriginSchema = Type.Union([
 const ExecutionComplianceSchema = Type.Union([
   Type.Literal("matched"), Type.Literal("deviated"),
   Type.Literal("not_applicable"), Type.Literal("unknown"),
+]);
+export const EntrySignalTypeSchema = Type.Union([
+  Type.Literal("right_side"), Type.Literal("left_reversal"), Type.Literal("trial_start"),
+  Type.Literal("swing"), Type.Literal("limit_up"), Type.Literal("discretionary"),
 ]);
 
 export const PortfolioContextQuerySchema = strictObject({
@@ -230,6 +253,7 @@ const PositionChangeSchema = strictObject({
   change_date: DateSchema,
   decision_origin: Type.Optional(DecisionOriginSchema),
   execution_compliance: Type.Optional(ExecutionComplianceSchema),
+  entry_signal_type: Type.Optional(EntrySignalTypeSchema),
   plan_output_id: Type.Optional(Type.String({ pattern: "^[0-9]+$" })),
   attribution_note: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
   deviation_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
@@ -243,6 +267,19 @@ const LegacyPortfolioWriteSchema = strictObject({
   reason: ReasonSchema,
   ...PositionChangeSchema.properties,
 });
+export const PositionEntrySignalWriteSchema = strictObject({
+  code: CodeSchema,
+  entry_signal_type: EntrySignalTypeSchema,
+  reason: ReasonSchema,
+});
+export type PositionEntrySignalWriteInput = Static<typeof PositionEntrySignalWriteSchema>;
+
+export function validatePositionEntrySignalWriteInput(input: unknown): PositionEntrySignalWriteInput {
+  const parsed = validateToolInput<PositionEntrySignalWriteInput>(
+    "position_entry_signal_write", PositionEntrySignalWriteSchema, input,
+  );
+  return { code: parsed.code.trim(), entry_signal_type: parsed.entry_signal_type, reason: parsed.reason.trim() };
+}
 export type PositionChangePortfolioWriteInput =
   Omit<Static<typeof PositionChangeSchema>, "decision_origin" | "execution_compliance"> & {
     decision_origin: Static<typeof DecisionOriginSchema>;
@@ -313,6 +350,7 @@ const ScheduledPoolAttentionItemSchema = strictObject({
   action: Type.Union([Type.Literal("mark"), Type.Literal("clear")]),
   code: CodeSchema,
   pool: PoolKindSchema,
+  missing_signals: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 20 })),
   attention_status: Type.Optional(Type.Union([Type.Literal("qualified"), Type.Literal("approaching")])),
   attention_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 420 })),
   attention_from: Type.Optional(DateSchema),
@@ -328,6 +366,7 @@ const LegacyScheduledPoolAttentionSchema = objectRoot(Type.Union([
     action: Type.Literal("mark"),
     code: CodeSchema,
     pool: PoolKindSchema,
+    missing_signals: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 20 })),
     attention_status: Type.Union([Type.Literal("qualified"), Type.Literal("approaching")]),
     attention_reason: Type.String({ minLength: 1, maxLength: 420 }),
     attention_from: DateSchema,
@@ -411,7 +450,7 @@ const ChangeSummarySchema = Type.Optional(Type.String({ maxLength: 500 }));
 
 const StrategyDocumentChangeSchema = strictObject({
   document_id: RevisionIdSchema,
-  base_revision_id: RevisionIdSchema,
+  base_sha256: HashSchema,
   content: ContentTextSchema,
 });
 
@@ -525,6 +564,7 @@ export const JobWriteSchema = objectRoot(Type.Union([
     job_type: Type.Union([Type.Literal("datasource"), Type.Literal("agent_flow"), Type.Literal("analysis")]),
     config: JobConfigSchema,
     prompt_id: Type.Optional(RevisionIdSchema),
+    model_id: Type.Optional(Type.Union([RevisionIdSchema, Type.Null()])),
     enabled: Type.Optional(Type.Boolean()),
   }),
   strictObject({
@@ -536,6 +576,7 @@ export const JobWriteSchema = objectRoot(Type.Union([
     cron: Type.Optional(Type.String({ minLength: 9, maxLength: 100 })),
     config: Type.Optional(JobConfigSchema),
     prompt_id: Type.Optional(RevisionIdSchema),
+    model_id: Type.Optional(Type.Union([RevisionIdSchema, Type.Null()])),
     enabled: Type.Optional(Type.Boolean()),
   }),
   strictObject({
@@ -747,11 +788,19 @@ export function validateWebSearchInput(input: unknown): WebSearchInput {
   const parsed = validateToolInput<WebSearchInput>("web_search", WebSearchSchema, input);
   const query = parsed.query.trim();
   if (!query) throw new Error("web_search query 不能为空");
+  const domains = parsed.domains?.map((domain) => domain.toLowerCase());
   return {
     ...parsed,
     query,
-    ...(parsed.domains ? { domains: [...new Set(parsed.domains)] } : {}),
+    ...(domains ? { domains: [...new Set(domains)] } : {}),
   };
+}
+
+export function validateWebFetchInput(input: unknown): WebFetchInput {
+  const parsed = validateToolInput<WebFetchInput>("web_fetch", WebFetchSchema, input);
+  const url = parsed.url.trim();
+  if (!url) throw new Error("web_fetch url 不能为空");
+  return { ...parsed, url };
 }
 
 function isRealDate(value: string): boolean {
@@ -840,6 +889,12 @@ export function validatePortfolioWriteInput(input: unknown): PortfolioWriteInput
       if (!executionCompliance) throw new Error(`${change.code} ${change.kind} 必须提供 execution_compliance`);
       if ((decisionOrigin === "unplanned_exception" || executionCompliance === "deviated") && !change.deviation_reason?.trim()) {
         throw new Error(`${change.code} 计划外例外或执行偏离必须提供 deviation_reason`);
+      }
+      if (change.kind === "buy" && !change.entry_signal_type) {
+        throw new Error(`${change.code} buy 必须提供 entry_signal_type（right_side/left_reversal/trial_start/swing/limit_up/discretionary）`);
+      }
+      if (change.kind !== "buy" && change.entry_signal_type !== undefined) {
+        throw new Error(`${change.code} entry_signal_type 仅 buy 事件可以填写`);
       }
       const normalized: PositionChangePortfolioWriteInput = {
         ...change,
@@ -972,9 +1027,15 @@ export function validateScheduledPoolAttentionInput(input: unknown): ScheduledPo
         throw new Error(`${item.code} 近期关注起止日期必须是有效日历日期`);
       }
       if (item.attention_until < item.attention_from) throw new Error(`${item.code} 近期关注结束日期不得早于开始日期`);
-      return { ...item, code: item.code.trim(), attention_reason: item.attention_reason.trim() };
+      const missingSignals = [...new Set((item.missing_signals ?? []).map((value) => value.trim()))];
+      if (missingSignals.some((value) => !value)) throw new Error(`${item.code} 缺失条件不得为空白`);
+      if (item.attention_status === "approaching" && !missingSignals.length) {
+        throw new Error(`${item.code} 即将符合必须通过 missing_signals 逐项列出尚未成立的条件及次日确认标准`);
+      }
+      if (item.attention_status === "qualified" && missingSignals.length) throw new Error(`${item.code} 已成立信号不得包含缺失条件`);
+      return { ...item, code: item.code.trim(), attention_reason: item.attention_reason.trim(), missing_signals: missingSignals };
     }
-    if (item.attention_status || item.attention_reason || item.attention_from || item.attention_until) {
+    if (item.attention_status || item.attention_reason || item.attention_from || item.attention_until || item.missing_signals !== undefined) {
       throw new Error(`${item.code} clear 不接受关注状态、原因或日期`);
     }
     return { ...item, code: item.code.trim() };
@@ -1051,14 +1112,14 @@ export function validateJobWriteInput(input: unknown): JobWriteInput {
   const parsed = validateToolInput<JobWriteInput>("job_write", JobWriteSchema, input);
   if (parsed.action === "create_job") {
     if (parsed.job_type === "agent_flow" && !parsed.prompt_id) throw new Error("agent_flow 作业必须提供 prompt_id");
-    if (parsed.job_type === "datasource" && parsed.prompt_id) throw new Error("datasource 作业不能绑定 prompt_id");
-    if (parsed.job_type === "analysis" && parsed.prompt_id) throw new Error("analysis 作业不能绑定 prompt_id");
+    if (parsed.job_type !== "agent_flow" && parsed.prompt_id) throw new Error(`${parsed.job_type} 作业不能绑定 prompt_id`);
+    if (parsed.job_type !== "agent_flow" && parsed.model_id) throw new Error(`${parsed.job_type} 作业不能指定模型`);
     if (parsed.job_type === "datasource" && !("pipeline" in parsed.config)) throw new Error("datasource 作业 config 类型不匹配");
     if (parsed.job_type === "agent_flow" && ("pipeline" in parsed.config || "analysis_type" in parsed.config)) throw new Error("agent_flow 作业 config 类型不匹配");
     if (parsed.job_type === "analysis" && !("analysis_type" in parsed.config)) throw new Error("analysis 作业 config 类型不匹配");
   }
   if (parsed.action === "update_job") {
-    const changed = [parsed.name, parsed.cron, parsed.config, parsed.prompt_id, parsed.enabled]
+    const changed = [parsed.name, parsed.cron, parsed.config, parsed.prompt_id, parsed.model_id, parsed.enabled]
       .some((value) => value !== undefined);
     if (!changed) throw new Error("job_write update_job 至少需要一个更新字段");
     if (Number.isNaN(new Date(parsed.base_updated_at).getTime())) throw new Error("base_updated_at 不是有效时间");

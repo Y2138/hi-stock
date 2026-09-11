@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+import { AGENT_NOTIFICATION_SUMMARY_MAX_CHARS, DAILY_PLAN_NOTIFICATION_MAX_CHARS, deliverNextNotification, enqueueJobConclusion, listNotifications as listNotificationPage, getNotification, extractConclusion, previewJobConclusion, queueTestNotification, retryNotification, sendFeishu, updateNotificationSettings, validateWebhook } from "../../server/modules/notifications/service.js";
 // M3 作业系统：cron 去重/missed、Runner/重试/锁、API 与安全配置回归。
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
@@ -23,6 +25,10 @@ import { executeJobRun, resolveDailyUpdateScope } from "../../server/scheduler/r
 import { JobScheduler } from "../../server/scheduler/service.js";
 import { cronOccurrences, dailyMarketGate, shanghaiDate } from "../../server/scheduler/time.js";
 import { api, prepareTestDb, resetSchema, seedTestStrategy, startTestServer, type TestServer } from "./helpers.js";
+
+async function listNotifications(pool: pg.Pool) {
+  return Promise.all((await listNotificationPage(pool)).items.map((item) => getNotification(pool, item.id)));
+}
 
 const prepared = await prepareTestDb();
 
@@ -81,6 +87,30 @@ it("任务完成门禁只接受本次正确日期的工具结果，并按真实�
   poolResult({ codes: ["600000.SH"] }, [{ pool: "short", member_count: 1 }]);
   expect(weekly.missing().some((name) => name.includes("完整摘要"))).toBe(false);
   expect(weekly.missing()).toContain("analysis_run");
+
+  const nightly = createJobCompletionGate("nightly_sector_opportunity_scan", "2026-08-17");
+  let nightlyCall = 0;
+  function nightlyObserved(name: string, args: Record<string, unknown>, details: unknown, isError = false) {
+    const toolCallId = `nightly-${nightlyCall++}`;
+    nightly.observe({ type: "tool_start", data: { toolCallId, name, args } });
+    nightly.observe({ type: "tool_end", data: { toolCallId, name, isError, result: { details } } });
+  }
+  for (const name of [
+    "strategy_document_query", "board_query", "market_snapshot_query", "indicator_query",
+    "strategy_screen_query", "stock_research_query",
+  ]) nightlyObserved(name, {}, {});
+  nightlyObserved("analysis_run", {
+    requests: [{ analysis_type: "sector_temperature", as_of: "2026-08-17", codes: ["881001.TI"] }],
+  }, { items: [{ analysis_type: "sector_temperature", status: "success" }] });
+  expect(nightly.missing().some((name) => name.includes("完整 881"))).toBe(true);
+  nightlyObserved("analysis_run", {
+    requests: [{ analysis_type: "sector_temperature", as_of: "2026-08-16" }],
+  }, { items: [{ analysis_type: "sector_temperature", status: "partial" }] });
+  expect(nightly.missing().some((name) => name.includes("完整 881"))).toBe(true);
+  nightlyObserved("analysis_run", {
+    requests: [{ analysis_type: "sector_temperature", as_of: "2026-08-17" }],
+  }, { items: [{ analysis_type: "sector_temperature", status: "partial" }] });
+  expect(nightly.missing()).toEqual([]);
 });
 
 
@@ -95,6 +125,42 @@ function dailySummary(gaps: unknown[] = []) {
     fetchRunIds: ["1"],
   };
 }
+
+// 以下机器人地址/密钥均为不可用测试占位值；网络请求全部注入模拟函数。
+const testWebhook = "https://open.feishu.cn/open-apis/bot/v2/hook/notification-test-placeholder";
+const testSecret = "notification-test-secret-not-a-credential";
+
+it("飞书仅请求官方地址，签名采用秒时间戳，业务失败与网络错误不泄漏凭据", async () => {
+  for (const url of ["http://127.0.0.1/hook", testWebhook + "?token=secret", testWebhook + "/extra", "https://open.feishu.cn.evil.test/open-apis/bot/v2/hook/placeholder"]) {
+    expect(() => validateWebhook(url)).toThrow("官方");
+  }
+  const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({ code: 0 }));
+  await sendFeishu(testWebhook, testSecret, "测试正文", fetcher);
+  const [url, options] = fetcher.mock.calls[0]!;
+  expect(url).toBe(testWebhook);
+  expect(options?.redirect).toBe("error");
+  const body = JSON.parse(options!.body as string);
+  expect(body.msg_type).toBe("text");
+  expect(body.content).toEqual({ text: "测试正文" });
+  expect(Math.abs(Number(body.timestamp) - Date.now()/1000)).toBeLessThan(2);
+  expect(body.sign).toBe(crypto.createHmac("sha256", `${body.timestamp}\n${testSecret}`).update("").digest("base64"));
+  fetcher.mockResolvedValue(Response.json({ code: 19021, msg: testWebhook + testSecret }));
+  await expect(sendFeishu(testWebhook, testSecret, "测试", fetcher)).rejects.toThrow("19021");
+  fetcher.mockResolvedValue(Response.json({ StatusCode: 0 }));
+  await expect(sendFeishu(testWebhook, testSecret, "测试", fetcher)).rejects.toThrow("成功标记");
+  fetcher.mockRejectedValue(new Error(testWebhook + testSecret));
+  await expect(sendFeishu(testWebhook, testSecret, "测试", fetcher)).rejects.toThrow(/^飞书连接超时、响应无效或网络异常$/);
+});
+
+it("结论摘要提取保留条件，忽略代码块与进度，无结论不推送，超长结论不截半句", () => {
+  expect(extractConclusion("正在研究，请等待")).toBeNull();
+  expect(extractConclusion("## 结论\n旧结论\n## 结论摘要\n最终条件\n### 风险\n仍需复核")).toBe("最终条件\n### 风险\n仍需复核");
+  expect(extractConclusion("```md\n## 结论摘要\n假的结论\n```\n还在处理中")).toBeNull();
+  expect(extractConclusion("# 报告\n## 结论摘要\n暂无结论")).toBe("");
+  expect(extractConclusion("## 结论摘要\n- 价格<10且量>100才评估。\n- 风险：未触发不能执行。\n## 证据\n不应出现在摘要中")).toBe("- 价格＜10且量＞100才评估。\n- 风险：未触发不能执行。");
+  expect(extractConclusion("## 结论摘要\n" + "结".repeat(AGENT_NOTIFICATION_SUMMARY_MAX_CHARS))).toHaveLength(AGENT_NOTIFICATION_SUMMARY_MAX_CHARS);
+  expect(extractConclusion("## 结论摘要\n" + "结".repeat(AGENT_NOTIFICATION_SUMMARY_MAX_CHARS + 1))).toContain("完整结果");
+});
 
 describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
   let pool: pg.Pool;
@@ -123,7 +189,247 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     await pool.end();
   });
 
-  it("迁移初始化八个受控作业，板块目录与成分同步默认启用，cron 固定按上海时区解析", async () => {
+  it("飞书设置、测试通知与列表接口仅回显状态，不接受外部地址或非法字段", async () => {
+    expect((await api(server.baseUrl, "POST", "/api/notifications/test", {})).status).toBe(400);
+    expect((await api(server.baseUrl, "PATCH", "/api/notifications/settings", { enabled: true })).status).toBe(400);
+    expect((await api(server.baseUrl, "PATCH", "/api/notifications/settings", { webhook: "https://example.com" })).status).toBe(400);
+    expect((await api(server.baseUrl, "PATCH", "/api/notifications/settings", { extra: testSecret })).status).toBe(400);
+    const saved = await api(server.baseUrl, "PATCH", "/api/notifications/settings", { enabled: true, webhook: testWebhook, sign_secret: testSecret });
+    expect(saved.status).toBe(200);
+    expect(saved.json).toMatchObject({ enabled: true, webhook_configured: true, sign_secret_configured: true });
+    const read = await api(server.baseUrl, "GET", "/api/notifications/settings");
+    expect(JSON.stringify([saved, read])).not.toContain(testSecret);
+    expect(JSON.stringify([saved, read])).not.toContain(testWebhook);
+    const queued = await api(server.baseUrl, "POST", "/api/notifications/test", {});
+    expect(queued.status).toBe(202);
+    expect(queued.json).toMatchObject({ kind: "test", status: "pending" });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ code: 19021, msg: testSecret }));
+    await deliverNextNotification(pool, fetcher);
+    const history = await api(server.baseUrl, "GET", "/api/notifications");
+    expect(JSON.stringify(history)).not.toContain(testSecret);
+    expect(JSON.stringify(history)).not.toContain(testWebhook);
+    expect((await api(server.baseUrl, "POST", `/api/notifications/${queued.json.id}/retry`, {})).status).toBe(202);
+    expect((await api(server.baseUrl, "POST", "/api/notifications/invalid/retry", {})).status).toBe(400);
+  });
+
+  it("每日计划成功后完整推送持仓预案、标的信号和打板机会，重试不重跑计划；新计划替代旧通知", async () => {
+    await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret });
+    const instruments = await pool.query(`INSERT INTO market_instrument (code,name,kind) VALUES
+      ('600000.SH','持仓样本','stock'), ('000001.SZ','信号样本','stock'), ('002001.SZ','打板样本','stock'),
+      ('600100.SH','精简样本','stock') RETURNING code,id`);
+    const ids = Object.fromEntries(instruments.rows.map((row) => [row.code, row.id]));
+    await pool.query(`INSERT INTO market_instrument (code,name,kind)
+      SELECT '610' || lpad(n::text,3,'0') || '.SH', '额外持仓' || n::text, 'stock' FROM generate_series(1,8) n
+      UNION ALL
+      SELECT '003' || lpad(n::text,3,'0') || '.SZ', '额外机会' || n::text, 'stock' FROM generate_series(1,9) n`);
+    const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
+    const agentFlow = vi.fn(async () => {
+      await pool.query(`INSERT INTO daily_plan_playbook
+        (source_job_run_id,target_date,item_kind,instrument_id,code,name,grade,priority,action,trigger_kind,headline,auction_md,intraday_md,evidence_md,missing_md,invalidation_md,risk_md)
+        VALUES
+        ($1,'2026-08-17','position_action',$2,'600000.SH','持仓样本',NULL,100,'reduce','condition','满足条件后减仓',NULL,'价格<10且成交量>100，跌破支撑且反抽失败后才评估',NULL,NULL,'反抽站回支撑则失效','未触发不得执行'),
+        ($1,'2026-08-17','position_action',$4,'600100.SH','精简样本',NULL,1,'exit','open','跌破12.5元清仓',NULL,NULL,NULL,NULL,NULL,NULL),
+        ($1,'2026-08-17','off_pool_opportunity',$3,'002001.SZ','打板样本','A',1,'observe','condition','竞价转强后按打板预案复核','高开幅度与封单同时达标','回封确认后才评估','连板、龙虎榜与板块聚集共振','仍缺竞价确认','竞价转弱或开板不回封','高位分歧风险')`,
+        [run.id, ids['600000.SH'], ids['002001.SZ'], ids['600100.SH']]);
+      await pool.query(`INSERT INTO daily_plan_playbook
+        (source_job_run_id,target_date,item_kind,instrument_id,code,name,grade,priority,action,trigger_kind,headline,auction_md,intraday_md,evidence_md,missing_md,invalidation_md,risk_md)
+        SELECT $1::bigint,'2026-08-17'::date,'position_action',instrument.id,instrument.code,instrument.name,NULL,100+n,'hold','condition',
+          repeat('持仓条件预案',20),repeat('竞价观察条件',20),repeat('盘中复核条件',20),NULL,NULL,repeat('持仓失效条件',20),repeat('持仓风险提示',20)
+        FROM generate_series(1,8) n JOIN market_instrument instrument
+          ON instrument.code='610' || lpad(n::text,3,'0') || '.SH'
+        UNION ALL
+        SELECT $1::bigint,'2026-08-17'::date,'off_pool_opportunity',instrument.id,instrument.code,instrument.name,'B',1+n,'observe','condition',
+          repeat('打板条件预案',20),repeat('竞价确认条件',20),repeat('盘中回封条件',20),repeat('机会证据摘要',20),
+          repeat('尚缺确认条件',20),repeat('机会失效条件',20),repeat('机会风险提示',20)
+        FROM generate_series(1,9) n JOIN market_instrument instrument
+          ON instrument.code='003' || lpad(n::text,3,'0') || '.SZ'`, [run.id]);
+      const extraSignals = Array.from({ length: 12 }, (_, index) => ({
+        action: "mark",
+        code: `${String(300001 + index).padStart(6, "0")}.SZ`,
+        pool: index % 2 === 0 ? "short" : "long",
+        attention_status: index % 3 === 0 ? "qualified" : "near_qualified",
+        attention_reason: `补充标的 ${index + 1} 的量价、板块和风险条件需要继续复核后再执行`,
+        attention_from: "2026-08-18",
+        attention_until: "2026-08-20",
+      }));
+      await pool.query(`INSERT INTO agent_tool_audit (session_id,tool_name,args,status) VALUES ($1,'pool_attention_write',$2,'ok')`, [run.session_id, {
+        reason: "每日计划信号全量对账",
+        items: [{ action: "mark", code: "000001.SZ", pool: "short", attention_status: "qualified",
+          attention_reason: "右侧六条件已满足，等待次日回踩确认", attention_from: "2026-08-18", attention_until: "2026-08-20" }, ...extraSignals],
+      }]);
+      return "# 已完成每日计划";
+    });
+    const finished = await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow }, run.id);
+    expect(finished?.status).toBe("success");
+    let notices = await listNotifications(pool);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].content).toContain("【持仓预案｜10 项】");
+    expect(notices[0].content).toContain("跌破支撑且反抽失败后才评估");
+    expect(notices[0].content).toContain("价格＜10且成交量＞100");
+    expect(notices[0].content).toContain("未触发不得执行");
+    expect(notices[0].content).toContain("精简样本 600100.SH｜退出");
+    expect(notices[0].content).toContain("预案：跌破12.5元清仓");
+    expect(notices[0].content).not.toContain("按完整计划复核");
+    expect(notices[0].content).not.toContain("未提供，执行前需核对");
+    expect(notices[0].content).not.toContain("详见完整计划");
+    expect(notices[0].content).toContain("【标的信号｜13 项】");
+    expect(notices[0].content).toContain("信号样本 000001.SZ｜短线｜已符合");
+    expect(notices[0].content).toContain("右侧六条件已满足，等待次日回踩确认");
+    expect(notices[0].content).toContain("【打板机会预案｜10 项】");
+    expect(notices[0].content).toContain("打板样本 002001.SZ｜A 级｜顺序 1");
+    expect(notices[0].content).toContain("竞价转强后按打板预案复核");
+    expect(notices[0].content).toContain("高开幅度与封单同时达标");
+    expect(notices[0].content).toContain("回封确认后才评估");
+    expect(notices[0].content).toContain("连板、龙虎榜与板块聚集共振");
+    expect(notices[0].content).toContain("竞价转弱或开板不回封");
+    expect(notices[0].content).toContain("高位分歧风险");
+    expect(notices[0].content).toContain("不代表信号已触发或交易已执行");
+    expect(notices[0].content).toMatch(/另有 \d+ 项持仓预案/);
+    expect(notices[0].content).toMatch(/另有 \d+ 项标的信号/);
+    expect(notices[0].content).toMatch(/另有 \d+ 项打板机会/);
+    expect([...notices[0].content].length).toBeLessThanOrEqual(DAILY_PLAN_NOTIFICATION_MAX_CHARS);
+    await enqueueJobConclusion(pool, notices[0].output_id);
+    expect(await listNotifications(pool)).toHaveLength(1);
+    const connection = await pool.connect();
+    try {
+      await connection.query("BEGIN");
+      await connection.query("DELETE FROM notification_delivery");
+      await enqueueJobConclusion(connection, notices[0].output_id);
+      await connection.query("ROLLBACK");
+    } finally { connection.release(); }
+    expect((await listNotifications(pool))[0].id).toBe(notices[0].id);
+    const fetcher = vi.fn<typeof fetch>().mockRejectedValue(new Error(testSecret));
+    await deliverNextNotification(pool, fetcher);
+    notices = await listNotifications(pool);
+    expect(notices[0]).toMatchObject({ status: "pending", attempts: 1 });
+    expect(new Date(notices[0].next_attempt_at).getTime()).toBeGreaterThan(Date.now()+50_000);
+    await deliverNextNotification(pool, fetcher);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await pool.query("UPDATE notification_delivery SET next_attempt_at=now()");
+    fetcher.mockImplementation(async () => Response.json({ code: 0 }));
+    await Promise.all([deliverNextNotification(pool, fetcher), deliverNextNotification(pool, fetcher)]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect((await listNotifications(pool))[0]).toMatchObject({ status: "sent", attempts: 2 });
+    expect(agentFlow).toHaveBeenCalledTimes(1);
+    expect((await pool.query("SELECT status,attempt_count FROM job_run WHERE id=$1", [run.id])).rows[0]).toMatchObject({ status: "success", attempt_count: 1 });
+    await pool.query("UPDATE notification_delivery SET status='failed'");
+    const newer = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
+    await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => "# 更新计划\n\n## 结论摘要\n继续观察，条件尚未触发。" }, newer.id);
+    expect((await previewJobConclusion(pool))?.content).toContain("更新版");
+    expect((await previewJobConclusion(pool))?.content).toContain("条件尚未触发");
+    await deliverNextNotification(pool, fetcher);
+    expect((await listNotifications(pool)).find((n) => n.id === notices[0].id)?.status).toBe("cancelled");
+    await expect(retryNotification(pool, notices[0].id)).rejects.toThrow("仅可补发");
+  });
+
+  it("通知租约恢复、有限重试、关闭暂停、过期和更换渠道取消旧通知", async () => {
+    await updateNotificationSettings(pool, { webhook: testWebhook, sign_secret: testSecret });
+    await queueTestNotification(pool);
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 503 }));
+    await pool.query("UPDATE notification_delivery SET status='sending', attempts=1, lease_until=now()-interval '1 second'");
+    await deliverNextNotification(pool, fetcher);
+    expect((await listNotifications(pool))[0]).toMatchObject({ status: "pending", attempts: 2 });
+    await pool.query("UPDATE notification_delivery SET next_attempt_at=now()");
+    await deliverNextNotification(pool, fetcher);
+    expect((await listNotifications(pool))[0]).toMatchObject({ status: "failed", attempts: 3 });
+    await deliverNextNotification(pool, fetcher);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    await queueTestNotification(pool);
+    await updateNotificationSettings(pool, { sign_secret: "another-placeholder" });
+    expect((await listNotifications(pool)).every((n) => n.status === 'cancelled')).toBe(true);
+    await queueTestNotification(pool);
+    await pool.query("UPDATE notification_delivery SET created_at=now()-interval '2 days' WHERE status='pending'");
+    expect(await deliverNextNotification(pool, fetcher)).toBe(false);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    await updateNotificationSettings(pool, { enabled: true });
+    const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
+    await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => "# 计划\n\n## 结论摘要\n等待复核。" }, run.id);
+    await updateNotificationSettings(pool, { enabled: false });
+    expect(await deliverNextNotification(pool, fetcher)).toBe(false);
+    await updateNotificationSettings(pool, { enabled: true });
+    fetcher.mockImplementation(async () => Response.json({ code: 0 }));
+    expect(await deliverNextNotification(pool, fetcher)).toBe(true);
+  });
+
+  it("全部Agent任务结论独立推送，按任务订阅；失败、无结论与非Agent输出不排队", async () => {
+    await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret });
+    const finish = async (code: string, markdown: string) => {
+      const run = await queueManualJob(pool, code, "2026-08-17");
+      expect((await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => markdown }, run.id))?.status).toBe("success");
+      return run;
+    };
+    await finish("midweek_check", "# 检查报告\n## 结论摘要\n等待条件，不追高。");
+    await finish("weekly_review", "# 周复盘\n## 结论摘要\n本周无调整，数据不足仍需复核。");
+    const notifications = await listNotifications(pool);
+    expect(notifications.map((item) => item.job_code).sort()).toEqual(["midweek_check", "weekly_review"]);
+    expect(notifications.every((item) => item.kind === "agent_result")).toBe(true);
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({ code: 0 }));
+    await updateNotificationSettings(pool, { job_codes: ["weekly_review"] });
+    await deliverNextNotification(pool, fetcher);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect((await listNotifications(pool)).find((n) => n.job_code === 'midweek_check')?.status).toBe("pending");
+    expect((await listNotifications(pool)).find((n) => n.job_code === 'weekly_review')?.status).toBe("sent");
+    await updateNotificationSettings(pool, { job_codes: null });
+    await deliverNextNotification(pool, fetcher);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    await finish("weekly_review", "# 复盘\n## 结论摘要\n暂无结论");
+    await finish("daily_plan_flow", "# 正文但没有结论");
+    expect(await listNotifications(pool)).toHaveLength(2);
+    const failed = await queueManualJob(pool, "weekly_review", "2026-08-17");
+    await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => { throw new Error("模型失败"); } }, failed.id);
+    expect(await listNotifications(pool)).toHaveLength(2);
+    await expect(updateNotificationSettings(pool, { job_codes: ["daily_data_update"] })).rejects.toThrow("只能订阅");
+    await expect(updateNotificationSettings(pool, { job_codes: ["missing_job"] })).rejects.toThrow("只能订阅");
+    await updateNotificationSettings(pool, { job_codes: [] });
+    await finish("weekly_review", "## 结论摘要\n满足条件才操作。");
+    expect(await listNotifications(pool)).toHaveLength(2);
+    const query = await api(server.baseUrl, "GET", "/api/notifications?job_code=midweek_check&status=sent");
+    expect((query.json.items as unknown[]).length).toBe(1);
+    const preview = await api(server.baseUrl, "GET", "/api/notifications/preview?job_code=midweek_check");
+    expect(preview.json).toMatchObject({ job_code: "midweek_check" });
+    expect((await pool.query("SELECT content::text FROM chat_message WHERE role='user' ORDER BY id LIMIT 1")).rows[0].content).toContain("结论摘要");
+  });
+
+  it("新增Agent任务自动纳入全部订阅，非Agent结果不能借用输出类型触发推送", async () => {
+    await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret });
+    const template = (await listJobDefinitions(pool)).find((job) => job.code === 'weekly_review')!;
+    const custom = await createJobDefinition(pool, { code: "custom_conclusion", name: "自定义结论任务", cron: "0 16 * * 1-5", job_type: "agent_flow", config: {}, prompt_id: template.prompt_id });
+    const run = await queueManualJob(pool, custom.code, "2026-08-17");
+    await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => "## 结论摘要\n仅在条件满足后调整。" }, run.id);
+    expect((await listNotifications(pool))[0]).toMatchObject({ job_code: custom.code, kind: "agent_result" });
+    const dataRun = await queueManualJob(pool, "daily_data_update", "2026-08-17");
+    await pool.query("UPDATE job_run SET status='success' WHERE id=$1", [dataRun.id]);
+    const output = await pool.query(`INSERT INTO job_run_output(job_id,run_id,output_type,target_date,markdown,sha256,source)
+      SELECT job_id,id,'daily_plan',target_date,'## 结论摘要\n不能发送',repeat('a',64),'agent_flow' FROM job_run WHERE id=$1 RETURNING id::text`, [dataRun.id]);
+    await enqueueJobConclusion(pool, output.rows[0].id);
+    expect(await listNotifications(pool)).toHaveLength(1);
+  });
+
+  it("通知按游标分页且正文按需读取，新通知插入不导致后续页重复或漏项", async () => {
+    await updateNotificationSettings(pool, { webhook: testWebhook, sign_secret: testSecret });
+    await pool.query(`INSERT INTO notification_delivery(kind,channel_revision,content,status)
+      SELECT 'test', 2, '正文-' || n::text, CASE WHEN n%2=0 THEN 'sent' ELSE 'failed' END FROM generate_series(1,45) n`);
+    const first = await listNotificationPage(pool);
+    expect(first.items).toHaveLength(20);
+    expect(first.next_cursor).not.toBeNull();
+    expect(first.items[0]).not.toHaveProperty("content");
+    await queueTestNotification(pool);
+    const second = await listNotificationPage(pool, { before: first.next_cursor });
+    const third = await listNotificationPage(pool, { before: second.next_cursor });
+    expect(second.items).toHaveLength(20);
+    expect(third.items).toHaveLength(5);
+    expect(third.next_cursor).toBeNull();
+    expect(new Set([...first.items,...second.items,...third.items].map((item) => item.id)).size).toBe(45);
+    const filtered = await api(server.baseUrl, "GET", "/api/notifications?status=failed");
+    expect((filtered.json.items as Array<{status: string}>).every((n) => n.status==='failed')).toBe(true);
+    const detail = await api(server.baseUrl, "GET", `/api/notifications/${first.items[0].id}`);
+    expect(detail.json.content).toBe("正文-45");
+    expect((await api(server.baseUrl, "GET", "/api/notifications?before=invalid")).status).toBe(400);
+    expect((await api(server.baseUrl, "GET", "/api/notifications?status=invalid")).status).toBe(400);
+    expect((await api(server.baseUrl, "GET", "/api/notifications/999999")).status).toBe(404);
+  });
+
+  it("迁移初始化九个受控作业，板块目录与成分同步默认启用，cron 固定按上海时区解析", async () => {
     const jobs = await listJobDefinitions(pool);
     expect(jobs.map((job) => job.code)).toEqual([
       "auction_opportunity_assessment",
@@ -133,11 +439,22 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       "daily_plan_flow",
       "market_catalog_sync",
       "midweek_check",
+      "nightly_sector_opportunity_scan",
       "weekly_review",
     ]);
     expect(jobs.find((job) => job.code === "midweek_check")?.cron).toBe("30 17 * * 2");
     expect(jobs.find((job) => job.code === "weekly_review")?.cron).toBe("0 20 * * 0");
     expect(jobs.find((job) => job.code === "auction_opportunity_assessment")?.cron).toBe("30 9 * * 1-5");
+    const nightly = jobs.find((job) => job.code === "nightly_sector_opportunity_scan")!;
+    expect(nightly.cron).toBe("0 23 * * 1-5");
+    expect(nightly.enabled).toBe(true);
+    const nightlyModel = (await pool.query<{ provider_key: string; model_key: string }>(
+      `SELECT provider.provider_key, model.model_key
+         FROM llm_model model JOIN llm_provider provider ON provider.id = model.provider_id
+        WHERE model.id = $1`,
+      [nightly.model_id],
+    )).rows[0]!;
+    expect(nightlyModel).toEqual({ provider_key: "deepseek", model_key: "deepseek-v4-pro" });
     const dailyPlan = jobs.find((job) => job.code === "daily_plan_flow")!;
     expect(dailyPlan.cron).toBe("15 17 * * 1-5");
     expect(dailyPlan.config).toEqual({});
@@ -152,7 +469,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const prompts = await pool.query<{ code: string; content: string }>(
       `SELECT p.code, r.content FROM job_prompt p JOIN job_prompt_revision r ON r.id = p.current_revision_id ORDER BY p.code`,
     );
-    expect(prompts.rows).toHaveLength(4);
+    expect(prompts.rows).toHaveLength(5);
     expect(prompts.rows.filter((row) => row.code !== "auction_opportunity_assessment")
       .every((row) => row.content.includes("当前最终策略"))).toBe(true);
     expect(prompts.rows.filter((row) => row.code !== "auction_opportunity_assessment")
@@ -162,6 +479,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const dailyPrompt = prompts.rows.find((row) => row.code === "daily_plan_flow")!.content;
     const midweekPrompt = prompts.rows.find((row) => row.code === "midweek_check")!.content;
     const weeklyPrompt = prompts.rows.find((row) => row.code === "weekly_review")!.content;
+    const nightlyPrompt = prompts.rows.find((row) => row.code === "nightly_sector_opportunity_scan")!.content;
     expect(dailyPrompt).toContain("pool_attention_write");
     expect(dailyPrompt).toContain("daily_plan_context_query");
     expect(dailyPrompt.length).toBeLessThan(4_000);
@@ -169,7 +487,12 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(midweekPrompt.length).toBeLessThan(1_200);
     expect(weeklyPrompt).toContain("analysis_run(long_valuation)");
     expect(weeklyPrompt.length).toBeLessThan(1_200);
-    expect([dailyPrompt, midweekPrompt, weeklyPrompt]
+    expect(nightlyPrompt).toContain('"analysis_type":"sector_temperature"');
+    expect(nightlyPrompt).toContain("不得传 `codes`");
+    expect(nightlyPrompt).toContain("每个板块最多保留 2 只标的");
+    expect(nightlyPrompt).toContain("不超过 600 个中文字符");
+    expect(nightlyPrompt.length).toBeLessThan(4_000);
+    expect([dailyPrompt, midweekPrompt, weeklyPrompt, nightlyPrompt]
       .every((content) => !content.includes("本节替代前文"))).toBe(true);
     const auctionPrompt = prompts.rows.find((row) => row.code === "auction_opportunity_assessment")!.content;
     expect(auctionPrompt).toContain("tool_catalog");
@@ -198,6 +521,48 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         new Date("2026-08-31T10:00:00Z"),
       ).map((date) => date.toISOString()),
     ).toEqual(["2026-08-28T09:15:00.000Z", "2026-08-31T09:15:00.000Z"]);
+  });
+
+  it("Agent 任务可固定、切换或清空模型，非 Agent 任务拒绝模型绑定", async () => {
+    const promptId = (await pool.query<{ id: string }>(
+      "SELECT id::text FROM job_prompt WHERE code = 'daily_plan_flow'",
+    )).rows[0]!.id;
+    const modelId = (await pool.query<{ id: string }>(
+      `SELECT model.id::text
+         FROM llm_model model JOIN llm_provider provider ON provider.id = model.provider_id
+        WHERE provider.provider_key = 'deepseek' AND model.model_key = 'deepseek-v4-pro'`,
+    )).rows[0]!.id;
+    const job = await createJobDefinition(pool, {
+      code: "fixed_model_probe",
+      name: "固定模型探针",
+      cron: "0 1 * * *",
+      job_type: "agent_flow",
+      config: {},
+      prompt_id: promptId,
+      model_id: modelId,
+    });
+    expect(job.model_id).toBe(modelId);
+    expect((await updateJobDefinition(pool, job.code, { model_id: null })).model_id).toBeNull();
+    expect((await updateJobDefinition(pool, job.code, { model_id: modelId })).model_id).toBe(modelId);
+    await expect(createJobDefinition(pool, {
+      code: "missing_model_probe",
+      name: "不存在模型探针",
+      cron: "0 2 * * *",
+      job_type: "agent_flow",
+      config: {},
+      prompt_id: promptId,
+      model_id: "999999999",
+    })).rejects.toThrow("模型不存在");
+    await expect(createJobDefinition(pool, {
+      code: "datasource_model_probe",
+      name: "数据模型探针",
+      cron: "0 3 * * *",
+      job_type: "datasource",
+      config: { pipeline: "daily_market_update", export_volume: false },
+      model_id: modelId,
+    })).rejects.toThrow("不能指定模型");
+    await expect(updateJobDefinition(pool, "daily_data_update", { model_id: modelId }))
+      .rejects.toThrow("不能指定模型");
   });
 
   it("日更范围包含核心指数、官方行业和当日池外市场结构候选，不跟随全量目录膨胀", async () => {
@@ -296,14 +661,26 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const manual = await queueManualJob(pool, "daily_plan_flow", "2026-08-18");
     expect(manual.session_id).toBeTruthy();
     const session = await pool.query(
-      "SELECT session_type, session_status, source FROM chat_session WHERE id = $1",
+      "SELECT session_type, session_status, source, model_id::text FROM chat_session WHERE id = $1",
       [manual.session_id],
     );
+    const activeModelId = (await pool.query<{ model_id: string | null }>(
+      "SELECT active_model_id::text AS model_id FROM llm_setting WHERE singleton",
+    )).rows[0]!.model_id;
     expect(session.rows[0]).toEqual({
       session_type: "job",
       session_status: "queued",
       source: "manual_job",
+      model_id: activeModelId,
     });
+
+    const nightlyDefinition = (await listJobDefinitions(pool))
+      .find((job) => job.code === "nightly_sector_opportunity_scan")!;
+    const nightlyManual = await queueManualJob(pool, nightlyDefinition.code, "2026-08-18");
+    expect((await pool.query<{ model_id: string | null }>(
+      "SELECT model_id::text FROM chat_session WHERE id = $1",
+      [nightlyManual.session_id],
+    )).rows[0]!.model_id).toBe(nightlyDefinition.model_id);
 
     const datasource = await queueManualJob(
       pool,
@@ -338,6 +715,17 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         [flow.id, scheduledAt],
       )).rows[0]!.count),
     ).toBe(1);
+
+    const nightlyScheduled = await insertScheduledJobRun(
+      pool,
+      nightlyDefinition.id,
+      new Date("2026-08-19T13:00:00Z"),
+      "queued",
+    );
+    expect((await pool.query<{ model_id: string | null }>(
+      "SELECT model_id::text FROM chat_session WHERE id = $1",
+      [nightlyScheduled!.session_id],
+    )).rows[0]!.model_id).toBe(nightlyDefinition.model_id);
   });
 
   it("Agent session 创建失败时排队事务整体回滚，不留下可执行 job_run", async () => {
@@ -422,15 +810,17 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         pool: "short",
         attention_status: "approaching",
         attention_reason: "每日计划·即将符合：仍缺放量站稳关键位",
+        missing_signals: ["右侧信号：放量站稳关键位"],
         attention_from: "2026-08-18",
         attention_until: "2026-08-25",
       }],
     });
     expect((await pool.query(
-      `SELECT attention_reason,attention_from::text,attention_until::text
+      `SELECT attention_signal,attention_reason,attention_from::text,attention_until::text
          FROM pool_membership membership JOIN market_instrument instrument ON instrument.id=membership.instrument_id
         WHERE membership.effective_to IS NULL AND instrument.code='990088.SZ'`,
     )).rows[0]).toEqual({
+      attention_signal: { status: "approaching", missing_signals: ["右侧信号：放量站稳关键位"] },
       attention_reason: "每日计划·即将符合：仍缺放量站稳关键位",
       attention_from: "2026-08-18",
       attention_until: "2026-08-25",
@@ -1167,6 +1557,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         [run.session_id],
       );
       expect(refresh.rows[0]!.data.targets).toContain("dashboard");
+      expect(refresh.rows[0]!.data.targets).toContain("market");
     } finally {
       vi.restoreAllMocks();
       setAiRuntimeForTests(null);

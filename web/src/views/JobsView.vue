@@ -3,7 +3,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { apiClient, type ApiFail } from "../api/client";
-import type { JobDefinition, JobPrompt, JobRun, JobRunDetail, JobRunOutput } from "../api/types";
+import type { JobDefinition, JobPrompt, JobRun, JobRunDetail, JobRunOutput, LlmConfigCatalog } from "../api/types";
 import MarkdownView from "../components/MarkdownView.vue";
 import StateBlock from "../components/StateBlock.vue";
 import { useResource } from "../composables/useResource";
@@ -55,6 +55,7 @@ const GROUP_INFO: Record<string, { title: string; description: string }> = {
 
 const jobs = useResource<JobDefinition[]>(() => apiClient.get<JobDefinition[]>("/api/jobs"));
 const prompts = useResource<JobPrompt[]>(() => apiClient.get<JobPrompt[]>("/api/job-prompts"));
+const llmCatalog = useResource<LlmConfigCatalog>(() => apiClient.get<LlmConfigCatalog>("/api/llm/providers"));
 const filter = ref<"all" | "enabled" | "paused">("all");
 const actionKey = ref<string | null>(null);
 const historyJob = ref<JobDefinition | null>(null);
@@ -107,6 +108,16 @@ function executionLabel(job: JobDefinition): string {
   if (job.job_type === "analysis") return prettyJson(job.config) ?? "—";
   const prompt = (prompts.data.value ?? []).find((item) => item.id === job.prompt_id);
   return prompt ? `${prompt.name} · v${prompt.current_revision_no}` : "未绑定有效提示词";
+}
+
+function modelLabel(job: JobDefinition): string {
+  if (job.job_type !== "agent_flow") return "不调用模型";
+  if (!job.model_id) return "跟随系统默认";
+  for (const provider of llmCatalog.data.value?.providers ?? []) {
+    const model = provider.models.find((item) => item.id === job.model_id);
+    if (model) return `${provider.name} · ${model.name}`;
+  }
+  return `模型 #${job.model_id}（当前不可用）`;
 }
 
 function responsibility(job: JobDefinition): string {
@@ -214,7 +225,7 @@ function openOutput(id: string): void {
 }
 
 async function refresh(): Promise<void> {
-  await Promise.all([jobs.reload(), prompts.reload()]);
+  await Promise.all([jobs.reload(), prompts.reload(), llmCatalog.reload()]);
   if (historyJob.value) await openHistory(historyJob.value, selectedRunId.value);
 }
 
@@ -291,6 +302,7 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
               <dl class="job-kv job-purpose">
                 <dt>职责</dt><dd>{{ responsibility(job) }}</dd>
                 <dt>产出</dt><dd>{{ expectedResult(job) }}</dd>
+                <template v-if="job.job_type === 'agent_flow'"><dt>模型</dt><dd>{{ modelLabel(job) }}</dd></template>
                 <dt>下次运行</dt><dd>{{ job.next_run ? fmtTime(job.next_run) : "已暂停" }}</dd>
                 <dt>最近状态</dt><dd><span v-if="job.latest_run" class="badge" :class="STATUS_CLASS[job.latest_run.status]">{{ STATUS_LABELS[job.latest_run.status] }}</span><span v-else>尚未运行</span></dd>
               </dl>

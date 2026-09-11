@@ -19,6 +19,7 @@ export interface PositionRow {
   cost_price: number;
   cost_basis: string | null;
   opened_at: string | null;
+  entry_signal_type: EntrySignalType | null;
   updated_at: string;
   close: number | null;
   close_date: string | null;
@@ -32,6 +33,8 @@ export const DECISION_ORIGINS = ["strategy_signal", "planned_discretionary", "un
 export type DecisionOrigin = (typeof DECISION_ORIGINS)[number];
 export const EXECUTION_COMPLIANCE = ["matched", "deviated", "not_applicable", "unknown"] as const;
 export type ExecutionCompliance = (typeof EXECUTION_COMPLIANCE)[number];
+export const ENTRY_SIGNAL_TYPES = ["right_side", "left_reversal", "trial_start", "swing", "limit_up", "discretionary"] as const;
+export type EntrySignalType = (typeof ENTRY_SIGNAL_TYPES)[number];
 
 export interface PositionChangeRow {
   id: string;
@@ -55,6 +58,7 @@ export interface PositionChangeRow {
   plan_output_type: string | null;
   plan_target_date: string | null;
   entry_auction_assessment_id: string | null;
+  entry_signal_type: EntrySignalType | null;
   entry_signal_date: string | null;
   entry_assessment_date: string | null;
   entry_signal_review_type: string | null;
@@ -89,7 +93,7 @@ export async function listPositions(db: Db): Promise<PositionRow[]> {
   const r = await db.query<PositionRow>(
     `SELECT p.instrument_id::text, i.code, i.name, i.kind,
             p.quantity::float, p.cost_price::float, p.cost_basis,
-            p.opened_at::text, p.updated_at,
+            p.opened_at::text, p.entry_signal_type, p.updated_at,
             mb.close::float AS close, mb.bar_date::text AS close_date,
             COALESCE(attribution.breakdown, '{}'::jsonb) AS attribution_breakdown
        FROM portfolio_position p
@@ -137,6 +141,7 @@ export async function listPositionChanges(db: Db, limit = 100, codes?: string[])
             c.plan_output_id::text, plan.output_type AS plan_output_type,
             plan.target_date::text AS plan_target_date,
             c.entry_auction_assessment_id::text,
+            c.entry_signal_type,
             entry_item.target_date::text AS entry_signal_date,
             entry_run.target_date::text AS entry_assessment_date,
             entry_assessment.review_type AS entry_signal_review_type,
@@ -241,6 +246,7 @@ export interface RecordChangeInput {
   source_session_id?: string | null;
   decision_origin: DecisionOrigin;
   execution_compliance: ExecutionCompliance;
+  entry_signal_type?: EntrySignalType;
   plan_output_id?: string | null;
   attribution_note?: string | null;
   deviation_reason?: string | null;
@@ -333,6 +339,12 @@ export async function recordPositionChange(
     if (!inst.rows[0]) throw apiErrors.notFound(`未知标的代码：${input.code}`);
     const instrumentId = inst.rows[0].id;
     if (input.source === "chat" && !input.source_session_id) throw apiErrors.badRequest("Agent 成交事件必须绑定来源会话");
+    if (input.kind === "buy" && !input.entry_signal_type) {
+      throw apiErrors.badRequest("买入事件必须声明 entry_signal_type（买入信号类型）");
+    }
+    if (input.kind !== "buy" && input.entry_signal_type) {
+      throw apiErrors.badRequest("entry_signal_type 仅买入事件可以填写");
+    }
     if ((input.decision_origin === "unplanned_exception" || input.execution_compliance === "deviated") && !input.deviation_reason?.trim()) {
       throw apiErrors.badRequest("计划外例外或执行偏离必须填写 deviation_reason");
     }
@@ -385,15 +397,16 @@ export async function recordPositionChange(
       `INSERT INTO portfolio_position_change
          (instrument_id, change_date, kind, quantity, price, amount, reason, source,
           decision_origin, execution_compliance, strategy_change_seq, strategy_snapshot_hash,
-          plan_output_id, entry_auction_assessment_id, source_session_id, attribution_note, deviation_reason,
-          cost_price_before, realized_pnl)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+          plan_output_id, entry_auction_assessment_id, entry_signal_type, source_session_id,
+          attribution_note, deviation_reason, cost_price_before, realized_pnl)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
        RETURNING id::text, instrument_id::text, change_date::text, kind,
                  quantity::float, price::float, amount::float,
                  cost_price_before::float, realized_pnl::float, reason, source,
                  decision_origin, execution_compliance, strategy_change_seq::text,
                  strategy_snapshot_hash, plan_output_id::text, NULL::text AS plan_output_type,
                  NULL::text AS plan_target_date, entry_auction_assessment_id::text,
+                 entry_signal_type,
                  NULL::text AS entry_signal_date, NULL::text AS entry_assessment_date,
                  NULL::text AS entry_signal_review_type, NULL::text AS entry_signal_grade,
                  NULL::text AS entry_signal_headline, source_session_id::text,
@@ -407,7 +420,8 @@ export async function recordPositionChange(
         amount,
         input.reason ?? null, input.source, input.decision_origin, input.execution_compliance,
         strategy.rows[0].change_seq, strategy.rows[0].current_hash,
-        planOutputId, entrySignal?.id ?? null, input.source_session_id ?? null,
+        planOutputId, entrySignal?.id ?? null, input.entry_signal_type ?? null,
+        input.source_session_id ?? null,
         input.attribution_note?.trim() || null, input.deviation_reason?.trim() || null,
         costPriceBefore, realizedPnl,
       ],
@@ -422,27 +436,31 @@ export async function recordPositionChange(
           // 无持仓或已清零：按本次成交重新建仓
           await client.query(
             `INSERT INTO portfolio_position
-               (instrument_id, quantity, cost_price, opened_at, updated_at)
-             VALUES ($1, $2, $3, $4, now())
+               (instrument_id, quantity, cost_price, opened_at, entry_signal_type, updated_at)
+             VALUES ($1, $2, $3, $4, $5, now())
              ON CONFLICT (instrument_id) DO UPDATE SET
                quantity = EXCLUDED.quantity, cost_price = EXCLUDED.cost_price,
-               opened_at = EXCLUDED.opened_at, updated_at = now()`,
-            [instrumentId, qty, price, input.change_date],
+               opened_at = EXCLUDED.opened_at, entry_signal_type = EXCLUDED.entry_signal_type,
+               updated_at = now()`,
+            [instrumentId, qty, price, input.change_date, input.entry_signal_type!],
           );
         } else {
           const oldQty = Number(existing.quantity);
           const oldCost = Number(existing.cost_price);
           const newQty = oldQty + qty;
           const newCost = (oldQty * oldCost + qty * price) / newQty;
+          // 加仓使用新信号类型作为当前管理口径
           await client.query(
-            "UPDATE portfolio_position SET quantity = $2, cost_price = $3, updated_at = now() WHERE instrument_id = $1",
-            [instrumentId, newQty, newCost],
+            `UPDATE portfolio_position SET quantity = $2, cost_price = $3,
+                    entry_signal_type = $4, updated_at = now()
+              WHERE instrument_id = $1`,
+            [instrumentId, newQty, newCost, input.entry_signal_type!],
           );
         }
         // 每日计划自动关注用于等待入场，买入成交后已经完成使命；人工关注继续保留。
         await client.query(
           `UPDATE pool_membership
-              SET attention_reason = NULL, attention_from = NULL, attention_until = NULL
+              SET attention_reason = NULL, attention_from = NULL, attention_until = NULL, attention_signal = NULL
             WHERE instrument_id = $1 AND effective_to IS NULL
               AND attention_reason LIKE '每日计划·%'`,
           [instrumentId],
@@ -491,5 +509,85 @@ export async function recordPositionChange(
       },
       position,
     };
+  });
+}
+
+export interface UpdateEntrySignalTypeInput {
+  code: string;
+  entry_signal_type: EntrySignalType;
+  reason: string;
+  source: "chat" | "job";
+  source_session_id?: string | null;
+}
+
+/**
+ * 修正当前持仓的买入信号类型（评估口径）：同步覆盖最近一笔买入事件与持仓行，
+ * 并插入一条 fact_correction 留痕事件，不动数量与成本。
+ */
+export async function updatePositionEntrySignalType(
+  db: TransactionDb,
+  input: UpdateEntrySignalTypeInput,
+): Promise<{ position: PositionRow; previous_type: EntrySignalType | null }> {
+  return inServiceTransaction(db, async (client) => {
+    const inst = await client.query<{ id: string }>(
+      "SELECT id::text FROM market_instrument WHERE code = $1",
+      [input.code],
+    );
+    if (!inst.rows[0]) throw apiErrors.notFound(`未知标的代码：${input.code}`);
+    const instrumentId = inst.rows[0].id;
+    if (input.source === "chat" && !input.source_session_id) throw apiErrors.badRequest("Agent 修正事件必须绑定来源会话");
+
+    const current = await client.query<{ entry_signal_type: EntrySignalType | null; opened_at: string | null }>(
+      `SELECT entry_signal_type, opened_at::text
+         FROM portfolio_position WHERE instrument_id = $1 AND quantity > 0 FOR UPDATE`,
+      [instrumentId],
+    );
+    if (!current.rows[0]) throw apiErrors.badRequest(`标的 ${input.code} 当前无持仓，不能修正买入信号类型`);
+    const previousType = current.rows[0].entry_signal_type ?? null;
+
+    const strategy = await client.query<{ change_seq: string; current_hash: string }>(
+      "SELECT change_seq::text, current_hash FROM strategy_state WHERE singleton = 1",
+    );
+    if (!strategy.rows[0]) throw apiErrors.conflict("当前策略状态缺失，无法固化修正归因");
+
+    await client.query(
+      "UPDATE portfolio_position SET entry_signal_type = $2, updated_at = now() WHERE instrument_id = $1",
+      [instrumentId, input.entry_signal_type],
+    );
+    // 持仓周期内最近一笔买入事件同步补正；无买入事件的历史导入持仓只改持仓行。
+    await client.query(
+      `UPDATE portfolio_position_change change
+          SET entry_signal_type = $2
+         WHERE change.id = (
+           SELECT latest.id
+             FROM portfolio_position_change latest
+            WHERE latest.instrument_id = $1
+              AND latest.kind = 'buy'
+              AND $3::date IS NOT NULL
+              AND latest.change_date >= $3::date
+            ORDER BY latest.change_date DESC, latest.id DESC LIMIT 1
+         )`,
+      [instrumentId, input.entry_signal_type, current.rows[0].opened_at],
+    );
+    await client.query(
+      `INSERT INTO portfolio_position_change
+         (instrument_id, change_date, kind, reason, source, decision_origin, execution_compliance,
+          strategy_change_seq, strategy_snapshot_hash, source_session_id, attribution_note)
+       VALUES ($1, CURRENT_DATE, 'note', $2, $3, 'fact_correction', 'not_applicable', $4, $5, $6, $7)`,
+      [
+        instrumentId,
+        input.reason.trim(),
+        input.source,
+        strategy.rows[0].change_seq,
+        strategy.rows[0].current_hash,
+        input.source_session_id ?? null,
+        `修正买入信号类型：${previousType ?? "未记录"} → ${input.entry_signal_type}；依据：${input.reason.trim()}`,
+      ],
+    );
+
+    const rows = await listPositions(client);
+    const position = rows.find((row) => row.instrument_id === instrumentId) ?? null;
+    if (!position) throw apiErrors.conflict("修正后持仓行缺失");
+    return { position, previous_type: previousType };
   });
 }

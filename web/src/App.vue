@@ -44,6 +44,9 @@ const viewKey = ref(0);
 const statusKey = ref(0);
 const route = useRoute();
 const router = useRouter();
+const settingsAgentOpen = ref(false);
+const isSettingsPage = computed(() => route.path === "/settings" || route.path.startsWith("/settings/"));
+const workspaceOpen = computed(() => isSettingsPage.value ? settingsAgentOpen.value : agentOpen.value);
 const activeResult = computed(() => {
   const result = parseResultRef(route.query.result);
   return result && isPreviewResult(result) ? result : null;
@@ -101,6 +104,7 @@ function onAskAi(event: Event): void {
 }
 
 function setAgentOpen(open: boolean): void {
+  if (isSettingsPage.value) { settingsAgentOpen.value = open; return; }
   agentOpen.value = open;
   localStorage.setItem("stock-agent-workspace-open", open ? "1" : "0");
 }
@@ -139,7 +143,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="shell" :class="{ 'nav-collapsed': navCollapsed, 'agent-open': agentOpen }">
+  <div class="shell" :class="{ 'nav-collapsed': navCollapsed, 'agent-open': workspaceOpen }">
     <nav class="side-nav">
       <div class="brand-row">
         <span class="brand-full">Stock 策略演进</span>
@@ -182,7 +186,7 @@ onBeforeUnmount(() => {
     <CommandPalette :open="paletteOpen" @close="paletteOpen = false" />
     <AppMessageCenter />
     <AgentWorkspace
-      :open="agentOpen"
+      :open="workspaceOpen"
       :request="aiRequest"
       @open="setAgentOpen(true)"
       @close="setAgentOpen(false)"

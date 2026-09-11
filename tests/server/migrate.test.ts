@@ -23,10 +23,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
 
   it("连续执行两次幂等：第二次不重复应用", async () => {
     const first = await runMigrations(pool);
-    expect(first.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]);
+    expect(first.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89]);
     const second = await runMigrations(pool);
     expect(second.applied).toEqual([]);
-    expect(second.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81]);
+    expect(second.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89]);
     // 表结构真实存在，0005 已按领域重命名非前缀表
     const tables = await pool.query(
       "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
@@ -79,6 +79,8 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "market_stock_character_metric",
       "market_system_tracking",
       "market_trading_day",
+      "notification_delivery",
+      "notification_setting",
       "pool_board_preference",
       "pool_membership",
       "portfolio_account_snapshot",
@@ -92,7 +94,6 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "script_version",
       "strategy_doc",
       "strategy_document",
-      "strategy_document_revision",
       "strategy_evolution_backtest",
       "strategy_evolution_log",
       "strategy_publish_proposal",
@@ -160,7 +161,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       `SELECT prompt.code, revision.content
          FROM job_prompt prompt
          JOIN job_prompt_revision revision ON revision.id = prompt.current_revision_id
-        WHERE prompt.code IN ('daily_plan_flow', 'midweek_check', 'weekly_review')
+        WHERE prompt.code IN ('daily_plan_flow', 'midweek_check', 'weekly_review', 'nightly_sector_opportunity_scan')
         ORDER BY prompt.code`,
     );
     const promptByCode = new Map(prompts.rows.map((row) => [row.code, row.content]));
@@ -176,6 +177,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(dailyPlan).toContain("不得加入持仓、池外标的或覆盖人工关注");
     expect(dailyPlan).toContain("全部 `position_action`");
     expect(dailyPlan).toContain("系统保存到 `job_run_output`");
+    expect(dailyPlan).toContain("## 预案文案纪律");
+    expect(dailyPlan).toContain("只写可观测且该持仓特有的改判条件");
+    expect(dailyPlan).toContain("停牌、跌停无法成交属于必然情形");
+    expect(dailyPlan).toContain("没有当日新增信息的字段直接省略");
     expect(dailyPlan.length).toBeLessThan(4_000);
     expect(dailyPlan).not.toContain("本节替代前文");
     expect(dailyPlan).not.toContain("database_schema");
@@ -196,6 +201,14 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(weekly).toContain("analysis_run(long_valuation)");
     expect(weekly.length).toBeLessThan(1_200);
     expect(weekly).not.toContain("database_query");
+    const nightly = promptByCode.get("nightly_sector_opportunity_scan")!;
+    expect(nightly).toContain('"analysis_type":"sector_temperature"');
+    expect(nightly).toContain("不得传 `codes`");
+    expect(nightly).toContain("1–3 个板块");
+    expect(nightly).toContain("每个板块最多保留 2 只标的");
+    expect(nightly).toContain("## 结论摘要");
+    expect(nightly).toContain("不超过 600 个中文字符");
+    expect(nightly.length).toBeLessThan(4_000);
     expect(prompts.rows.every((row) => !row.content.includes("本节替代前文"))).toBe(true);
     expect(prompts.rows.every((row) => !row.content.includes("数据获取规范"))).toBe(true);
     const benchmark = (await pool.query<{
@@ -209,7 +222,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
               (benchmark.sample_counts ->> 'seal_turnover_ratio')::int AS seal_samples, benchmark.sha256
          FROM strategy_score_benchmark benchmark
          JOIN strategy_document document
-           ON document.current_revision_id = benchmark.document_revision_id
+           ON document.id = benchmark.document_id
         WHERE document.code = 'limit_up_board'`,
     )).rows[0]!;
     expect(benchmark).toEqual({
@@ -244,6 +257,29 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(auction.content).not.toContain("今日池外机会");
     expect(auction.content).not.toContain("S 日一字");
     expect(auction.content).not.toContain("E 日候选");
+    const nightlyJob = (await pool.query<{
+      code: string;
+      cron: string;
+      model_key: string;
+      provider_key: string;
+      context_window: number;
+      max_tokens: number;
+    }>(
+      `SELECT definition.code, definition.cron, model.model_key, provider.provider_key,
+              model.context_window, model.max_tokens
+         FROM job_definition definition
+         JOIN llm_model model ON model.id = definition.model_id
+         JOIN llm_provider provider ON provider.id = model.provider_id
+        WHERE definition.code = 'nightly_sector_opportunity_scan'`,
+    )).rows[0]!;
+    expect(nightlyJob).toEqual({
+      code: "nightly_sector_opportunity_scan",
+      cron: "0 23 * * 1-5",
+      model_key: "deepseek-v4-pro",
+      provider_key: "deepseek",
+      context_window: 1_000_000,
+      max_tokens: 128_000,
+    });
     const retiredTables = await pool.query<{ name: string | null }>(
       `SELECT to_regclass(name)::text AS name
          FROM unnest(ARRAY[
@@ -252,6 +288,39 @@ describe.skipIf(!prepared)("迁移运行器", () => {
          ]) AS name`,
     );
     expect(retiredTables.rows.every((row) => row.name === null)).toBe(true);
+  });
+
+  it("近期关注迁移保留历史状态，不猜测缺口或人工关注信号", async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("ALTER TABLE pool_membership DROP COLUMN attention_signal");
+      for (const [code, reason] of [
+        ["990081.SZ", "每日计划·已符合：已确认"],
+        ["990082.SZ", "每日计划·即将符合：等待放量"],
+        ["990083.SZ", "人工持续跟踪"],
+      ]) {
+        await client.query("INSERT INTO market_instrument (code, name, kind) VALUES ($1, '迁移测试标的', 'stock')", [code]);
+        await client.query(
+          `INSERT INTO pool_membership (instrument_id, pool, role, effective_from, attention_reason)
+           SELECT id, 'short', '短线', '2026-09-09', $2 FROM market_instrument WHERE code = $1`, [code, reason],
+        );
+      }
+      const sql = await fs.readFile(path.join(import.meta.dirname, "../../server/migrations/0084_近期关注信号状态与缺口.sql"), "utf8");
+      await client.query(sql);
+      expect((await client.query(
+        `SELECT instrument.code, membership.attention_signal
+         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+         WHERE instrument.code IN ('990081.SZ', '990082.SZ', '990083.SZ') ORDER BY instrument.code`,
+      )).rows).toEqual([
+        { code: "990081.SZ", attention_signal: { status: "qualified", missing_signals: [] } },
+        { code: "990082.SZ", attention_signal: { status: "approaching", missing_signals: [] } },
+        { code: "990083.SZ", attention_signal: null },
+      ]);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
   });
 
   it("篡改已应用迁移文件后报错中止", async () => {

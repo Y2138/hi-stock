@@ -45,7 +45,7 @@ const selectedProposalChange = computed(() =>
 const proposalDiff = computed<DiffRow[] | null>(() => {
   const document = selectedDocument.value;
   const change = selectedProposalChange.value;
-  return document && change ? buildDiffRows(document.current_content, change.content) : null;
+  return document && change ? buildDiffRows(document.content, change.content) : null;
 });
 const proposalDiffText = computed(() => {
   if (!proposalDiff.value) return null;
@@ -229,7 +229,7 @@ watch(() => route.query.proposal, (id) => {
             @click="selectedDocumentId = document.id"
           >
             <strong>{{ document.title }}</strong>
-            <span>{{ ROLE_LABELS[document.role] }} · 技术修订 {{ document.current_revision_no }}</span>
+            <span>{{ ROLE_LABELS[document.role] }}</span>
           </button>
         </aside>
 
@@ -238,7 +238,7 @@ watch(() => route.query.proposal, (id) => {
             <div class="reader-head">
               <div>
                 <div class="card-title">{{ selectedDocument.title }}</div>
-                <p class="card-desc num">{{ selectedDocument.code }} · {{ shortHash(selectedDocument.current_sha256) }} · {{ fmtTime(selectedDocument.updated_at) }}</p>
+                <p class="card-desc num">{{ selectedDocument.code }} · {{ shortHash(selectedDocument.sha256) }} · {{ fmtTime(selectedDocument.updated_at) }}</p>
               </div>
               <span v-if="selectedProposalChange" class="badge warn num">待审差异 {{ proposalDiffText }}</span>
             </div>
@@ -249,7 +249,7 @@ watch(() => route.query.proposal, (id) => {
                 <template v-else><span class="sign">{{ row.type === "add" ? "+" : row.type === "del" ? "−" : " " }}</span>{{ row.text }}</template>
               </div>
             </div>
-            <MarkdownView v-else :source="selectedDocument.current_content" />
+            <MarkdownView v-else :source="selectedDocument.content" />
           </template>
         </main>
       </div>

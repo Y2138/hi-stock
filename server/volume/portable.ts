@@ -14,9 +14,10 @@ import { ensureDatabase } from "./restore.js";
 import { redactEphemeralCode } from "../agent/redaction.js";
 
 export const DEFAULT_PORTABLE_DIR = path.join(PROJECT_ROOT, "bootstrap");
-export const PORTABLE_FORMAT_VERSION = 4 as const;
+export const PORTABLE_FORMAT_VERSION = 5 as const;
 export const PORTABLE_FORBIDDEN = [
   "system_setting.hithink_api_key",
+  "notification_*",
   "llm_provider.api_key",
   "llm_*",
   "agent_*",
@@ -40,29 +41,30 @@ interface PortableTableSpec {
 }
 
 /**
- * 可提交固定资产包的唯一白名单：当前策略/演进摘要 + 定时任务定义/提示词。
+ * 可提交固定资产包的唯一白名单：当前策略正文/演进摘要 + 定时任务定义/提示词。
  * 未列出的运行数据和本机设置绝不进入 payload；尤其不读取任何 api_key。
+ * 策略只携带当前最终正文，不携带历史版本。
  * 表顺序同时是恢复插入顺序，必须满足外键依赖。
  */
 export const PORTABLE_TABLES: readonly PortableTableSpec[] = [
   { table: "job_prompt", columns: ["id", "code", "name", "status", "current_revision_id", "created_at", "updated_at"], orderBy: ["id"], identity: true },
   { table: "job_prompt_revision", columns: ["id", "prompt_id", "revision_no", "content", "sha256", "source", "base_revision_id", "change_summary", "created_at"], orderBy: ["id"], identity: true },
-  { table: "job_definition", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "enabled"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
+  { table: "job_definition", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
   { table: "strategy_evolution_log", columns: ["id", "outline", "conclusion", "adjustments", "adoption_status", "strategy_hash_before", "strategy_hash_after", "created_at", "decided_at"], orderBy: ["id"], identity: true, jsonColumns: ["adjustments"] },
-  { table: "strategy_document", columns: ["id", "code", "title", "role", "injection_order", "current_revision_id", "created_at", "updated_at"], orderBy: ["id"], identity: true },
-  { table: "strategy_document_revision", columns: ["id", "document_id", "revision_no", "content", "sha256", "source", "created_at"], orderBy: ["id"], identity: true },
-  { table: "strategy_score_benchmark", columns: ["id", "document_revision_id", "benchmark_code", "training_start", "training_end", "methodology", "distributions", "sample_counts", "source_summary", "sha256", "created_at"], orderBy: ["id"], identity: true, jsonColumns: ["distributions", "sample_counts", "source_summary"], dateColumns: ["training_start", "training_end"] },
+  { table: "strategy_document", columns: ["id", "code", "title", "role", "injection_order", "content", "sha256", "created_at", "updated_at"], orderBy: ["id"], identity: true },
+  { table: "strategy_score_benchmark", columns: ["id", "document_id", "benchmark_code", "training_start", "training_end", "methodology", "distributions", "sample_counts", "source_summary", "sha256", "created_at"], orderBy: ["id"], identity: true, jsonColumns: ["distributions", "sample_counts", "source_summary"], dateColumns: ["training_start", "training_end"] },
   { table: "strategy_state", columns: ["singleton", "change_seq", "current_hash", "last_evolution_id", "updated_at"], orderBy: ["singleton"] },
 ] as const;
 
 export interface PortableHashRow {
   code: string;
-  revision_no: number;
   sha256: string;
+  /** 仅作业提示词仍有内部版本号；策略只保留当前正文。 */
+  revision_no?: number;
 }
 
 export interface PortableManifest {
-  version: 4;
+  version: 5;
   kind: "portable_fixed_assets";
   exported_at: string;
   migration_max: number;
@@ -102,11 +104,10 @@ async function fileSha256(file: string): Promise<string> {
 async function revisionHashes(db: Db, kind: "strategy" | "prompt"): Promise<PortableHashRow[]> {
   const result = kind === "strategy"
     ? await db.query<PortableHashRow>(
-        `SELECT d.code, r.revision_no, r.sha256 FROM strategy_document_revision r
-          JOIN strategy_document d ON d.id = r.document_id ORDER BY d.code, r.revision_no`,
+        `SELECT code, sha256 FROM strategy_document ORDER BY code`,
       )
     : await db.query<PortableHashRow>(
-        `SELECT p.code, r.revision_no, r.sha256 FROM job_prompt_revision r
+        `SELECT p.code, r.sha256 FROM job_prompt_revision r
           JOIN job_prompt p ON p.id = r.prompt_id ORDER BY p.code, r.revision_no`,
       );
   return result.rows;
@@ -144,6 +145,18 @@ async function* payloadLines(db: Db): AsyncGenerator<string> {
         [pageSize, offset],
       );
       for (const row of result.rows) {
+        if (spec.table === "job_definition" && row.model_id !== null) {
+          const binding = await db.query<{ provider_key: string; model_key: string }>(
+            `SELECT provider.provider_key, model.model_key
+               FROM llm_model model
+               JOIN llm_provider provider ON provider.id = model.provider_id
+              WHERE model.id = $1`,
+            [row.model_id],
+          );
+          if (!binding.rows[0]) throw new Error(`定时任务 ${String(row.code)} 绑定的模型不存在`);
+          row.model_provider_key = binding.rows[0].provider_key;
+          row.model_key = binding.rows[0].model_key;
+        }
         yield JSON.stringify({ type: "row", table: spec.table, row: redactEphemeralCode(row) }) + "\n";
       }
       if (result.rows.length < pageSize) break;
@@ -239,8 +252,6 @@ const RESET_STATEMENTS = [
   "DELETE FROM strategy_evolution_backtest",
   "DELETE FROM strategy_score_benchmark",
   "DELETE FROM strategy_state",
-  "UPDATE strategy_document SET current_revision_id = NULL",
-  "DELETE FROM strategy_document_revision",
   "DELETE FROM strategy_publish_proposal",
   "DELETE FROM strategy_evolution_log",
   "DELETE FROM strategy_document",
@@ -273,8 +284,32 @@ const RESET_STATEMENTS = [
   "DELETE FROM market_instrument",
 ] as const;
 
+async function resolvePortableJobModels(client: pg.PoolClient, rows: Record<string, unknown>[]): Promise<void> {
+  for (const row of rows) {
+    const providerKey = row.model_provider_key;
+    const modelKey = row.model_key;
+    if (providerKey === undefined && modelKey === undefined) continue;
+    if (typeof providerKey !== "string" || typeof modelKey !== "string") {
+      throw new Error(`初始化包任务 ${String(row.code)} 的模型标识不完整`);
+    }
+    const model = await client.query<{ id: string }>(
+      `SELECT model.id::text
+         FROM llm_model model
+         JOIN llm_provider provider ON provider.id = model.provider_id
+        WHERE provider.provider_key = $1 AND model.model_key = $2`,
+      [providerKey, modelKey],
+    );
+    if (!model.rows[0]) {
+      throw new Error(`初始化包任务 ${String(row.code)} 需要未安装模型 ${providerKey}/${modelKey}`);
+    }
+    // 数字主键只属于源实例；恢复时按稳定的厂商键和模型键重新绑定。
+    row.model_id = model.rows[0].id;
+  }
+}
+
 async function insertBatch(client: pg.PoolClient, spec: PortableTableSpec, rows: Record<string, unknown>[]): Promise<void> {
   if (!rows.length) return;
+  if (spec.table === "job_definition") await resolvePortableJobModels(client, rows);
   const values: unknown[] = [];
   const jsonColumns = new Set(spec.jsonColumns ?? []);
   const tuples = rows.map((row) => {
@@ -313,20 +348,6 @@ async function restorePayload(pool: pg.Pool, payloadPath: string): Promise<void>
   try {
     await client.query("BEGIN");
     await client.query("SET CONSTRAINTS ALL DEFERRED");
-    const benchmarkTemplates = await client.query<{
-      benchmark_code: string;
-      training_start: string;
-      training_end: string;
-      methodology: string;
-      distributions: unknown;
-      sample_counts: unknown;
-      source_summary: unknown;
-      sha256: string;
-    }>(
-      `SELECT benchmark_code, training_start::text, training_end::text, methodology,
-              distributions, sample_counts, source_summary, sha256
-         FROM strategy_score_benchmark ORDER BY id`,
-    );
     for (const statement of RESET_STATEMENTS) await client.query(statement);
     const lines = readline.createInterface({ input: fs.createReadStream(payloadPath).pipe(createGunzip()), crlfDelay: Infinity });
     let headerSeen = false;
@@ -355,24 +376,6 @@ async function restorePayload(pool: pg.Pool, payloadPath: string): Promise<void>
     }
     await flush();
     if (!headerSeen) throw new Error("初始化包 payload 为空");
-    const benchmarkCount = await client.query<{ count: number }>("SELECT count(*)::int AS count FROM strategy_score_benchmark");
-    if (benchmarkCount.rows[0]!.count === 0) {
-      for (const benchmark of benchmarkTemplates.rows) {
-        await client.query(
-          `INSERT INTO strategy_score_benchmark
-             (document_revision_id, benchmark_code, training_start, training_end, methodology,
-              distributions, sample_counts, source_summary, sha256)
-           SELECT document.current_revision_id, $1, $2, $3, $4, $5, $6, $7, $8
-             FROM strategy_document document
-            WHERE document.code = 'limit_up_board' AND document.current_revision_id IS NOT NULL`,
-          [
-            benchmark.benchmark_code, benchmark.training_start, benchmark.training_end,
-            benchmark.methodology, benchmark.distributions, benchmark.sample_counts,
-            benchmark.source_summary, benchmark.sha256,
-          ],
-        );
-      }
-    }
     await resetSequences(client);
     await client.query("COMMIT");
   } catch (error) {

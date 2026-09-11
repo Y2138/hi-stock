@@ -7,8 +7,10 @@ import StateBlock from "../components/StateBlock.vue";
 import UiInput from "../components/ui/UiInput.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
+import { appMessage } from "../stores/message";
 import { askAi } from "../utils/askAi";
 import { fmtDate, fmtNum } from "../utils/format";
+import { attentionSignalLabel, compareAttentionQuality } from "../utils/poolAttention";
 
 const props = defineProps<{ pool: "short" | "long" }>();
 const router = useRouter();
@@ -17,6 +19,7 @@ const selected = ref("attention");
 const boardQuery = ref("");
 const searchFocused = ref(false);
 const detailMember = ref<PoolMember | null>(null);
+const removingAttentionCode = ref<string | null>(null);
 const data = useResource<PoolViewData>(() => apiClient.get<PoolViewData>(`/api/pools/${props.pool}`));
 const focusedMemberCode = computed(() => typeof route.query.member === "string" ? route.query.member : null);
 const focusedMember = computed(() => (data.data.value?.members ?? []).find((member) => member.code === focusedMemberCode.value) ?? null);
@@ -43,6 +46,15 @@ const boardMatches = computed(() => {
       .some((value) => value.toLocaleLowerCase("zh-CN").includes(keyword)),
   ).slice(0, 8);
 });
+const memberMatches = computed(() => {
+  const keyword = boardQuery.value.trim().toLocaleLowerCase("zh-CN");
+  const members = data.data.value?.members ?? [];
+  if (!keyword) return [];
+  return members.filter((member) =>
+    [member.name, member.code]
+      .some((value) => value.toLocaleLowerCase("zh-CN").includes(keyword)),
+  ).slice(0, 8);
+});
 const visibleMembers = computed(() => {
   const members = data.data.value?.members ?? [];
   if (selected.value === "all") {
@@ -50,7 +62,7 @@ const visibleMembers = computed(() => {
       ? [...members].sort((left, right) => Number(right.code === focusedMemberCode.value) - Number(left.code === focusedMemberCode.value))
       : members;
   }
-  if (selected.value === "attention") return members.filter(isAttention);
+  if (selected.value === "attention") return members.filter(isAttention).sort(compareAttentionQuality);
   if (selected.value === "etf") return members.filter((member) => member.kind === "etf");
   if (selected.value === "unclassified") return members.filter((member) => member.kind === "stock" && member.boards.length === 0);
   return members.filter((member) => member.boards.some((board) => board.code === selected.value));
@@ -76,15 +88,27 @@ function memberStockCharacter(member: PoolMember): string {
   return member.stock_character ?? member.tags.find((tag) => tag.startsWith("股性："))?.slice(3) ?? "—";
 }
 
-function selectFirstBoard(): void {
-  const first = boardMatches.value[0];
-  if (first) selectBoard(first.code);
+function selectFirstMatch(): void {
+  const board = boardMatches.value[0];
+  if (board) {
+    selectBoard(board.code);
+    return;
+  }
+  const member = memberMatches.value[0];
+  if (member) selectMember(member.code);
 }
 
 function selectBoard(code: string): void {
   selected.value = code;
   boardQuery.value = "";
   searchFocused.value = false;
+}
+
+function selectMember(code: string): void {
+  selected.value = "all";
+  boardQuery.value = "";
+  searchFocused.value = false;
+  void router.push({ path: route.path, query: { ...route.query, member: code } });
 }
 
 function goMarket(code: string): void {
@@ -107,20 +131,52 @@ function maintainWithAgent(): void {
   askAi(
     `请维护标的池，当前页面是${title.value}。新增、迁池或改变角色时只加载并调用一次 pool_onboard；把我明确的池别或角色直接传入，未明确时采用服务端推荐。服务端会统一完成数据同步、正式指标重算、版本化五维股性/阶段/评分和入池确认卡，不要再组合行情、分析或 pool_write。当前买入信号和止损都不属于入池判断。`,
     "维护标的池",
-    { confirmation: `打开 Agent 维护${title.value}？\n\n页面本身只查询，业务事实由 Agent 核对后写入。` },
+    { confirmation: `打开 Agent 维护${title.value}？\n\n新增、迁池和改变角色由 Agent 核对后写入。` },
   );
 }
 
 function markAttentionWithAgent(member: PoolMember): void {
   const instruction = isAttention(member)
-    ? "请先让我选择调整关注原因/期限或直接移出近期关注；移除时将 attention_reason、attention_from、attention_until 同时设为 null。"
+    ? "请先让我选择新的关注原因或期限。"
     : "请先让我确认关注原因与期限。";
   askAi(
     `请维护${title.value}标的 ${member.name}（${member.code}）的近期关注。先查询当前有效 pool_membership，` +
     `仅使用 pool_write update 修改 attention_reason、attention_from、attention_until，保留原角色和全部研究属性；${instruction}写入成功后刷新 pools。`,
     `近期关注 · ${member.name}`,
-    { confirmation: `打开 Agent 处理 ${member.name} 的近期关注？\n\n页面不会直接改写标的池。` },
+    { confirmation: `打开 Agent 处理 ${member.name} 的近期关注？\n\n新增和调整由 Agent 核对后写入；已有关注也可在页面直接移除。` },
   );
+}
+
+async function removeAttention(member: PoolMember): Promise<void> {
+  if (removingAttentionCode.value || !isAttention(member)) return;
+  if (!window.confirm(
+    `确认移除 ${member.name}（${member.code}）的近期关注？\n\n标的仍保留在${title.value}，角色和研究属性不会改变。`,
+  )) return;
+
+  removingAttentionCode.value = member.code;
+  try {
+    const result = await apiClient.delete<PoolMember>(
+      `/api/pools/${props.pool}/${encodeURIComponent(member.code)}/attention`,
+    );
+    if (!result.ok) return;
+
+    const current = data.data.value;
+    if (current) {
+      data.data.value = {
+        ...current,
+        members: current.members.map((item) => item.code === member.code ? result.data : item),
+        attention_count: Math.max(0, current.attention_count - 1),
+      };
+    }
+    if (detailMember.value?.code === member.code) detailMember.value = result.data;
+    appMessage.success(`${member.name} 已从近期关注中移除`);
+    await data.reload();
+    if (detailMember.value?.code === member.code) {
+      detailMember.value = data.data.value?.members.find((item) => item.code === member.code) ?? result.data;
+    }
+  } finally {
+    removingAttentionCode.value = null;
+  }
 }
 
 function pct(value: number | null): string {
@@ -173,29 +229,45 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
               <UiInput
                 v-model="boardQuery"
                 type="search"
-                aria-label="快速查找大行业"
-                placeholder="快速定位大行业"
+                aria-label="快速查找大行业或标的"
+                placeholder="快速定位大行业 / 标的"
                 role="combobox"
                 :aria-expanded="searchFocused && Boolean(boardQuery)"
                 aria-controls="board-search-results"
                 @focus="searchFocused = true"
                 @blur="searchFocused = false"
-                @keyup.enter="selectFirstBoard"
+                @keyup.enter="selectFirstMatch"
                 @keyup.esc="boardQuery = ''"
               />
-              <button class="btn compact board-locate" type="button" :disabled="!boardMatches.length" @click="selectFirstBoard">定位</button>
+              <button class="btn compact board-locate" type="button" :disabled="!boardMatches.length && !memberMatches.length" @click="selectFirstMatch">定位</button>
               <div v-if="searchFocused && boardQuery" id="board-search-results" class="board-results" role="listbox">
-                <button
-                  v-for="board in boardMatches"
-                  :key="board.code"
-                  type="button"
-                  role="option"
-                  @mousedown.prevent
-                  @click="selectBoard(board.code)"
-                >
-                  {{ board.name }}
-                </button>
-                <span v-if="boardMatches.length === 0">没有匹配的大行业</span>
+                <template v-if="boardMatches.length">
+                  <span class="results-group">大行业</span>
+                  <button
+                    v-for="board in boardMatches"
+                    :key="board.code"
+                    type="button"
+                    role="option"
+                    @mousedown.prevent
+                    @click="selectBoard(board.code)"
+                  >
+                    {{ board.name }}
+                  </button>
+                </template>
+                <template v-if="memberMatches.length">
+                  <span class="results-group">标的</span>
+                  <button
+                    v-for="member in memberMatches"
+                    :key="member.id"
+                    type="button"
+                    role="option"
+                    @mousedown.prevent
+                    @click="selectMember(member.code)"
+                  >
+                    {{ member.name }}<span class="num code-sub results-code">{{ member.code }}</span>
+                  </button>
+                </template>
+                <span v-if="!boardMatches.length && !memberMatches.length">没有匹配的大行业或标的</span>
               </div>
             </div>
           </div>
@@ -228,7 +300,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           <div class="content-head">
             <div>
               <div class="card-title">{{ selectedLabel }}（{{ visibleMembers.length }}）</div>
-              <p class="card-desc">当前有效池成员及其研究、阶段与关注状态。</p>
+              <p class="card-desc">{{ selected === "attention" ? "按信号完整度排序：已成立 → 待补信号 → 状态未明确；同档按代码排序，不混用研究评分。" : "当前有效池成员及其研究、阶段与关注状态。" }}</p>
             </div>
             <div v-if="selected !== 'all' && selected !== 'attention' && selected !== 'etf' && selected !== 'unclassified'" class="content-actions">
               <a class="btn compact" :href="`https://q.10jqka.com.cn/thshy/detail/code/${selected.split('.')[0]}/`" target="_blank" rel="noopener noreferrer">查看板块成分</a>
@@ -237,12 +309,12 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           </div>
           <p v-if="visibleMembers.length === 0" class="state-block empty">当前视图没有标的</p>
           <div v-else class="table-wrap">
-            <table class="data-table clickable" :class="{ 'research-visible': showResearch }">
+            <table class="data-table clickable" :class="{ 'research-visible': showResearch && selected !== 'attention', 'attention-view': selected === 'attention' }">
               <colgroup>
-                <col class="col-instrument"><col class="col-role"><col v-if="showResearch" class="col-summary"><col v-if="showResearch" class="col-tags">
-                <col class="col-stage"><col class="col-industry"><col class="col-attention"><col class="col-action">
+                <col class="col-instrument"><col class="col-role"><col v-if="showResearch && selected !== 'attention'" class="col-summary"><col v-if="showResearch && selected !== 'attention'" class="col-tags">
+                <col v-if="selected !== 'attention'" class="col-stage"><col v-if="selected !== 'attention'" class="col-industry"><col class="col-attention"><col class="col-action">
               </colgroup>
-              <thead><tr><th>标的 / 行情</th><th>角色 / 分级</th><th v-if="showResearch">研究摘要</th><th v-if="showResearch">研究标签</th><th>阶段 / 股性</th><th>行业细分（官方）</th><th>近期关注</th><th>操作</th></tr></thead>
+              <thead><tr><th>标的 / 行情</th><th>角色 / 分级</th><th v-if="showResearch && selected !== 'attention'">研究摘要</th><th v-if="showResearch && selected !== 'attention'">研究标签</th><th v-if="selected !== 'attention'">阶段 / 股性</th><th v-if="selected !== 'attention'">行业细分（官方）</th><th>近期关注</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="member in visibleMembers" :key="member.id" :class="{ 'focused-row': member.code === focusedMemberCode }" tabindex="0" @click="openMemberDetail(member)" @keydown.enter="openMemberDetail(member)" @keydown.space.prevent="openMemberDetail(member)">
                   <td>
@@ -250,17 +322,30 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                     <div class="quote"><span class="num">{{ member.last === null ? "—" : fmtNum(member.last) }}</span><span :class="{ up: (member.change_pct ?? 0) > 0, down: (member.change_pct ?? 0) < 0 }">{{ pct(member.change_pct) }}</span></div>
                   </td>
                   <td><span class="badge accent">{{ member.role }}</span><div>{{ member.grade ?? "—" }} · {{ member.score ?? "—" }}</div></td>
-                  <td v-if="showResearch"><div class="cell-clamp clamp-3 summary">{{ member.evaluation_summary ?? "—" }}</div></td>
-                  <td v-if="showResearch"><div v-if="researchTags(member).length" class="tag-preview"><div v-for="(tag, index) in researchTags(member).slice(0, 2)" :key="tag" class="tag-preview-row"><span class="badge compact-tag">{{ tag }}</span><span v-if="index === 1 && researchTags(member).length > 2" class="tag-more">余 {{ researchTags(member).length - 2 }} 条</span></div></div><span v-else>—</span></td>
-                  <td><strong class="cell-clamp clamp-1">{{ memberStage(member) }}</strong><div class="muted cell-clamp clamp-2">{{ memberStockCharacter(member) }}</div></td>
-                  <td>
+                  <td v-if="showResearch && selected !== 'attention'"><div class="cell-clamp clamp-3 summary">{{ member.evaluation_summary ?? "—" }}</div></td>
+                  <td v-if="showResearch && selected !== 'attention'"><div v-if="researchTags(member).length" class="tag-preview"><div v-for="(tag, index) in researchTags(member).slice(0, 2)" :key="tag" class="tag-preview-row"><span class="badge compact-tag">{{ tag }}</span><span v-if="index === 1 && researchTags(member).length > 2" class="tag-more">余 {{ researchTags(member).length - 2 }} 条</span></div></div><span v-else>—</span></td>
+                  <td v-if="selected !== 'attention'"><strong class="cell-clamp clamp-1">{{ memberStage(member) }}</strong><div class="muted cell-clamp clamp-2">{{ memberStockCharacter(member) }}</div></td>
+                  <td v-if="selected !== 'attention'">
                     <button v-for="board in displayIndustries(member)" :key="board.code" class="market-link industry-text" type="button" @click.stop="goMarket(board.code)">{{ board.name }}</button>
                     <span v-if="member.boards.length === 0" class="muted">{{ member.kind === "etf" ? "不适用" : "待同步" }}</span>
                   </td>
                   <td class="attention-cell">
-                    <strong v-if="isAttention(member)" class="cell-clamp clamp-2">{{ member.attention_reason }}</strong>
+                    <template v-if="isAttention(member)">
+                      <span class="badge signal-status" :class="member.attention_signal?.status ?? 'unknown'">{{ attentionSignalLabel(member) }}</span>
+                      <ul v-if="member.attention_signal?.status === 'approaching'" class="signal-gaps">
+                        <li v-for="gap in member.attention_signal.missing_signals" :key="gap">待确认：{{ gap }}</li>
+                        <li v-if="!member.attention_signal.missing_signals.length">缺口待补充，请结合关注原因核实</li>
+                      </ul>
+                      <strong class="cell-clamp clamp-2">{{ member.attention_reason }}</strong>
+                    </template>
                     <span v-else class="muted">未关注</span>
-                    <div class="attention-footer"><span class="muted">{{ isAttention(member) ? `${fmtDate(member.attention_from) ?? "现在"}–${fmtDate(member.attention_until) ?? "持续"}` : "—" }}</span><button class="detail-trigger agent-entry" type="button" @click.stop="markAttentionWithAgent(member)">{{ isAttention(member) ? "调整 / 移除" : "关注" }}</button></div>
+                    <div class="attention-footer">
+                      <span class="muted">{{ isAttention(member) ? `${fmtDate(member.attention_from) ?? "现在"}–${fmtDate(member.attention_until) ?? "持续"}` : "—" }}</span>
+                      <div class="attention-actions">
+                        <button class="detail-trigger agent-entry" type="button" @click.stop="markAttentionWithAgent(member)">{{ isAttention(member) ? "调整" : "关注" }}</button>
+                        <button v-if="isAttention(member)" class="detail-trigger remove-attention" type="button" :disabled="removingAttentionCode === member.code" @click.stop="removeAttention(member)">{{ removingAttentionCode === member.code ? "移除中" : "移除" }}</button>
+                      </div>
+                    </div>
                   </td>
                   <td class="row-action-cell"><button class="btn compact" type="button" @click.stop="goMarket(member.code)">查看行情</button></td>
                 </tr>
@@ -286,7 +371,23 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           </dl>
           <section v-if="showResearch" class="detail-section"><h3>研究摘要</h3><p>{{ detailMember.evaluation_summary ?? "暂无研究摘要" }}</p></section>
           <section v-if="showResearch" class="detail-section"><h3>研究标签</h3><div v-if="researchTags(detailMember).length" class="detail-tags"><span v-for="tag in researchTags(detailMember)" :key="tag" class="badge">{{ tag }}</span></div><p v-else class="muted">暂无研究标签</p></section>
-          <section class="detail-section"><h3>近期关注</h3><template v-if="isAttention(detailMember)"><p>{{ detailMember.attention_reason }}</p><div class="muted">{{ fmtDate(detailMember.attention_from) ?? "现在" }}–{{ fmtDate(detailMember.attention_until) ?? "持续" }}</div></template><p v-else class="muted">当前未关注</p><button class="btn compact agent-entry" type="button" @click="markAttentionWithAgent(detailMember)">{{ isAttention(detailMember) ? "调整或移除关注" : "标记关注" }}</button></section>
+          <section class="detail-section">
+            <h3>近期关注</h3>
+            <template v-if="isAttention(detailMember)">
+              <span class="badge signal-status" :class="detailMember.attention_signal?.status ?? 'unknown'">{{ attentionSignalLabel(detailMember) }}</span>
+              <ul v-if="detailMember.attention_signal?.status === 'approaching'" class="signal-gaps">
+                <li v-for="gap in detailMember.attention_signal.missing_signals" :key="gap">待确认：{{ gap }}</li>
+                <li v-if="!detailMember.attention_signal.missing_signals.length">缺口待补充，请结合关注原因核实</li>
+              </ul>
+              <p>{{ detailMember.attention_reason }}</p>
+              <div class="muted">{{ fmtDate(detailMember.attention_from) ?? "现在" }}–{{ fmtDate(detailMember.attention_until) ?? "持续" }}</div>
+            </template>
+            <p v-else class="muted">当前未关注</p>
+            <div class="detail-attention-actions">
+              <button class="btn compact agent-entry" type="button" @click="markAttentionWithAgent(detailMember)">{{ isAttention(detailMember) ? "调整关注" : "标记关注" }}</button>
+              <button v-if="isAttention(detailMember)" class="btn compact remove-attention" type="button" :disabled="removingAttentionCode === detailMember.code" @click="removeAttention(detailMember)">{{ removingAttentionCode === detailMember.code ? "移除中" : "移除关注" }}</button>
+            </div>
+          </section>
         </div>
       </aside>
     </div>
@@ -294,6 +395,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 </template>
 
 <style scoped>
+.signal-status{margin-bottom:6px;white-space:normal}.signal-status.qualified{color:var(--accent);border:1px solid currentColor}.signal-status.approaching{color:var(--warning, #9a6400);border:1px solid currentColor}.signal-status.unknown{color:var(--ink-faint)}
+.signal-gaps{margin:2px 0 8px;padding-left:16px;font-size:12px;line-height:1.6;overflow-wrap:anywhere}.signal-gaps li+li{margin-top:4px}
+
 .pool-head,.content-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.content-actions{display:flex;gap:7px;flex:none}
 .pool-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;min-width:0}
 .pool-explorer{position:relative;z-index:4;min-width:0;padding:0}
@@ -305,6 +409,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .board-results button{border:0;border-radius:6px;background:transparent;color:var(--ink);padding:8px 10px;text-align:left;cursor:pointer}
 .board-results button:hover{background:var(--accent-soft);color:var(--accent-ink)}
 .board-results span{padding:10px;color:var(--ink-faint);font-size:var(--fs-sm)}
+.board-results .results-group{padding:6px 10px 2px;font-weight:700;letter-spacing:.02em}
+.board-results .results-group:not(:first-child){margin-top:4px;border-top:1px solid var(--line)}
+.board-results .results-code{margin-left:6px;padding:0}
 .pool-tabs{display:flex;gap:2px;overflow-x:auto;padding:0 10px}
 .pool-tabs button{display:inline-flex;align-items:center;gap:5px;flex:none;min-height:40px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--ink-soft);padding:0 11px;white-space:nowrap;cursor:pointer;font:500 var(--fs-sm)/1 var(--font-body);transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease),color var(--dur) var(--ease)}
 .pool-tabs button:hover{background:var(--paper-deep);color:var(--ink)}
@@ -317,13 +424,14 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .data-table{min-width:850px;table-layout:fixed}.data-table.research-visible{min-width:1080px}
 .data-table thead th{position:sticky;top:0;z-index:2;padding:9px 12px;background:var(--paper-deep);box-shadow:0 1px 0 var(--line);font-size:11px;letter-spacing:.02em}
 .data-table td{padding:12px;line-height:1.45}
+.data-table.attention-view{min-width:620px}.attention-view .col-attention{width:auto}.attention-view .signal-status{max-width:100%;overflow-wrap:anywhere}
 .data-table th:first-child,.data-table td:first-child{position:sticky;left:0;z-index:1;background:var(--card)}
 .data-table th:first-child{z-index:3;background:var(--paper-deep)}
 .data-table th:last-child,.data-table td:last-child{position:sticky;right:0;z-index:1;background:var(--card);box-shadow:-1px 0 var(--line)}
 .data-table th:last-child{z-index:3;background:var(--paper-deep)}
 .data-table tbody tr:hover td:first-child,.data-table tbody tr:hover td:last-child{background:var(--accent-soft)}
 .col-instrument{width:130px}.col-role{width:90px}.col-summary{width:190px}.col-tags{width:130px}.col-stage{width:125px}.col-industry{width:155px}.col-attention{width:210px}.col-action{width:86px}
-.attention-footer,.member-detail-head,.member-detail-actions{display:flex;align-items:center;justify-content:space-between;gap:8px}.detail-trigger{flex:none;border:0;background:transparent;padding:0;color:var(--accent-ink);font:600 11px var(--font-body);cursor:pointer}.detail-trigger:hover{text-decoration:underline}.quote{display:flex;gap:8px;margin-top:5px}.cell-clamp{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.clamp-1{-webkit-line-clamp:1}.clamp-2{-webkit-line-clamp:2}.clamp-3{-webkit-line-clamp:3}.summary{color:var(--ink-soft)}.tag-preview{display:grid;gap:4px}.tag-preview-row{display:flex;align-items:center;min-width:0;gap:4px}.compact-tag{display:block;min-width:0;max-width:100%;overflow:hidden;padding-inline:7px;text-overflow:ellipsis}.tag-preview-row:last-child .compact-tag{flex:1}.tag-more{flex:none;color:var(--ink-faint);font:600 10px var(--font-mono);white-space:nowrap}.attention-cell{min-width:0}.attention-footer{margin-top:6px}.attention-footer>.muted{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-action-cell{vertical-align:middle!important}.row-action-cell .btn{white-space:nowrap}.data-table tbody tr:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}.market-link{display:block;border:0;background:transparent;padding:0;color:var(--accent-ink);text-align:left;cursor:pointer;font:inherit}.market-link:hover{text-decoration:underline}.industry-text{font-weight:600}.up{color:var(--up)}.down{color:var(--down)}
+.attention-footer,.member-detail-head,.member-detail-actions{display:flex;align-items:center;justify-content:space-between;gap:8px}.attention-actions,.detail-attention-actions{display:flex;align-items:center;gap:8px}.detail-trigger{flex:none;border:0;background:transparent;padding:0;color:var(--accent-ink);font:600 11px var(--font-body);cursor:pointer}.detail-trigger:hover{text-decoration:underline}.remove-attention{color:var(--bad)}.remove-attention:disabled{cursor:wait;opacity:.55}.quote{display:flex;gap:8px;margin-top:5px}.cell-clamp{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.clamp-1{-webkit-line-clamp:1}.clamp-2{-webkit-line-clamp:2}.clamp-3{-webkit-line-clamp:3}.summary{color:var(--ink-soft)}.tag-preview{display:grid;gap:4px}.tag-preview-row{display:flex;align-items:center;min-width:0;gap:4px}.compact-tag{display:block;min-width:0;max-width:100%;overflow:hidden;padding-inline:7px;text-overflow:ellipsis}.tag-preview-row:last-child .compact-tag{flex:1}.tag-more{flex:none;color:var(--ink-faint);font:600 10px var(--font-mono);white-space:nowrap}.attention-cell{min-width:0}.attention-footer{margin-top:6px}.attention-footer>.muted{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-action-cell{vertical-align:middle!important}.row-action-cell .btn{white-space:nowrap}.data-table tbody tr:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}.market-link{display:block;border:0;background:transparent;padding:0;color:var(--accent-ink);text-align:left;cursor:pointer;font:inherit}.market-link:hover{text-decoration:underline}.industry-text{font-weight:600}.up{color:var(--up)}.down{color:var(--down)}
 .member-detail-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}.member-detail-panel{display:grid;width:min(620px,94vw);height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.member-detail-head{padding:14px 18px;border-bottom:1px solid var(--line);background:var(--card)}.member-detail-head>div:first-child{display:flex;align-items:center;min-width:0;gap:8px}.member-detail-head strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.detail-close{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:19px;line-height:1;cursor:pointer}.detail-close:hover{border-color:var(--accent);color:var(--accent-ink)}.member-detail-scroll{min-height:0;overflow:auto;padding:18px 20px 48px}.detail-overview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0;margin:0;border-block:1px solid var(--line)}.detail-overview>div{padding:12px 10px}.detail-overview>div:nth-child(odd){border-right:1px solid var(--line)}.detail-overview dt{margin-bottom:4px;color:var(--ink-faint);font-size:11px}.detail-overview dd{margin:0;overflow-wrap:anywhere;line-height:1.55}.detail-section{padding:18px 2px;border-bottom:1px solid var(--line)}.detail-section h3{margin:0 0 8px;font-size:var(--fs-md)}.detail-section p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);line-height:1.65}.detail-section .btn{margin-top:12px}.detail-tags{display:flex;align-items:flex-start;flex-wrap:wrap;gap:6px}.detail-tags .badge{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 .member-focus{display:flex;align-items:center;gap:10px;margin-bottom:12px;border-color:var(--accent);background:var(--accent-soft)}.focused-row{outline:2px solid var(--accent);outline-offset:-2px;background:var(--accent-soft)}
 @container business (max-width:720px){.pool-toolbar,.content-head{align-items:stretch;flex-direction:column}.board-search{width:100%;grid-template-columns:minmax(0,1fr) auto}.content-actions{align-self:flex-start}}

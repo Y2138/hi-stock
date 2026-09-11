@@ -5,6 +5,15 @@ const REQUIRED_READS: Record<string, readonly string[]> = {
   daily_plan_flow: ["strategy_document_query", "daily_plan_context_query", "swing_signal_query", "limit_up_signal_query"],
   midweek_check: ["strategy_document_query", "pool_context_query", "daily_plan_context_query"],
   weekly_review: ["strategy_document_query", "pool_context_query", "portfolio_context_query", "daily_plan_context_query", "swing_signal_query"],
+  nightly_sector_opportunity_scan: [
+    "strategy_document_query",
+    "analysis_run",
+    "board_query",
+    "market_snapshot_query",
+    "indicator_query",
+    "strategy_screen_query",
+    "stock_research_query",
+  ],
 };
 const TARGET_DATE_TOOLS = new Set(["daily_plan_context_query", "swing_signal_query", "auction_context_query"]);
 
@@ -64,6 +73,22 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
         }
       }
       const missing = required.filter((name) => !results.has(name));
+      if (jobCode === "nightly_sector_opportunity_scan" && results.has("analysis_run")) {
+        const items = results.get("analysis_run")?.items;
+        const requests = successfulArgs.get("analysis_run")?.requests;
+        const hasFullSectorScan = Array.isArray(items) && items.some((item) =>
+          object(item).analysis_type === "sector_temperature"
+          && ["success", "partial"].includes(String(object(item).status)),
+        ) && Array.isArray(requests) && requests.some((request) => {
+          const value = object(request);
+          return value.analysis_type === "sector_temperature"
+            && value.as_of === targetDate
+            && value.codes === undefined;
+        });
+        if (!hasFullSectorScan) {
+          missing.push("analysis_run（需要目标日完整 881 一级行业板块温度扫描或明确缺口）");
+        }
+      }
       const neededPools = jobCode === "weekly_review" ? ["short", "long"] : jobCode === "midweek_check" ? ["short"] : [];
       if (neededPools.some((pool) => !fullPools.has(pool))) {
         missing.push(`pool_context_query（需要 ${neededPools.join("、")} 池完整摘要，不能只查询部分代码）`);

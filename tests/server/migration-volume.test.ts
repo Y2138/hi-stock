@@ -32,6 +32,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
   let outDir: string;
   let targetUrl: string;
   let adminUrl: string;
+  let sourceNightlyModelId: string;
   const targetDb = `stock_test_portable_${process.pid}`;
 
   beforeAll(async () => {
@@ -39,6 +40,23 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     await resetSchema(pool);
     await runMigrations(pool);
     await seedTestStrategy(pool, "# 固定资产包测试策略");
+    await pool.query(
+      `DELETE FROM llm_model model USING llm_provider provider
+        WHERE model.provider_id = provider.id
+          AND provider.provider_key = 'deepseek'
+          AND model.model_key = 'deepseek-v4-pro'`,
+    );
+    sourceNightlyModelId = (await pool.query<{ id: string }>(
+      `INSERT INTO llm_model
+         (provider_id, model_key, name, input_modalities, reasoning, context_window, max_tokens)
+       SELECT id, 'deepseek-v4-pro', 'DeepSeek V4 Pro', '["text"]'::jsonb, true, 1000000, 128000
+         FROM llm_provider WHERE provider_key = 'deepseek'
+       RETURNING id::text`,
+    )).rows[0]!.id;
+    await pool.query(
+      `UPDATE job_definition SET model_id = $1 WHERE code = 'nightly_sector_opportunity_scan'`,
+      [sourceNightlyModelId],
+    );
     outDir = await fs.mkdtemp(path.join(os.tmpdir(), "portable-volume-test-"));
     const target = new URL(prepared!.url);
     target.pathname = `/${targetDb}`;
@@ -77,6 +95,8 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     );
     await pool.query("UPDATE llm_provider SET api_key = 'sk-portable-must-never-export' WHERE provider_key = 'deepseek'");
     await pool.query("UPDATE system_setting SET hithink_api_key = 'hithink-portable-must-never-export' WHERE singleton = true");
+    await pool.query("UPDATE notification_setting SET webhook='https://open.feishu.cn/open-apis/bot/v2/hook/portable-placeholder', sign_secret='notification-portable-never-export', enabled=true");
+    await pool.query("INSERT INTO notification_delivery(kind,channel_revision,content) VALUES ('test',1,'notification-content-never-export')");
     const session = await pool.query<{ id: string }>("INSERT INTO chat_session (title) VALUES ('敏感会话') RETURNING id::text");
     await pool.query(
       "INSERT INTO chat_message (session_id, seq, role, content) VALUES ($1, 1, 'user', $2)",
@@ -139,26 +159,33 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
   it("固定资产包只含策略与定时任务，恢复后运行数据为空且逐表哈希一致", async () => {
     const exported = await exportPortableInitialization(pool, { outDir, now: new Date("2026-08-18T10:00:00+08:00") });
     const manifest = await readPortableManifest(exported.payloadPath);
-    expect(manifest.version).toBe(4);
+    expect(manifest.version).toBe(5);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(81);
-    expect(manifest.tables.strategy_document_revision).toBeGreaterThan(0);
-    expect(manifest.tables.strategy_score_benchmark).toBe(2);
+    expect(manifest.migration_max).toBe(89);
+    expect(manifest.tables.strategy_document).toBeGreaterThan(0);
+    expect(manifest.tables.strategy_document_revision).toBeUndefined();
+    expect(manifest.tables.strategy_score_benchmark).toBe(1);
     expect(manifest.tables.job_definition).toBeGreaterThan(0);
     expect(manifest.tables.market_bar).toBeUndefined();
     expect(manifest.tables.pool_membership).toBeUndefined();
     expect(manifest.tables.backtest_run).toBeUndefined();
     expect(manifest.tables.portfolio_position).toBeUndefined();
     expect(manifest.tables.daily_plan_auction_assessment).toBeUndefined();
-    expect(manifest.strategy_hashes.length).toBe(manifest.tables.strategy_document_revision);
+    expect(manifest.strategy_hashes.length).toBe(manifest.tables.strategy_document);
 
     const payload = gunzipSync(await fs.readFile(exported.payloadPath)).toString("utf8");
     expect(payload).not.toContain("sk-portable-must-never-export");
     expect(payload).not.toContain("hithink-portable-must-never-export");
+    expect(payload).not.toContain("notification-portable-never-export");
+    expect(payload).not.toContain("notification-content-never-export");
     expect(payload).not.toContain("PORTABLE_BACKTEST_SOURCE_MUST_NOT_EXPORT");
     expect(payload).not.toContain('"created_at":{}');
     expect(payload).toMatch(/"created_at":"\d{4}-\d{2}-\d{2}T/);
+    expect(payload).toContain('"model_provider_key":"deepseek"');
+    expect(payload).toContain('"model_key":"deepseek-v4-pro"');
     for (const forbidden of [
+      "notification_setting",
+      "notification_delivery",
       "chat_session",
       "chat_message",
       "agent_confirmation",
@@ -186,12 +213,21 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     expect(restored.diffs).toEqual([]);
     const target = createPool(targetUrl);
     try {
-      expect((await target.query("SELECT count(*)::int AS count FROM strategy_document_revision")).rows[0]!.count).toBe(manifest.tables.strategy_document_revision);
-      expect((await target.query("SELECT count(*)::int AS count FROM strategy_score_benchmark")).rows[0]!.count).toBe(2);
+      expect((await target.query("SELECT count(*)::int AS count FROM strategy_document")).rows[0]!.count).toBe(manifest.tables.strategy_document);
+      expect((await target.query("SELECT count(*)::int AS count FROM strategy_score_benchmark")).rows[0]!.count).toBe(1);
       expect((await target.query(
         "SELECT sha256 FROM strategy_score_benchmark WHERE benchmark_code = 'daban_v1_4_fixed_20250901_20260122'",
       )).rows[0]!.sha256).toBe("b3a53d2308bf56e977fd5a89c7f2305b32db352ac760521e9988bfc2a34de3f1");
       expect((await target.query("SELECT count(*)::int AS count FROM job_definition")).rows[0]!.count).toBe(manifest.tables.job_definition);
+      const restoredNightly = (await target.query<{ model_id: string; provider_key: string; model_key: string }>(
+        `SELECT definition.model_id::text, provider.provider_key, model.model_key
+           FROM job_definition definition
+           JOIN llm_model model ON model.id = definition.model_id
+           JOIN llm_provider provider ON provider.id = model.provider_id
+          WHERE definition.code = 'nightly_sector_opportunity_scan'`,
+      )).rows[0]!;
+      expect(restoredNightly).toMatchObject({ provider_key: "deepseek", model_key: "deepseek-v4-pro" });
+      expect(restoredNightly.model_id).not.toBe(sourceNightlyModelId);
       expect((await target.query("SELECT count(*)::int AS count FROM market_bar")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM portfolio_position")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM daily_plan_auction_assessment")).rows[0]!.count).toBe(0);
@@ -200,6 +236,8 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       expect((await target.query("SELECT count(*)::int AS count FROM pool_membership")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM backtest_run")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT api_key FROM llm_provider WHERE provider_key = 'deepseek'")).rows[0]!.api_key).toBeNull();
+      expect((await target.query("SELECT enabled, webhook, sign_secret FROM notification_setting")).rows[0]).toEqual({ enabled: false, webhook: null, sign_secret: null });
+      expect((await target.query("SELECT count(*)::int AS count FROM notification_delivery")).rows[0].count).toBe(0);
       expect((await target.query("SELECT hithink_api_key FROM system_setting WHERE singleton = true")).rows[0]!.hithink_api_key).toBeNull();
     } finally {
       await target.end();

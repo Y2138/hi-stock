@@ -49,7 +49,7 @@ export const jobRoutes = {
 
   async create({ pool, body }: Ctx) {
     const value = bodyObject(body);
-    assertOnly(value, ["code", "name", "cron", "job_type", "config", "prompt_id", "enabled"]);
+    assertOnly(value, ["code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled"]);
     const row = await createJobDefinition(pool, {
       code: value.code,
       name: value.name,
@@ -57,6 +57,7 @@ export const jobRoutes = {
       job_type: value.job_type,
       config: value.config,
       prompt_id: value.prompt_id,
+      model_id: value.model_id,
       enabled: value.enabled,
     });
     return { status: 201, data: row };

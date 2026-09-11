@@ -296,6 +296,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     const bought = await recordPositionChange(pool, {
       code: "300750.SZ", kind: "buy", quantity: 100, price: 101,
       change_date: "2026-08-28", source: "chat", source_session_id: sessionId,
+      entry_signal_type: "limit_up",
       decision_origin: "strategy_signal", execution_compliance: "matched",
     });
     expect(bought.change).toMatchObject({

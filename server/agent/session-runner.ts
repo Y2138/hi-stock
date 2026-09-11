@@ -21,7 +21,7 @@ import {
 } from "./repo.js";
 import { redactAgentMessages } from "./redaction.js";
 import { buildChatTools, JOB_FLOW_TOOL_BUNDLES, type ToolScope } from "./tools.js";
-import { createOnDemandToolSet } from "./tool-catalog.js";
+import { createOnDemandToolSet, loadedToolNamesFromMessages } from "./tool-catalog.js";
 
 const sessionQueues = new Map<string, Promise<void>>();
 const MAX_PERSISTED_FRAME_BYTES = 64 * 1024;
@@ -220,7 +220,13 @@ export async function runAgentSessionTurn(
     }, input.toolScope);
     const preload = input.toolScope?.kind === "job" && !input.tools && Object.hasOwn(JOB_FLOW_TOOL_BUNDLES, input.toolScope.jobCode)
       ? JOB_FLOW_TOOL_BUNDLES[input.toolScope.jobCode] ?? [] : [];
-    const toolSet = createOnDemandToolSet(availableTools, preload);
+    const availableToolNames = new Set(availableTools.map((tool) => tool.name));
+    const restored = input.historyMode === "empty"
+      ? []
+      : loadedToolNamesFromMessages(historyRows.map((row) => row.content))
+        .filter((name) => availableToolNames.has(name));
+    const initialToolNames = [...new Set([...preload, ...restored])];
+    const toolSet = createOnDemandToolSet(availableTools, initialToolNames);
     const runId = crypto.randomUUID();
     let nextSeq = await nextMessageSeq(input.pool, session.id);
     const metrics = await AgentRunMetricRecorder.start({

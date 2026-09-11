@@ -4,6 +4,7 @@ import { loadConfig } from "./config.js";
 import { closePool, getPool } from "./db/client.js";
 import { MigrationConflictError, runMigrations } from "./db/migrate.js";
 import { createApiServer } from "./http/router.js";
+import { NotificationWorker } from "./modules/notifications/service.js";
 import { JobScheduler } from "./scheduler/service.js";
 import { IndicatorWorker } from "./indicators/worker.js";
 import { recoverInterruptedAgentSessions } from "./agent/session-runner.js";
@@ -72,6 +73,7 @@ async function main(): Promise<void> {
     databaseUrl: config.databaseUrl,
   });
   const indicatorWorker = new IndicatorWorker(pool);
+  const notificationWorker = new NotificationWorker(pool);
   const server = createApiServer({ pool });
   let shuttingDown = false;
   const shutdown = async () => {
@@ -86,6 +88,7 @@ async function main(): Promise<void> {
       console.error(`调度器停止失败：${(error as Error).message}`);
       process.exitCode = 1;
     });
+    await notificationWorker.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await closePool();
   };
@@ -105,6 +108,7 @@ async function main(): Promise<void> {
   try {
     await scheduler.start();
     indicatorWorker.start();
+    notificationWorker.start();
     console.log("作业调度器已启动：30 秒 tick，时区 Asia/Shanghai。");
     console.log("指标工作器已启动。");
     console.log("统一 Agent session 执行器已启用。");

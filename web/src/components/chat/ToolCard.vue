@@ -7,6 +7,7 @@ import { prettyJson } from "../../utils/format";
 import { resultRefsOfTool } from "../../utils/results";
 import type { UiToolCall } from "../../utils/chat";
 import ResultLink from "../ResultLink.vue";
+import ToolElapsed from "./ToolElapsed.vue";
 
 const props = defineProps<{ tool: UiToolCall }>();
 const emit = defineEmits<{ (e: "decide", action: "approve" | "reject"): void }>();
@@ -171,6 +172,11 @@ const CONF_STATUS_LABEL: Record<string, string> = {
       <span class="tool-state" :class="tool.status">
         {{ tool.status === "running" ? "运行中" : tool.status === "error" ? "失败" : "完成" }}
       </span>
+      <ToolElapsed
+        :started-at="tool.startedAt"
+        :ended-at="tool.endedAt"
+        :running="tool.status === 'running'"
+      />
     </div>
     <div v-if="argsSummary" class="tool-args num" :title="prettyJson(tool.args) ?? ''">{{ argsSummary }}</div>
 

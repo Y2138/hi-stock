@@ -38,7 +38,7 @@ const shortPool = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/
 const longPool = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools/long"));
 const dailyPlan = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>("/api/plans/latest"));
 
-// 打板机会：404 = 计划尚未生成结构化预案，不算错误。
+// 打板机会：仪表盘只汇总数量，明细在市场结构页展示。404 = 计划尚未生成结构化预案，不算错误。
 const planLoading = computed(() => dailyPlan.loading.value);
 const planMissing = computed(() => !dailyPlan.data.value && dailyPlan.error.value?.status === 404);
 const planError = computed(() => (planMissing.value ? null : dailyPlan.error.value));
@@ -47,30 +47,11 @@ const planEmpty = computed(() => {
   return board !== null && board.opportunities.length === 0;
 });
 const opportunities = computed(() => dailyPlan.data.value?.opportunities ?? []);
-const GRADE_LABELS: Record<string, string> = {
-  A: "双路线共振",
-  B: "单路线信号",
-  C: "旧版待复核",
-};
-const AUCTION_LABELS: Record<string, string> = {
-  worth_entering: "超出当前策略",
-  signal_passed: "信号通过",
-  observe: "历史继续观察",
-  give_up: "放弃",
-  unavailable: "数据不足",
-};
-const AUCTION_REVIEW_LABELS: Record<string, string> = {
-  one_word_continue: "一字延续",
-  turnover_advance: "换手晋级",
-  divergence: "分歧验证",
-  give_up: "失效",
-  data_insufficient: "数据不足",
-  legacy_observe: "历史观察",
-};
-const auctionAssessmentCount = computed(() =>
-  opportunities.value.filter((item) => item.auction_assessment !== null).length,
+const planTargetDate = computed(() => dailyPlan.data.value?.plan.target_date ?? null);
+const planPendingReview = computed(() =>
+  opportunities.value.filter((item) => item.auction_assessment === null).length,
 );
-const isLegacyOpportunitySet = computed(() => opportunities.value.length > 4);
+const planDataGap = computed(() => opportunities.value.filter((item) => item.grade === null).length);
 
 const today = () => new Date().toISOString().slice(0, 10);
 const isRecentAttention = (member: PoolMember) => Boolean(
@@ -404,30 +385,25 @@ onMounted(reloadAll);
           <span class="section-label">标的池</span>
           <h2>近期关注</h2>
         </div>
+        <RouterLink to="/short-pool">进入标的池</RouterLink>
       </div>
       <StateBlock
         :loading="recentAttentionLoading"
         :error="recentAttentionError"
-        :skeleton-rows="3"
+        :skeleton-rows="2"
         @retry="reloadAll"
       >
-        <div class="recent-attention-grid">
-          <section v-for="group in recentAttentionGroups" :key="group.to" class="recent-attention-group">
-            <div class="subsection-head">
-              <h3>{{ group.label }}（{{ group.members.length }}）</h3>
-              <RouterLink :to="group.to">查看标的池</RouterLink>
-            </div>
-            <p v-if="group.members.length === 0" class="no-runs">暂无近期关注标的</p>
-            <div v-else class="attention-list">
-              <RouterLink v-for="member in group.members" :key="member.id" :to="group.to" class="attention-item recent-attention-item">
-                <span class="attention-content">
-                  <strong>{{ member.name }}（<span class="num">{{ member.code }}</span>）</strong>
-                  <small>{{ member.attention_reason }}</small>
-                </span>
-                <span class="row-arrow" aria-hidden="true">→</span>
-              </RouterLink>
-            </div>
-          </section>
+        <div class="overview-grid">
+          <RouterLink
+            v-for="group in recentAttentionGroups"
+            :key="group.to"
+            :to="group.to"
+            class="overview-item link"
+          >
+            <span class="overview-label">{{ group.label }}</span>
+            <strong class="num">{{ group.members.length }}</strong>
+            <small>处于近期关注 · 点击查看明细</small>
+          </RouterLink>
         </div>
       </StateBlock>
     </article>
@@ -435,78 +411,39 @@ onMounted(reloadAll);
     <article class="card dashboard-card plan-opportunities-card">
       <div class="card-heading">
         <div>
-          <span class="section-label">
-            每日计划 · {{ dailyPlan.data.value?.plan.target_date ?? "—" }}
-            <template v-if="opportunities.length > 0"> · {{ isLegacyOpportunitySet ? "历史候选" : "打板信号" }} {{ opportunities.length }} · T+1 复核 {{ auctionAssessmentCount }}/{{ opportunities.length }}</template>
-          </span>
+          <span class="section-label">每日计划 · {{ planTargetDate ?? "—" }}</span>
           <h2>打板机会</h2>
         </div>
-        <span v-if="opportunities.length > 0" class="count-badge active">{{ opportunities.length }}</span>
+        <RouterLink to="/market-structure">查看市场结构</RouterLink>
       </div>
       <p class="strategy-scope-note">
-        <template v-if="isLegacyOpportunitySet">当前展示的是旧计划口径；按最新《打板策略》生成的新计划每日最多 4 只。</template>
-        <template v-else>T 日收盘按当前《打板策略》筛选；小额实盘验证期展示信号通过、放弃或数据不足，是否成交及数量由用户自主决定。</template>
+        此处只汇总数量；逐只信号、评分依据与 T+1 竞价复核详情在市场结构页的“打板机会”查看。
       </p>
       <StateBlock
         :loading="planLoading"
         :error="planError"
         :empty="planEmpty"
         empty-text="本计划没有形成有效打板信号"
-        :skeleton-rows="3"
+        :skeleton-rows="2"
         @retry="dailyPlan.reload"
       >
-        <p v-if="planMissing" class="no-runs">每日计划尚未生成结构化预案，生成后此处展示按策略优先级排序的打板机会。</p>
-        <div v-else-if="opportunities.length > 0" class="plan-opportunity-table-wrap">
-          <table class="data-table plan-opportunity-table">
-            <thead>
-              <tr>
-                <th scope="col">优先级</th>
-                <th scope="col">标的</th>
-                <th scope="col">T 日信号</th>
-                <th scope="col">评分与依据</th>
-                <th scope="col">T+1 竞价复核</th>
-                <th scope="col">风险与失效</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="item in opportunities" :key="item.id">
-                <td class="num">{{ item.priority }}</td>
-                <td>
-                  <RouterLink :to="{ path: '/market', query: { code: item.code, view: 'detail' } }">
-                    <strong>{{ item.name }}</strong>
-                    <small class="num"> {{ item.code }}</small>
-                  </RouterLink>
-                </td>
-                <td class="signal-cell">
-                  <span class="grade-badge" :class="`grade-${item.grade?.toLowerCase()}`">
-                    {{ item.grade ? `${item.grade} · ${GRADE_LABELS[item.grade] ?? "待复核"}` : "数据不足" }}
-                  </span>
-                  <small>{{ item.headline }}</small>
-                </td>
-                <td>
-                  {{ item.auction_assessment?.assessment_summary ?? item.evidence_md ?? item.headline }}
-                  <small v-if="item.auction_assessment && item.evidence_md" class="plan-evidence">T 日依据：{{ item.evidence_md }}</small>
-                  <small v-if="item.missing_md" class="data-gap">数据缺口：{{ item.missing_md }}</small>
-                </td>
-                <td class="auction-result-cell">
-                  <template v-if="item.auction_assessment">
-                    <span class="auction-badge" :class="`auction-${item.auction_assessment.conclusion}`">
-                      {{ AUCTION_LABELS[item.auction_assessment.conclusion] }} · {{ AUCTION_REVIEW_LABELS[item.auction_assessment.review_type] }}
-                    </span>
-                    <small>{{ item.auction_assessment.metrics_summary }}</small>
-                    <small v-if="item.auction_assessment.benchmark_tags.length > 0" class="auction-tags">
-                      {{ item.auction_assessment.benchmark_tags.join(" · ") }}
-                    </small>
-                  </template>
-                  <span v-else class="auction-pending">待 T+1 竞价复核</span>
-                </td>
-                <td class="risk-cell">
-                  <span>{{ item.risk_md ?? "—" }}</span>
-                  <small v-if="item.invalidation_md">失效：{{ item.invalidation_md }}</small>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+        <p v-if="planMissing" class="no-runs">每日计划尚未生成结构化预案，生成后此处显示打板机会数量。</p>
+        <div v-else class="overview-grid">
+          <div class="overview-item">
+            <span class="overview-label">打板信号</span>
+            <strong class="num">{{ opportunities.length }}</strong>
+            <small>本计划有效信号</small>
+          </div>
+          <div class="overview-item">
+            <span class="overview-label">待 T+1 复核</span>
+            <strong class="num">{{ planPendingReview }}</strong>
+            <small>尚未完成竞价复核</small>
+          </div>
+          <div class="overview-item">
+            <span class="overview-label">数据不足</span>
+            <strong class="num" :class="{ down: planDataGap > 0 }">{{ planDataGap }}</strong>
+            <small>等级为空，需补齐数据</small>
+          </div>
         </div>
       </StateBlock>
     </article>
@@ -879,18 +816,49 @@ onMounted(reloadAll);
   color: var(--ink-faint);
 }
 
-.recent-attention-grid {
+.overview-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-lg);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--space-sm);
 }
 
-.recent-attention-group {
+.overview-item {
+  display: grid;
+  gap: 1px;
   min-width: 0;
+  padding: 12px 13px;
+  border: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
 }
 
-.recent-attention-item {
-  grid-template-columns: minmax(0, 1fr) auto;
+.overview-item.link {
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+
+.overview-item.link:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.overview-label {
+  color: var(--ink-soft);
+  font-size: var(--fs-xs);
+}
+
+.overview-item strong {
+  font-size: clamp(20px, 2vw, 26px);
+  line-height: 1.25;
+  letter-spacing: -0.03em;
+}
+
+.overview-item small {
+  overflow: hidden;
+  color: var(--ink-faint);
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .empty-attention {
@@ -1031,10 +999,6 @@ onMounted(reloadAll);
 
   .metric-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .recent-attention-grid {
-    grid-template-columns: minmax(0, 1fr);
   }
 
   .metric-item strong {

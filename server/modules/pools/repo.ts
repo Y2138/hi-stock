@@ -4,6 +4,11 @@ import { inServiceTransaction, type TransactionDb } from "../../db/transaction.j
 
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
 export type PoolKind = "short" | "long";
+export interface PoolAttentionSignal {
+  status: "qualified" | "approaching";
+  missing_signals: string[];
+}
+
 export interface PoolMemberRow {
   id: string;
   pool: PoolKind;
@@ -21,6 +26,7 @@ export interface PoolMemberRow {
   effective_from: string;
   effective_to: string | null;
   note: string | null;
+  attention_signal: PoolAttentionSignal | null;
   attention_reason: string | null;
   attention_from: string | null;
   attention_until: string | null;
@@ -62,7 +68,7 @@ const MEMBER_SELECT = `SELECT membership.id::text, membership.pool, membership.r
   membership.stock_character, membership.stock_character_profile, membership.stage, membership.evaluation_summary,
   membership.profile_as_of::text, membership.profile_calculation_version, membership.profile_input_sha256,
   membership.effective_from::text, membership.effective_to::text, membership.note,
-  membership.attention_reason, membership.attention_from::text, membership.attention_until::text,
+  membership.attention_signal, membership.attention_reason, membership.attention_from::text, membership.attention_until::text,
   instrument.code, instrument.name, instrument.kind,
   latest_close.close::float8 AS last,
   latest_close.prev_close::float8,
@@ -172,6 +178,7 @@ export interface PoolChangeInput {
 }
 
 export interface PoolAttentionInput {
+  attention_signal?: PoolAttentionSignal | null;
   code: string;
   pool: PoolKind;
   attention_reason: string | null;
@@ -205,6 +212,15 @@ export async function setPoolAttention(
     const before = current.rows[0];
     if (!before) throw new Error(`标的 ${input.code} 不在当前${input.pool === "short" ? "短线" : "长线"}池中`);
     const reason = input.attention_reason?.trim() || null;
+    const signal = reason ? input.attention_signal ?? null : null;
+    if (signal) {
+      if (!["qualified", "approaching"].includes(signal.status) ||
+          !Array.isArray(signal.missing_signals) || signal.missing_signals.length > 20 ||
+          signal.missing_signals.some((item) => typeof item !== "string" || !item.trim() || item.length > 200)) {
+        throw new Error("关注信号状态或缺失条件无效");
+      }
+      if (signal.status === "qualified" && signal.missing_signals.length) throw new Error("已成立信号不得包含缺失条件");
+    }
     if (input.attention_from && !validDate(input.attention_from)) throw new Error("attention_from 必须是有效日期");
     if (input.attention_until && !validDate(input.attention_until)) throw new Error("attention_until 必须是有效日期");
     if (input.attention_from && input.attention_until && input.attention_until < input.attention_from) {
@@ -213,9 +229,34 @@ export async function setPoolAttention(
     if (!reason && (input.attention_from || input.attention_until)) throw new Error("清除近期关注时必须同时清除起止日期");
     await client.query(
       `UPDATE pool_membership
-          SET attention_reason = $2, attention_from = $3, attention_until = $4
+          SET attention_reason = $2, attention_from = $3, attention_until = $4, attention_signal = $5
         WHERE id = $1`,
-      [before.id, reason, input.attention_from, input.attention_until],
+      [before.id, reason, input.attention_from, input.attention_until, signal ? JSON.stringify(signal) : null],
+    );
+    const after = await client.query<PoolMemberRow>(`${MEMBER_SELECT} WHERE membership.id = $1`, [before.id]);
+    return { before, after: after.rows[0]! };
+  });
+}
+
+/** 用户从池页面手动移除近期关注；只清空当前角色的短期关注状态。 */
+export async function clearPoolAttention(
+  db: TransactionDb,
+  input: { code: string; pool: PoolKind },
+): Promise<{ before: PoolMemberRow; after: PoolMemberRow } | null> {
+  return inServiceTransaction(db, async (client) => {
+    const current = await client.query<PoolMemberRow>(
+      `${MEMBER_SELECT}
+        WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL
+        ORDER BY membership.id DESC LIMIT 1 FOR UPDATE OF membership`,
+      [input.code, input.pool],
+    );
+    const before = current.rows[0];
+    if (!before) return null;
+    await client.query(
+      `UPDATE pool_membership
+          SET attention_reason = NULL, attention_from = NULL, attention_until = NULL, attention_signal = NULL
+        WHERE id = $1`,
+      [before.id],
     );
     const after = await client.query<PoolMemberRow>(`${MEMBER_SELECT} WHERE membership.id = $1`, [before.id]);
     return { before, after: after.rows[0]! };
@@ -258,6 +299,7 @@ export async function applyPoolChange(
       return setPoolAttention(client, {
         code: input.code,
         pool: input.pool,
+        attention_signal: input.attention_reason === undefined ? before.attention_signal : null,
         attention_reason: input.attention_reason === undefined ? before.attention_reason : input.attention_reason,
         attention_from: input.attention_from === undefined ? before.attention_from : input.attention_from,
         attention_until: input.attention_until === undefined ? before.attention_until : input.attention_until,
@@ -301,6 +343,7 @@ export async function applyPoolChange(
     if (attentionUntil && !validDate(attentionUntil)) throw new Error("attention_until 必须是有效日期");
     if (attentionFrom && attentionUntil && attentionUntil < attentionFrom) throw new Error("attention_until 不得早于 attention_from");
 
+    const attentionSignal = input.attention_reason === undefined ? before?.attention_signal ?? null : null;
     const values = [
       input.pool, role, grade, score, JSON.stringify(tags), stockCharacter,
       JSON.stringify(stockCharacterProfile), stage, evaluationSummary,
@@ -316,9 +359,9 @@ export async function applyPoolChange(
            pool=$2, role=$3, grade=$4, score=$5, tags=$6, stock_character=$7,
            stock_character_profile=$8, stage=$9, evaluation_summary=$10, profile_as_of=$11,
            profile_calculation_version=$12, profile_input_sha256=$13, attention_reason=$14,
-           attention_from=$15, attention_until=$16, evaluation_session_id=$17, note=$18
+           attention_from=$15, attention_until=$16, evaluation_session_id=$17, note=$18, attention_signal=$19
          WHERE id=$1`,
-        [before.id, ...values.slice(0, 16), values[17]],
+        [before.id, ...values.slice(0, 16), values[17], attentionSignal ? JSON.stringify(attentionSignal) : null],
       );
       const afterRows = await client.query<PoolMemberRow>(`${MEMBER_SELECT} WHERE membership.id = $1`, [before.id]);
       return { before, after: afterRows.rows[0]! };
@@ -329,10 +372,10 @@ export async function applyPoolChange(
       `INSERT INTO pool_membership
          (instrument_id, pool, role, grade, score, tags, stock_character, stock_character_profile, stage,
           evaluation_summary, profile_as_of, profile_calculation_version, profile_input_sha256, attention_reason,
-          attention_from, attention_until, evaluation_session_id, effective_from, note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+          attention_from, attention_until, evaluation_session_id, effective_from, note, attention_signal)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
        RETURNING id::text`,
-      [instrumentId, ...values],
+      [instrumentId, ...values, attentionSignal ? JSON.stringify(attentionSignal) : null],
     );
     const afterRows = await client.query<PoolMemberRow>(
       `${MEMBER_SELECT} WHERE membership.id = $1`,

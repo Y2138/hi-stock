@@ -39,6 +39,7 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
     tools: [
       "pool_onboard",
       "portfolio_write",
+      "position_entry_signal_write",
       "pool_write",
       "job_write",
       "memory_write",
@@ -52,7 +53,7 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
   },
   {
     title: "研究与回测",
-    tools: ["memory_query", "web_search", "read_backtest_source", "run_backtest"],
+    tools: ["memory_query", "web_search", "web_fetch", "read_backtest_source", "run_backtest"],
   },
   {
     title: "系统与排障",
@@ -80,6 +81,47 @@ export interface OnDemandToolSet {
   initialTools: AgentTool[];
   currentTools: () => AgentTool[];
   syncContext: (context: AgentContext) => AgentContext | undefined;
+}
+
+type MessageRecord = Record<string, unknown>;
+
+function recordOf(value: unknown): MessageRecord | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as MessageRecord
+    : null;
+}
+
+function loadedNamesOfCatalogResult(message: MessageRecord): string[] {
+  if (message.role !== "toolResult" || message.toolName !== "tool_catalog" || message.isError === true) return [];
+  const details = recordOf(message.details);
+  const loaded = details?.loaded;
+  if (Array.isArray(loaded)) return loaded.filter((name): name is string => typeof name === "string");
+
+  const content = message.content;
+  if (!Array.isArray(content)) return [];
+  const text = content
+    .map((part) => recordOf(part))
+    .find((part) => part?.type === "text" && typeof part.text === "string")?.text;
+  if (typeof text !== "string") return [];
+  try {
+    const parsed = recordOf(JSON.parse(text));
+    return Array.isArray(parsed?.loaded)
+      ? parsed.loaded.filter((name): name is string => typeof name === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 从持久化消息恢复本会话已成功加载的完整工具定义，服务重启和上下文压缩后仍然有效。 */
+export function loadedToolNamesFromMessages(messages: readonly unknown[]): string[] {
+  const loaded = new Set<string>();
+  for (const value of messages) {
+    const message = recordOf(value);
+    if (!message) continue;
+    for (const name of loadedNamesOfCatalogResult(message)) loaded.add(name);
+  }
+  return [...loaded];
 }
 
 function result(value: unknown): AgentToolResult<unknown> {
@@ -118,6 +160,15 @@ export function createOnDemandToolSet(tools: AgentTool[], initialNames: readonly
   const loaded = new Set<string>(initialNames);
   const names = [...available.keys()];
   const metadata = groupedMetadata([...available.values()]);
+  const catalogDescription = () => {
+    const loadedNames = [...loaded];
+    const loadedHint = loadedNames.length
+      ? `当前会话已加载：${loadedNames.join("、")}；这些工具已在工具列表中，可直接调用，禁止再次请求加载。`
+      : "当前会话尚未加载完整工具定义。";
+    return `目录按职能分组；已出现在工具列表中的能力可直接调用。${loadedHint}` +
+      `其余能力按任务需要一次加载最多 ${MAX_LOAD_COUNT} 个工具，下一轮即可直接调用；` +
+      `不要加载无关工具。database_schema/database_query 会成对加载，用于纵向工具尚未覆盖的内部只读探索或排障。可用目录：\n${metadata}`;
+  };
   const parameters = Type.Object({
     names: Type.Array(Type.Union(names.map((name) => Type.Literal(name))), {
       minItems: 1,
@@ -128,9 +179,7 @@ export function createOnDemandToolSet(tools: AgentTool[], initialNames: readonly
   const catalog: AgentTool = {
     name: "tool_catalog",
     label: "加载工具详情",
-    description:
-      `目录按职能分组；已出现在工具列表中的能力可直接调用。其余能力按任务需要一次加载最多 ${MAX_LOAD_COUNT} 个工具，下一轮即可直接调用；` +
-      `不要加载无关工具。database_schema/database_query 会成对加载，用于纵向工具尚未覆盖的内部只读探索或排障。可用目录：\n${metadata}`,
+    description: catalogDescription(),
     parameters,
     executionMode: "sequential",
     execute: async (_id, raw, signal) => {
@@ -145,13 +194,16 @@ export function createOnDemandToolSet(tools: AgentTool[], initialNames: readonly
         : requested;
       const newlyLoaded = resolved.filter((name) => !loaded.has(name));
       for (const name of resolved) loaded.add(name);
+      catalog.description = catalogDescription();
       return result({
         loaded: resolved,
         newly_loaded: newlyLoaded,
+        already_loaded: resolved.filter((name) => !newlyLoaded.includes(name)),
         loaded_count: loaded.size,
         available_count: available.size,
-        instruction:
-          "工具完整定义已加载；优先使用纵向工具，未覆盖的内部问题可用受控数据库只读查询。现在直接调用所需工具，不要再次查询目录。",
+        instruction: newlyLoaded.length
+          ? "工具完整定义已加载；现在直接调用所需工具，后续轮次无需再次加载。"
+          : "这些工具已在当前会话中加载，可直接调用；不要再次查询目录。",
       });
     },
   };

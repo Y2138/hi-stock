@@ -1,5 +1,4 @@
 import type pg from "pg";
-import { queryLimitUpSignals, type LimitUpSignalResult } from "./limit-up-signals.js";
 
 type Db = Pick<pg.Pool, "query">;
 
@@ -93,7 +92,6 @@ export async function queryMarketStructure(
   );
   const ladderItems = limitLadderItems(ladderSnapshot.rows[0]?.ladder, input.date);
   let items: unknown[];
-  let limitUpSignals: LimitUpSignalResult | null = null;
   let rowCount = coverage.row_count;
   if (input.dataset.startsWith("limit_") && input.dataset !== "limit_ladder") {
     const eventType = input.dataset === "limit_up" ? "up" : input.dataset === "limit_down" ? "down" : "break";
@@ -126,16 +124,7 @@ export async function queryMarketStructure(
         LIMIT $3 OFFSET $4`,
       [input.date, eventType, input.size, (input.page - 1) * input.size],
     );
-    if (input.dataset === "limit_up") {
-      limitUpSignals = await queryLimitUpSignals(db, input.date);
-      const candidateByCode = new Map(limitUpSignals.candidates.map((candidate) => [candidate.code, candidate]));
-      items = result.rows.map((row) => ({
-        ...row,
-        limit_up_signal: candidateByCode.get(String(row.code)) ?? null,
-      }));
-    } else {
-      items = result.rows;
-    }
+    items = result.rows;
   } else if (input.dataset === "limit_ladder") {
     rowCount = ladderItems.length;
     items = ladderItems.slice((input.page - 1) * input.size, input.page * input.size);
@@ -181,7 +170,6 @@ export async function queryMarketStructure(
     page: input.page,
     size: input.size,
     items,
-    limit_up_signals: limitUpSignals,
     counts: {
       ...Object.fromEntries(countResult.rows.map((row) => [row.dataset, row.row_count])),
       limit_ladder: ladderItems.length,

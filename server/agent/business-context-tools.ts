@@ -8,7 +8,7 @@ import {
   listPositions,
 } from "../modules/positions/repo.js";
 import { listPoolView } from "../modules/pools/repo.js";
-import { getCurrentStrategy, getStrategySnapshot } from "../modules/strategy/repo.js";
+import { getCurrentStrategy } from "../modules/strategy/repo.js";
 import { findJobPrompt, listJobPrompts } from "../modules/job-prompts/repo.js";
 import { listJobDefinitions, listJobOutputs, listJobRuns } from "../scheduler/repo.js";
 import { queryAuctionAssessmentContext, queryHistoricalPlanItems } from "../modules/plans/repo.js";
@@ -81,14 +81,11 @@ export function strategyDocumentPurpose(document: { role: string; title: string 
   return `需要执行“${document.title}”对应专项判断时读取`;
 }
 
+/**
+ * 系统只保留当前最终策略，运行中的会话和任务始终读取当前正文，不回放历史版本。
+ */
 export async function strategyForSession(deps: { pool: pg.Pool; sessionId: string | null }) {
-  if (!deps.sessionId) return getCurrentStrategy(deps.pool);
-  const session = await deps.pool.query<{ strategy_state_revision: string | null }>(
-    "SELECT strategy_state_revision::text FROM chat_session WHERE id = $1",
-    [deps.sessionId],
-  );
-  const revision = session.rows[0]?.strategy_state_revision;
-  return revision ? getStrategySnapshot(deps.pool, revision) : getCurrentStrategy(deps.pool);
+  return getCurrentStrategy(deps.pool);
 }
 
 function summarizeRun(run: Awaited<ReturnType<typeof listJobRuns>>[number]) {
@@ -166,6 +163,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
                   grade: member.grade,
                   score: member.score,
                   stage: member.stage,
+                  attention_signal: member.attention_signal,
                   attention_reason: member.attention_reason,
                   attention_from: member.attention_from,
                   attention_until: member.attention_until,
@@ -287,10 +285,8 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
               title: document.title,
               role: document.role,
               purpose: strategyDocumentPurpose(document),
-              current_revision_id: document.current_revision_id,
-              current_revision_no: document.current_revision_no,
-              current_sha256: document.current_sha256,
-              current_content: document.current_content,
+              sha256: document.sha256,
+              content: document.content,
             })),
           };
         },

@@ -9,7 +9,7 @@ import { backtestRoutes } from "../modules/backtests/routes.js";
 import { marketRoutes } from "../modules/market/routes.js";
 import { positionRoutes } from "../modules/positions/routes.js";
 import { plansRoutes } from "../modules/plans/routes.js";
-import { listPoolView } from "../modules/pools/repo.js";
+import { clearPoolAttention, listPoolView } from "../modules/pools/repo.js";
 import { volumeRoutes } from "../volume/routes.js";
 import { chatRoutes } from "../agent/routes.js";
 import { llmConfigRoutes } from "../agent/ai/routes.js";
@@ -21,6 +21,7 @@ import { analysisRoutes } from "../analysis/routes.js";
 import { strategyRoutes } from "../modules/strategy/routes.js";
 import { boardRoutes } from "../modules/boards/routes.js";
 import { memoryRoutes } from "../modules/memory/routes.js";
+import { notificationRoutes } from "../modules/notifications/routes.js";
 import { systemSettingsRoutes } from "../system-settings-routes.js";
 
 /** 统一 API 错误：携带 HTTP 状态码与稳定错误码 */
@@ -294,6 +295,14 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
       if (params.pool !== "short" && params.pool !== "long") throw apiErrors.notFound("标的池不存在");
       return { data: await listPoolView(pool, params.pool) };
     }),
+    route("DELETE", "/api/pools/:pool/:code/attention", async ({ params }) => {
+      if (params.pool !== "short" && params.pool !== "long") throw apiErrors.notFound("标的池不存在");
+      const code = params.code?.trim().toUpperCase() ?? "";
+      if (!/^[A-Z0-9._-]{1,32}$/u.test(code)) throw apiErrors.badRequest("标的代码无效");
+      const result = await clearPoolAttention(pool, { pool: params.pool, code });
+      if (!result) throw apiErrors.notFound(`标的 ${code} 不在当前${params.pool === "short" ? "短线" : "长线"}池中`);
+      return { data: result.after };
+    }),
     // 二期 M1 收尾：数据卷 HTTP 路由（技术设计 v2.0 §九，只追加；恢复的前端二次确认在 web 侧）
     route("GET", "/api/volume/snapshots", volumeRoutes.listSnapshots),
     route("GET", "/api/volume/portable", volumeRoutes.listPortable),
@@ -311,6 +320,13 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("PATCH", "/api/llm/models/:id", llmConfigRoutes.updateModel),
     route("DELETE", "/api/llm/models/:id", llmConfigRoutes.deleteModel),
     route("POST", "/api/llm/models/:id/activate", llmConfigRoutes.activateModel),
+    route("GET", "/api/notifications/settings", notificationRoutes.settings),
+    route("PATCH", "/api/notifications/settings", notificationRoutes.update),
+    route("GET", "/api/notifications/preview", notificationRoutes.preview),
+    route("POST", "/api/notifications/test", notificationRoutes.test),
+    route("GET", "/api/notifications", notificationRoutes.list),
+    route("GET", "/api/notifications/:id", notificationRoutes.detail),
+    route("POST", "/api/notifications/:id/retry", notificationRoutes.retry),
     route("GET", "/api/system/settings", systemSettingsRoutes.get),
     route("PATCH", "/api/system/settings", systemSettingsRoutes.update),
     route("GET", "/api/agent/settings", agentSettingsRoutes.get),

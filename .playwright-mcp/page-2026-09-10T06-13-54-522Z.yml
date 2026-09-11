@@ -1,0 +1,574 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - heading "《Agent 评测白皮书》系列01：Agent 评测全览" [level=1] [ref=e7]
+      - generic [ref=e8]:
+        - generic [ref=e9]: 原创
+        - generic [ref=e10]: 图灵Agent评测
+        - button "美团技术团队" [ref=e12] [cursor=pointer]
+        - generic:
+          - emphasis [ref=e13]: 2026年9月10日 10:24
+          - emphasis [ref=e14]: 北京
+      - generic [ref=e15]:
+        - generic [ref=e18]:
+          - img "图片" [ref=e26]
+          - paragraph [ref=e29]:
+            - text: 点亮👆
+            - generic [ref=e30]: “☆”星标
+            - text: ，不错过推送内容~
+        - generic [ref=e32]:
+          - paragraph [ref=e33]:
+            - generic [ref=e34]: 全文速读
+          - paragraph [ref=e36]:
+            - generic [ref=e37]:
+              - text: 前不久，我们发布了一篇
+              - generic [ref=e38]:
+                - text: 《
+                - link "Agent评测漫谈" [ref=e39]:
+                  - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783112&idx=1&sn=785b0bc4b98c0324a528cb87717f3032&scene=21#wechat_redirect
+                - text: 》，收到最多的反馈是：方法论看懂了，但落到自己项目上还是不知道从哪下手。于是我们推出了《Agent评测白皮书》系列博客，体系化地为大家讲解评测的落地指南，分为《评测全览》、《冷启动篇》、《扩量篇》、《自进化篇》等共4篇，本文为系列的第一篇。
+          - paragraph [ref=e40]:
+            - generic [ref=e41]: 本系列博客面向 Agent 产品、研发、算法、运营和评测负责人。我们给出的做法来自我们评测团队在美团多个业务的实践，它们在各自的场景里被验证有效，但迁移到新场景时仍然需要结合业务特点做调整。比起照搬步骤，更值得关注的是每个做法背后要解决的问题。理解了问题，做法自然可以因地制宜。
+          - paragraph [ref=e42]:
+            - generic [ref=e43]: 🎈我们还在文末增加了读者互动环节，欢迎大家晒出自己的见解、思考，分享实践经验，一起交流学习。
+        - list
+        - paragraph [ref=e44]:
+          - generic [ref=e45]: 本文目录
+        - list [ref=e46]:
+          - listitem [ref=e47]:
+            - generic [ref=e48]: 综述
+          - list [ref=e51]:
+            - listitem [ref=e52]:
+              - generic [ref=e53]: 搭一个 Agent 正在变得越来越容易
+            - listitem [ref=e55]:
+              - generic [ref=e56]: 评测认知的稀缺
+            - listitem [ref=e58]:
+              - generic [ref=e59]: 这个系列博客想做什么
+          - listitem [ref=e61]:
+            - generic [ref=e62]: 前言
+          - listitem [ref=e64]:
+            - generic [ref=e65]: 一、完备的评测体系是什么样子
+          - list [ref=e67]:
+            - listitem [ref=e68]:
+              - generic [ref=e69]: 1.1 回到原点：评测是 Agent 效果的“精密量具”
+            - listitem [ref=e71]:
+              - generic [ref=e72]: 1.2 两条相互咬合的 Loop
+            - listitem [ref=e74]:
+              - generic [ref=e75]: 1.3 评测体系的三种能力
+            - listitem [ref=e77]:
+              - generic [ref=e78]: 1.4 评测体系的构成
+          - listitem [ref=e80]:
+            - generic [ref=e81]: 二、离线评测：变更的门控
+          - list [ref=e83]:
+            - listitem [ref=e84]:
+              - generic [ref=e85]: 2.1 评测集：评测体系的核心资产
+            - listitem [ref=e87]:
+              - generic [ref=e88]: 2.2 回测执行：把评测集用起来
+          - listitem [ref=e90]:
+            - generic [ref=e91]: 三、在线评测与在线监控：真实世界的反馈
+          - list [ref=e93]:
+            - listitem [ref=e94]:
+              - generic [ref=e95]: 3.1 在线评测的三种手段
+            - listitem [ref=e97]:
+              - generic [ref=e98]: 3.2 巡检：两个模块的交集
+            - listitem [ref=e100]:
+              - generic [ref=e101]: 3.3 在线监控关注什么
+          - listitem [ref=e103]:
+            - generic [ref=e104]: 四、Case 挖掘与归因：驱动双环演进的枢纽
+          - list [ref=e106]:
+            - listitem [ref=e107]:
+              - generic [ref=e108]: 4.1 Case 挖掘的四大类来源
+            - listitem [ref=e110]:
+              - generic [ref=e111]: 4.2 Case 池的分化：Good Case 与 Bad Case
+            - listitem [ref=e113]:
+              - generic [ref=e114]: 4.3 归因：从“这里出了问题”到“为什么出问题”
+          - listitem [ref=e116]:
+            - generic [ref=e117]: 五、Agent 观测基建：一切的地基
+          - list [ref=e119]:
+            - listitem [ref=e120]:
+              - generic [ref=e121]: 5.1 观测基建的建设思路
+          - listitem [ref=e123]:
+            - generic [ref=e124]: 六、评测体系成熟度自查
+          - listitem [ref=e126]:
+            - generic [ref=e127]: 七、小结与下一篇预告
+          - listitem [ref=e129]:
+            - generic [ref=e130]: 八、FAQ
+        - separator [ref=e133]
+        - heading "综述" [level=2] [ref=e134]
+        - heading "| 搭一个 Agent 正在变得越来越容易" [level=3] [ref=e137]
+        - paragraph [ref=e139]: 过去三年，有两条趋势在同时发生。
+        - paragraph [ref=e140]:
+          - generic [ref=e141]:
+            - text: 一是
+            - strong [ref=e142]: 基座模型的能力持续进化
+            - text: ，它带来的结果是对使用者的要求在往下降。早期要让模型稳定地按格式输出、正确地选中一个工具，需要反复打磨 Prompt、设计各种兜底。现在这些能力越来越多地由模型本身承担，长上下文、原生工具调用、更强的指令遵循和多步推理，把大量原本需要工程去补的地方补上了。
+        - paragraph [ref=e143]:
+          - generic [ref=e144]:
+            - text: 二是
+            - strong [ref=e145]: Agent 框架的功能持续丰富
+            - text: 。从早期需要自己实现规划、记忆、工具注册和状态管理，到现在框架和协议层把这些抽象成标准组件，接一个工具、加一个 Skill，工作量都在显著下降。
+        - paragraph [ref=e146]: 两条曲线叠加，结论很直接：搭建 Agent 门槛正在逐年降低。这带来的直接变化是 Agent 落地场景越来越多，越来越发散。
+        - heading "| 评测认知的稀缺" [level=3] [ref=e147]
+        - paragraph [ref=e149]: 自 2022 年底 ChatGPT（基于 GPT-3.5）发布以来，市场上出现了一波又一波 Agent 项目。但是那些真正走过冷启动、完成灰度扩量、推到全量的项目数量屈指可数。这导致掌握 Agent 评测方法的人非常稀缺。
+        - paragraph [ref=e150]: 过去三年绝大部分 Agent 项目都死掉了。它们消失的原因有一些共性：
+        - list [ref=e151]:
+          - listitem [ref=e152]:
+            - generic [ref=e154]:
+              - strong [ref=e155]: 停在 Demo
+              - text: ：演示效果很好，一接真实流量就发现覆盖不住，用户的问法、数据的脏乱、场景的边界远超预期，团队疲于打补丁，最后不了了之。
+          - listitem [ref=e156]:
+            - generic [ref=e158]:
+              - strong [ref=e159]: 卡在扩量
+              - text: ：小范围试用还行，一放量各种问题集中暴露。团队既说不清问题出在哪一层，也不敢大改，因为改完不知道会不会把原来对的地方弄坏，项目在原地反复摇摆。
+          - listitem [ref=e160]:
+            - generic [ref=e162]:
+              - strong [ref=e163]: 说不清业务价值
+              - text: ：模型换了几轮，Prompt 迭代了几十版，团队自己觉得变好了，但拿不出证据。到了要资源、要继续投入的时候，回答不了“项目到底带来了什么”，最终停止投入。
+        - paragraph [ref=e164]:
+          - generic [ref=e165]:
+            - text: 这三种死法看起来不同，追下去会发现共同点：
+            - strong [ref=e166]: 团队缺少一套可靠的判断机制
+            - text: 。不知道当前版本行不行，不知道问题出在哪一层，不知道改完是真的变好还是换了个地方出错，也不知道怎么向外证明这件事的价值。做决策靠的是感觉和个别案例，而感觉在复杂系统面前不可靠。
+        - paragraph [ref=e167]:
+          - generic [ref=e168]:
+            - text: 把两件事放在一起看，会得到一个略显割裂的图景：
+            - strong [ref=e169]: 搭 Agent 的门槛在快速降低，把 Agent 做好的认知却仍十分稀缺
+            - text: 。并且，有限的评测认知面对发散的场景，同样力不从心。做好一个 ChatBot 的经验，并不能无缝泛化到做一个长程 Agent 身上。为此，我们希望将团队两年来在众多业务方中打磨出的评测的认知，以体系化的形式分享给大家，希望能帮大家少走一些弯路。
+        - heading "| 这个系列博客想做什么" [level=3] [ref=e170]
+        - paragraph [ref=e172]:
+          - generic [ref=e173]:
+            - text: 前不久，我们发布了一篇博客《
+            - link "Agent 评测漫谈" [ref=e174]:
+              - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783112&idx=1&sn=785b0bc4b98c0324a528cb87717f3032&scene=21#wechat_redirect
+            - text: 》，介绍了评测的核心方法论，回答的是“评测是什么、为什么这么做”。文章发出后，我们收到不少的反馈，其中出现频率最高的一类是：方法论看了，但具体到自己的项目，还是不知道从哪下手。
+        - paragraph [ref=e175]: 为此，我们计划撰写《Agent 评测白皮书》系列博客，体系化地为大家讲解评测的落地指南 —— 先做什么后做什么，每一步的产出物长什么样，做到什么程度算达标，遇到常见的坑怎么处理。计划分四篇：
+        - figure [ref=e176]:
+          - img "图片" [ref=e178]
+        - paragraph [ref=e179]: 本系列博客面向 Agent 产品、研发、算法、运营和评测负责人。如果你正在从零开始搭一个 Agent，或者手里的项目卡在某个阶段推不动，希望这几篇能提供一些可以直接用上的东西。
+        - paragraph [ref=e180]:
+          - generic [ref=e181]:
+            - text: 这里也需要强调一下：
+            - strong [ref=e182]: 评测是一门实践科学
+            - text: ，本系列给出的做法来自我们评测团队在美团多个业务的实践，它们在各自的场景里被验证有效，但迁移到新场景时仍然需要结合业务特点做调整。比起照搬步骤，更值得关注的是每个做法背后要解决的问题。理解了问题，做法自然可以因地制宜。
+        - heading "前言" [level=2] [ref=e183]
+        - paragraph [ref=e186]:
+          - generic [ref=e187]:
+            - text: 第一篇《评测全览》目的在于让大家系统地了解评测的构成，我们用一套统一的语言对齐行业内尚在发散和纠缠的概念，用一套叙事逻辑打通冷启动、扩量和自进化。有了全览之后，大家可以以终为始，判断自己现在处在哪里、下一步补哪一块。完备的评测体系可以概括为
+            - strong [ref=e188]: 四个模块、三种能力、两条 Loop、一套资产
+            - text: 。
+        - heading "一、完备的评测体系是什么样子" [level=2] [ref=e189]
+        - heading "| 1.1 回到原点：评测是 Agent 效果的“精密量具”" [level=3] [ref=e192]
+        - paragraph [ref=e194]:
+          - generic [ref=e195]:
+            - text: 评测的核心目的是回答两个问题：
+            - strong [ref=e196]: Agent 好不好？到底哪里好、哪里不好
+            - text: ？前者给出判断，后者指明方向。一套完备的评测体系必须同时回答这两个问题。
+        - paragraph [ref=e197]:
+          - generic [ref=e198]:
+            - text: 在《
+            - link "Agent 评测漫谈" [ref=e199]:
+              - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783112&idx=1&sn=785b0bc4b98c0324a528cb87717f3032&scene=21#wechat_redirect
+            - text: 》一文中，我们认为评测是一套“精密量具”，这个类比其实包含两个隐喻：
+        - list [ref=e200]:
+          - listitem [ref=e201]:
+            - generic [ref=e203]:
+              - strong [ref=e204]: 量具要准（方差小才置信）
+              - text: ：同一个样本，不同的人、不同的时间、人和机器，量出来的结果要一致。这对应博客方法论中的“人人一致、人机一致”。
+          - listitem [ref=e205]:
+            - generic [ref=e207]:
+              - strong [ref=e208]: 量具需要能定期校准
+              - text: ：业务扩量后用户画像变了、Agent 能力边界扩了、业务目标有变化了，原有的评测集和 Rubric 就会逐渐失去代表性。这对应评测体系自身的迭代能力。
+        - paragraph [ref=e209]: 第二点是评测贴近真实业务场景、消除独裁者偏差的关键手段，但却是最容易被忽略的。
+        - heading "| 1.2 两条相互咬合的 Loop" [level=3] [ref=e210]
+        - paragraph [ref=e212]: 理想的评测体系是一套持续运转的系统。它由两条 Loop 构成，二者共享同一批线上真实样本，通过 Case 挖掘与归因这个枢纽相互咬合。
+        - figure [ref=e213]:
+          - img "图片" [ref=e215]
+        - paragraph [ref=e216]:
+          - strong [ref=e217]: 第一条：评测体系迭代 Loop（评测演进）
+        - paragraph [ref=e218]: Agent 上线后，在线评测和在线监控开始持续产出异常信号。这些信号背后的线上真实样本，经过 Case 挖掘进入 Case 池，再经过归因判断问题性质。如果归因结论是“评测集没有覆盖这类问题”，那么这个样本就应该补充进评测集；如果归因结论是“评测标准判错了”，那么迭代评测是 Metrics 和 Rubric 本身。这条 Loop 让评测集从冷启动人工搭建逐步逼近真实用户的反馈，逐步消除前文博客中提到的独裁者偏差。
+        - paragraph [ref=e219]:
+          - strong [ref=e220]: 第二条：Agent 迭代 Loop（Agent 演进）
+        - paragraph [ref=e221]: 同样是这批线上真实样本，经过 Case 挖掘和归因之后，定位到 Agent 本身的问题点——可能是 Prompt 写得不够明确、某个 Skill 的描述导致路由错误、上下文管理丢了关键信息，或者模型能力确实不够。研发据此做出变更，变更后用评测集回测，确认没有引入退化，再上线 AB 观察真实效果。这条 Loop 让 Agent 的能力持续提升，同时保证每次提升不以牺牲已有能力为代价。
+        - paragraph [ref=e222]: 除了 Case 挖掘和归因这个显而易见的咬合点，其实还有第二个咬合点——评测资产（评测集）。评测体系迭代 Loop 的产出是更完善的评测集，回测的门禁价值就越高；回测门禁越严格，Agent 上线后暴露的新问题就越少。从而形成正反馈。
+        - heading "| 1.3 评测体系的三种能力" [level=3] [ref=e223]
+        - paragraph [ref=e225]: 把两条 Loop 放在一起看，完备的评测体系要同时具备三种能力，并沉淀评测资产（评测集）。
+        - figure [ref=e226]:
+          - img "图片" [ref=e228]
+        - paragraph [ref=e229]:
+          - generic [ref=e230]:
+            - strong [ref=e231]: 评测资产（评测集）
+            - text: ：
+        - paragraph [ref=e232]: 这三种能力运转起来后，会沉淀下可复用的资产，它们才是评测体系真正的长期价值。
+        - list [ref=e233]:
+          - listitem [ref=e234]:
+            - generic [ref=e236]:
+              - strong [ref=e237]: 评测标准
+              - text: （Metrics & Rubric）：团队对“好”的共识的显式化、可量化，消除评测的模糊度。
+          - listitem [ref=e238]:
+            - generic [ref=e240]:
+              - strong [ref=e241]: 评测样本
+              - text: ：真实问题的结构化沉淀。黄金集定义了“好的下限”，错题集记录了“踩过的坑”，挑战集标定了“能力的边界”。它的价值在于可回归——每一个曾经犯过的错，都不应该再犯第二次。
+        - paragraph [ref=e242]:
+          - generic [ref=e243]:
+            - text: 但“什么叫好”的共识和“踩过哪些坑”的记录会随着 Agent 扩量而持续扩充。从这个意义上说，评测体系建设的本质，是
+            - strong [ref=e244]: 把团队对业务质量的隐性认知，转化为可量化、可复用、可传递、可自动执行的显性资产
+            - text: 。
+        - heading "| 1.4 评测体系的构成" [level=3] [ref=e245]
+        - paragraph [ref=e247]: 从评测体系的视角，可以拆解出四个模块。前三个模块分别回答不同的问题，第四个模块是前三者的地基。
+        - figure [ref=e248]:
+          - img "图片" [ref=e250]
+        - figure [ref=e251]:
+          - img "图片" [ref=e253]
+        - blockquote [ref=e254]:
+          - paragraph [ref=e255]:
+            - strong [ref=e256]: 关于模块划分的说明
+          - paragraph [ref=e257]: 业界和开源领域对离线评测的定义非常清晰，而在线评测、在线监控、观测以及 Case 挖掘与归因这几个模块彼此之间存在模糊地带，例如 Arize AI、LangFuse、Braintrust 对这几个概念的划分就不尽相同。例如有的产品把“Online Evaluation”和“Monitoring”合并成一个概念，有的把 Trace 采集归入 Observability 而把 Trace 分析归入 Evaluation。
+          - paragraph [ref=e258]: 由于行业内没有形成统一的概念划分，为了方便后续讨论中的概念对齐，以及用一套框架贯穿冷启动、扩量和自进化，我们拆解出上面这四个大模块。读者在实践过程中可以按自己团队的组织方式重新切分，不漏掉任何一项职责即可。
+        - paragraph [ref=e259]:
+          - strong [ref=e260]: 一个贯穿全文的例子
+        - paragraph [ref=e261]: 为了让后面的讨论有实感，我们先约定一个贯穿全文的场景——商家经营分析 Agent（对应内部的商家 Claw 类场景）。
+        - figure [ref=e262]:
+          - img "图片" [ref=e264]
+        - paragraph [ref=e265]: 这个场景的特点是典型的长程 Agent：多步骤、多 Skill 调用、有中间产物、与环境频繁交互、没有唯一正确答案。后面每讲一个模块，我们都会回到这个例子上看它具体长什么样。
+        - heading "二、离线评测：变更的门控" [level=2] [ref=e266]
+        - paragraph [ref=e269]: 离线评测的核心作用在于 Agent 版本变更后的回测，可以作为上线前的门控。它依赖：固定评测集（固定样本和固定评测标准）、尽可能贴近生产的固定执行环境。
+        - paragraph [ref=e270]: 当 Agent Harness 的任何一个环节发生变化——模型升级、Prompt 调整、知识库更新、Skill 新增或下线——都可以通过离线评测验证效果，避免不成熟的变更导致 Agent 能力劣化。
+        - blockquote [ref=e271]:
+          - paragraph [ref=e272]:
+            - strong [ref=e273]: 为什么强调“固定”
+          - paragraph [ref=e274]: 回测的本质是控制变量对比：只让 Agent 版本变化，其他一切保持不变，这样分数的差异才能归因到版本变更上。
+          - paragraph [ref=e275]: 实践中最容易被破坏的是执行环境。比如评测时调用的是测试环境的下游接口，而测试环境的数据和生产不一致；或者沙箱里没有预置用户的历史文件，导致 Agent 拿不到必要的上下文。这类环境差异会让离线分数和线上表现系统性偏离，最终让团队不再信任离线评测。
+          - paragraph [ref=e276]: 一个实用的检验方法：拿同一批样本，分别在离线环境和线上影子流量里跑一遍，看两边的结论是否一致。差异过大，说明环境保真度不够。
+        - heading "| 2.1 评测集：评测体系的核心资产" [level=3] [ref=e277]
+        - heading "2.1.1 评测集的构成" [level=4] [ref=e279]
+        - paragraph [ref=e281]:
+          - generic [ref=e282]:
+            - text: 广义的评测集由（
+            - strong [ref=e283]: 问题、参考答案、评价标准
+            - text: ）三元组构成，其中
+            - strong [ref=e284]: 问题-参考答案
+            - text: 合起来称作评测样本。这个概念最早出自大模型评测领域，如今被借用到 Agent 评测领域。
+        - paragraph [ref=e285]: 但随着 Agent 形态从 ChatBot 演进到长程 Agent，这三元组的具体含义也在发生迁移：
+        - figure [ref=e286]:
+          - img "图片" [ref=e288]
+        - paragraph [ref=e289]: 这个迁移背后是一个根本性变化：Agent 评测从“答案评测”走向“行为评测”。短程场景下，参考答案是一个可以逐字比对的字符串；长程场景下，参考答案变成了一段对执行过程的描述，评测要看的是 Agent 走过的路径是否符合预期，以及最终环境状态是否达成目标。
+        - paragraph [ref=e290]:
+          - generic [ref=e291]:
+            - text: 借用 Anthropic《
+            - link "Demystifying evals for AI agents" [ref=e292]:
+              - /url: https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+            - text: 》文中对长程 Agent 评测 Task 定义：为“具有明确输入和成功标准的单个测试”，这个概念同样可以泛化到短程 Agent 领域。
+        - paragraph [ref=e293]: 借用这个概念，评测集的每一行三元组都可以看做一个 Task。
+        - paragraph [ref=e294]: 具体而言 Task 里要有固定输入，比如 Query / answer，或者 prompt / expected behavior；评价部分由 Metrics 和 Rubric 构成，其中 Rubric 是最小粒度的评测标准。
+        - figure [ref=e295]:
+          - img "图片" [ref=e297]
+        - paragraph [ref=e298]: 一个完整的 Task 大致长这样：
+        - figure [ref=e299]:
+          - img "图片" [ref=e301]
+        - paragraph [ref=e302]:
+          - generic [ref=e303]:
+            - text: 《
+            - link "Agent 评测漫谈" [ref=e304]:
+              - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783112&idx=1&sn=785b0bc4b98c0324a528cb87717f3032&scene=21#wechat_redirect
+            - text: 》中强调的二元化 Rubric思路就是用在这里的：把“这个 PPT 做得好不好”这种模糊判断，下钻成一组可以回答是/否的具体检查项，从而将模糊的问题尽可能量化，消除分歧。人人一致率和人机一致率的提升，本质上都来自这种下钻。
+        - heading "2.1.2 评测集的分类：端到端与过程" [level=4] [ref=e305]
+        - paragraph [ref=e307]:
+          - generic [ref=e308]:
+            - text: 评测集总体上可以分成两类：
+            - strong [ref=e309]: 端到端评测集和过程评测集
+            - text: 。每一个评测集都由上文的三元组构成。
+        - paragraph [ref=e310]: 对于端到端评测和过程评测，都可以建立我们常说的黄金集、必过集，这两套概念彼此独立不冲突。
+        - figure [ref=e311]:
+          - img "图片" [ref=e313]
+        - paragraph [ref=e314]:
+          - generic [ref=e315]:
+            - strong [ref=e316]: 为什么两类都需要
+            - text: ？端到端评测集看的是最终结果，重点回答“
+            - strong [ref=e317]: 事有没有办成
+            - text: ”；过程评测集看执行过程，回答的是“
+            - strong [ref=e318]: 中间哪一步出了问题
+            - text: ”。回到商家经营分析的例子。端到端评测集告诉你“100 个任务里有 68 个交付了可用的 PPT”，端到端交付率是业务方最关心的数字。但当这个数字从 68 掉到 55 时，端到端评测集无法告诉你原因。而过程评测集可以：如果“投放数据 Skill 调用成功率”从 95% 掉到 70%，问题就定位到了；如果 Skill 成功率没变、但“数据合并正确率”下降，问题就在另一处。若过程评测集指标未发生波动，但端到端交付率降低，则说明发生了未知异常，需要我们进一步挖掘和归因从而迭代评测集。
+        - paragraph [ref=e319]:
+          - generic [ref=e320]:
+            - strong [ref=e321]: 一个实用的经验
+            - text: ：端到端评测集回答“要不要拉响警报”，过程评测集回答“警报响了该找谁”。只有端到端，你会陷入“知道坏了但不知道哪坏了”；只有过程，你会陷入“每个模块都达标但用户就是不满意”，二者相辅相成。
+        - paragraph [ref=e322]: 再次强调，端到端评测集是站在用户视角建立的。也就是说当 Agent 功能逐渐增加之后，需要按照端到端的功能模块建立不同的端到端评测集。例如商家 Agent，门店经营是一个核心功能模块，由若干个 Skill 构成；门店百科又是一个核心功能模块，由查数 Skill 和门店知识库构成。这种情况应该分别建立端到端评测集。
+        - heading "2.1.3 评测集的分层拆解" [level=4] [ref=e323]
+        - paragraph [ref=e325]: 过程评测集还可以继续往下拆。比如知识库相关的问题，可以单独沉淀成知识库评测集；具体 Skill 调用相关的问题，可以沉淀成 Skill 评测集。后面业务长出新的子场景，也可以继续往下拆。
+        - paragraph [ref=e326]:
+          - generic [ref=e327]:
+            - strong [ref=e328]: 评测集要随着 Agent 的功能发展、随着问题的出现而不断细化
+            - text: 。以商家经营分析为例，可以拆成这样一棵树：
+        - figure [ref=e329]:
+          - img "图片" [ref=e331]
+        - paragraph [ref=e332]:
+          - generic [ref=e333]:
+            - text: 拆解带来的一个额外收益是
+            - strong [ref=e334]: 责任清晰
+            - text: 。当过程评测集和组织分工对齐后，某一层的分数下降，就能直接找到对应的负责人，而不需要先开一轮会来确定“这是谁的问题”。
+        - blockquote [ref=e335]:
+          - paragraph [ref=e336]:
+            - generic [ref=e337]: 拆解的边界：不要过早拆得太细
+          - paragraph [ref=e338]:
+            - generic [ref=e339]:
+              - text: 分层拆解是演进的结果，不是设计的起点。《
+              - link "Agent 评测漫谈" [ref=e340]:
+                - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783112&idx=1&sn=785b0bc4b98c0324a528cb87717f3032&scene=21#wechat_redirect
+              - text: 》博客中明确提到评测是一门实践科学，与其设计精妙的评测体系，不如抓住核心场景先跑起来。
+          - paragraph [ref=e341]: 正确的顺序是：先建端到端评测集和核心模块的过程评测集跑起来，遇到“知道坏了但不知道哪坏了”的情况，再进一步丰富。让拆解被真实问题驱动，而不是被完备性焦虑驱动。这一点在《冷启动篇》会详细展开。
+        - heading "| 2.2 回测执行：把评测集用起来" [level=3] [ref=e342]
+        - paragraph [ref=e344]: Agent 发生变更时，评测集起到门控的作用。通过回测，我们能保证变更前后核心链路、核心指标的一致性。但“跑一遍评测集”和“建立有效的回测机制”之间还有距离。几个关键的工程考量：
+        - list [ref=e345]:
+          - listitem [ref=e346]:
+            - generic [ref=e348]:
+              - strong [ref=e349]: 多次试验（Trial）取稳定结论
+              - text: 。大模型输出天然有随机性，同一个 Task 跑两次结果可能不同。实践中通常对每个 Task 运行多次试验，也就是我们常说的 Pass@k，用通过率（Pass Rate）而非单次通过与否作为结论。
+          - listitem [ref=e350]:
+            - generic [ref=e352]:
+              - strong [ref=e353]: 分层门禁
+              - text: 。不是所有 Rubric 都同等重要。安全类、数据准确性类的检查项应该是“一票否决”，任何一条不过就阻断发布；体验类、加分项则可以设置阈值。
+          - listitem [ref=e354]:
+            - generic [ref=e356]:
+              - strong [ref=e357]: 接入研发流程才有约束力
+              - text: 。真正有效的做法是把回测嵌入 CI/CD 或发布流程，让它成为一道自动执行的关卡。
+              - strong [ref=e358]: 没有接入流程的门禁，本质上只是一个建议
+              - text: 。
+        - blockquote [ref=e359]:
+          - paragraph [ref=e360]:
+            - strong [ref=e361]: 离线评测的固有局限
+          - paragraph [ref=e362]: 必须清醒认识到离线评测能力的边界。它只能发现已知的问题——评测集里没有的场景，回测永远测不出来。
+          - paragraph [ref=e363]: 例如商家经营分析的场景：如果评测集里全是“制作 PPT”类任务，那么当用户开始大量提出“帮我对比三家门店的数据”这种新需求时，固定的离线评测集显然无法覆盖到新出现的 Case。
+          - paragraph [ref=e364]: 这正是为什么完备的评测体系必须包含在线部分——离线负责守住已知，在线负责发现未知。
+        - heading "三、在线评测与在线监控：真实世界的反馈" [level=2] [ref=e365]
+        - paragraph [ref=e368]: 离线评测做得再丰富多样，也是无法穷举所有场景的，而在线评测接受真实世界得分反馈，则可以弥补这部分短板。
+        - paragraph [ref=e369]: 在线评测和在线监控处理的是线上真实运行时的质量观察。二者关注的层面不同，但有一块重要的交集 —— 巡检。
+        - list [ref=e370]:
+          - listitem [ref=e371]:
+            - generic [ref=e373]:
+              - strong [ref=e374]: 在线评测
+              - text: 包括 AB、影子模式和巡检，用于在真实线上环境中观察 Agent 的效果。
+          - listitem [ref=e375]:
+            - generic [ref=e377]:
+              - strong [ref=e378]: 在线监控
+              - text: 则关注 Skill/Tool 成功率、失败率、Token 消耗、异常波动等运行指标。
+        - paragraph [ref=e379]:
+          - generic [ref=e380]:
+            - text: 一个直观的区分：在线评测回答“
+            - strong [ref=e381]: 系统工作得好不好
+            - text: ”，在线监控回答“
+            - strong [ref=e382]: 系统有没有在正常工作
+            - text: ”。前者是质量视角，后者是运维视角。Skill 调用成功率 100% 但每次都返回了错误的数据，监控是绿的，评测是红的。
+        - heading "| 3.1 在线评测的三种手段" [level=3] [ref=e383]
+        - figure [ref=e385]:
+          - img "图片" [ref=e387]
+        - paragraph [ref=e388]:
+          - generic [ref=e389]:
+            - strong [ref=e390]: 三者的互补关系
+            - text: ：影子模式在上线前用真实流量兜底，AB 在上线后确认业务价值，巡检在日常持续盯住基本盘。
+        - heading "| 3.2 巡检：两个模块的交集" [level=3] [ref=e391]
+        - paragraph [ref=e393]: 巡检处在在线评测和在线监控的交集上，核心作用是持续监控线上 Agent 效果的稳定性。巡检是业务上把“线上质量观察”变成“持续可追踪过程”的常用手段。最常见的做法是从离线评测集中抽取一部分代表性的 Task 用于周期性检查线上 Agent 的表现，随着评测精细化，也可以单独维护一套巡检评测集。巡检同时具备两种属性：
+        - list [ref=e394]:
+          - listitem [ref=e395]:
+            - generic [ref=e397]:
+              - strong [ref=e398]: 评测属性
+              - text: ：看某类能力有没有持续稳定，比如关键任务成功率是否低于预期。这是在做质量判断。
+          - listitem [ref=e399]:
+            - generic [ref=e401]:
+              - strong [ref=e402]: 监控属性
+              - text: ：把分数变化、失败样本和异常趋势沉淀下来，作为后续 Case 挖掘和归因的输入。这是在做信号产出。
+        - paragraph [ref=e403]: 回到商家经营分析的例子，一套合理的巡检可以这样设计：
+        - figure [ref=e404]:
+          - img "图片" [ref=e406]
+        - heading "| 3.3 在线监控关注什么" [level=3] [ref=e407]
+        - paragraph [ref=e409]: 在线监控关注的是运行指标，工程中常见的大量稳定性指标，都在在线监控的范围内。常见的监控维度包括：
+        - list [ref=e410]:
+          - listitem [ref=e411]:
+            - generic [ref=e413]:
+              - strong [ref=e414]: 可用性类
+              - text: ：Skill/Tool 调用成功率、失败率、超时率、异常类型分布。这是最基础也最容易见效的一层。
+          - listitem [ref=e415]:
+            - generic [ref=e417]:
+              - strong [ref=e418]: 成本类
+              - text: ：Token 消耗、单任务平均步数、平均耗时。
+          - listitem [ref=e419]:
+            - generic [ref=e421]:
+              - strong [ref=e422]: 行为监控类
+              - text: ：任务类型分布、Skill 调用频次分布、平均对话轮次。这一层的价值在于发现用户结构的变化。当某类新任务的占比快速上升，往往意味着评测集需要扩充了。
+        - paragraph [ref=e423]: 稳定性指标和行为监控类指标要放在一起看，才能得出有意义的结论。举例来说，任务完成率下降 5 个点，如果同时观察到某个 Skill 的失败率从 2% 涨到 15%，那结论极大概率是工程问题；如果 Skill 都正常，但“数据对比类”任务占比从 10% 涨到 35%，那结论是用户结构变了、Agent 在新场景上能力不足——这两种情况的应对完全不同。这就是 Case 挖掘和归因的范畴了。
+        - heading "四、Case 挖掘与归因：驱动双环演进的枢纽" [level=2] [ref=e424]
+        - paragraph [ref=e427]: Case 挖掘与归因主要承接在线评测和在线监控中暴露出来的问题线索，同时也接收线上反馈、真实样本采样和业务规则筛出的样本。
+        - paragraph [ref=e428]:
+          - generic [ref=e429]:
+            - text: 职责分工上：
+            - strong [ref=e430]: Case 挖掘负责把样本收进 Case 池，归因负责继续往下定位，判断 Agent 流程里的核心问题点
+            - text: 。
+        - paragraph [ref=e431]: 这个模块是整个体系的枢纽，也是当下火热的“Agent 自进化”的核心切入点。
+        - heading "| 4.1 Case 挖掘的四大类来源" [level=3] [ref=e432]
+        - figure [ref=e434]:
+          - img "图片" [ref=e436]
+        - paragraph [ref=e437]:
+          - generic [ref=e438]:
+            - strong [ref=e439]: 四类来源需要搭配使用，因为它们的“盲区”不同
+            - text: 。只靠线上反馈，你只能看到用户愿意抱怨的那部分问题；只靠监控，你只能看到能被指标刻画的问题；只靠规则挖掘，你只能看到自己已经想到的风险。
+            - strong [ref=e440]: 随机采样是唯一能发现“你根本没想到的问题”的手段，虽然它成本最高、命中率最低，但不可省略
+            - text: 。
+        - heading "| 4.2 Case 池的分化：Good Case 与 Bad Case" [level=3] [ref=e441]
+        - paragraph [ref=e443]: 挖掘出来的样本进入 Case 池后，可以继续区分为 Good Case 和 Bad Case，分别沉淀成不同类型的资产：
+        - figure [ref=e444]:
+          - img "图片" [ref=e446]
+        - paragraph [ref=e447]:
+          - generic [ref=e448]:
+            - strong [ref=e449]: 错题集是回报最直接的一类资产
+            - text: 。它的逻辑很朴素：每一个曾经犯过的错，都不应该再犯第二次。
+        - paragraph [ref=e450]:
+          - generic [ref=e451]:
+            - strong [ref=e452]: 而黄金集的价值容易被低估
+            - text: 。Bad Case 告诉你哪里不行，但它不能告诉你“到什么程度才算行”。没有黄金集，团队在讨论质量时只能各说各话；有了黄金集，“我们要做到这个水平”就变成了一个可以指着看的具体样本。
+        - heading "| 4.3 归因：从“这里出了问题”到“为什么出问题”" [level=3] [ref=e453]
+        - paragraph [ref=e455]: 归因的目标，是定位 Agent 流程里的核心问题点。一个 Bad Case 只能说明“这里出了问题”，还不能说明“为什么出问题”。
+        - paragraph [ref=e456]: 归因要继续判断问题发生在哪个环节：常见的做法是将 Agent 执行过程全链路铺开，通过 Trace 日志逐一定位问题点，这个过程与软件问题排查过程中看日志查 bug 高度雷同。正因如此归因高度依赖观测基建 Trace。这个过程可以由人工完成，也可以由机器辅助完成。
+        - paragraph [ref=e457]: 一个可操作的归因分层，大致如下：
+        - figure [ref=e458]:
+          - img "图片" [ref=e460]
+        - paragraph [ref=e461]: 归因明确之后，正向 Case 一般可以归入评测集中的黄金集、挑战集；负向 Case 则会进入两条不同的路径：
+        - list [ref=e462]:
+          - listitem [ref=e463]:
+            - generic [ref=e464]: 进入 Agent 效果迭代——修复、回测、上线。这是 Agent 迭代 Loop。
+          - listitem [ref=e465]:
+            - generic [ref=e466]: 校验 Rubric，如果现有 Rubric 没有准确刻画风险，则需要迭代 Rubric，同时将 Case 流入错题集。这是评测体系迭代 Loop。
+        - figure [ref=e467]:
+          - img "图片" [ref=e469]
+        - paragraph [ref=e470]:
+          - generic [ref=e471]:
+            - text: 很多团队只走了第一条路径——默认“评测说不行就是 Agent 不行”。这种默认假设会带来一个隐蔽的问题：
+            - strong [ref=e472]: Agent 会被优化成“迎合评测标准”，而不是“解决用户问题”
+            - text: 。当评测标准本身有偏差时，优化得越努力，偏离真实需求越远。定期检查“是不是评测判错了”，是评测体系自我校准的必要动作。
+        - heading "五、Agent 观测基建：一切的地基" [level=2] [ref=e473]
+        - paragraph [ref=e476]:
+          - generic [ref=e477]:
+            - generic [ref=e478]:
+              - text: 《
+              - link "Agent 评测漫谈" [ref=e479]:
+                - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783112&idx=1&sn=785b0bc4b98c0324a528cb87717f3032&scene=21#wechat_redirect
+              - text: 》里有一个朴素的表述：
+            - strong [ref=e480]: 看不见的问题，几乎不可能被稳定解决
+            - text: 。观测的核心价值在于让 Agent 链路白盒化。这也是 Agent 研发公式“
+            - strong [ref=e481]: 观测 + 评测 = 持续迭代
+            - text: ”中，观测被放在第一位的原因。
+        - paragraph [ref=e482]: Agent 的一次执行是一条长链路：用户输入 → 意图理解 → 任务规划 → 工具/Skill 调用 → 环境交互 → 中间结果处理 → 策略调整 → 最终输出。只要其中任意一层出问题，最终效果都可能劣化。但如果系统只能看到“用户说了什么”和“最后回复了什么”，就几乎无法判断问题根因。这正是工业界发展出 Trace 系统的动因——将黑盒内部的推理过程进行全路径披露，把所有影响模型输出的输入信息都记录下来。前篇博客中已经充分论述了观测之于评测的意义，这里不再赘述。
+        - heading "| 5.1 观测基建的建设思路" [level=3] [ref=e483]
+        - paragraph [ref=e485]: 从 Trace SDK，到如今集成在 OpenClaw、Claude Code 当中的 Trace Plugin。观测基建也随着 Agent Harness 高速迭代。
+        - paragraph [ref=e486]: 综合前面的讨论，一套支撑完备评测体系的观测基建，至少应该具备以下能力：
+        - figure [ref=e487]:
+          - img "图片" [ref=e489]
+        - paragraph [ref=e490]: 由于 Agent Harness 迭代太快，哪怕是开源社区，相关基建也是落后于需求的。观测是地基，但这不意味着必须项目启动之初就需要建立一套完备的系统 。实际落地过程中，观测指标、观测基建也是需要基于需求反向设计的。判断标准很简单：当你发现“想自动化判断某件事，但数据里没有”的时候，就是补埋点的时候。
+        - paragraph [ref=e491]:
+          - generic [ref=e492]:
+            - text: 一个务实的建设思路是：
+            - strong [ref=e493]: 先保证“最小可归因”
+            - text: ——至少能拿到完整的模型调用输入输出和 Skill 调用记录，能凭 Trace 复现一个 Bad Case 到底发生了什么。这是冷启动阶段的底线，也是《冷启动篇》会重点讨论的内容。
+        - figure [ref=e494]:
+          - img "图片" [ref=e496]
+        - heading "六、评测体系成熟度自查" [level=2] [ref=e497]
+        - paragraph [ref=e500]: 实践中，我们观察到各业务方评测体系三种最常见的“部分完备”形态。它们各自能解决一部分问题，但都存在明确的能力缺口。
+        - figure [ref=e501]:
+          - img "图片" [ref=e503]
+        - paragraph [ref=e504]: 第三种形态最值得警惕，因为它看起来最“完备”——既有评测集又有监控看板，汇报时数据很齐全。但由于缺少中间的枢纽，两套体系是割裂的：线上发现的问题回不到评测集，评测集的结论也解释不了线上现象。这种形态往往投入不少但收效有限，团队容易陷入“我们该做的都做了，为什么还是这样”的困惑。
+        - paragraph [ref=e505]: 最后，把前面的讨论收敛成一张可以直接使用的自查表。建议对照打分，找出自己业务最短的那块板。
+        - figure [ref=e506]:
+          - img "图片" [ref=e508]
+        - blockquote [ref=e509]:
+          - paragraph [ref=e510]:
+            - generic [ref=e511]: 如何使用这张表？
+          - paragraph [ref=e513]: 不要追求所有维度都达到 L3。不同业务阶段对应不同的合理水位：冷启动阶段，观测 L1 + 评测集 L1 + 回测门禁 L1 就足以支撑起最小闭环；扩量阶段，重点是把评测标准和在线评测推到 L2，少量指标推到 L3；全量运营阶段，才需要考虑 L3 的自动化与规模化。
+          - paragraph [ref=e514]: 更有价值的用法是看“短板”和“错配”。如果你的评测标准已经到了 L3（机评规模化），但 Case 挖掘还在 L0（靠用户投诉），那么再精密的机评也只是在重复评测已知的样本——投入应该转向补齐挖掘能力。体系的能力上限，由最短的那块板决定。
+        - heading "七、小结与下一篇预告" [level=2] [ref=e515]
+        - paragraph [ref=e518]:
+          - generic [ref=e519]:
+            - text: 回到本篇开头的问题：一套完备的评测体系长什么样？可以概括为
+            - strong [ref=e520]: 四个模块、三种能力、两条 Loop、一套资产
+            - text: ：
+        - list [ref=e521]:
+          - listitem [ref=e522]:
+            - generic [ref=e524]:
+              - strong [ref=e525]: 四个模块
+              - text: ：离线评测负责守住已知、在线评测与监控负责发现未知、Case 挖掘与归因负责定位和分派、观测基建作为一切的地基。
+          - listitem [ref=e526]:
+            - generic [ref=e528]:
+              - strong [ref=e529]: 三种能力
+              - text: ：发现问题、定位问题、驱动演进。缺一项，体系就会在对应环节卡住。
+          - listitem [ref=e530]:
+            - generic [ref=e532]:
+              - strong [ref=e533]: 两条 Loop
+              - text: ：Agent 迭代 Loop 让能力持续提升，评测体系迭代 Loop 让量具持续校准。二者在 Case 挖掘与归因处共享入口，在评测集处共享资产。
+          - listitem [ref=e534]:
+            - generic [ref=e536]:
+              - strong [ref=e537]: 一套资产
+              - text: ： 覆盖 Agent 各功能模块的端到端和过程评测集，它是 Agent 效果的守门员，是评测体系真正的长期价值，是 Agent 效果稳定性的锚点，也是将来 Agent 自进化的地基。
+        - paragraph [ref=e538]: 需要强调的是，这张全景图是“终局”而不是“起点”。没有任何一个团队应该照着这张图从头到尾建一遍——那既不现实，投入产出也不划算。
+        - paragraph [ref=e539]:
+          - generic [ref=e540]:
+            - generic [ref=e541]:
+              - text: 《
+              - link "Agent 评测漫谈" [ref=e542]:
+                - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783112&idx=1&sn=785b0bc4b98c0324a528cb87717f3032&scene=21#wechat_redirect
+              - text: 》里有一句话值得在这里重复：
+            - strong [ref=e543]: Agent 评测是一门实践科学，起步阶段“让数据飞轮高效运转起来”的意义，远大于“设计一个复杂精妙的评测体系”
+            - text: 。全景图的价值在于让你在每个阶段都清楚：我现在处在哪里，下一步补哪一块收益最大，以及某一块暂时不做的代价是什么。
+        - paragraph [ref=e544]: 那么起点在哪里？在一穷二白、没有评测集的冷启动阶段，如何实现评测飞轮的最小闭环？这正是下一篇《冷启动篇》将要回答的问题。
+        - heading "八、FAQ" [level=2] [ref=e545]
+        - paragraph [ref=e548]:
+          - strong [ref=e549]: Q：Agent 离线评测集只用在回测吗，为什么不可以按照大模型迭代一样必须比上一次得分高才可以发版？
+        - paragraph [ref=e550]: 这个问题涉及到 Agent 的评测和大模型评测的核心差异，需要从两个方面回答。
+        - paragraph [ref=e551]: 1、Agent 为什么不像基座模型一样打榜？基座模型提供的是通用能力，可以拆解出一系列的通用能力。提醒大家，大模型评测本身也是行业极其专业的领域。目前大家看到的大模型基座能力的评价指标体系是在过去三年中无数论文堆砌而来的。这三年基座模型 benchmark 的含义本身也发生了极大的变化。而 Agent 是服务于垂直业务领域的，最佳的 Agent 指标就是业务指标，所以对 Agent 而言，上线 AB 看业务指标变化是评价其能力的黄金标准。
+        - paragraph [ref=e552]: 2、评测集可以拆分为必过集合和挑战集。显然在垂直业务领域里，挑战集的构建是极其困难的，非常容易跟不上 Agent 版本功能迭代。而必过集样本属于 Agent 核心功能，对于已知的问题必须尽可能解决才可以上线。所以日常工作中，经常会出现必考题（必过集）都会了，难题（挑战集）又见不到的情况。
+        - paragraph [ref=e553]: 综上，Agent 离线评测更多是用在回测方面，真实效果的好坏直接通过线上 AB 看业务指标。
+        - paragraph [ref=e554]:
+          - generic [ref=e555]: 补充：如果设立了挑战集，一定要及时更新拟合线上真实场景的分布，否则评测集不置信。
+        - img "图片" [ref=e557]
+        - paragraph [ref=e558]: 欢迎大家在文末评论区积极留言，可以围绕Agent评测，展开深入的讨论和经验分享。我们会精选一些评论，给大家送上一份美团定制的小礼品。
+        - paragraph [ref=e562]:
+          - generic [ref=e563]: "---------- END ----------"
+        - generic [ref=e565]:
+          - paragraph [ref=e566]:
+            - generic [ref=e567]: 推荐阅读
+          - paragraph [ref=e570]:
+            - link "Agent评测漫谈 —— 由浅入深讲解Agent评测" [ref=e572]:
+              - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783112&idx=1&sn=785b0bc4b98c0324a528cb87717f3032&scene=21#wechat_redirect
+          - paragraph [ref=e573]:
+            - link "用Agent评测思路管理AI Coding —— 31万行代码AI重构的实践" [ref=e575]:
+              - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651782575&idx=1&sn=c4c3e41bf57fe08b573ccf76d83cd270&scene=21#wechat_redirect
+          - paragraph [ref=e576]:
+            - link "美团智播——数字人直播技术创新与实践" [ref=e578]:
+              - /url: https://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&mid=2651783277&idx=1&sn=69b406db34fc05f4a17b0310dcf3a7f5&scene=21#wechat_redirect
+        - paragraph [ref=e579]
+        - paragraph [ref=e580]:
+          - img "图片" [ref=e582]
+        - img "图片" [ref=e584]
+        - link "美团技术团队 ， 这里是美团、大众点评、美团无人机、美团无人车等技术团队对外技术交流的窗口，我们会定期分享在AI领域的探索与实践、研发技能和技术招聘信息，希望跟大家一起交流学习，拥抱未来。 562篇原创内容 公众号" [ref=e591]:
+          - option [ref=e592]:
+            - generic [ref=e597]:
+              - strong [ref=e599]: 美团技术团队
+              - generic [ref=e601]: 这里是美团、大众点评、美团无人机、美团无人车等技术团队对外技术交流的窗口，我们会定期分享在AI领域的探索与实践、研发技能和技术招聘信息，希望跟大家一起交流学习，拥抱未来。
+              - generic [ref=e602]: 562篇原创内容
+            - generic [aria-hidden] [ref=e605]: 公众号
+        - generic [ref=e606]: ❤️❤️❤️ 如果这篇文章对你有帮助，欢迎大家帮忙点赞、评论，分享给更多的小伙伴。⬇️
+    - generic [ref=e611]:
+      - button "大模型 · 目录" [ref=e612]
+      - 'button "上一篇 · GeoRA: 为RLVR设计的LoRA——ACL 2026杰出论文解析" [ref=e618]':
+        - generic [ref=e619]:
+          - generic [ref=e620]: 上一篇
+          - generic [ref=e621]:
+            - text: ·
+            - generic [ref=e622]: "GeoRA: 为RLVR设计的LoRA——ACL 2026杰出论文解析"
+  - generic [ref=e633]:
+    - link "美团技术团队" [ref=e643]
+    - generic [ref=e647]:
+      - button "赞" [ref=e649]:
+        - generic [aria-hidden] [ref=e650]: 赞
+      - button "分享" [ref=e652]:
+        - generic [aria-hidden] [ref=e653]: 分享
+      - button "在看" [ref=e655]:
+        - generic [aria-hidden] [ref=e656]: 推荐
+      - button "留言 写留言" [ref=e658]:
+        - generic [ref=e659]: 写留言

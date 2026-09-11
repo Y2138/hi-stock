@@ -19,6 +19,9 @@ export interface UiToolCall {
   args: Record<string, unknown> | null;
   status: "running" | "done" | "error";
   resultText: string | null;
+  /** 工具调用开始、结束时间（毫秒时间戳）；用于在状态右侧展示实时耗时。 */
+  startedAt?: number;
+  endedAt?: number;
   confirmation: UiConfirmation | null;
   /** 结果摘要展开态 */
   expanded: boolean;
@@ -228,6 +231,7 @@ export function rowsToMessages(rows: ChatMessageRow[], confirmations: Confirmati
             args: call.arguments ?? null,
             status: "running",
             resultText: null,
+            startedAt: Number.isFinite(Date.parse(row.created_at)) ? Date.parse(row.created_at) : undefined,
             confirmation: null,
             expanded: false,
           };
@@ -247,6 +251,7 @@ export function rowsToMessages(rows: ChatMessageRow[], confirmations: Confirmati
       const tool = toolByCallId.get(msg.toolCallId);
       if (!tool) continue;
       tool.status = msg.isError ? "error" : "done";
+      tool.endedAt = Number.isFinite(Date.parse(row.created_at)) ? Date.parse(row.created_at) : undefined;
       tool.resultText = resultTextOf({ content: msg.content });
       const details = msg.details;
       if (details?.confirmation_id) {

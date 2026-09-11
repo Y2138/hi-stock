@@ -65,7 +65,7 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
     name: "pool_attention_write",
     label: "批量维护每日计划近期关注",
     description:
-      "一次提交本轮应保留的全部近期关注并在同一事务对账。items 中的 mark 是完整保留集合，遗漏的历史自动关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧自动关注；人工关注永不清除或覆盖。只维护已在短线池或长线池中的标的，不得新增标的、改变池角色或研究属性。",
+      "一次提交本轮应保留的全部近期关注并在同一事务对账。items 中的 mark 是完整保留集合，遗漏的历史自动关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧自动关注；人工关注永不清除或覆盖。只维护已在短线池或长线池中的标的，不得新增标的、改变池角色或研究属性。qualified 表示信号已成立，不得有缺失条件；approaching 必须在 missing_signals 中逐项列出尚未成立的信号和次日确认标准（包含策略名称与实际阈值，只使用查询证据，不得臆造）。不同策略不可合成统一质量分，页面按已成立、待补信号分档展示。",
     parameters: ScheduledPoolAttentionSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {
@@ -131,6 +131,7 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
                   code: item.code,
                   pool: item.pool,
                   attention_reason: `${DAILY_PREFIX}${item.attention_status === "qualified" ? "已符合" : "即将符合"}：${item.attention_reason!.replace(/^每日计划·(?:已符合|即将符合)：/, "")}`,
+                  attention_signal: { status: item.attention_status!, missing_signals: item.missing_signals ?? [] },
                   attention_from: item.attention_from!,
                   attention_until: item.attention_until!,
                 })
@@ -146,6 +147,7 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
               pool: item.pool,
               action: item.action,
               previous_attention_reason: write.before.attention_reason,
+              attention_signal: write.after.attention_signal,
               attention_reason: write.after.attention_reason,
               attention_from: write.after.attention_from,
               attention_until: write.after.attention_until,

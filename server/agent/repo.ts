@@ -27,8 +27,6 @@ export interface ChatSessionRow {
   session_status: ChatSessionStatus;
   source: ChatSessionSource;
   parent_session_id: string | null;
-  strategy_state_revision: string | null;
-  strategy_state_sha256: string | null;
   started_at: string | null;
   finished_at: string | null;
   last_error_summary: string | null;
@@ -71,7 +69,6 @@ export interface ToolAuditRow {
 
 const SESSION_COLS = `id::text, title, archived, model_id::text,
   session_type, session_status, source, parent_session_id::text,
-  strategy_state_revision::text, strategy_state_sha256,
   started_at, finished_at, last_error_summary,
   context_summary, context_summary_through_seq,
   context_summary_estimated_tokens, context_compacted_at,
@@ -79,7 +76,6 @@ const SESSION_COLS = `id::text, title, archived, model_id::text,
 // 0017 分段迁移测试仍需创建会话；压缩列在 0018 前以空检查点返回。
 const SESSION_CREATE_COLS = `id::text, title, archived, model_id::text,
   session_type, session_status, source, parent_session_id::text,
-  strategy_state_revision::text, strategy_state_sha256,
   started_at, finished_at, last_error_summary,
   NULL::text AS context_summary, 0::int AS context_summary_through_seq,
   0::int AS context_summary_estimated_tokens,
@@ -144,12 +140,11 @@ export async function getSession(db: Db, id: string): Promise<ChatSessionRow | n
 
 export interface CreateSessionInput {
   title?: string;
+  model_id?: string | null;
   session_type?: ChatSessionType;
   session_status?: ChatSessionStatus;
   source?: ChatSessionSource;
   parent_session_id?: string | null;
-  strategy_state_revision?: string | null;
-  strategy_state_sha256?: string | null;
 }
 
 export async function createSession(
@@ -159,19 +154,17 @@ export async function createSession(
   const input = typeof value === "string" ? { title: value } : value ?? {};
   const r = await db.query<ChatSessionRow>(
     `INSERT INTO chat_session
-       (title, model_id, session_type, session_status, source, parent_session_id,
-        strategy_state_revision, strategy_state_sha256)
-     VALUES ($1, (SELECT active_model_id FROM llm_setting WHERE singleton = true),
-             $2, $3, $4, $5, $6, $7)
+       (title, model_id, session_type, session_status, source, parent_session_id)
+     VALUES ($1, COALESCE($2::bigint, (SELECT active_model_id FROM llm_setting WHERE singleton = true)),
+             $3, $4, $5, $6)
      RETURNING ${SESSION_CREATE_COLS}`,
     [
       input.title?.trim() || "新会话",
+      input.model_id ?? null,
       input.session_type ?? "interactive",
       input.session_status ?? "idle",
       input.source ?? "user",
       input.parent_session_id ?? null,
-      input.strategy_state_revision ?? null,
-      input.strategy_state_sha256 ?? null,
     ],
   );
   return r.rows[0]!;

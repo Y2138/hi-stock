@@ -177,13 +177,8 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   },
   strategy_document: {
     domain: "当前策略",
-    description: "策略与核心指引的稳定身份、展示顺序和当前技术修订指针。",
+    description: "当前最终策略与核心指引的稳定身份、展示顺序和当前正文。",
     write_policy: "只允许当前策略页面真人批准 strategy_publish_request 提案时更新。",
-  },
-  strategy_document_revision: {
-    domain: "当前策略",
-    description: "发布所需的不可变技术修订；页面只展示当前最终正文，不提供历史版本入口。",
-    write_policy: "只允许真人策略发布事务追加。",
   },
   strategy_evolution_log: {
     domain: "当前策略",

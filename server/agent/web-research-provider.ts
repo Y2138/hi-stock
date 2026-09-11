@@ -1,17 +1,5 @@
 // Web 研究供应商契约与首期 DeepSeek 原生搜索实现。只搜索并返回来源，不抓取任意 URL。
 
-export const WEB_RESEARCH_ALLOWED_DOMAINS = [
-  "bse.cn",
-  "cninfo.com.cn",
-  "csrc.gov.cn",
-  "gov.cn",
-  "ndrc.gov.cn",
-  "pbc.gov.cn",
-  "sse.com.cn",
-  "stats.gov.cn",
-  "szse.cn",
-] as const;
-
 export interface WebResearchResult {
   title: string;
   url: string;
@@ -24,7 +12,7 @@ export interface WebResearchResult {
 export interface WebResearchProvider {
   search(input: {
     query: string;
-    allowedDomains: string[];
+    domains?: string[];
     maxResults: number;
     recencyDays?: number;
   }, signal?: AbortSignal): Promise<WebResearchResult[]>;
@@ -56,12 +44,14 @@ interface DeepSeekContentBlock {
 
 const DEEPSEEK_SEARCH_ENDPOINT = "https://api.deepseek.com/anthropic/v1/messages";
 
-function allowedDomain(url: string, domains: string[]): string | null {
+function normalizeResearchUrl(url: string, domains?: string[]): { url: string; domain: string } | null {
   try {
     const parsed = new URL(url);
     if (!(WEB_RESEARCH_CONTRACT_LIMITS.allowedProtocols as readonly string[]).includes(parsed.protocol)) return null;
-    const host = parsed.hostname.toLowerCase().replace(/\.$/u, "");
-    return domains.find((domain) => host === domain || host.endsWith(`.${domain}`)) ?? null;
+    const domain = parsed.hostname.toLowerCase().replace(/\.$/u, "");
+    if (domains?.length && !domains.some((allowed) => domain === allowed || domain.endsWith(`.${allowed}`))) return null;
+    parsed.hash = "";
+    return { url: parsed.toString(), domain };
   } catch {
     return null;
   }
@@ -100,7 +90,7 @@ export function createDeepSeekWebResearchProvider(
         : new Date(now().getTime() - input.recencyDays * 86_400_000).toISOString().slice(0, 10);
       const scopedQuery = [
         `Perform a web search for the query: ${input.query}`,
-        `Only return sources from these domains: ${input.allowedDomains.join(", ")}.`,
+        input.domains?.length ? `Only return sources from these domains: ${input.domains.join(", ")}.` : "",
         cutoff ? `Prefer sources published on or after ${cutoff}; keep the publication date when available.` : "",
       ].filter(Boolean).join("\n");
       const timeoutSignal = AbortSignal.timeout(60_000);
@@ -139,23 +129,23 @@ export function createDeepSeekWebResearchProvider(
         if (block.type !== "web_search_tool_result" || !Array.isArray(block.content)) continue;
         sawSearchResultBlock = true;
         for (const item of block.content as Array<Record<string, unknown>>) {
-          if (item.type !== "web_search_result" || typeof item.url !== "string" || seen.has(item.url)) continue;
-          const domain = allowedDomain(item.url, input.allowedDomains);
-          if (!domain) continue;
-          const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : domain;
-          const snippet = (snippets.get(item.url) ?? "供应商未返回摘要")
+          if (item.type !== "web_search_result" || typeof item.url !== "string") continue;
+          const normalized = normalizeResearchUrl(item.url, input.domains);
+          if (!normalized || seen.has(normalized.url)) continue;
+          const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : normalized.domain;
+          const snippet = (snippets.get(item.url) ?? snippets.get(normalized.url) ?? "供应商未返回摘要")
             .slice(0, WEB_RESEARCH_CONTRACT_LIMITS.maxSnippetChars);
           const result: WebResearchResult = {
             title,
-            url: item.url,
-            domain,
+            url: normalized.url,
+            domain: normalized.domain,
             publishedAt: typeof item.page_age === "string" && item.page_age.trim() ? item.page_age : null,
             fetchedAt,
             snippet,
           };
-          const chars = title.length + item.url.length + snippet.length;
+          const chars = title.length + normalized.url.length + snippet.length;
           if (totalChars + chars > WEB_RESEARCH_CONTRACT_LIMITS.maxTotalChars) return results;
-          seen.add(item.url);
+          seen.add(normalized.url);
           results.push(result);
           totalChars += chars;
           if (results.length >= input.maxResults) return results;

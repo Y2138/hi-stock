@@ -4,6 +4,7 @@ import { computed, ref } from "vue";
 import { TOOL_LABELS } from "../../api/types";
 import type { UiToolCall } from "../../utils/chat";
 import ToolCard from "./ToolCard.vue";
+import ToolElapsed from "./ToolElapsed.vue";
 
 const props = defineProps<{ tools: UiToolCall[] }>();
 const emit = defineEmits<{
@@ -16,6 +17,15 @@ const label = computed(() => TOOL_LABELS[name.value] ?? name.value);
 const running = computed(() => props.tools.filter((tool) => tool.status === "running").length);
 const failed = computed(() => props.tools.filter((tool) => tool.status === "error").length);
 const done = computed(() => props.tools.length - running.value - failed.value);
+const startedAt = computed(() => {
+  const values = props.tools.map((tool) => tool.startedAt).filter((value): value is number => Number.isFinite(value));
+  return values.length ? Math.min(...values) : undefined;
+});
+const endedAt = computed(() => {
+  if (running.value) return undefined;
+  const values = props.tools.map((tool) => tool.endedAt).filter((value): value is number => Number.isFinite(value));
+  return values.length ? Math.max(...values) : undefined;
+});
 </script>
 
 <template>
@@ -31,6 +41,7 @@ const done = computed(() => props.tools.length - running.value - failed.value);
       <span class="tool-group-state" :class="running ? 'running' : failed ? 'error' : 'done'">
         {{ tools.length }} 项
       </span>
+      <ToolElapsed :started-at="startedAt" :ended-at="endedAt" :running="running > 0" />
     </div>
     <div class="tool-group-summary">
       已完成 {{ done }}<template v-if="running"> · 运行中 {{ running }}</template><template v-if="failed"> · 失败 {{ failed }}</template>

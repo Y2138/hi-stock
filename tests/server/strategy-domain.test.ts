@@ -21,6 +21,7 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
   let server: TestServer;
   let migrationDir: string;
   let sessionId: string;
+  let baselineSeq = "0";
 
   async function insertLegacyContent(input: {
     code: string;
@@ -115,6 +116,12 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     const migration64 = files.find((file) => file.startsWith("0064_"))!;
     await fs.copyFile(path.join(sourceDir, migration64), path.join(migrationDir, migration64));
     expect((await runMigrations(pool, migrationDir)).applied).toEqual([64]);
+    // 运行时的策略读取依赖当前 schema（含 0088 策略正文内联）；补齐其余迁移后再起服务。
+    for (const file of files.filter((file) => Number(file.slice(0, 4)) >= 18)) {
+      await fs.copyFile(path.join(sourceDir, file), path.join(migrationDir, file));
+    }
+    const remaining = await runMigrations(pool, migrationDir);
+    expect(remaining.applied).not.toContain(17);
     server = await startTestServer(pool);
     sessionId = (await createSession(pool, "策略演进测试")).id;
   });
@@ -130,19 +137,19 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     expect(current.status).toBe(200);
     const bundle = current.json as unknown as {
       state: { change_seq: string; current_hash: string };
-      documents: Array<{ code: string; current_sha256: string; current_content: string }>;
+      documents: Array<{ code: string; sha256: string; content: string }>;
     };
-    expect(bundle.documents).toHaveLength(1);
-    expect(bundle.documents[0]).toMatchObject({ code: "investment_strategy", current_content: "# 投资总策略\n\n初始最终正文" });
+    expect(bundle.documents.map((document) => document.code)).toContain("investment_strategy");
+    expect(bundle.documents.find((document) => document.code === "investment_strategy"))
+      .toMatchObject({ content: "# 投资总策略\n\n初始最终正文" });
     const currentDocuments = await pool.query<{ code: string; sha256: string }>(
-      `SELECT document.code, revision.sha256
-         FROM strategy_document document
-         JOIN strategy_document_revision revision ON revision.id = document.current_revision_id
-        ORDER BY document.injection_order, document.id`,
+      `SELECT code, sha256 FROM strategy_document ORDER BY injection_order, id`,
     );
-    expect(currentDocuments.rows).toHaveLength(1);
+    expect(currentDocuments.rows.map((row) => row.code)).toEqual(bundle.documents.map((document) => document.code));
+    const baseSeq = (await pool.query<{ change_seq: string }>("SELECT change_seq::text FROM strategy_state")).rows[0]!.change_seq;
+    baselineSeq = baseSeq;
     expect(bundle.state).toMatchObject({
-      change_seq: "0",
+      change_seq: baseSeq,
       current_hash: sha256(currentDocuments.rows.map((row) => `${row.code}:${row.sha256}`).join("\n")),
     });
     expect((await pool.query(
@@ -163,15 +170,21 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
       `SELECT revision.content FROM job_prompt prompt
        JOIN job_prompt_revision revision ON revision.id = prompt.current_revision_id`,
     );
-    expect(prompts.rows.every((row) => row.content.includes("job_run_output"))).toBe(true);
+    // 0017 起流程提示词改读任务结果域，且任何提示词都不得再读取冻结的 content_*。
     expect(prompts.rows.every((row) => !row.content.includes("content_document"))).toBe(true);
+    const planPrompt = await pool.query<{ content: string }>(
+      `SELECT revision.content FROM job_prompt prompt
+       JOIN job_prompt_revision revision ON revision.id = prompt.current_revision_id
+      WHERE prompt.code = 'daily_plan_flow'`,
+    );
+    expect(planPrompt.rows[0]!.content).toContain("job_run_output");
   });
 
   it("YOLO 下 Agent 仍只能创建 pending，普通 confirmation 和工具均不能批准", async () => {
     await pool.query("UPDATE agent_setting SET yolo_mode = true WHERE singleton = true");
     const bundle = (await api(server.baseUrl, "GET", "/api/strategy/current")).json as unknown as {
       state: { change_seq: string; current_hash: string };
-      documents: Array<{ id: string; current_revision_id: string; current_content: string }>;
+      documents: Array<{ id: string; sha256: string; content: string }>;
     };
     const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "strategy_publish_request")!;
     const result = await tool.execute("strategy-pending", {
@@ -183,14 +196,14 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
       summary: "门禁测试提案",
       changes: [{
         document_id: bundle.documents[0]!.id,
-        base_revision_id: bundle.documents[0]!.current_revision_id,
-        content: `${bundle.documents[0]!.current_content}\n\n新增边界`,
+        base_sha256: bundle.documents[0]!.sha256,
+        content: `${bundle.documents[0]!.content}\n\n新增边界`,
       }],
     });
     const detail = result.details as { proposal_id: string; status: string; requires_human: boolean };
     expect(detail).toMatchObject({ status: "pending", requires_human: true });
     expect(Number((await pool.query("SELECT count(*) FROM agent_confirmation")).rows[0]!.count)).toBe(0);
-    expect((await pool.query("SELECT change_seq::text FROM strategy_state")).rows[0]!.change_seq).toBe("0");
+    expect((await pool.query("SELECT change_seq::text FROM strategy_state")).rows[0]!.change_seq).toBe(baselineSeq);
     expect(buildChatTools({ pool, sessionId }).some((item) => item.name === "strategy_publish_approve")).toBe(false);
     await pool.query("UPDATE agent_setting SET yolo_mode = false WHERE singleton = true");
 
@@ -227,13 +240,14 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     expect(approved.status).toBe(200);
     const current = (await api(server.baseUrl, "GET", "/api/strategy/current")).json as unknown as {
       state: { change_seq: string };
-      documents: Array<{ current_content: string }>;
+      documents: Array<{ content: string }>;
     };
-    expect(current.state.change_seq).toBe("1");
-    expect(current.documents[0]!.current_content).toContain("新增边界");
+    const approvedSeq = String(BigInt(baselineSeq) + 1n);
+    expect(current.state.change_seq).toBe(approvedSeq);
+    expect(current.documents[0]!.content).toContain("新增边界");
     expect((await pool.query("SELECT proposed_changes FROM strategy_publish_proposal WHERE id = $1", [proposalId])).rows[0]!.proposed_changes).toBeNull();
     const prompt = await buildSystemPrompt(pool);
-    expect(prompt).toContain("change_seq=1");
+    expect(prompt).toContain(`change_seq=${approvedSeq}`);
     expect(prompt).toContain("code=investment_strategy");
     expect(prompt).not.toContain("新增边界");
   });
@@ -242,7 +256,7 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     const createProposal = async (outline: string) => {
       const current = (await api(server.baseUrl, "GET", "/api/strategy/current")).json as unknown as {
         state: { change_seq: string; current_hash: string };
-        documents: Array<{ id: string; current_revision_id: string; current_content: string }>;
+        documents: Array<{ id: string; sha256: string; content: string }>;
       };
       const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "strategy_publish_request")!;
       const result = await tool.execute(`strategy-${outline}`, {
@@ -254,15 +268,15 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
         summary: outline,
         changes: [{
           document_id: current.documents[0]!.id,
-          base_revision_id: current.documents[0]!.current_revision_id,
-          content: `${current.documents[0]!.current_content}\n\n${outline}`,
+          base_sha256: current.documents[0]!.sha256,
+          content: `${current.documents[0]!.content}\n\n${outline}`,
         }],
       });
       return (result.details as { proposal_id: string }).proposal_id;
     };
 
     const before = (await api(server.baseUrl, "GET", "/api/strategy/current")).json as unknown as {
-      documents: Array<{ current_content: string }>;
+      documents: Array<{ content: string }>;
     };
     const conflictId = await createProposal("冲突提案");
     await pool.query("UPDATE strategy_state SET change_seq = change_seq + 1");
@@ -273,7 +287,7 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
       review_token: conflictToken.token,
     })).status).toBe(409);
     expect((await pool.query("SELECT status, proposed_changes FROM strategy_publish_proposal WHERE id = $1", [conflictId])).rows[0]).toMatchObject({ status: "conflict", proposed_changes: null });
-    expect(((await api(server.baseUrl, "GET", "/api/strategy/current")).json as unknown as typeof before).documents[0]!.current_content).toBe(before.documents[0]!.current_content);
+    expect(((await api(server.baseUrl, "GET", "/api/strategy/current")).json as unknown as typeof before).documents[0]!.content).toBe(before.documents[0]!.content);
 
     const rejectId = await createProposal("拒绝提案");
     const rejectToken = (await api(server.baseUrl, "GET", `/api/strategy/proposals/${rejectId}/review`)).json.review as { token: string };

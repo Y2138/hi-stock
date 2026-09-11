@@ -16,10 +16,8 @@ export interface StrategyDocument {
   title: string;
   role: "portfolio" | "short" | "long" | "guidance";
   injection_order: number;
-  current_revision_id: string;
-  current_revision_no: number;
-  current_sha256: string;
-  current_content: string;
+  sha256: string;
+  content: string;
   updated_at: string;
 }
 
@@ -44,7 +42,7 @@ export interface StrategyEvolution {
 
 export interface StrategyProposalChange {
   document_id: string;
-  base_revision_id: string;
+  base_sha256: string;
   content: string;
 }
 
@@ -177,6 +175,8 @@ export interface JobDefinition {
   job_type: JobType;
   config: Record<string, unknown>;
   prompt_id: string | null;
+  /** Agent 任务固定模型；为空时创建运行会话时跟随系统当前模型。 */
+  model_id: string | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -353,52 +353,7 @@ export interface MarketStructureResponse {
   page: number;
   size: number;
   items: Array<Record<string, unknown>>;
-  limit_up_signals: LimitUpSignalResult | null;
   counts?: Partial<Record<MarketStructureDataset, number>>;
-}
-
-export interface LimitUpSignalCandidate {
-  code: string;
-  name: string;
-  main_theme: string;
-  streak_count: number;
-  open_count: number | null;
-  seal_money: number | null;
-  turnover: number | null;
-  features: Record<string, number | null>;
-  ranks: Record<string, number>;
-  cluster_score: number;
-  momentum_score: number;
-  cluster_rank: number;
-  momentum_rank: number;
-  cluster_signal: boolean;
-  momentum_signal: boolean;
-  signal_grade: "A" | "B-抱团" | "B-主升" | null;
-  data_status: "ready" | "data_insufficient";
-  missing_inputs: string[];
-  neutral_inputs: string[];
-  risk_flags: string[];
-}
-
-export interface LimitUpSignalResult {
-  date: string;
-  strategy_revision_id: string | null;
-  benchmark: {
-    code: string;
-    revision_id: string;
-    training_start: string;
-    training_end: string;
-    methodology: string;
-    sample_counts: Record<string, number>;
-    source_summary: Record<string, unknown>;
-    sha256: string;
-  } | null;
-  status: "success" | "partial" | "unavailable";
-  gaps: string[];
-  candidate_count: number;
-  signal_count: number;
-  signals: LimitUpSignalCandidate[];
-  candidates: LimitUpSignalCandidate[];
 }
 
 export type MarketStructureDataset =
@@ -412,6 +367,19 @@ export type MarketStructureDataset =
 
 // ---- 持仓与账户（server/modules/positions） ----
 
+export type EntrySignalType =
+  | "right_side"
+  | "left_reversal"
+  | "trial_start"
+  | "swing"
+  | "limit_up"
+  | "discretionary";
+
+export const ENTRY_SIGNAL_TYPE_LABELS: Record<string, string> = {
+  right_side: "右侧主升", left_reversal: "左侧反转", trial_start: "试盘启动",
+  swing: "波段", limit_up: "打板", discretionary: "自主决策",
+};
+
 export interface Position {
   instrument_id: string;
   code: string;
@@ -421,6 +389,7 @@ export interface Position {
   cost_price: number;
   cost_basis: string | null;
   opened_at: string | null;
+  entry_signal_type: EntrySignalType | null;
   updated_at: string;
   close: number | null;
   close_date: string | null;
@@ -494,6 +463,7 @@ export interface PositionChange {
   plan_output_type: string | null;
   plan_target_date: string | null;
   entry_auction_assessment_id: string | null;
+  entry_signal_type: EntrySignalType | null;
   entry_signal_date: string | null;
   entry_assessment_date: string | null;
   entry_signal_review_type: string | null;
@@ -548,6 +518,7 @@ export interface PoolMember {
   effective_from: string;
   effective_to: string | null;
   note: string | null;
+  attention_signal: { status: "qualified" | "approaching"; missing_signals: string[] } | null;
   attention_reason: string | null;
   attention_from: string | null;
   attention_until: string | null;
@@ -906,3 +877,32 @@ export const TOOL_LABELS: Record<string, string> = {
   trigger_job: "触发系统作业",
   ui_refresh: "刷新页面数据",
 };
+
+export interface NotificationSettings {
+  enabled: boolean;
+  job_codes: string[] | null;
+  jobs: Array<{ code: string; name: string; enabled: boolean }>;
+  webhook_configured: boolean;
+  sign_secret_configured: boolean;
+  revision: number;
+  updated_at: string;
+}
+export interface NotificationDelivery {
+  id: string;
+  output_id: string | null;
+  kind: "daily_plan" | "agent_result" | "test";
+  job_code: string | null;
+  job_name: string | null;
+  content: string;
+  status: "pending" | "sending" | "sent" | "failed" | "cancelled";
+  attempts: number;
+  error: string | null;
+  created_at: string;
+  sent_at: string | null;
+  next_attempt_at: string;
+}
+
+export interface NotificationPage {
+  items: Omit<NotificationDelivery, "content">[];
+  next_cursor: string | null;
+}

@@ -20,6 +20,8 @@ export interface JobDefinitionRow {
   job_type: JobType;
   config: Record<string, unknown>;
   prompt_id: string | null;
+  /** Agent 任务固定模型；空值表示创建运行会话时跟随系统当前模型。 */
+  model_id: string | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;

@@ -36,7 +36,7 @@ function validationError(error: unknown): never {
 
 export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLatest[]> {
   const result = await db.query<JobDefinitionRow & { latest_run: Partial<JobRunRow> | null }>(
-    `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text, d.enabled,
+    `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text, to_jsonb(d)->>'model_id' AS model_id, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
             (SELECT json_build_object(
@@ -59,10 +59,11 @@ export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLates
 
 export async function findJobByCode(db: Db, code: string): Promise<JobDefinitionRow | null> {
   const result = await db.query<JobDefinitionRow>(
-    `SELECT id::text, code, name, cron, job_type, config, prompt_id::text, enabled,
-            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
-            to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
-       FROM job_definition WHERE code = $1`,
+    `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text,
+            to_jsonb(d)->>'model_id' AS model_id, d.enabled,
+            to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+            to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
+       FROM job_definition d WHERE d.code = $1`,
     [code],
   );
   return result.rows[0] ?? null;
@@ -70,7 +71,7 @@ export async function findJobByCode(db: Db, code: string): Promise<JobDefinition
 
 export async function createJobDefinition(
   db: Db,
-  input: { code: unknown; name: unknown; cron: unknown; job_type: unknown; config: unknown; prompt_id?: unknown; enabled?: unknown },
+  input: { code: unknown; name: unknown; cron: unknown; job_type: unknown; config: unknown; prompt_id?: unknown; model_id?: unknown; enabled?: unknown },
 ): Promise<JobDefinitionRow> {
   const code = assertCode(input.code);
   const name = assertName(input.name);
@@ -88,13 +89,14 @@ export async function createJobDefinition(
     throw apiErrors.badRequest("enabled 必须是布尔值");
   }
   const promptId = await validatePromptBinding(db, jobType, input.prompt_id);
+  const modelId = await validateModelBinding(db, jobType, input.model_id);
   const result = await db.query<JobDefinitionRow>(
-    `INSERT INTO job_definition (code, name, cron, job_type, config, prompt_id, enabled)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, enabled,
+    `INSERT INTO job_definition (code, name, cron, job_type, config, prompt_id, model_id, enabled)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, enabled,
                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
-    [code, name, cron, jobType, JSON.stringify(config), promptId, input.enabled ?? true],
+    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, input.enabled ?? true],
   );
   return result.rows[0]!;
 }
@@ -104,7 +106,7 @@ export async function updateJobDefinition(
   code: string,
   patch: Record<string, unknown>,
 ): Promise<JobDefinitionRow> {
-  const allowed = ["name", "cron", "job_type", "config", "prompt_id", "enabled", "base_updated_at"];
+  const allowed = ["name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "base_updated_at"];
   const unknown = Object.keys(patch).filter((key) => !allowed.includes(key));
   if (unknown.length > 0) throw apiErrors.badRequest(`包含未知字段：${unknown.join(", ")}`);
   if (Object.keys(patch).length === 0) throw apiErrors.badRequest("缺少可更新字段");
@@ -139,19 +141,38 @@ export async function updateJobDefinition(
     jobType,
     patch.prompt_id === undefined ? current.prompt_id : patch.prompt_id,
   );
+  const modelId = await validateModelBinding(
+    db,
+    jobType,
+    patch.model_id === undefined ? current.model_id : patch.model_id,
+  );
   const result = await db.query<JobDefinitionRow>(
     `UPDATE job_definition
         SET name = $2, cron = $3, job_type = $4, config = $5,
-            prompt_id = $6, enabled = $7, updated_at = now()
+            prompt_id = $6, model_id = $7, enabled = $8, updated_at = now()
       WHERE code = $1
-        AND ($8::timestamptz IS NULL OR updated_at = $8::timestamptz)
-      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, enabled,
+        AND ($9::timestamptz IS NULL OR updated_at = $9::timestamptz)
+      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, enabled,
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
-    [code, name, cron, jobType, JSON.stringify(config), promptId, patch.enabled ?? current.enabled, baseUpdatedAt],
+    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, patch.enabled ?? current.enabled, baseUpdatedAt],
   );
   if (!result.rows[0]) throw apiErrors.conflict("作业定义已被其他会话更新，请刷新后重试");
   return result.rows[0];
+}
+
+async function validateModelBinding(db: Db, jobType: JobType, value: unknown): Promise<string | null> {
+  if (jobType !== "agent_flow") {
+    if (value !== undefined && value !== null) throw apiErrors.badRequest(`${jobType} 作业不能指定模型`);
+    return null;
+  }
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) {
+    throw apiErrors.badRequest("model_id 必须是数字字符串或 null");
+  }
+  const model = await db.query<{ id: string }>("SELECT id::text FROM llm_model WHERE id = $1", [value]);
+  if (!model.rows[0]) throw apiErrors.badRequest(`模型不存在：${value}`);
+  return model.rows[0].id;
 }
 
 async function validatePromptBinding(db: Db, jobType: JobType, value: unknown): Promise<string | null> {
@@ -194,6 +215,7 @@ export async function findJobRunById(db: Db, id: string): Promise<(JobRunRow & {
             r.log, r.artifacts, r.data_gaps, r.result_md, r.started_at, r.finished_at, r.created_at,
             json_build_object('id', d.id::text, 'code', d.code, 'name', d.name,
               'cron', d.cron, 'job_type', d.job_type, 'config', d.config, 'prompt_id', d.prompt_id::text,
+              'model_id', to_jsonb(d)->>'model_id',
               'enabled', d.enabled,
               'created_at', to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
               'updated_at', to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')) AS job
@@ -241,7 +263,7 @@ export async function findJobOutputById(
             o.legacy_content_document_id::text, o.created_at,
             json_build_object('id', d.id::text, 'code', d.code, 'name', d.name,
               'cron', d.cron, 'job_type', d.job_type, 'config', d.config,
-              'prompt_id', d.prompt_id::text, 'enabled', d.enabled,
+              'prompt_id', d.prompt_id::text, 'model_id', to_jsonb(d)->>'model_id', 'enabled', d.enabled,
               'created_at', to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
               'updated_at', to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')) AS job
        FROM job_run_output o JOIN job_definition d ON d.id = o.job_id
@@ -296,6 +318,7 @@ export async function queueManualJob(
     if (def.job_type !== "agent_flow") return run;
     const session = await createSession(client, {
       title: `${def.name} · ${targetDate}`,
+      model_id: def.model_id,
       session_type: "job",
       session_status: "queued",
       source: "manual_job",
@@ -314,8 +337,8 @@ export async function insertScheduledJobRun(
   status: "queued" | "missed",
 ): Promise<JobRunRow | null> {
   return inServiceTransaction(db, async (client) => {
-    const definition = await client.query<{ name: string; job_type: JobType }>(
-      "SELECT name, job_type FROM job_definition WHERE id = $1",
+    const definition = await client.query<{ name: string; job_type: JobType; model_id: string | null }>(
+      "SELECT name, job_type, model_id::text FROM job_definition WHERE id = $1",
       [jobId],
     );
     const def = definition.rows[0];
@@ -339,6 +362,7 @@ export async function insertScheduledJobRun(
     if (!run || status === "missed" || def.job_type !== "agent_flow") return run ?? null;
     const session = await createSession(client, {
       title: `${def.name} · ${targetDate}`,
+      model_id: def.model_id,
       session_type: "job",
       session_status: "queued",
       source: "cron",

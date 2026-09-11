@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { Agent, type AgentContext, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
-import type { ResolvedChatModel } from "../ai/runtime.js";
+import { resilientChatStream, type ResolvedChatModel } from "../ai/runtime.js";
 import { sha256Json } from "../hash.js";
 import { registerAgentRun } from "../run-control.js";
 import { buildChatTools } from "../tools.js";
@@ -65,7 +65,7 @@ export async function runAgentTurn(deps: {
       tools: deps.tools ?? buildChatTools({ pool: deps.pool, sessionId: deps.sessionId }),
       messages: deps.messages,
     },
-    streamFn: deps.runtime.models.streamSimple.bind(deps.runtime.models),
+    streamFn: resilientChatStream(deps.runtime),
     beforeToolCall: async ({ toolCall, args }) => {
       const signature = sha256Json({ name: toolCall.name, args });
       consecutiveIdenticalToolCalls = signature === lastToolSignature

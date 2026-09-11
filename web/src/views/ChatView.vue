@@ -22,12 +22,12 @@ import type {
 import MarkdownView from "../components/MarkdownView.vue";
 import StateBlock from "../components/StateBlock.vue";
 import ToolGroupCard from "../components/chat/ToolGroupCard.vue";
-import AgentActivityBar from "../components/chat/AgentActivityBar.vue";
 import UiSelect, { type SelectOption } from "../components/ui/UiSelect.vue";
 import { useResource } from "../composables/useResource";
 import { useStreamTypewriter } from "../composables/useStreamTypewriter";
 import { appMessage } from "../stores/message";
 import { fmtTime } from "../utils/format";
+import { activityLabel } from "../utils/agent-activity";
 import {
   groupMessagesIntoTurns,
   groupToolCalls,
@@ -243,7 +243,9 @@ const messages = ref<UiMessage[]>([]);
 const conversationTurns = computed(() =>
   groupMessagesIntoTurns(
     messages.value,
-    activeSession.value?.session_status === "running" ? `pending-${activeSession.value.id}` : undefined,
+    activeSession.value && ["queued", "running"].includes(activeSession.value.session_status)
+      ? `pending-${activeSession.value.id}`
+      : undefined,
     activeSession.value?.updated_at,
   ),
 );
@@ -288,6 +290,23 @@ function allTools(): UiToolCall[] {
 
 function agentTurnTime(turn: UiAgentTurn): string | null {
   return fmtTime(turn.messages[turn.messages.length - 1]?.createdAt);
+}
+
+const currentActivity = computed(() => activeId.value ? activities.value[activeId.value] ?? null : null);
+const currentActivityProgress = computed(() => {
+  const { completed, total } = currentActivity.value ?? {};
+  return typeof completed === "number" && typeof total === "number" && total > 0 && completed >= 0 && completed <= total
+    ? `${completed} / ${total} 项`
+    : null;
+});
+const currentActivityText = computed(() => {
+  if (!sending.value && activeSession.value?.session_status === "queued") return "任务已排队，等待执行";
+  if (!sending.value && !eventsConnected.value) return "进度连接恢复中";
+  return activityLabel(currentActivity.value, activeSession.value?.session_type === "job");
+});
+
+function isLatestAgentPhase(turn: UiAgentTurn, index: number): boolean {
+  return index === turn.messages.length - 1;
 }
 
 /** 最后一段不含工具的可见文本是回答；其余可见文本属于 Agent 的思考与执行进展。 */
@@ -695,6 +714,7 @@ function handleFrame(frame: ChatSseFrame, state: TurnStreamState): void {
         args: frame.data.args ?? null,
         status: "running",
         resultText: null,
+        startedAt: Date.now(),
         confirmation: null,
         expanded: false,
       });
@@ -709,6 +729,7 @@ function handleFrame(frame: ChatSseFrame, state: TurnStreamState): void {
       const tool = ui.tools.find((t) => t.id === frame.data.toolCallId);
       if (tool) {
         tool.status = frame.data.isError ? "error" : "done";
+        tool.endedAt = Date.now();
         tool.resultText = resultTextOf(frame.data.result);
       }
       scrollBottom();
@@ -1214,17 +1235,15 @@ onBeforeUnmount(() => {
                         </section>
 
                         <section
-                          v-if="phase.streaming && !phase.text && phase.tools.length === 0"
-                          class="agent-phase pending"
+                          v-if="phase.streaming && isLatestAgentPhase(turn, phaseIndex)"
+                          class="agent-phase activity"
+                          :class="{ disconnected: !sending && !eventsConnected }"
                           role="status"
-                          aria-label="Agent 正在思考"
+                          aria-live="polite"
                         >
-                          <div class="assistant-thinking">
-                            <span>思考与进展</span>
-                            <span class="thinking-dots" aria-hidden="true">
-                              <i></i><i></i><i></i>
-                            </span>
-                          </div>
+                          <span class="activity-dot" aria-hidden="true"></span>
+                          <span class="activity-text">{{ currentActivityText }}</span>
+                          <span v-if="currentActivityProgress" class="activity-progress">{{ currentActivityProgress }}</span>
                         </section>
 
                         <div v-if="phase.errorText" class="chat-error-bar">⚠ {{ phase.errorText }}</div>
@@ -1254,14 +1273,6 @@ onBeforeUnmount(() => {
         </button>
 
         <!-- 输入区 -->
-        <AgentActivityBar
-          v-if="activeId && (isAgentRunning || activeSession?.session_status === 'queued')"
-          :key="activeId"
-          :activity="activities[activeId] ?? null"
-          :is-job="activeSession?.session_type === 'job'"
-          :connected="sending || eventsConnected"
-          :queued="!sending && activeSession?.session_status === 'queued'"
-        />
         <div class="composer">
           <p v-if="draftContextLabel" class="context-prefill">
             <span>✦ 已带入：{{ draftContextLabel }}</span>
@@ -1826,35 +1837,40 @@ onBeforeUnmount(() => {
   animation: blink 900ms steps(2) infinite;
 }
 
-.assistant-thinking {
+.agent-phase.activity {
   display: flex;
+  min-height: 24px;
   align-items: center;
   gap: 8px;
-  min-height: 24px;
   color: var(--ink-soft);
   font-size: var(--fs-sm);
 }
 
-.thinking-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.thinking-dots i {
-  width: 5px;
-  height: 5px;
+.agent-phase.activity .activity-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
   border-radius: 50%;
-  background: var(--ink-faint);
+  background: var(--accent-strong);
   animation: thinking-pulse 1.15s ease-in-out infinite;
 }
 
-.thinking-dots i:nth-child(2) {
-  animation-delay: 120ms;
+.agent-phase.activity.disconnected .activity-dot {
+  background: var(--warn);
+  animation: none;
 }
 
-.thinking-dots i:nth-child(3) {
-  animation-delay: 240ms;
+.agent-phase.activity .activity-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-phase.activity .activity-progress {
+  margin-left: auto;
+  flex: none;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .user-text {
@@ -2165,7 +2181,7 @@ onBeforeUnmount(() => {
 
 @media (prefers-reduced-motion: reduce) {
   .msg,
-  .thinking-dots i,
+  .agent-phase.activity .activity-dot,
   .agent-phase.active :deep(.markdown-view > :last-child)::after {
     animation: none;
   }

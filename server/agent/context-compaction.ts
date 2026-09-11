@@ -1,6 +1,6 @@
 // Agent 上下文压缩：保留原始 chat_message，仅用持久摘要替换模型可见的旧前缀。
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ResolvedChatModel } from "./ai/runtime.js";
+import { resilientChatStream, type ResolvedChatModel } from "./ai/runtime.js";
 import type { ChatMessageRow, ChatSessionRow } from "./repo.js";
 import { redactAgentMessage } from "./redaction.js";
 
@@ -154,7 +154,7 @@ async function summarize(
       tools: [],
       messages: [],
     },
-    streamFn: runtime.models.streamSimple.bind(runtime.models),
+    streamFn: resilientChatStream(runtime),
   });
   try {
     await agent.prompt(fallback);

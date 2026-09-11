@@ -18,10 +18,8 @@ export interface StrategyDocumentRow {
   title: string;
   role: "portfolio" | "short" | "long" | "guidance";
   injection_order: number;
-  current_revision_id: string;
-  current_revision_no: number;
-  current_sha256: string;
-  current_content: string;
+  sha256: string;
+  content: string;
   updated_at: string;
 }
 
@@ -46,7 +44,7 @@ export interface StrategyEvolutionRow {
 
 export interface StrategyProposalChange {
   document_id: string;
-  base_revision_id: string;
+  base_sha256: string;
   content: string;
 }
 
@@ -84,10 +82,8 @@ export interface StrategyProposalRow {
 const STATE_SELECT = `SELECT change_seq::text, current_hash, last_evolution_id::text, updated_at
   FROM strategy_state WHERE singleton = 1`;
 const DOCUMENT_SELECT = `SELECT d.id::text, d.code, d.title, d.role, d.injection_order,
-       d.current_revision_id::text, r.revision_no AS current_revision_no,
-       r.sha256 AS current_sha256, r.content AS current_content, d.updated_at
+       d.sha256, d.content, d.updated_at
   FROM strategy_document d
-  JOIN strategy_document_revision r ON r.id = d.current_revision_id
  ORDER BY d.injection_order, d.id`;
 
 function sha256(value: string): string {
@@ -95,7 +91,7 @@ function sha256(value: string): string {
 }
 
 function calculateStrategyHash(documents: StrategyDocumentRow[]): string {
-  return sha256(documents.map((document) => `${document.code}:${document.current_sha256}`).join("\n"));
+  return sha256(documents.map((document) => `${document.code}:${document.sha256}`).join("\n"));
 }
 
 function stringField(value: unknown, field: string, max: number): string {
@@ -145,7 +141,7 @@ export function validateStrategyProposalInput(value: unknown): StrategyProposalI
       throw apiErrors.badRequest(`changes[${index}] 必须是对象`);
     }
     const change = item as Record<string, unknown>;
-    const itemUnknown = Object.keys(change).filter((key) => !["document_id", "base_revision_id", "content"].includes(key));
+    const itemUnknown = Object.keys(change).filter((key) => !["document_id", "base_sha256", "content"].includes(key));
     if (itemUnknown.length > 0) throw apiErrors.badRequest(`changes[${index}] 包含未知字段：${itemUnknown.join("、")}`);
     const documentId = idField(change.document_id, `changes[${index}].document_id`);
     if (seen.has(documentId)) throw apiErrors.badRequest(`changes 存在重复 document_id：${documentId}`);
@@ -153,7 +149,7 @@ export function validateStrategyProposalInput(value: unknown): StrategyProposalI
     const content = stringField(change.content, `changes[${index}].content`, 1024 * 1024);
     return {
       document_id: documentId,
-      base_revision_id: idField(change.base_revision_id, `changes[${index}].base_revision_id`),
+      base_sha256: hashField(change.base_sha256, `changes[${index}].base_sha256`),
       content,
     };
   });
@@ -198,67 +194,9 @@ export async function getCurrentStrategy(db: TransactionDb): Promise<StrategyBun
 }
 
 /**
- * 读取指定 change_seq 的技术快照。页面不暴露历史正文，但作业重试必须能够复用首次
- * 固化的策略，而不能悄悄改用发布后的新策略。
+ * 系统只保留当前最终策略，不保留也重建历史正文。运行记录里的 change_seq 与集合哈希
+ * 只用于归因标签，不再据此回放旧策略。
  */
-export async function getStrategySnapshot(
-  db: TransactionDb,
-  changeSeq: string,
-): Promise<StrategyBundle> {
-  if (!/^\d+$/.test(changeSeq)) throw apiErrors.badRequest("strategy change_seq 必须是非负整数");
-  return inServiceTransaction(db, async (client) => {
-    const currentState = (await client.query<StrategyStateRow>(`${STATE_SELECT} FOR SHARE`)).rows[0];
-    if (!currentState) throw apiErrors.notFound("当前策略尚未初始化");
-    if (BigInt(changeSeq) > BigInt(currentState.change_seq)) {
-      throw apiErrors.notFound(`策略快照不存在：change_seq=${changeSeq}`);
-    }
-    if (changeSeq === currentState.change_seq) return getCurrentStrategy(client);
-
-    const documents = await client.query<StrategyDocumentRow>(
-      `SELECT d.id::text, d.code, d.title, d.role, d.injection_order,
-              r.id::text AS current_revision_id, r.revision_no AS current_revision_no,
-              r.sha256 AS current_sha256, r.content AS current_content, r.created_at AS updated_at
-         FROM strategy_document d
-         JOIN LATERAL (
-           SELECT revision.*
-             FROM strategy_document_revision revision
-             LEFT JOIN strategy_publish_proposal proposal ON proposal.id = revision.proposal_id
-            WHERE revision.document_id = d.id
-              AND (
-                revision.source = 'migration'
-                OR (proposal.status = 'approved' AND proposal.base_change_seq < $1::bigint)
-              )
-            ORDER BY revision.revision_no DESC
-            LIMIT 1
-         ) r ON true
-        ORDER BY d.injection_order, d.id`,
-      [changeSeq],
-    );
-    const currentCount = await client.query<{ count: string }>("SELECT count(*)::text AS count FROM strategy_document");
-    if (documents.rows.length !== Number(currentCount.rows[0]!.count)) {
-      throw apiErrors.conflict(`策略快照 ${changeSeq} 不完整，已停止作业执行`);
-    }
-    const snapshotHash = calculateStrategyHash(documents.rows);
-    const evolution = await client.query<{ id: string; decided_at: string }>(
-      `SELECT e.id::text, e.decided_at
-         FROM strategy_publish_proposal p
-         JOIN strategy_evolution_log e ON e.id = p.evolution_id
-        WHERE p.status = 'approved' AND p.base_change_seq < $1::bigint
-        ORDER BY p.base_change_seq DESC LIMIT 1`,
-      [changeSeq],
-    );
-    return {
-      state: {
-        change_seq: changeSeq,
-        current_hash: snapshotHash,
-        last_evolution_id: evolution.rows[0]?.id ?? null,
-        updated_at: evolution.rows[0]?.decided_at ?? documents.rows.at(-1)!.updated_at,
-      },
-      documents: documents.rows,
-    };
-  });
-}
-
 export async function listStrategyEvolutions(db: QueryDb, limit = 50): Promise<StrategyEvolutionRow[]> {
   const result = await db.query<StrategyEvolutionRow>(
     `SELECT e.id::text, e.session_id::text, e.outline, e.conclusion, e.adjustments,
@@ -326,15 +264,15 @@ export async function createStrategyProposal(
         current_hash: current.current_hash,
       });
     }
-    const documents = await client.query<{ id: string; current_revision_id: string }>(
-      `SELECT id::text, current_revision_id::text FROM strategy_document
+    const documents = await client.query<{ id: string; sha256: string }>(
+      `SELECT id::text, sha256 FROM strategy_document
         WHERE id = ANY($1::bigint[]) FOR UPDATE`,
       [input.changes.map((change) => change.document_id)],
     );
     if (documents.rows.length !== input.changes.length) throw apiErrors.badRequest("changes 包含未知策略文档");
-    const currentById = new Map(documents.rows.map((document) => [document.id, document.current_revision_id]));
+    const currentById = new Map(documents.rows.map((document) => [document.id, document.sha256]));
     for (const change of input.changes) {
-      if (currentById.get(change.document_id) !== change.base_revision_id) {
+      if (currentById.get(change.document_id) !== change.base_sha256) {
         throw apiErrors.conflict(`策略文档 ${change.document_id} 基线已变化`);
       }
     }
@@ -435,33 +373,25 @@ export async function approveStrategyProposal(
     changes: proposal.proposed_changes,
     backtest_run_ids: [],
   }).changes;
-  const documents = await client.query<{ id: string; current_revision_id: string }>(
-    `SELECT id::text, current_revision_id::text FROM strategy_document
+  const documents = await client.query<{ id: string; sha256: string }>(
+    `SELECT id::text, sha256 FROM strategy_document
       WHERE id = ANY($1::bigint[]) FOR UPDATE`,
     [changes.map((change) => change.document_id)],
   );
-  const currentById = new Map(documents.rows.map((document) => [document.id, document.current_revision_id]));
+  const currentById = new Map(documents.rows.map((document) => [document.id, document.sha256]));
   if (
     documents.rows.length !== changes.length ||
-    changes.some((change) => currentById.get(change.document_id) !== change.base_revision_id)
+    changes.some((change) => currentById.get(change.document_id) !== change.base_sha256)
   ) {
     await markProposalConflict(client, proposal, "批准时策略文档基线已变化");
     return { proposal: (await findStrategyProposal(client, id))!, conflict: true, state };
   }
   for (const change of changes) {
-    const next = await client.query<{ revision_no: number }>(
-      "SELECT COALESCE(MAX(revision_no), 0) + 1 AS revision_no FROM strategy_document_revision WHERE document_id = $1",
-      [change.document_id],
-    );
-    const revision = await client.query<{ id: string }>(
-      `INSERT INTO strategy_document_revision
-         (document_id, revision_no, content, sha256, source, proposal_id)
-       VALUES ($1, $2, $3, $4, 'human_publish', $5) RETURNING id::text`,
-      [change.document_id, next.rows[0]!.revision_no, change.content, sha256(change.content), id],
-    );
+    const digest = sha256(change.content);
+    if (digest === change.base_sha256) throw apiErrors.badRequest(`策略文档 ${change.document_id} 正文与当前一致，无需发布`);
     await client.query(
-      "UPDATE strategy_document SET current_revision_id = $2, updated_at = now() WHERE id = $1",
-      [change.document_id, revision.rows[0]!.id],
+      "UPDATE strategy_document SET content = $2, sha256 = $3, updated_at = now() WHERE id = $1",
+      [change.document_id, change.content, digest],
     );
   }
   const currentDocuments = (await client.query<StrategyDocumentRow>(DOCUMENT_SELECT)).rows;
