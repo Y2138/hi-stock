@@ -54,6 +54,9 @@ const WINDOWS = {
    *  2017-2021 无真实 881，统一用合成行业环境（与 2023-2026 同一口径跑完全程）。 */
   longEarly: { start: "2017-01-03", end: "2022-12-30", env: "synthetic_881" },
   longFull: { start: "2017-01-03", end: "2026-08-31", env: "synthetic_881" },
+  /** 行业外推验证窗（第十轮追加）：新能源牛 2019-2021（合成环境）、AI 硬件牛 2025-2026（真实环境）。 */
+  newEnergy: { start: "2019-01-02", end: "2021-12-31", env: "synthetic_881" },
+  aiHardware: { start: "2025-01-02", end: "2026-08-31", env: "current_881" },
 } as const;
 type WindowName = keyof typeof WINDOWS;
 
@@ -167,6 +170,8 @@ const regimeMode = args.includes("--regime");
 const segmentsOnly = args.includes("--segments-only");
 /** 按段名子串过滤（regime 模式）。 */
 const segmentFilter = argOf("--segment");
+/** 自定义行业组（strata cyclical 模式）：逗号分隔 881 板块代码，覆盖默认周期 13 类。 */
+const boardsArg = argOf("--boards");
 /** 周期行业收口模式：--close 跑收口矩阵；--signals 跑入场信号研究矩阵；--cyclical-ablate 剔除指定行业（留一消融）。 */
 const closeMode = args.includes("--close");
 const signalsMode = args.includes("--signals");
@@ -448,6 +453,7 @@ async function selectByCharacter(kind: "hype" | "cyclical" | "calm", since?: str
       ? `, span AS (SELECT i.code, min(b.bar_date) AS first_day FROM market_bar b JOIN market_instrument i ON i.id=b.instrument_id
           WHERE i.kind='stock' AND b.freq='day' AND i.code ~ '^\\d{6}\\.(SH|SZ)$' GROUP BY i.code)`
       : "";
+    const BOARD_LIST = (boardsArg ? boardsArg.split(",").map(b => b.trim()).filter(Boolean) : CYCLICAL_BOARDS) as string[];
     const { rows } = await pool.query<{ code: string; board: string }>(
       `WITH boards AS (SELECT i.id, i.code AS board_code FROM market_instrument i WHERE i.code = ANY($1::text[])),
          bad AS (SELECT i.code FROM market_bar b JOIN market_instrument i ON i.id=b.instrument_id
@@ -462,8 +468,8 @@ async function selectByCharacter(kind: "hype" | "cyclical" | "calm", since?: str
        JOIN px ON px.code = i.code${spanJoin ? " " + spanJoin.trim() : ""}
        WHERE m.effective_to IS NULL AND px.n >= 200 AND i.code NOT IN (SELECT code FROM bad) AND i.code ~ '^\\d{6}\\.(SH|SZ)$' ORDER BY i.code`,
       since
-        ? [CYCLICAL_BOARDS, CHARACTER_WINDOW.start, CHARACTER_WINDOW.end, screenStart, since]
-        : [CYCLICAL_BOARDS, CHARACTER_WINDOW.start, CHARACTER_WINDOW.end, screenStart]);
+        ? [BOARD_LIST, CHARACTER_WINDOW.start, CHARACTER_WINDOW.end, screenStart, since]
+        : [BOARD_LIST, CHARACTER_WINDOW.start, CHARACTER_WINDOW.end, screenStart]);
     if (rows.length < 50) throw new Error(`周期行业分层过小：${rows.length}`);
     const excludedC = (await smallExclusion) ?? new Set<string>();
     const codes = applyExclusion(rows.map(row => row.code), excludedC);
@@ -472,6 +478,13 @@ async function selectByCharacter(kind: "hype" | "cyclical" | "calm", since?: str
     for (const row of rows) {
       if (excludedC.has(row.code)) continue;
       groupByBoard.get(row.board)?.codes.push(row.code);
+    }
+    if (boardsArg) {
+      // 自定义行业组：分组载荷与实验矩阵引用同一数组，原地重建。
+      const rebuilt = [...groupByBoard.values()].filter(group => group.codes.length > 0)
+        .map(group => ({ board: group.board, codes: [...group.codes] }));
+      CYCLICAL_GROUPS.length = 0;
+      CYCLICAL_GROUPS.push(...rebuilt);
     }
     return codes;
   }
@@ -814,8 +827,8 @@ if (regimeMode) {
       const outerCodes = await selectByCharacter(name as "hype" | "cyclical" | "calm");
       const label = name === "hype" ? "炒作型" : name === "cyclical" ? "周期行业" : `未知分层(${name})`;
       if (name === "cyclical" && signalsMode) {
-        const longWindow = window.startsWith("long");
-        const codes = longWindow
+        const needsSince = window.startsWith("long") || window === "newEnergy";
+        const codes = needsSince
           ? await selectByCharacter("cyclical", WINDOWS[window].start)
           : outerCodes;
         const spec: WindowSpec = { ...windowSpec(window), warmup: 130 };
