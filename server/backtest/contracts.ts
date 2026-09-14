@@ -49,6 +49,18 @@ export const StandardResidualMomentumSchema = object({
   min_value: Type.Number({ minimum: -1, maximum: 1 }),
 });
 export type StandardResidualMomentum = Static<typeof StandardResidualMomentumSchema>;
+/** 右侧信号研究消融参数：部分确认门槛、条件屏蔽与触发阈值覆盖（缺省=生产口径完全一致）。 */
+export const StandardRightSideParamsSchema = object({
+  min_passed_count: Type.Optional(Type.Integer({ minimum: 3, maximum: 6 })),
+  disable_conditions: Type.Optional(Type.Array(Type.Union([
+    Type.Literal("dif_positive"), Type.Literal("ma20_rising"), Type.Literal("macd_accelerating"),
+    Type.Literal("bullish_alignment"), Type.Literal("bullish_body"), Type.Literal("volume_expanding"),
+  ]), { maxItems: 5 })),
+  macd_delta_min: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 0.01 })),
+  volume_ratio_min: Type.Optional(Type.Number({ minimum: 0.5, maximum: 3 })),
+  body_min_pct: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 0.1 })),
+});
+export type StandardRightSideParams = Static<typeof StandardRightSideParamsSchema>;
 /** 右侧退出模型：simple=固定止损+可选一档止盈+时间兜底；production_tiered=生产§2分档全量；
  *  profit_trail=只保留分批止盈与移动止损（去掉时间兜底/崩坏复核造成的换手），让盈利单奔跑。 */
 const exitModel = Type.Union([Type.Literal("simple"), Type.Literal("production_tiered"), Type.Literal("profit_trail")]);
@@ -98,6 +110,7 @@ export const StandardBacktestPlanSchema = object({
   stop_loss_pct: Type.Number({ exclusiveMinimum: 0, maximum: 0.5 }),
   take_profit_pct: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1 })),
   exit_model: Type.Optional(exitModel),
+  right_side_params: Type.Optional(StandardRightSideParamsSchema),
   max_holding_days: Type.Integer({ minimum: 1, maximum: 2520 }),
   min_amplitude_20: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 0.5 })),
   max_open_gap_pct: Type.Optional(Type.Number({ minimum: 0, maximum: 0.2 })),
@@ -210,6 +223,11 @@ export function validateStandardPlan(input: unknown): StandardBacktestPlan {
     throw new Error("左侧放宽参数仅支持左侧反转单规则研究");
   }
   if (parsed.exit_model !== undefined && parsed.rule !== "right_side_daily_v1") throw new Error("退出模型仅右侧单规则研究支持");
+  if (parsed.right_side_params !== undefined && parsed.rule !== "right_side_daily_v1") throw new Error("右侧信号消融参数仅右侧单规则研究支持");
+  if (parsed.right_side_params?.min_passed_count !== undefined) {
+    const active = 6 - (parsed.right_side_params.disable_conditions?.length ?? 0);
+    if (parsed.right_side_params.min_passed_count > active) throw new Error("部分确认门槛不得超过启用条件数");
+  }
   if (parsed.exit_model === "production_tiered" && parsed.take_profit_pct !== undefined) {
     throw new Error("生产分档退出模型已含分批止盈，不与一档止盈并用");
   }

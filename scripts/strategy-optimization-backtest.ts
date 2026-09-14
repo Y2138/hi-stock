@@ -25,7 +25,7 @@ import { createPortfolioEngine } from "../server/backtest/portfolio-engine.js";
 import { verifySettlement } from "../server/backtest/settlement.js";
 import { evaluateOscillation } from "../server/backtest/engine.js";
 import {
-  validateStandardPlan, type StandardBacktestPlan, type StandardDay, type StandardEquity,
+  validateStandardPlan, type StandardBacktestPlan, type StandardDay, type StandardEquity, type StandardRightSideParams,
 } from "../server/backtest/contracts.js";
 import { closePool, getPool } from "../server/db/client.js";
 import { loadConfig } from "../server/config.js";
@@ -163,8 +163,9 @@ const regimeMode = args.includes("--regime");
 const segmentsOnly = args.includes("--segments-only");
 /** 按段名子串过滤（regime 模式）。 */
 const segmentFilter = argOf("--segment");
-/** 周期行业收口模式：--close 跑收口矩阵；--cyclical-ablate 板块1,板块2 剔除指定行业后跑收口（留一消融）。 */
+/** 周期行业收口模式：--close 跑收口矩阵；--signals 跑入场信号研究矩阵；--cyclical-ablate 剔除指定行业（留一消融）。 */
 const closeMode = args.includes("--close");
+const signalsMode = args.includes("--signals");
 const ablateBoards = (argOf("--cyclical-ablate") ?? "").split(",").map(b => b.trim()).filter(Boolean);
 const onlyNames = argOf("--only")?.split(",");
 const sampleSize = Number(argOf("--sample") ?? SAMPLE_SIZE);
@@ -537,6 +538,83 @@ function cyclicalCloseExperiments(): Experiment[] {
   ];
 }
 
+/** 周期股入场信号研究矩阵（第十轮）：确认强度、六条件逐条屏蔽、触发阈值敏感性、开盘执行与多信号结构。
+ *  底座统一为已验证的盈利奔跑+熔断5；锚点=收口基准（六条件全过）。 */
+function cyclicalSignalExperiments(): Experiment[] {
+  const base = { exit_model: "profit_trail" as const, drawdown_circuit: true, stop_streak_circuit: true };
+  const disable = (...conditions: Array<NonNullable<StandardRightSideParams["disable_conditions"]>[number]>) =>
+    ({ right_side_params: { disable_conditions: conditions } });
+  return [
+    { name: "信号_底座_六条件", question: "锚点：收口基准复跑（六条件全过+盈利奔跑+熔断5）", overrides: { ...base } },
+    { name: "信号_五条件", question: "确认强度：passed>=5（放宽量能或阳线类）", overrides: { ...base, right_side_params: { min_passed_count: 5 } } },
+    { name: "信号_四条件", question: "确认强度：passed>=4", overrides: { ...base, right_side_params: { min_passed_count: 4 } } },
+    { name: "信号_去量能", question: "屏蔽 volume_expanding：量能条件是否在周期股上是噪声", overrides: { ...base, ...disable("volume_expanding") } },
+    { name: "信号_去阳线", question: "屏蔽 bullish_body：实体涨幅条件贡献", overrides: { ...base, ...disable("bullish_body") } },
+    { name: "信号_去排列", question: "屏蔽 bullish_alignment：短期多头排列贡献", overrides: { ...base, ...disable("bullish_alignment") } },
+    { name: "信号_去MA20上行", question: "屏蔽 ma20_rising：中期趋势条件贡献", overrides: { ...base, ...disable("ma20_rising") } },
+    { name: "信号_去DIF", question: "屏蔽 dif_positive：DIF>0 贡献", overrides: { ...base, ...disable("dif_positive") } },
+    { name: "信号_去MACD加速", question: "屏蔽 macd_accelerating：加速条件贡献", overrides: { ...base, ...disable("macd_accelerating") } },
+    { name: "信号_MACD加速_0.05bp", question: "阈值敏感性：MACD增量门槛 0.1%→0.05%", overrides: { ...base, right_side_params: { macd_delta_min: 0.0005 } } },
+    { name: "信号_MACD加速_0.2bp", question: "阈值敏感性：0.1%→0.2%", overrides: { ...base, right_side_params: { macd_delta_min: 0.002 } } },
+    { name: "信号_量比_1.0", question: "阈值敏感性：放量门槛 1.2→1.0 倍", overrides: { ...base, right_side_params: { volume_ratio_min: 1.0 } } },
+    { name: "信号_量比_1.5", question: "阈值敏感性：1.2→1.5 倍", overrides: { ...base, right_side_params: { volume_ratio_min: 1.5 } } },
+    { name: "信号_阳线_0.5", question: "阈值敏感性：阳线实体 1%→0.5%", overrides: { ...base, right_side_params: { body_min_pct: 0.005 } } },
+    { name: "信号_阳线_2", question: "阈值敏感性：1%→2%", overrides: { ...base, right_side_params: { body_min_pct: 0.02 } } },
+    { name: "信号_开盘缺口0", question: "执行：次日开盘不高于信号收盘（不追高）", overrides: { ...base, max_open_gap_pct: 0 } },
+    { name: "信号_开盘缺口2", question: "执行：缺口上限 5%→2%", overrides: { ...base, max_open_gap_pct: 0.02 } },
+    { name: "信号_左侧组合A_熔断", question: "多信号：左侧组合A+组合级熔断（左侧首次配底座）", overrides: {
+      rule: "portfolio_daily_v1", drawdown_circuit: true, stop_streak_circuit: true,
+      strategies: [{ rule: "left_reversal_daily_v1", codes: [], allocation_pct: 1, max_positions: 5, daily_buy_limit: 5, position_fraction: 0.2,
+        left_reversal_params: { five_day_decline_pct: 0.04, rsi_max: 40, ma20_deviation_pct: 0.05 } }] } },
+    { name: "信号_右左组合_熔断", question: "多信号：右侧底座60%+左侧组合A40%+组合级熔断", overrides: {
+      rule: "portfolio_daily_v1", drawdown_circuit: true, stop_streak_circuit: true,
+      strategies: [
+        { rule: "right_side_daily_v1", codes: [], allocation_pct: 0.6, max_positions: 4, daily_buy_limit: 4, position_fraction: 0.25, exit_model: "profit_trail" },
+        { rule: "left_reversal_daily_v1", codes: [], allocation_pct: 0.4, max_positions: 3, daily_buy_limit: 3, position_fraction: 0.34,
+          left_reversal_params: { five_day_decline_pct: 0.04, rsi_max: 40, ma20_deviation_pct: 0.05 } },
+      ] } },
+    { name: "信号_波段_熔断", question: "多信号：波段箱体+组合级熔断（周期宇宙首测）", overrides: {
+      rule: "portfolio_daily_v1", drawdown_circuit: true, stop_streak_circuit: true,
+      strategies: [{ rule: "swing_box_daily_v1", codes: [], allocation_pct: 1, max_positions: 5, daily_buy_limit: 5, position_fraction: 0.2 }] } },
+    // 第十轮合并验证：两个跨窗一致的单因素（MACD 门槛减半 + 开盘缺口 2%）叠加，加阳线档对照。
+    { name: "合并_MACD005_缺口2", question: "MACD加速门槛0.05%+开盘缺口上限2%", overrides: { ...base,
+      right_side_params: { macd_delta_min: 0.0005 }, max_open_gap_pct: 0.02 } },
+    { name: "合并_MACD005_缺口2_阳线05", question: "合并+阳线实体0.5%（阳线档对照）", overrides: { ...base,
+      right_side_params: { macd_delta_min: 0.0005, body_min_pct: 0.005 }, max_open_gap_pct: 0.02 } },
+    { name: "缺口2_费用压力", question: "单因素缺口2+30bp滑点压力", overrides: { ...base, max_open_gap_pct: 0.02,
+      costs: { label: "费用压力:佣金万2.5最低5元,卖税10bp,滑点30bp", commission_bps: 2.5, minimum_commission: 5, sell_tax_bps: 10, slippage_bps: 30, volume_participation: 0.02 } } },
+    { name: "MACD005_费用压力", question: "单因素MACD005+30bp滑点压力", overrides: { ...base,
+      right_side_params: { macd_delta_min: 0.0005 },
+      costs: { label: "费用压力:佣金万2.5最低5元,卖税10bp,滑点30bp", commission_bps: 2.5, minimum_commission: 5, sell_tax_bps: 10, slippage_bps: 30, volume_participation: 0.02 } } },
+    { name: "合并_MACD005_缺口2_费用压力", question: "合并+30bp滑点压力", overrides: { ...base,
+      right_side_params: { macd_delta_min: 0.0005 }, max_open_gap_pct: 0.02,
+      costs: { label: "费用压力:佣金万2.5最低5元,卖税10bp,滑点30bp", commission_bps: 2.5, minimum_commission: 5, sell_tax_bps: 10, slippage_bps: 30, volume_participation: 0.02 } } },
+    { name: "合并_MACD005_缺口2_阳线05_费用压力", question: "合并阳线档+30bp滑点压力", overrides: { ...base,
+      right_side_params: { macd_delta_min: 0.0005, body_min_pct: 0.005 }, max_open_gap_pct: 0.02,
+      costs: { label: "费用压力:佣金万2.5最低5元,卖税10bp,滑点30bp", commission_bps: 2.5, minimum_commission: 5, sell_tax_bps: 10, slippage_bps: 30, volume_participation: 0.02 } } },
+  ];
+}
+
+/** 组合类信号实验的 strategies.codes 用运行时宇宙填充（脚本阶段静态数组不可用）。 */
+function fillSignalCodes(overrides: Partial<StandardBacktestPlan>, codes: string[]): Partial<StandardBacktestPlan> {
+  const strategies = (overrides as { strategies?: Array<Record<string, unknown>> }).strategies;
+  if (!strategies) return overrides;
+  // 多策略按 allocation 比例前后段切分宇宙（契约禁止同一标的进多个子策略）。
+  if (strategies.length <= 1) {
+    return { ...overrides, strategies: strategies.map(strategy => ({ ...strategy, codes })) } as Partial<StandardBacktestPlan>;
+  }
+  const weights = strategies.map(strategy => Number(strategy.allocation_pct ?? 0));
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  let cursor = 0;
+  const filled = strategies.map((strategy, index) => {
+    const share = Math.max(1, Math.round((weights[index]! / totalWeight) * codes.length));
+    const slice = codes.slice(cursor, index === strategies.length - 1 ? codes.length : cursor + share);
+    cursor += slice.length;
+    return { ...strategy, codes: slice };
+  });
+  return { ...overrides, strategies: filled } as Partial<StandardBacktestPlan>;
+}
+
 /** 与契约一致：正式起点前六年、按月截断。 */
 function standardSeed(start: string): string {
   const year = Number(start.slice(0, 4)) - 6;
@@ -716,6 +794,16 @@ if (regimeMode) {
     for (const name of names) {
       const codes = await selectByCharacter(name as "hype" | "cyclical" | "calm");
       const label = name === "hype" ? "炒作型" : name === "cyclical" ? "周期行业" : `未知分层(${name})`;
+      if (name === "cyclical" && signalsMode) {
+        const spec: WindowSpec = { ...windowSpec(window), warmup: 130 };
+        const experiments = cyclicalSignalExperiments().map(exp => ({
+          ...exp,
+          overrides: fillSignalCodes(exp.overrides, codes),
+        })).filter(exp => !onlyNames || onlyNames.some(n => exp.name.includes(n)));
+        await runBatch(spec, codes, experiments, "周期信号研究",
+          `周期行业 13 类成分 ${codes.length} 只（归属回看近似）${excludeSmall ? "；CH-3 换手代理剔除最小30%" : ""}；底座=盈利奔跑+熔断5`);
+        continue;
+      }
       if (name === "cyclical" && (closeMode || ablateBoards.length)) {
         // 收口/消融：剔除指定板块的股票与分组，环境预热加长覆盖绝对动量窗口。
         const ablated = new Set(ablateBoards);

@@ -134,6 +134,7 @@ export function createStandardEngine(input: StandardBacktestPlan): StandardEngin
   const sells = new Map<string, SellIntent>();
   let buys: Array<{ code: string; budget: number; signalClose: number }> = [];
   const tieredExits = plan.exit_model === "production_tiered" || plan.exit_model === "profit_trail";
+  const rightSideParams = plan.right_side_params;
   let externallyPaused = false;
   const industryGate = plan.industry_momentum;
   const residualGate = plan.residual_momentum;
@@ -295,7 +296,7 @@ export function createStandardEngine(input: StandardBacktestPlan): StandardEngin
     }
     // profit_trail 模型去掉时间兜底与崩坏复核（两者是分档全量模型换手的主要来源），保留盈利奔跑部分。
     if (plan.exit_model === "production_tiered" && !position.firstScaled) {
-      const evaluation = evaluateRightSideSignal(rows);
+      const evaluation = evaluateRightSideSignal(rows, rightSideParams);
       if (evaluation && evaluation.passed_count <= 2) return { reason: "review_exit", quantity: null };
       if (holdingDays >= 5) return { reason: "time_fallback", quantity: null };
     }
@@ -528,7 +529,7 @@ export function createStandardEngine(input: StandardBacktestPlan): StandardEngin
           }
           if (benchReturn === null || stockReturn - benchReturn < residualGate.min_value) continue;
         }
-        const signal = evaluateRightSideSignal(histories.get(code)!.rows);
+        const signal = evaluateRightSideSignal(histories.get(code)!.rows, rightSideParams);
         if (!signal) continue;
         evaluatedCount += 1;
         if (signal.price_signal) {

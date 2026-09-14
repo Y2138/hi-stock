@@ -42,6 +42,7 @@ function childPlan(plan: StandardBacktestPlan, strategy: StandardStrategyPlan, i
   inherit("industry_momentum", !isPortfolio ? plan.industry_momentum : undefined);
   inherit("near_52w_high_min", !isPortfolio ? plan.near_52w_high_min : undefined);
   inherit("absolute_momentum", !isPortfolio ? plan.absolute_momentum : undefined);
+  inherit("right_side_params", !isPortfolio ? plan.right_side_params : undefined);
   inherit("residual_momentum", !isPortfolio ? plan.residual_momentum : undefined);
   inherit("vol_target_sigma", !isPortfolio ? plan.vol_target_sigma : undefined);
   inherit("drawdown_scale_max", !isPortfolio ? plan.drawdown_scale_max : undefined);

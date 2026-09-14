@@ -548,10 +548,8 @@ describe("固定样本日频研究内核（纯函数，无数据库）", () => {
       const nextDay = swingMode ? bar(1, base0 * 1.04, base0 * 1.04, 300_000) : bar(1, base0 * 1.03, base0 * 1.03, 300_000);
       const bought = engine.next({ date: date(1), market_recovery: null, bars: [nextDay] });
       const quantity = fills(bought, "buy")[0]!.details.quantity as number;
-      console.log("VOLDBG", code, "swing", swingMode, "quantity", quantity);
       return quantity;
     };
-    console.log("VOLDBG A:", runVol(VOL_A, true), "B:", runVol(VOL_B, false));
     expect(runVol(VOL_A, true)).toBeLessThan(runVol(VOL_B, false));
     // 回撤连续缩仓：回撤超过阈值后新开仓预算归零（订单生成但执行因预算不足拒绝）。
     const ddEngine = createStandardEngine(plan({ drawdown_scale_max: 0.05 }));
@@ -965,4 +963,34 @@ describe("固定样本日频研究内核（纯函数，无数据库）", () => {
       industry_momentum: { days: 20, top_k: 1 } }))).not.toThrow();
     expect(() => validateStandardPlan(plan({ absolute_momentum: { days: 20, min_return: 0 } } as Partial<StandardBacktestPlan>)))
       .not.toThrow();
+  });
+
+  it("右侧信号消融参数：部分确认、条件屏蔽与阈值覆盖改变信号触发（缺省行为不变）", () => {
+    // 量能未放大（与预热持平）的突破日（收盘+8%，避开涨停使量能阈值不减半）：历史六条件口径无信号；
+    // min5 或屏蔽量能条件后触发。
+    const quietVolumeDay = { ...day(0, { open: 10.5, close: 10.8, volume: 100_000 }) };
+    const strict = createStandardEngine(plan());
+    const minFive = createStandardEngine(plan({ right_side_params: { min_passed_count: 5 } }));
+    const noVolume = createStandardEngine(plan({ right_side_params: { disable_conditions: ["volume_expanding"] } }));
+    for (const engine of [strict, minFive, noVolume]) {
+      for (let i = -60; i < 0; i += 1) engine.next(day(i));
+    }
+    const strictResult = strict.next(quietVolumeDay);
+    const fiveResult = minFive.next(quietVolumeDay);
+    const noVolumeResult = noVolume.next(quietVolumeDay);
+    expect(strictResult.events.some((event) => event.type === "signal" && event.code === CODE)).toBe(false);
+    expect(fiveResult.events.some((event) => event.type === "order")).toBe(true);
+    expect(noVolumeResult.events.some((event) => event.type === "order")).toBe(true);
+    // 阈值覆盖：弱阳线（+0.47% < 生产1%）默认无信号；body_min_pct=0.004 时触发。
+    const weakBodyDay = day(0, { open: 10.75, close: 10.8, volume: 200_000 });
+    const weakStrict = createStandardEngine(plan());
+    const weakBody = createStandardEngine(plan({ right_side_params: { body_min_pct: 0.004 } }));
+    for (const engine of [weakStrict, weakBody]) {
+      for (let i = -60; i < 0; i += 1) engine.next(day(i));
+    }
+    expect(weakStrict.next(weakBodyDay).events.some((event) => event.type === "order")).toBe(false);
+    expect(weakBody.next(weakBodyDay).events.some((event) => event.type === "order")).toBe(true);
+    // 校验：门槛不得超过启用条件数；消融参数仅右侧规则支持。
+    expect(() => validateStandardPlan(plan({ right_side_params: { min_passed_count: 6, disable_conditions: ["volume_expanding"] } })))
+      .toThrow("不得超过启用条件数");
   });
