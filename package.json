@@ -15,7 +15,10 @@
     "volume:export": "tsx scripts/volume-export.ts",
     "volume:restore": "tsx scripts/volume-restore.ts",
     "portable:export": "tsx scripts/portable-export.ts",
-    "portable:restore": "tsx scripts/portable-restore.ts"
+    "portable:restore": "tsx scripts/portable-restore.ts",
+    "market:backfill": "tsx scripts/market-backfill.ts",
+    "market:board-backfill": "tsx scripts/market-board-backfill.ts",
+    "market:industry-synthesize": "tsx scripts/market-industry-synthesize.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.2",

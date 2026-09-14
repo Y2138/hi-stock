@@ -15,6 +15,15 @@ export interface ServerConfig {
   databaseUrl: string;
   host: "127.0.0.1" | "0.0.0.0";
   port: number;
+  /** 日更是否覆盖全市场个股（缺省开启）；关闭后只更新持仓、标的池、核心指数与行业板块。 */
+  dailyFullMarket: boolean;
+  /** 指标工作器两次领取之间的空闲等待毫秒；越小吞吐越高。 */
+  indicatorIntervalMs: number;
+}
+
+function booleanEnv(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === "") return fallback;
+  return !["0", "false", "off", "no"].includes(value.trim().toLowerCase());
 }
 
 /** 读取运行配置；缺少 DATABASE_URL 时抛错，由入口打印检查提示 */
@@ -33,7 +42,17 @@ export function loadConfig(): ServerConfig {
   if (host !== "127.0.0.1" && host !== "0.0.0.0") {
     throw new Error(`SERVER_HOST 非法：${host}`);
   }
-  return { databaseUrl, host, port };
+  const indicatorIntervalMs = Number(process.env.INDICATOR_WORKER_INTERVAL_MS ?? "50");
+  if (!Number.isInteger(indicatorIntervalMs) || indicatorIntervalMs < 0 || indicatorIntervalMs > 60_000) {
+    throw new Error(`INDICATOR_WORKER_INTERVAL_MS 非法：${process.env.INDICATOR_WORKER_INTERVAL_MS}`);
+  }
+  return {
+    databaseUrl,
+    host,
+    port,
+    dailyFullMarket: booleanEnv(process.env.DAILY_UPDATE_FULL_MARKET, true),
+    indicatorIntervalMs,
+  };
 }
 
 /**

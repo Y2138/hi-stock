@@ -429,7 +429,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect((await api(server.baseUrl, "GET", "/api/notifications/999999")).status).toBe(404);
   });
 
-  it("迁移初始化九个受控作业，板块目录与成分同步默认启用，cron 固定按上海时区解析", async () => {
+  it("迁移初始化十个受控作业，板块目录与成分同步默认启用，cron 固定按上海时区解析", async () => {
     const jobs = await listJobDefinitions(pool);
     expect(jobs.map((job) => job.code)).toEqual([
       "auction_opportunity_assessment",
@@ -440,6 +440,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       "market_catalog_sync",
       "midweek_check",
       "nightly_sector_opportunity_scan",
+      "weekly_full_market_indicators",
       "weekly_review",
     ]);
     expect(jobs.find((job) => job.code === "midweek_check")?.cron).toBe("30 17 * * 2");
@@ -565,7 +566,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       .rejects.toThrow("不能指定模型");
   });
 
-  it("日更范围包含核心指数、官方行业和当日池外市场结构候选，不跟随全量目录膨胀", async () => {
+  it("日更范围默认覆盖全市场个股，但宽域标的只做快照追加不重拉", async () => {
     await pool.query(
       `INSERT INTO market_instrument (code,name,kind,lifecycle_status) VALUES
          ('000300.SH','沪深300','index','active'),
@@ -595,9 +596,18 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
        SELECT '2026-08-20','org',id,1000000,repeat('b',64)
          FROM market_instrument WHERE code='600003.SH'`,
     );
-    const scope = await resolveDailyUpdateScope(pool, "2026-08-20");
-    expect(scope.codes).toEqual(["000300.SH", "600002.SH", "600003.SH", "881101.TI", "884001.TI"]);
-    expect(scope.minute30).toEqual(["000300.SH"]);
+    // 全市场开启（生产默认）：普通池外个股进入快照范围，但不进入缺口重拉名单。
+    const full = await resolveDailyUpdateScope(pool, "2026-08-20", "snapshot", { fullMarket: true });
+    expect(full.codes).toEqual([
+      "000300.SH", "600001.SH", "600002.SH", "600003.SH", "881101.TI", "884001.TI",
+    ]);
+    expect(full.refetchCodes).toEqual(["000300.SH", "600002.SH", "600003.SH", "881101.TI", "884001.TI"]);
+    expect(full.minute30).toEqual(["000300.SH"]);
+
+    // 显式关闭全市场：恢复只覆盖持仓、池、核心指数、行业与当日结构候选。
+    const scoped = await resolveDailyUpdateScope(pool, "2026-08-20", "snapshot", { fullMarket: false });
+    expect(scoped.codes).toEqual(["000300.SH", "600002.SH", "600003.SH", "881101.TI", "884001.TI"]);
+    expect(scoped.refetchCodes).toEqual(scoped.codes);
   });
 
   it("同一 job/scheduled_for 并发 tick 只插入一条", async () => {

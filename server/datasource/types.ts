@@ -31,6 +31,8 @@ export interface Bar {
   turnover?: number;
   /** 复权口径 forward/none；未知则省略（落库为 NULL） */
   adjustment?: "forward" | "none";
+  /** 成交量单位；标准回测要求股票日线为 share/shares/股，普通行情通道可省略由落库层按频率补默认值。 */
+  volumeUnit?: "share" | "shares" | "股";
 }
 
 export interface FetchResult {

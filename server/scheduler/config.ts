@@ -23,6 +23,7 @@ const DATASOURCE_PIPELINES = new Set<DatasourcePipeline>([
   "market_catalog_sync",
   "board_membership_sync",
   "daily_market_structure",
+  "full_market_indicator_refresh",
 ]);
 
 export function assertJobType(value: unknown): JobType {

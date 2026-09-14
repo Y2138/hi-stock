@@ -259,6 +259,7 @@ const RESET_STATEMENTS = [
   "DELETE FROM fundamental_snapshot",
   "DELETE FROM valuation_snapshot",
   "DELETE FROM backtest_run",
+  "DELETE FROM backtest_input_set",
   "DELETE FROM portfolio_position_snapshot_daily",
   "DELETE FROM portfolio_position_change",
   "DELETE FROM portfolio_position",

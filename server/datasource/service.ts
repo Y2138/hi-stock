@@ -79,6 +79,7 @@ export async function storeBars(
   freq: MarketFreq,
   bars: Bar[],
   channel: string,
+  options: { markIndicator?: boolean } = {},
 ): Promise<number> {
   if (bars.length === 0) return 0;
   const dates: string[] = [];
@@ -90,6 +91,7 @@ export async function storeBars(
   const volumes: (number | null)[] = [];
   const turnovers: (number | null)[] = [];
   const adjustments: (string | null)[] = [];
+  const volumeUnits: (string | null)[] = [];
   for (const bar of bars) {
     dates.push(bar.date);
     times.push(barTimeOf(bar, freq));
@@ -100,27 +102,31 @@ export async function storeBars(
     volumes.push(bar.volume ?? null);
     turnovers.push(bar.turnover ?? null);
     adjustments.push(bar.adjustment ?? null);
+    // A 股股票/指数/ETF/板块日线与 30 分钟成交量按“股”落库；期货日线保留未知单位。
+    volumeUnits.push(bar.volumeUnit ?? (freq === "futures_day" ? null : "股"));
   }
   const r = await db.query<{ rows_written: number }>(
     `WITH written AS (
        INSERT INTO market_bar
-       (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, turnover, adjustment, channel)
-       SELECT $1, $2, d, t, o, h, l, c, v, amount, adj, $3
+       (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, turnover, adjustment, volume_unit, channel)
+       SELECT $1, $2, d, t, o, h, l, c, v, amount, adj, unit, $3
        FROM unnest(
          $4::date[], $5::timestamptz[], $6::numeric[], $7::numeric[],
-         $8::numeric[], $9::numeric[], $10::numeric[], $11::numeric[], $12::text[]
-       ) AS u(d, t, o, h, l, c, v, amount, adj)
+         $8::numeric[], $9::numeric[], $10::numeric[], $11::numeric[], $12::text[], $13::text[]
+       ) AS u(d, t, o, h, l, c, v, amount, adj, unit)
        ON CONFLICT (instrument_id, freq, bar_date, bar_time) DO UPDATE SET
          open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
          volume = EXCLUDED.volume,
          turnover = EXCLUDED.turnover,
          adjustment = COALESCE(EXCLUDED.adjustment, market_bar.adjustment),
+         volume_unit = COALESCE(EXCLUDED.volume_unit, market_bar.volume_unit),
          channel = EXCLUDED.channel, fetched_at = now()
        RETURNING bar_date
      ), dirty AS (
        INSERT INTO market_indicator_dirty
          (instrument_id, freq, earliest_date, generation, reason, updated_at)
        SELECT $1, $2, min(bar_date), 1, '行情写入或历史修订', now() FROM written
+       WHERE $14::boolean
        ON CONFLICT (instrument_id, freq) DO UPDATE SET
          earliest_date = LEAST(market_indicator_dirty.earliest_date, EXCLUDED.earliest_date),
          generation = market_indicator_dirty.generation + 1,
@@ -129,7 +135,8 @@ export async function storeBars(
        RETURNING 1
      )
      SELECT count(*)::int AS rows_written FROM written`,
-    [instrumentId, freq, channel, dates, times, opens, highs, lows, closes, volumes, turnovers, adjustments],
+    [instrumentId, freq, channel, dates, times, opens, highs, lows, closes, volumes, turnovers, adjustments, volumeUnits,
+     options.markIndicator !== false],
   );
   return r.rows[0]?.rows_written ?? bars.length;
 }
@@ -317,6 +324,7 @@ export async function fetchAndStore(
   db: Db,
   req: FetchRequest,
   deps: ServiceDeps & { instrumentName?: string } = {},
+  options: { markIndicator?: boolean } = {},
 ): Promise<FetchStoreOutcome> {
   const candidates = (deps.channels ?? defaultChannels(db, deps)).filter((c) => c.supports(req));
   if (candidates.length === 0) {
@@ -347,8 +355,12 @@ export async function fetchAndStore(
     throw new Error(`全部通道失败（market_fetch_run #${runId} 已留痕）：${failures.join("；")}`);
   }
   result.degradedFrom = degradedFrom;
-  const rowsWritten = await storeBars(db, instrumentId, req.freq, result.bars, result.channel);
-  if (req.freq !== "30m") await recomputeMa(db, instrumentId, req.freq);
+  const rowsWritten = await storeBars(db, instrumentId, req.freq, result.bars, result.channel, {
+    markIndicator: options.markIndicator,
+  });
+  if (req.freq !== "30m" && options.markIndicator !== false) {
+    await recomputeMa(db, instrumentId, req.freq);
+  }
   const fetchRunId = await insertFetchRun(db, {
     channel: result.channel,
     scope: scopeOf(req),
@@ -370,8 +382,19 @@ export async function fetchAndStore(
 }
 
 export interface DailyUpdateScope {
-  /** 持仓/池内标的，以及需要长期持久化的指数和板块 */
+  /** 需要写入日线的全部代码（可含全市场宽域标的，只做快照追加） */
   codes: string[];
+  /**
+   * 允许缺口修复与逐标的 K 线重拉的代码；缺省等于 codes。
+   * 全市场模式下用它把宽域标的排除在重拉之外，避免除权/停牌触发全市场逐标的请求。
+   */
+  refetchCodes?: string[];
+  /**
+   * 日更后需要重算指标与均线的代码（信号相关范围：持仓、标的池、核心指数、行业板块、结构候选）。
+   * 缺省等于 codes；全市场模式下用它把宽域标的排除在每日指标计算之外，控制计算成本。
+   * 宽域标的的指标由每周全市场重算任务分批补齐。
+   */
+  indicatorCodes?: string[];
   /** 期货主力连续品种（如 CU0），当年起窗口覆盖拉取 */
   futures?: string[];
   /** 需要 30 分钟线的代码（关键位分析范围） */
@@ -386,6 +409,8 @@ export interface DailyUpdateSummary {
   date: string;
   snapshotRows: number;
   refetched: string[];
+  /** 因宽域模式跳过逐标的 K 线重拉的标的数（仅计数，不记为任务缺口） */
+  refetchSkipped?: number;
   futuresRows: number;
   minute30Rows: number;
   gaps: unknown[];
@@ -523,6 +548,9 @@ export async function dailyMarketUpdate(
     fetchRunIds: [],
   };
   const maDirty = new Map<string, string>();
+  const refetchAllowed = new Set(scope.refetchCodes ?? scope.codes);
+  // 指标与均线只对信号相关范围计算；宽域标的的指标交由每周全市场重算任务分批补齐。
+  const indicatorAllowed = new Set(scope.indicatorCodes ?? scope.codes);
   const previousOpen = scope.dayMode === "historical" ? null : await db.query<{ date: string | null }>(
     `SELECT max(trade_date)::text AS date
        FROM market_trading_day
@@ -598,13 +626,20 @@ export async function dailyMarketUpdate(
           (previousOpenDate !== null && prevRow.bar_date !== previousOpenDate) ||
           (quote.prevClose != null && Math.abs(quote.prevClose - Number(prevRow.close)) / Number(prevRow.close) > 0.11) ||
           dayDiff(barDate, prevRow.bar_date) > 3;
-        if (needRefetch) {
+        // 宽域标的（全市场扩展）只做快照追加；缺口只计数不重拉，也不记为任务缺口，
+        // 避免每天因个别标的除权就触发全市场逐标的 K 线请求并把任务长期标成 partial。
+        const skipRefetch = needRefetch && !refetchAllowed.has(code);
+        if (skipRefetch) summary.refetchSkipped = (summary.refetchSkipped ?? 0) + 1;
+        const computeIndicators = indicatorAllowed.has(code);
+        if (needRefetch && !skipRefetch) {
           const start = prevRow ? addDays(prevRow.bar_date, 1) : addDays(barDate, -65);
-          const outcome = await fetchAndStore(db, { code: quote.code, freq: "day", start, end: barDate }, deps);
+          const outcome = await fetchAndStore(db, { code: quote.code, freq: "day", start, end: barDate }, deps, {
+            markIndicator: computeIndicators,
+          });
           summary.refetched.push(quote.code);
           summary.fetchRunIds.push(outcome.fetchRunId);
           groupRows += outcome.rowsWritten;
-          maDirty.set(instrumentId, code);
+          if (computeIndicators) maDirty.set(instrumentId, code);
           continue;
         }
         groupRows += await storeBars(
@@ -622,8 +657,9 @@ export async function dailyMarketUpdate(
             adjustment: group.kind === "stock" ? "forward" : "none",
           }],
           "hithink",
+          { markIndicator: computeIndicators },
         );
-        maDirty.set(instrumentId, code);
+        if (computeIndicators) maDirty.set(instrumentId, code);
       } catch (err) {
         groupGaps.push({ code, freq: "day", reason: `日线处理失败: ${(err as Error).message}` });
       }

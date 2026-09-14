@@ -32,6 +32,7 @@ services:
       SERVER_HOST: 0.0.0.0
       PORT: 8787
       AGENT_BACKTEST_WORKER_ENABLED: "true"
+      STANDARD_BACKTEST_ENABLED: ${STANDARD_BACKTEST_ENABLED:-false}
     ports:
       - "127.0.0.1:${APP_HOST_PORT:-8787}:8787"
     volumes:

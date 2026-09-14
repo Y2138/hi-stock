@@ -93,6 +93,8 @@ export interface RunnerDeps {
   databaseUrl: string;
   now?: () => Date;
   retryDelayMs?: number;
+  /** 日更是否覆盖全市场个股；缺省 true。用于把全市场纳入快照范围。 */
+  dailyFullMarket?: boolean;
   dailyUpdate?: (scope: DailyUpdateScope, jobRunId: string) => Promise<DailyUpdateSummary>;
   catalogSync?: (jobRunId: string) => Promise<CatalogSyncSummary>;
   boardMembershipSync?: (
@@ -134,11 +136,16 @@ const CORE_MARKET_INDEX_CODES = [
   "399006.SZ",
 ] as const;
 
-/** 当前持仓、有效标的池、市场结构候选、核心指数和官方行业是日更范围；期货单独走 futures_day。 */
+/**
+ * 当前持仓、有效标的池、市场结构候选、核心指数和官方行业是日更范围；期货单独走 futures_day。
+ * options.fullMarket=true 时把全部活跃个股也纳入快照范围；这些宽域标的只做快照追加，
+ * 缺口修复仍只对持仓、池、指数、行业和结构候选执行，避免全市场逐标的 K 线重拉。
+ */
 export async function resolveDailyUpdateScope(
   pool: pg.Pool,
   targetDate: string,
   dayMode: DailyMarketMode = "snapshot",
+  options: { fullMarket?: boolean } = {},
 ): Promise<DailyUpdateScope> {
   const day = await pool.query<{ code: string }>(
     `SELECT DISTINCT i.code
@@ -207,6 +214,18 @@ export async function resolveDailyUpdateScope(
   const futures = await pool.query<{ code: string }>(
     "SELECT code FROM market_instrument WHERE kind = 'futures' ORDER BY code",
   );
+  // 全市场扩展：仅快照追加。宽域标的（不在持仓/池/指数/行业/结构候选内）不参与缺口重拉，
+  // 防止除权或停牌导致全市场逐标的 K 线请求。
+  const fullMarket =
+    options.fullMarket === true && dayMode === "snapshot"
+      ? await pool.query<{ code: string }>(
+          "SELECT code FROM market_instrument WHERE kind = 'stock' AND lifecycle_status = 'active' ORDER BY code",
+        )
+      : null;
+  const coreCodes = new Set([...day.rows, ...structureCandidates.rows].map((row) => row.code));
+  const allCodes = fullMarket
+    ? [...new Set([...coreCodes, ...fullMarket.rows.map((row) => row.code)])].sort()
+    : [...coreCodes].sort();
   const minute30 = await pool.query<{ code: string }>(
     `SELECT DISTINCT i.code
        FROM market_instrument i
@@ -218,7 +237,10 @@ export async function resolveDailyUpdateScope(
   return {
     date: targetDate,
     dayMode,
-    codes: [...new Set([...day.rows, ...structureCandidates.rows].map((row) => row.code))].sort(),
+    codes: allCodes,
+    refetchCodes: fullMarket ? [...coreCodes].sort() : allCodes,
+    // 指标/均线只算信号相关范围，宽域标的交由每周全市场重算任务分批补齐。
+    indicatorCodes: fullMarket ? [...coreCodes].sort() : allCodes,
     futures: futures.rows.map((row) => row.code),
     minute30: minute30.rows.map((row) => row.code),
   };
@@ -401,6 +423,26 @@ async function pinJobPromptRevision(
   return revision;
 }
 
+/**
+ * 把全市场股票日线标记为待重算指标。只写脏标记，实际计算由后台指标工作器分批进行，
+ * 因此本操作是常数时间，不会阻塞调度器。返回标记的标的数。
+ */
+async function enqueueFullMarketIndicatorRefresh(pool: pg.Pool): Promise<number> {
+  const result = await pool.query(
+    `INSERT INTO market_indicator_dirty (instrument_id, freq, earliest_date, generation, reason, updated_at)
+     SELECT bar.instrument_id, 'day', min(bar.bar_date), 1, '每周全市场指标重算', now()
+       FROM market_bar bar
+       JOIN market_instrument instrument ON instrument.id = bar.instrument_id
+      WHERE instrument.kind = 'stock' AND bar.freq = 'day'
+      GROUP BY bar.instrument_id
+     ON CONFLICT (instrument_id, freq) DO UPDATE SET
+       earliest_date = LEAST(market_indicator_dirty.earliest_date, EXCLUDED.earliest_date),
+       generation = market_indicator_dirty.generation + 1,
+       reason = EXCLUDED.reason, updated_at = now()`,
+  );
+  return result.rowCount ?? 0;
+}
+
 async function executeDatasource(
   deps: RunnerDeps,
   run: JobRunRow,
@@ -417,7 +459,9 @@ async function executeDatasource(
     const artifacts: unknown[] = [];
     let result: JobExecutionResult;
     if (config.pipeline === "daily_market_update") {
-      const scope = await resolveDailyUpdateScope(deps.pool, run.target_date, dailyMode!);
+      const scope = await resolveDailyUpdateScope(deps.pool, run.target_date, dailyMode!, {
+        fullMarket: deps.dailyFullMarket !== false,
+      });
       const summary = deps.dailyUpdate
         ? await deps.dailyUpdate(scope, run.id)
         : await dailyMarketUpdate(deps.pool, scope, { jobRunId: run.id });
@@ -449,6 +493,14 @@ async function executeDatasource(
         status: summary.gaps.length > 0 ? "partial" : "success",
         log: `板块成分同步完成：板块 ${summary.completed.length}、成分 ${memberCount}、新增 ${opened}、关闭 ${closed}、缺口 ${summary.gaps.length}。`,
         dataGaps: summary.gaps,
+      };
+    } else if (config.pipeline === "full_market_indicator_refresh") {
+      // 每周把全市场日线的指标重算排入 dirty 队列，由后台指标工作器分批消化。
+      // 只标记，不在此同步计算，避免单次任务长时间占用调度器。
+      const queued = await enqueueFullMarketIndicatorRefresh(deps.pool);
+      result = {
+        status: "success",
+        log: `全市场指标重算已入队：${queued} 只标的，由指标工作器分批执行。`,
       };
     } else {
       const summary = deps.marketStructureSync

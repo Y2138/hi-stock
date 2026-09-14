@@ -280,12 +280,13 @@ export async function createStrategyProposal(
       const runs = await client.query<{ id: string }>(
         `SELECT id::text FROM backtest_run
           WHERE id = ANY($1::bigint[])
-            AND execution_status IN ('success','partial')
-            AND conclusion_status = 'final'`,
+            AND execution_status = 'success'
+            AND conclusion_status = 'final'
+            AND evidence_status = 'qualified' AND quality_status = 'complete' AND output_sha256 IS NOT NULL`,
         [input.backtest_run_ids],
       );
       if (runs.rows.length !== input.backtest_run_ids.length) {
-        throw apiErrors.badRequest("backtest_run_ids 包含不存在、未完成或尚未晋升为最终结论的回测");
+        throw apiErrors.badRequest("backtest_run_ids 仅接受账本完整且证据资格合格的最终回测；研究结果和旧未验证记录不能作为发布收益证据");
       }
     }
     const evolution = await client.query<{ id: string }>(

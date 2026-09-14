@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import pg from "pg";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPool } from "../../server/db/client.js";
 import { runMigrations } from "../../server/db/migrate.js";
@@ -27,6 +27,20 @@ import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
 
 const prepared = await prepareTestDb();
 
+async function seedFrozenInputFixture(pool: pg.Pool): Promise<void> {
+  const row = (await pool.query<{id: string}>(`INSERT INTO backtest_input_set(sha256,schema_version,manifest,row_count,byte_count)
+    VALUES (repeat('e',64),'fixture','{"private":"FROZEN_INPUT_MUST_NOT_EXPORT"}',0,0) RETURNING id::text`)).rows[0]!;
+  const payload = gzipSync('{"date":"2026-01-05","bars":[],"market_recovery":null}');
+  await pool.query(`INSERT INTO backtest_input_chunk(input_set_id,seq,trade_date,sha256,encoding,payload,raw_bytes,row_count)
+    VALUES ($1,0,'2026-01-05',repeat('f',64),'gzip-json-v1',$2,$3,0)`, [row.id, payload, gunzipSync(payload).length]);
+  const run=(await pool.query<{id:string}>("INSERT INTO backtest_run(name,kind,input_set_id) VALUES ('私有运行测试','research',$1) RETURNING id::text",[row.id])).rows[0]!;
+  await pool.query(`INSERT INTO backtest_event(run_id,generation,seq,trade_date,payload,sha256)
+    VALUES ($1,1,1,'2026-01-05','{"private":"RUNTIME_EVENT_MUST_NOT_EXPORT"}',repeat('a',64))`,[run.id]);
+  await pool.query(`INSERT INTO backtest_equity_daily(run_id,generation,trade_date,cash_cents,equity_cents,payload,sha256)
+    VALUES ($1,1,'2026-01-05',1,1,'{"private":"RUNTIME_EQUITY_MUST_NOT_EXPORT"}',repeat('b',64))`,[run.id]);
+}
+
+
 describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢复）", () => {
   let pool: pg.Pool;
   let outDir: string;
@@ -40,6 +54,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     await resetSchema(pool);
     await runMigrations(pool);
     await seedTestStrategy(pool, "# 固定资产包测试策略");
+    await seedFrozenInputFixture(pool);
     await pool.query(
       `DELETE FROM llm_model model USING llm_provider provider
         WHERE model.provider_id = provider.id
@@ -161,7 +176,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const manifest = await readPortableManifest(exported.payloadPath);
     expect(manifest.version).toBe(5);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(89);
+    expect(manifest.migration_max).toBe(95);
     expect(manifest.tables.strategy_document).toBeGreaterThan(0);
     expect(manifest.tables.strategy_document_revision).toBeUndefined();
     expect(manifest.tables.strategy_score_benchmark).toBe(1);
@@ -169,6 +184,10 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     expect(manifest.tables.market_bar).toBeUndefined();
     expect(manifest.tables.pool_membership).toBeUndefined();
     expect(manifest.tables.backtest_run).toBeUndefined();
+    expect(manifest.tables.backtest_input_set).toBeUndefined();
+    expect(manifest.tables.backtest_input_chunk).toBeUndefined();
+    expect(manifest.tables.backtest_event).toBeUndefined();
+    expect(manifest.tables.backtest_equity_daily).toBeUndefined();
     expect(manifest.tables.portfolio_position).toBeUndefined();
     expect(manifest.tables.daily_plan_auction_assessment).toBeUndefined();
     expect(manifest.strategy_hashes.length).toBe(manifest.tables.strategy_document);
@@ -179,6 +198,9 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     expect(payload).not.toContain("notification-portable-never-export");
     expect(payload).not.toContain("notification-content-never-export");
     expect(payload).not.toContain("PORTABLE_BACKTEST_SOURCE_MUST_NOT_EXPORT");
+    expect(payload).not.toContain("FROZEN_INPUT_MUST_NOT_EXPORT");
+    expect(payload).not.toContain("RUNTIME_EVENT_MUST_NOT_EXPORT");
+    expect(payload).not.toContain("RUNTIME_EQUITY_MUST_NOT_EXPORT");
     expect(payload).not.toContain('"created_at":{}');
     expect(payload).toMatch(/"created_at":"\d{4}-\d{2}-\d{2}T/);
     expect(payload).toContain('"model_provider_key":"deepseek"');
@@ -283,6 +305,7 @@ describe.skipIf(toolBlockReason !== null)("数据卷（导出→恢复→校验�
     pool = createPool(prepared!.url);
     await resetSchema(pool);
     await runMigrations(pool);
+    await seedFrozenInputFixture(pool);
     // 造数：一个标的 + 两个 freq 的若干 bar + 一条 market_fetch_run
     const inst = await pool.query<{ id: string }>(
       `INSERT INTO market_instrument (code, name, kind) VALUES ('999002.SZ', '卷测试股份', 'stock')
@@ -342,6 +365,10 @@ describe.skipIf(toolBlockReason !== null)("数据卷（导出→恢复→校验�
   it("导出 → 恢复到临时库 → manifest 校验通过，行数一致", async () => {
     const exported = await exportVolume(pool, sourceUrl, { outDir });
     expect(exported.manifest.tables["market_bar"]).toBe(3);
+    expect(exported.manifest.tables["backtest_input_set"]).toBe(1);
+    expect(exported.manifest.tables["backtest_input_chunk"]).toBe(1);
+    expect(exported.manifest.tables["backtest_event"]).toBe(1);
+    expect(exported.manifest.tables["backtest_equity_daily"]).toBe(1);
     expect(exported.manifest.market_bar_coverage["day"]).toMatchObject({
       count: 2,
       min: "2026-08-13",
