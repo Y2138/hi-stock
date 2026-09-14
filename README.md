@@ -50,6 +50,60 @@ docker compose --env-file .env.local up -d app
 
 固定资产恢复只用于首次部署的空数据库。启动后打开 <http://127.0.0.1:8787/>，在“设置”中配置扶摇数据源和 LLM 厂商。首次部署、验收、更新与恢复步骤见[独立部署说明](docs/独立部署说明.md)。
 
+## 初始化历史行情数据（可选，仅首次部署）
+
+新部署的数据库不含行情。系统默认的日更范围是持仓、标的池、核心指数和行业板块，只够日常运行；如果要回测或研究全市场，需要在首次部署时一次性引入全市场历史日线。这是**初始化操作，不是定期同步**：完成之后，各标的的日常更新由系统已有的日线更新链路负责。
+
+前提：已安装并登录 `hithink-finance` CLI（`npm i -g @hithink-tech/hithink-finance-cli`），并在“设置”中配置好扶摇 API Key。
+
+```bash
+# 1) 拉取扶摇全市场批量导出（十年日K + 复权事件）到本地 DuckDB
+hithink-finance data init
+
+# 2) 导出为可回填的 CSV，并写入 PostgreSQL market_bar
+npm run market:backfill -- --source duckdb
+```
+
+也可先导出到目录再回填，便于重复使用或断点重试：
+
+```bash
+npm run market:backfill -- --out /tmp/market-dump        # 导出 CSV，锚点取数据最新日
+npm run market:backfill -- --from /tmp/market-dump --anchor 2026-09-11
+npm run market:backfill -- --from /tmp/market-dump --dry-run   # 只统计不写库
+```
+
+**板块日线**（行业、概念、区域、特色）默认只有一级行业参与日更，历史深度也不足；补齐用：
+
+```bash
+npm run market:board-backfill -- --dry-run    # 先看缺口范围
+npm run market:board-backfill                 # 补齐头部历史与尾部停更（走限流队列，约 2-3 小时）
+```
+
+要点：
+
+- 回填把前复权价写入 `open/high/low/close`，原始成交价写入 `open_raw/high_raw/low_raw/close_raw`，交易所前收盘写入 `prev_close`；复权由 `server/datasource/adjustment.ts` 按固定锚点计算，不依赖供应商的前复权口径。
+- 命令幂等；默认拒绝在已有回填数据时重复执行（这是初始化工具，不是同步器），确需按新锚点重建历史时加 `--force`。
+- 全市场十年日线约 1,000 万行、约占 5 GB 数据库空间，请预留磁盘。
+- 回填完成后系统会标记指标待重算；服务启动后指标工作器会串行补齐，数据量大时需要较长时间。
+
+**之后的日常数据更新**由系统已有的链路完成。定时任务 `daily_data_update` 每个交易日更新持仓、标的池、核心指数、行业板块，并**默认覆盖全部活跃个股**（保证全市场历史持续更新）；需要单独补拉某个标的时使用：
+
+```bash
+npm run market:fetch -- --code 000636.SZ --freq day --start 2020-01-01 --end 2026-09-11
+```
+
+全市场扩展的行为分两层，用来控制计算成本：
+
+- **日线（行情）**：全部活跃个股每日只做当日快照追加（约 30 次批量请求，约 2.5 分钟）。缺口修复与 K 线重拉仍只对持仓、标的池、核心指数和行业板块执行，避免个别标的除权就触发全市场逐标的请求。
+- **指标（MA/MACD/RSI/股性）**：每日只对**信号相关范围**——持仓、标的池、核心指数、行业板块、当日结构候选——重算，约几分钟内完成，每日计划不会用到过期指标。其余约 5,000 只标的的指标由每周任务 `weekly_full_market_indicators`（周六 05:30）入队，后台指标工作器分批补齐（全量约 10–20 分钟）。
+
+如果不需要全市场每日行情更新（例如只做池内研究），可在 `.env.local` 关闭：
+
+```
+DAILY_UPDATE_FULL_MARKET=false          # 回退为只更新持仓、池、指数、行业板块
+INDICATOR_WORKER_INTERVAL_MS=2000       # 指标工作器回退到低负载节奏
+```
+
 ## 数据边界
 
 | 类型 | 保存位置 | 是否随 Git 同步 |
