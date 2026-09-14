@@ -43,6 +43,9 @@ function childPlan(plan: StandardBacktestPlan, strategy: StandardStrategyPlan, i
   inherit("near_52w_high_min", !isPortfolio ? plan.near_52w_high_min : undefined);
   inherit("absolute_momentum", !isPortfolio ? plan.absolute_momentum : undefined);
   inherit("right_side_params", !isPortfolio ? plan.right_side_params : undefined);
+  inherit("weakness_ma10_buffer", !isPortfolio ? plan.weakness_ma10_buffer : undefined);
+  inherit("adaptive_weakness_buffer", !isPortfolio ? plan.adaptive_weakness_buffer : undefined);
+  inherit("adaptive_open_gap", !isPortfolio ? plan.adaptive_open_gap : undefined);
   inherit("residual_momentum", !isPortfolio ? plan.residual_momentum : undefined);
   inherit("vol_target_sigma", !isPortfolio ? plan.vol_target_sigma : undefined);
   inherit("drawdown_scale_max", !isPortfolio ? plan.drawdown_scale_max : undefined);

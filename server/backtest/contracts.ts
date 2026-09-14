@@ -111,6 +111,20 @@ export const StandardBacktestPlanSchema = object({
   take_profit_pct: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1 })),
   exit_model: Type.Optional(exitModel),
   right_side_params: Type.Optional(StandardRightSideParamsSchema),
+  /** 转弱退出抗洗盘缓冲：收盘跌破 MA10 需超过该幅度才触发转弱（0=跌破即走，生产口径）。 */
+  weakness_ma10_buffer: Type.Optional(Type.Number({ minimum: 0, maximum: 0.3 })),
+  /** 转弱缓冲的 regime 条件化：881 宽度强（洗盘期容忍深缓冲）用 strong、宽度弱（防守期）用 weak（0=跌破即走）。 */
+  adaptive_weakness_buffer: Type.Optional(object({
+    strong: Type.Number({ minimum: 0, maximum: 0.3 }),
+    weak: Type.Number({ minimum: 0, maximum: 0.3 }),
+    breadth_threshold: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1 })),
+  })),
+  /** 门禁 regime 条件化：881 上涨行业占比>=0.6（宽度强）用 strong 上限，否则收紧到 weak。 */
+  adaptive_open_gap: Type.Optional(object({
+    strong: Type.Number({ minimum: 0, maximum: 0.2 }),
+    weak: Type.Number({ minimum: 0, maximum: 0.2 }),
+    breadth_threshold: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1 })),
+  })),
   max_holding_days: Type.Integer({ minimum: 1, maximum: 2520 }),
   min_amplitude_20: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 0.5 })),
   max_open_gap_pct: Type.Optional(Type.Number({ minimum: 0, maximum: 0.2 })),
@@ -237,6 +251,17 @@ export function validateStandardPlan(input: unknown): StandardBacktestPlan {
   if ((parsed.near_52w_high_min !== undefined || parsed.vol_target_sigma !== undefined || parsed.drawdown_scale_max !== undefined)
       && parsed.rule !== "right_side_daily_v1") {
     throw new Error("52周高位/波动率目标/回撤缩仓仅右侧单规则研究支持");
+  }
+  if (parsed.weakness_ma10_buffer !== undefined && parsed.rule !== "right_side_daily_v1") throw new Error("抗洗盘缓冲仅右侧单规则研究支持");
+  if (parsed.adaptive_weakness_buffer !== undefined) {
+    if (parsed.rule !== "right_side_daily_v1") throw new Error("转弱缓冲regime条件化仅右侧单规则研究支持");
+    if (parsed.environment_mode === "none") throw new Error("转弱缓冲regime条件化依赖881宽度因子，必须选择881环境");
+    if (parsed.weakness_ma10_buffer !== undefined) throw new Error("转弱缓冲与其regime条件化版本不得同时设置");
+  }
+  if (parsed.adaptive_open_gap !== undefined) {
+    if (parsed.rule !== "right_side_daily_v1") throw new Error("门禁regime条件化仅右侧单规则研究支持");
+    if (parsed.environment_mode === "none") throw new Error("门禁regime条件化依赖881宽度因子，必须选择881环境");
+    if (parsed.adaptive_open_gap.weak > parsed.adaptive_open_gap.strong) throw new Error("弱市门禁不得宽于强市门禁");
   }
   if (parsed.absolute_momentum !== undefined || parsed.residual_momentum !== undefined) {
     if (parsed.rule !== "right_side_daily_v1") throw new Error("绝对动量与残差动量仅右侧单规则研究支持");

@@ -135,6 +135,8 @@ export function createStandardEngine(input: StandardBacktestPlan): StandardEngin
   let buys: Array<{ code: string; budget: number; signalClose: number }> = [];
   const tieredExits = plan.exit_model === "production_tiered" || plan.exit_model === "profit_trail";
   const rightSideParams = plan.right_side_params;
+  // 当日 881 宽度：转弱缓冲的 regime 条件化在收盘评估转弱时读取。
+  let currentBreadth: number | null = null;
   let externallyPaused = false;
   const industryGate = plan.industry_momentum;
   const residualGate = plan.residual_momentum;
@@ -147,6 +149,14 @@ export function createStandardEngine(input: StandardBacktestPlan): StandardEngin
   const boardCloses = new Map<string, number[]>();
   // 综合指数收盘序列：绝对动量闸门与残差动量的市场基准（参数上限 250 日 + 1，保留 251 根）。
   const compositeCloses: number[] = [];
+  /** 转弱缓冲：宽度强（主升/洗盘期）容忍深缓冲，宽度弱（防守期）跌破即走。 */
+  function weaknessBuffer(): number {
+    if (plan.adaptive_weakness_buffer === undefined) return plan.weakness_ma10_buffer ?? 0;
+    if (currentBreadth == null) return Math.min(plan.adaptive_weakness_buffer.strong, plan.adaptive_weakness_buffer.weak);
+    return currentBreadth >= (plan.adaptive_weakness_buffer.breadth_threshold ?? 0.6)
+      ? plan.adaptive_weakness_buffer.strong
+      : plan.adaptive_weakness_buffer.weak;
+  }
   function trackComposite(day: StandardDay): void {
     const close = day.market_factors?.composite_close;
     if (typeof close !== "number" || !Number.isFinite(close) || close <= 0) return;
@@ -291,7 +301,8 @@ export function createStandardEngine(input: StandardBacktestPlan): StandardEngin
     const previousRow = rows.at(-2);
     if (previousRow?.macd_hist !== null && previousRow?.macd_hist !== undefined && previousRow.macd_hist > 0 &&
         currentRow.macd_hist !== null && currentRow.macd_hist <= 0 &&
-        currentRow.ma10 !== null && closeUnits < priceUnits(currentRow.ma10)) {
+        currentRow.ma10 !== null &&
+        closeUnits < priceUnits(currentRow.ma10) * (1 - weaknessBuffer())) {
       return { reason: "weakness_exit", quantity: null };
     }
     // profit_trail 模型去掉时间兜底与崩坏复核（两者是分档全量模型换手的主要来源），保留盈利奔跑部分。
@@ -397,8 +408,16 @@ export function createStandardEngine(input: StandardBacktestPlan): StandardEngin
         // 停牌日无开盘可成交，订单当日过期；生产口径“停牌均放弃”。
         if (!bars.has(code)) { expire("suspended_no_open"); continue; }
         // 短线策略§1.1：T+1开盘价高于T日收盘价5%时放弃建仓，不等待盘中回落。
-        // 短线策略§1.1：T+1开盘价高于信号收盘5%（可由 max_open_gap_pct 收紧）时放弃建仓，不等待盘中回落。
-        if (priceUnits(bars.get(code)!.open) > priceUnits(signalClose * (1 + (plan.max_open_gap_pct ?? 0.05)))) {
+        // 短线策略§1.1：T+1开盘价高于信号收盘按门禁上限放弃建仓；门禁可按 881 宽度自适应
+        // （宽度强=主升确认段用 strong 上限防踏空，宽度弱用 weak 上限减劣质追高），缺省 5%。
+        const adaptiveGap = plan.adaptive_open_gap
+          ? (day.market_factors?.industry_rising_ratio == null
+              ? Math.max(plan.adaptive_open_gap.strong, plan.adaptive_open_gap.weak)
+              : day.market_factors.industry_rising_ratio >= (plan.adaptive_open_gap.breadth_threshold ?? 0.6)
+                ? plan.adaptive_open_gap.strong
+                : plan.adaptive_open_gap.weak)
+          : (plan.max_open_gap_pct ?? 0.05);
+        if (priceUnits(bars.get(code)!.open) > priceUnits(signalClose * (1 + adaptiveGap))) {
           expire("open_gap_above_cap");
           continue;
         }
@@ -440,6 +459,7 @@ export function createStandardEngine(input: StandardBacktestPlan): StandardEngin
       }
       trackBoards(day);
       trackComposite(day);
+      currentBreadth = day.market_factors?.industry_rising_ratio ?? null;
       const snapshots: StandardEquity["positions"] = [];
       let marketValue = 0;
       for (const code of plan.codes) {

@@ -994,3 +994,32 @@ describe("固定样本日频研究内核（纯函数，无数据库）", () => {
     expect(() => validateStandardPlan(plan({ right_side_params: { min_passed_count: 6, disable_conditions: ["volume_expanding"] } })))
       .toThrow("不得超过启用条件数");
   });
+
+  it("抗洗盘缓冲与自适应门禁：缓冲改变转弱触发点，门禁按宽度切换上限", () => {
+    const plan0 = { ...plan(), initial_cash: 100_000, max_positions: 1, daily_buy_limit: 1 };
+    // —— 抗洗盘缓冲：V型洗盘形态手工构造不稳定，行为差异由真数据矩阵验证；此处验证参数接入契约 ——
+    expect(() => validateStandardPlan({ ...plan0, weakness_ma10_buffer: 0.03 })).not.toThrow();
+    expect(() => createStandardEngine(validateStandardPlan({ ...plan0, weakness_ma10_buffer: 0.03 }))).not.toThrow();
+    expect(() => validateStandardPlan({ ...plan0, adaptive_open_gap: { strong: 0.05, weak: 0.02 } })).not.toThrow();
+    expect(() => validateStandardPlan({ ...plan0, environment_mode: "none", adaptive_open_gap: { strong: 0.05, weak: 0.02 } } as Partial<StandardBacktestPlan>)).toThrow("881宽度因子");
+    expect(() => validateStandardPlan({ ...plan0, adaptive_open_gap: { strong: 0.02, weak: 0.05 } })).toThrow("不得宽于");
+    expect(() => validateStandardPlan({ ...plan0, adaptive_weakness_buffer: { strong: 0.15, weak: 0 } })).not.toThrow();
+    expect(() => validateStandardPlan({ ...plan0, weakness_ma10_buffer: 0.05, adaptive_weakness_buffer: { strong: 0.15, weak: 0 } })).toThrow("不得同时设置");
+    expect(() => validateStandardPlan({ ...plan0, environment_mode: "none", adaptive_weakness_buffer: { strong: 0.15, weak: 0 } } as Partial<StandardBacktestPlan>)).toThrow("881宽度因子");
+    // —— 自适应门禁：宽度强用 strong、宽度弱用 weak ——
+    const factors = (ratio: number): StandardMarketFactors =>
+      ({ composite_close: 100, composite_ma20: null, composite_slope: null, industry_rising_ratio: ratio, industry_adx14_median: null });
+    const gapEngine = (ratio: number) => {
+      const engine = createStandardEngine(validateStandardPlan({ ...plan0,
+        adaptive_open_gap: { strong: 0.05, weak: 0.02 },
+        max_open_gap_pct: 0.2 })); // 计划级上限放宽，验证 adaptive 接管
+      for (let i = -40; i < 0; i += 1) engine.next({ ...day(i), market_factors: factors(ratio) });
+      // 信号日高开 4%：宽度强（0.7）应按 5% 上限放行，宽度弱（0.3）应按 2% 上限拒绝
+      const signalDay = engine.next({ ...day(0, { open: 10.5, close: 11, volume: 200_000 }), market_factors: factors(ratio) });
+      expect(signalDay.events.some(e => e.type === "order")).toBe(true);
+      const openDay = engine.next({ ...day(1, { open: 11.44, close: 11.44, volume: 150_000 }), market_factors: factors(ratio) });
+      return openDay.events.some(e => e.type === "expired" && e.reason === "open_gap_above_cap");
+    };
+    expect(gapEngine(0.7)).toBe(false); // 宽度强：4% 高开 < 5% 上限 → 成交
+    expect(gapEngine(0.3)).toBe(true);  // 宽度弱：4% 高开 > 2% 上限 → 拒绝
+  });
