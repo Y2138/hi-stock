@@ -4,9 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type pg from "pg";
-import { MigrationConflictError, runMigrations } from "../../server/db/migrate.js";
+import { MigrationConflictError, runMigrations, loadMigrations } from "../../server/db/migrate.js";
 import { prepareTestDb, resetSchema } from "./helpers.js";
 
+const migrationVersions = (await loadMigrations(path.join(import.meta.dirname,"../../server/migrations"))).map(row=>row.version);
 const prepared = await prepareTestDb();
 
 describe.skipIf(!prepared)("迁移运行器", () => {
@@ -23,10 +24,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
 
   it("连续执行两次幂等：第二次不重复应用", async () => {
     const first = await runMigrations(pool);
-    expect(first.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89]);
+    expect(first.applied).toEqual(migrationVersions);
     const second = await runMigrations(pool);
     expect(second.applied).toEqual([]);
-    expect(second.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89]);
+    expect(second.skipped).toEqual(migrationVersions);
     // 表结构真实存在，0005 已按领域重命名非前缀表
     const tables = await pool.query(
       "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
@@ -41,6 +42,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "agent_tool_audit",
       "agent_tool_metric",
       "analysis_run",
+      "backtest_equity_daily",
+      "backtest_event",
+      "backtest_input_chunk",
+      "backtest_input_set",
       "backtest_run",
       "backtest_run_comparison",
       "backtest_run_source",
