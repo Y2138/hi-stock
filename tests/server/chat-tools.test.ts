@@ -2,10 +2,14 @@
 // - fetch_market_data 一次调用顺序处理多项并汇报聚合进度
 import type { AgentContext } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../../server/db/migrate.js";
 import { validateScheduledPoolAttentionInput } from "../../server/agent/tool-validation.js";
-import { buildChatTools } from "../../server/agent/tools.js";
+import { buildChatTools, JOB_FLOW_TOOL_BUNDLES } from "../../server/agent/tools.js";
+import * as standardRuntime from "../../server/modules/backtests/runtime.js";
+import * as standardService from "../../server/modules/backtests/service.js";
+import type { StandardBacktestPlan } from "../../server/backtest/contracts.js";
+import type { StandardRunStatus } from "../../server/backtest/runtime-contract.js";
 import { acquireAgentMutationLock } from "../../server/agent/mutation-lock.js";
 import { appendMessage, createSession } from "../../server/agent/repo.js";
 import { buildSystemPrompt } from "../../server/agent/prompt.js";
@@ -59,6 +63,169 @@ it("扶摇研究筛选不把未披露估值视为低估，并区分上游响应�
   expect(() => processHithinkResult(definition, nested, { select: ["metrics.roee"] })).toThrow("不存在字段");
   const sparse = { item: [...Array.from({ length: 100 }, () => ({ pe: null })), { pe: 8, roe: 15 }] };
   expect(processHithinkResult(definition, sparse, { where: [{ field: "roe", op: "gt", value: 10 }] }).matched_count).toBe(1);
+});
+
+const standardToolNames = ["preflight_backtest", "start_standard_backtest", "get_backtest_status", "cancel_backtest"];
+const standardPlan: StandardBacktestPlan = {
+  name: "标准回测工具测试", hypothesis: "仅验证工具边界", codes: ["000001.SZ"],
+  start: "2026-01-05", end: "2026-01-16", rule: "right_side_daily_v1",
+  environment_mode: "none", price_mode: "raw_research", initial_cash: 100000,
+  max_positions: 1, daily_buy_limit: 1, position_fraction: 0.2, stop_loss_pct: 0.08,
+  max_holding_days: 20, drawdown_circuit: false, stop_streak_circuit: false,
+  costs: { label: "测试费用", commission_bps: 3, minimum_commission: 5, sell_tax_bps: 5, slippage_bps: 2, volume_participation: 0.01 },
+};
+const standardStart = { plan: standardPlan, plan_hash: "a".repeat(64), input_hash: "b".repeat(64), idempotency_key: "tool-test" };
+const standardStatus: StandardRunStatus = {
+  id: "123", name: standardPlan.name, engine_type: "standard_daily", execution_status: "queued",
+  phase: "queued", progress: 0, quality_status: "pending", evidence_status: "research_only", replay_status: "pending",
+  plan_sha256: standardStart.plan_hash, input_sha256: standardStart.input_hash, execution_plan: standardPlan,
+  metrics_json: null, data_gaps: [], error_message: null, session_id: "1", started_at: null,
+  finished_at: null, cancel_requested_at: null, comparisons: [], enabled: true,
+};
+
+describe("标准回测工具边界（无数据库）", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  function fixture(sessionId: string | null = "2", acquired = true) {
+    const query = vi.fn(async (_sql: string, _values?: unknown[]) => ({ rows: [{
+      id: "1", session_id: sessionId, event_type: "ui_refresh", data: {}, created_at: "2026-09-11T00:00:00Z",
+    }] }));
+    const lockQuery = vi.fn(async (_sql: string, _values?: unknown[]) => ({ rows: [{ acquired }] }));
+    const release = vi.fn();
+    const connect = vi.fn(async () => ({ query: lockQuery, release }));
+    const pool = { query, connect } as unknown as pg.Pool;
+    const enabled = vi.spyOn(standardRuntime, "isStandardBacktestEnabled").mockReturnValue(false);
+    const start = vi.spyOn(standardRuntime, "startStandardBacktest").mockResolvedValue(standardStatus);
+    const status = vi.spyOn(standardRuntime, "getStandardBacktestStatus").mockResolvedValue(standardStatus);
+    const cancel = vi.spyOn(standardRuntime, "cancelStandardBacktest").mockResolvedValue({ ...standardStatus, cancel_requested_at: "2026-09-11T00:00:00Z" });
+    const preflight = vi.spyOn(standardService, "preflightStandardBacktest").mockResolvedValue({
+      executable: true, plan: standardPlan, plan_hash: standardStart.plan_hash, input_hash: standardStart.input_hash,
+      evidence_status: "research_only", estimated_compressed_bytes: 1000000,
+      manifest: {
+        version: "standard-input-v2", data_request_hash: "c".repeat(64), environment_codes: [], codes: standardPlan.codes,
+        seed_start: "2020-01-05", start: standardPlan.start, end: standardPlan.end, row_count: 2000, day_count: 2000,
+        gaps: [{ code: "POINT_IN_TIME_UNVERIFIED", domain: "input", severity: "warning", message: "仅研究证据" }],
+        chunks: Array.from({ length: 2000 }, () => ({ date: standardPlan.start, sha256: "d".repeat(64), bytes: 1000, rows: 1 })),
+      },
+    });
+    const tools = buildChatTools({ pool, sessionId });
+    const tool = (name: string) => tools.find(item => item.name === name)!;
+    return { pool, query, lockQuery, connect, release, enabled, start, status, cancel, preflight, tools, tool };
+  }
+
+  it("仅交互目录开放新增工具，默认未启用可发现，已知及未知任务均不扩权", () => {
+    const f = fixture();
+    expect(f.tools.filter(tool => standardToolNames.includes(tool.name)).map(tool => tool.name)).toEqual(standardToolNames);
+    expect(f.tool("start_standard_backtest").label).toContain("未启用");
+    expect(f.tool("preflight_backtest").description).toContain("默认 false");
+    expect(f.tool("run_backtest").description).toContain("不代表自动正式验证");
+    for (const jobCode of [...Object.keys(JOB_FLOW_TOOL_BUNDLES), "unknown_flow", "constructor"]) {
+      const names = buildChatTools({ pool: f.pool, sessionId: "2" }, { kind: "job", jobCode }).map(tool => tool.name);
+      expect(names.some(name => standardToolNames.includes(name))).toBe(false);
+    }
+    expect(f.query).not.toHaveBeenCalled();
+  });
+
+  it("预检返回精简白名单，content/details 均无逐块清单且不获取写锁", async () => {
+    const f = fixture();
+    const result = await f.tool("preflight_backtest").execute("preflight", { plan: standardPlan });
+    const data = JSON.parse(result.content.find(item => item.type === "text")!.text!);
+    expect(Object.keys(data).sort()).toEqual(["enabled", "executable", "plan", "plan_hash", "input_hash", "evidence_status", "coverage", "data_gaps"].sort());
+    expect(data).toMatchObject({ enabled: false, executable: true, evidence_status: "research_only",
+      coverage: { seed_start: "2020-01-05", start: standardPlan.start, end: standardPlan.end, row_count: 2000, day_count: 2000 },
+      data_gaps: [{ message: "仅研究证据" }],
+    });
+    expect(result.details).toEqual(data);
+    expect(JSON.stringify(result)).not.toMatch(/chunks|manifest|estimated_compressed_bytes/);
+    expect(JSON.stringify(result).length).toBeLessThan(5000);
+    expect(f.connect).not.toHaveBeenCalled();
+    expect(f.start).not.toHaveBeenCalled();
+  });
+
+  it("四个入口拒绝未知字段、源码、非法编号及非严格计划，错误审计仅留哈希", async () => {
+    const f = fixture();
+    for (const [name, input] of [
+      ["preflight_backtest", { plan: standardPlan, source_code: "secret-sentinel" }],
+      ["preflight_backtest", { plan: { ...standardPlan, costs: { ...standardPlan.costs, extra: true } } }],
+      ["start_standard_backtest", { ...standardStart, plan_hash: "invalid" }],
+      ["start_standard_backtest", { ...standardStart, source_code: "secret-sentinel" }],
+      ["get_backtest_status", { run_id: "0" }],
+      ["get_backtest_status", { run_id: "123", sql: "secret-sentinel" }],
+      ["cancel_backtest", { run_id: "123", reason: "" }],
+      ["cancel_backtest", { run_id: "123", reason: "用户取消", session_id: "1" }],
+    ] as const) await expect(f.tool(name).execute("invalid", input)).rejects.toThrow();
+    expect(f.preflight).not.toHaveBeenCalled();
+    expect(f.start).not.toHaveBeenCalled();
+    expect(f.status).not.toHaveBeenCalled();
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.connect).not.toHaveBeenCalled();
+    expect(f.query).toHaveBeenCalledTimes(8);
+    for (const [sql, values] of f.query.mock.calls) {
+      expect(sql).toContain("INSERT INTO agent_tool_audit");
+      expect(JSON.parse(String(values![2]))).toEqual({ redacted: true, args_sha256: expect.any(String) });
+      expect(values![4]).toBe("error");
+    }
+    expect(JSON.stringify(f.query.mock.calls)).not.toContain("secret-sentinel");
+  });
+
+  it("发起排队立即返回并审计刷新，不轮询；取消传来源会话且允许跨会话", async () => {
+    const f = fixture();
+    f.enabled.mockReturnValue(true);
+    const started = await f.tool("start_standard_backtest").execute("start", standardStart);
+    expect(started.details).toMatchObject({ id: "123", execution_status: "queued", evidence_status: "research_only" });
+    expect(f.start).toHaveBeenCalledExactlyOnceWith(f.pool, "2", standardStart);
+    expect(f.status).not.toHaveBeenCalled();
+    const cancelled = await f.tool("cancel_backtest").execute("cancel", { run_id: "123", reason: "用户要求停止" });
+    expect(cancelled.details).toMatchObject({ session_id: "1", cancel_requested_at: expect.any(String) });
+    expect(f.cancel).toHaveBeenCalledExactlyOnceWith(f.pool, "123", "用户要求停止", "2");
+    expect(f.connect).toHaveBeenCalledTimes(2);
+    expect(f.lockQuery.mock.calls.filter(([sql]) => sql.includes("pg_try_advisory_xact_lock"))).toHaveLength(2);
+    expect(f.lockQuery.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(2);
+    expect(f.release).toHaveBeenCalledTimes(2);
+    const audits = f.query.mock.calls.filter(([sql]) => sql.includes("INSERT INTO agent_tool_audit"));
+    expect(audits.map(([, values]) => [values![0], values![1], values![4]])).toEqual([
+      ["2", "start_standard_backtest", "ok"], ["2", "cancel_backtest", "ok"],
+    ]);
+    expect(f.query.mock.calls.filter(([sql]) => sql.includes("INSERT INTO chat_session_event"))).toHaveLength(2);
+    expect(f.query.mock.calls.every(([sql]) => /INSERT INTO (agent_tool_audit|chat_session_event)/.test(sql))).toBe(true);
+  });
+
+  it("只读状态无需同源会话或写锁，找不到运行显式失败", async () => {
+    const f = fixture();
+    expect((await f.tool("get_backtest_status").execute("status", { run_id: "123" })).details).toEqual(standardStatus);
+    expect(f.status).toHaveBeenCalledExactlyOnceWith(f.pool, "123");
+    f.status.mockResolvedValue(null);
+    await expect(f.tool("get_backtest_status").execute("missing", { run_id: "456" })).rejects.toThrow("不存在");
+    expect(f.connect).not.toHaveBeenCalled();
+    expect(f.start).not.toHaveBeenCalled();
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.query.mock.calls.every(([sql]) => sql.includes("INSERT INTO agent_tool_audit"))).toBe(true);
+  });
+
+  it("无持久会话、数据库写锁冲突时拒绝发起与取消", async () => {
+    const f = fixture(null);
+    for (const [name, input] of [["start_standard_backtest", standardStart], ["cancel_backtest", { run_id: "123", reason: "用户取消" }]] as const) {
+      await expect(f.tool(name).execute("no-session", input)).rejects.toThrow("session");
+    }
+    expect(f.connect).not.toHaveBeenCalled();
+    expect(f.start).not.toHaveBeenCalled();
+    expect(f.cancel).not.toHaveBeenCalled();
+    const busy = fixture("2", false);
+    await expect(busy.tool("start_standard_backtest").execute("busy", standardStart)).rejects.toThrow("另一对话");
+    await expect(busy.tool("cancel_backtest").execute("busy", { run_id: "123", reason: "用户取消" })).rejects.toThrow("另一对话");
+    expect(busy.start).not.toHaveBeenCalled();
+    expect(busy.cancel).not.toHaveBeenCalled();
+    expect(busy.lockQuery.mock.calls.filter(([sql]) => sql === "ROLLBACK")).toHaveLength(2);
+  });
+
+  it("关闭时保留服务拒绝结果，不伪报排队成功或刷新", async () => {
+    const f = fixture();
+    f.start.mockRejectedValue(new Error("标准回测未启用"));
+    await expect(f.tool("start_standard_backtest").execute("disabled", standardStart)).rejects.toThrow("未启用");
+    expect(f.query.mock.calls).toHaveLength(1);
+    expect(f.query.mock.calls[0]![1]![4]).toBe("error");
+    expect(f.lockQuery.mock.calls.map(([sql]) => sql)).toContain("ROLLBACK");
+  });
 });
 
 describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test 真实库）", () => {
@@ -351,6 +518,10 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "analysis_run",
       "strategy_screen_query",
       "read_backtest_source",
+      "preflight_backtest",
+      "start_standard_backtest",
+      "get_backtest_status",
+      "cancel_backtest",
       "run_backtest",
       "fetch_market_data",
       "fetch_hithink_data",
@@ -381,7 +552,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(portfolioSchema.required).toEqual(["reason", "changes"]);
     expect(
       tools
-        .filter((tool) => ["pool_onboard", "portfolio_write", "pool_write", "job_write", "finalize_backtest", "memory_write", "pool_attention_write", "daily_plan_write", "auction_assessment_write", "strategy_publish_request", "analysis_run", "strategy_screen_query", "run_backtest", "fetch_market_data", "fetch_hithink_data", "hithink_query", "trigger_job"].includes(tool.name))
+        .filter((tool) => ["pool_onboard", "portfolio_write", "pool_write", "job_write", "finalize_backtest", "memory_write", "pool_attention_write", "daily_plan_write", "auction_assessment_write", "strategy_publish_request", "analysis_run", "strategy_screen_query", "start_standard_backtest", "cancel_backtest", "run_backtest", "fetch_market_data", "fetch_hithink_data", "hithink_query", "trigger_job"].includes(tool.name))
         .every((tool) => tool.executionMode === "sequential"),
     ).toBe(true);
     const runBacktest = tools.find((tool) => tool.name === "run_backtest")!;
@@ -486,10 +657,11 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       expect(nightlyNames).not.toContain(forbidden);
     }
     const fallback = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "unknown_flow" });
-    expect(fallback.map((tool) => tool.name)).toEqual(full.map((tool) => tool.name));
+    const fallbackNames = full.map((tool) => tool.name).filter(name => !standardToolNames.includes(name));
+    expect(fallback.map((tool) => tool.name)).toEqual(fallbackNames);
     expect(fallback.map((tool) => tool.name)).not.toContain("daily_plan_write");
     expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "constructor" }).map((tool) => tool.name))
-      .toEqual(full.map((tool) => tool.name));
+      .toEqual(fallbackNames);
     const preloaded = createOnDemandToolSet(dailyPlan, dailyPlan.map((tool) => tool.name));
     expect(preloaded.initialTools.map((tool) => tool.name)).toEqual([
       "tool_catalog", ...dailyPlan.map((tool) => tool.name),
@@ -1519,6 +1691,30 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       tables: [{ table: "portfolio_position", schema_hash: "0".repeat(64) }],
     })) as { tables: Array<{ table: string }> };
     expect(legacyHash.tables[0]!.table).toBe("portfolio_position");
+  });
+
+  it("标准回测隐藏执行令牌、压缩载荷与逐块清单，拒绝读取及筛选排序", async () => {
+    const tools = buildChatTools({ pool, sessionId });
+    const schemaTool = tools.find(tool => tool.name === "database_schema")!;
+    const queryTool = tools.find(tool => tool.name === "database_query")!;
+    const names = ["backtest_run", "backtest_event", "backtest_equity_daily", "backtest_input_set", "backtest_input_chunk"];
+    const data = textOf(await schemaTool.execute("standard-schema", {
+      operation: "describe_tables", tables: names.map(table => ({ table })),
+    })) as { tables: Array<{ table: string; write_policy: string; columns: Array<{ name: string }> }> };
+    expect(data.tables.map(table => table.table).sort()).toEqual([...names].sort());
+    expect(data.tables.every(table => table.write_policy.includes("只读"))).toBe(true);
+    expect(JSON.stringify(data)).not.toContain("lease_token");
+    for (const [table, hidden] of [["backtest_run", "lease_token"], ["backtest_input_chunk", "payload"], ["backtest_input_set", "manifest"]]) {
+      expect(data.tables.find(item => item.table === table)!.columns.map(column => column.name)).not.toContain(hidden);
+      for (const query of [
+        { table, columns: [hidden] },
+        { table, mode: "count", filters: [{ column: hidden, op: "is_null", value: null }] },
+        { table, columns: [table === "backtest_input_chunk" ? "input_set_id" : "id"], order_by: [{ column: hidden }] },
+      ]) await expect(queryTool.execute("hidden-input", { queries: [query] })).rejects.toThrow("属于敏感凭据");
+    }
+    expect(textOf(await queryTool.execute("input-meta", { queries: [
+      { table: "backtest_input_chunk", columns: ["input_set_id", "seq", "trade_date", "sha256", "row_count"], limit: 1 },
+    ] }))).toMatchObject({ total_queries: 1 });
   });
 
   it("database_query 一次批量查询多个领域", async () => {

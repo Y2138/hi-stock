@@ -20,6 +20,17 @@ import {
   AGENT_BACKTEST_WORKER_VERSION,
 } from "../../server/backtest/agent-contract.js";
 import { runMigrations } from "../../server/db/migrate.js";
+import { createPool } from "../../server/db/client.js";
+import { contentHash, standardSeedStart, validateStandardPlan, type StandardBacktestPlan } from "../../server/backtest/contracts.js";
+import { decodeStandardChunk } from "../../server/backtest/input.js";
+import { StandardBacktestRunner } from "../../server/backtest/runner.js";
+import { createStandardWorker } from "../../server/backtest/executor.js";
+import { startStandardBacktest, getStandardBacktestStatus, cancelStandardBacktest, claimStandardRun, heartbeatStandardRun, expireStandardLeases, appendStandardDay, attachStandardInput } from "../../server/modules/backtests/runtime.js";
+import { createStrategyProposal } from "../../server/modules/strategy/repo.js";
+import { verifySettlement } from "../../server/backtest/settlement.js";
+import { listBacktestRuns } from "../../server/modules/backtests/repo.js";
+
+import { preflightStandardBacktest, freezeStandardBacktestInput, readFrozenStandardInput } from "../../server/modules/backtests/service.js";
 import { createSession } from "../../server/agent/repo.js";
 import { finalizeBacktest } from "../../server/modules/backtests/repo.js";
 import {
@@ -660,5 +671,255 @@ describe.skipIf(!prepared)("回测验证与只读 API", () => {
       progress: 100,
       code_cleanup_status: "deleted",
     });
+  });
+});
+
+
+const standardPlan: StandardBacktestPlan = {
+  name: "标准研究测试", hypothesis: "独立测试库验证输入冻结", codes: ["600000.SH"],
+  start: "2026-01-05", end: "2026-01-16", rule: "right_side_daily_v1", price_mode: "raw_research", environment_mode: "none",
+  initial_cash: 100000, max_positions: 1, daily_buy_limit: 1, position_fraction: 0.2,
+  stop_loss_pct: 0.05, max_holding_days: 20, drawdown_circuit: false, stop_streak_circuit: false,
+  costs: { label: "不可用于实盘的测试费用", commission_bps: 3, minimum_commission: 5, sell_tax_bps: 5, slippage_bps: 2, volume_participation: 0.01 },
+};
+
+describe("标准回测严格契约", () => {
+  it("只接受注册规则和完整显式成本，不接收源码或资格声明", () => {
+    expect(validateStandardPlan(standardPlan)).toEqual(standardPlan);
+    for (const input of [
+      { ...standardPlan, source_code: "secret-do-not-echo" },
+      { ...standardPlan, evidence_status: "qualified" },
+      { ...standardPlan, rule: "arbitrary_rule" },
+      { ...standardPlan, start: "2026-02-30" },
+      { ...standardPlan, codes: ["600000.SH", "600000.SH"] },
+      { ...standardPlan, costs: {} },
+      { ...standardPlan, initial_cash: Infinity },
+    ]) expect(() => validateStandardPlan(input)).toThrow();
+    try { validateStandardPlan({ ...standardPlan, source_code: "secret-do-not-echo" }); }
+    catch (error) { expect(String(error)).not.toContain("secret-do-not-echo"); }
+    expect(contentHash({ b: 2, a: 1 })).toBe(contentHash({ a: 1, b: 2 }));
+    expect(standardSeedStart("2024-02-29")).toBe("2018-02-28");
+    expect(standardSeedStart(standardPlan.start)).toBe("2020-01-05");
+  });
+});
+
+describe.skipIf(!prepared)("标准回测只读预检与不可变输入", () => {
+  let db: pg.Pool;
+  let instrumentId: string;
+  beforeAll(async () => {
+    db = createPool(prepared!.url);
+    await resetSchema(db);
+    await runMigrations(db);
+    instrumentId = (await db.query<{ id: string }>(
+      "INSERT INTO market_instrument(code,name,kind) VALUES ('600000.SH','纯合成测试标的','stock') RETURNING id::text",
+    )).rows[0]!.id;
+    // 明确合成日历与价格，不声称是实际行情。含六年种子与非交易日。
+    await db.query(`INSERT INTO market_trading_day(trade_date,is_open,source)
+      SELECT d::date, extract(isodow FROM d)<6, 'synthetic_test'
+      FROM generate_series('2020-01-05'::date,'2026-01-16'::date,'1 day') d`);
+    await db.query(`INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,volume_unit,adjustment,channel)
+      SELECT $1,'day',trade_date,trade_date::timestamp AT TIME ZONE 'UTC',10,11,9,10,100000,'shares','none','synthetic_test'
+      FROM market_trading_day WHERE is_open`, [instrumentId]);
+  }, 30000);
+  afterAll(async () => { await db?.end(); });
+
+  it("保留旧部分完成状态和正式锚点约束，新字段不伪造资格", async () => {
+    for (const status of ['legacy','partial','preparing','cancelled','rejected']) {
+      const row = (await db.query(`INSERT INTO backtest_run(name,kind,execution_status)
+        VALUES ('状态测试','research',$1) RETURNING evidence_status,quality_status,engine_type,status`, [status])).rows[0];
+      expect(row).toMatchObject({ evidence_status: 'legacy_unverified', quality_status: 'unchecked', engine_type: 'legacy', status: 'archived' });
+    }
+    await db.query("INSERT INTO backtest_run(name,kind,status) VALUES ('锚点','formal','active')");
+    await expect(db.query("INSERT INTO backtest_run(name,kind,status) VALUES ('重复锚点','formal','active')")).rejects.toThrow();
+  });
+
+  it("预检仅检查已有库数据，完整种子仍明确限制为研究证据", async () => {
+    const before = (await db.query('SELECT count(*)::int AS n FROM market_bar')).rows[0].n;
+    const report = await preflightStandardBacktest(db, standardPlan);
+    expect(report).toMatchObject({ executable: true, evidence_status: 'research_only', manifest: { seed_start: '2020-01-05', environment_codes: [] } });
+    expect(report.manifest.row_count).toBe(before);
+    expect(report.manifest.chunks[0]!.date).toBe('2020-01-06');
+    expect((await db.query('SELECT count(*)::int AS n FROM market_bar')).rows[0].n).toBe(before);
+    expect((await db.query('SELECT count(*)::int AS n FROM backtest_input_set')).rows[0].n).toBe(0);
+    expect(report.manifest.gaps.every(gap => gap.severity === 'warning')).toBe(true);
+  }, 20000);
+
+  it("冻结可重复复用，源数据修改不改变原输入，旧预检不能冻结新数据", async () => {
+    const report = await preflightStandardBacktest(db, standardPlan);
+    const expected = { plan_hash: report.plan_hash, input_hash: report.input_hash };
+    const frozen = await freezeStandardBacktestInput(db, standardPlan, expected);
+    expect((await freezeStandardBacktestInput(db, standardPlan, expected)).id).toBe(frozen.id);
+    const variantPlan = { ...standardPlan, stop_loss_pct: 0.08 };
+    const variantReport = await preflightStandardBacktest(db, variantPlan);
+    expect(variantReport.plan_hash).not.toBe(report.plan_hash);
+    expect(variantReport.input_hash).toBe(report.input_hash);
+    expect((await freezeStandardBacktestInput(db, variantPlan, {plan_hash: variantReport.plan_hash, input_hash: variantReport.input_hash})).id).toBe(frozen.id);
+    const original = [];
+    for await (const day of readFrozenStandardInput(db, frozen.id, frozen.sha256)) original.push(day);
+    await db.query("UPDATE market_bar SET volume=volume+1 WHERE instrument_id=$1 AND bar_date='2026-01-16'", [instrumentId]);
+    const unchanged = [];
+    for await (const day of readFrozenStandardInput(db, frozen.id, frozen.sha256)) unchanged.push(day);
+    expect(unchanged).toEqual(original);
+    await expect(freezeStandardBacktestInput(db, standardPlan, expected)).rejects.toThrow('输入已变化');
+    await expect(db.query("UPDATE backtest_input_set SET schema_version='tampered' WHERE id=$1", [frozen.id])).rejects.toThrow('不可修改');
+    await expect(db.query("UPDATE backtest_input_chunk SET sha256=repeat('f',64) WHERE input_set_id=$1", [frozen.id])).rejects.toThrow('不可修改');
+    const row = (await db.query("SELECT payload,encoding,raw_bytes,sha256,trade_date::text FROM backtest_input_chunk WHERE input_set_id=$1 ORDER BY seq LIMIT 1", [frozen.id])).rows[0];
+    expect(() => decodeStandardChunk({ ...row, sha256: 'f'.repeat(64) })).toThrow();
+    expect(() => decodeStandardChunk({ ...row, raw_bytes: 9 * 1024 * 1024 })).toThrow();
+    expect((await db.query('SELECT count(*)::int AS n FROM backtest_input_set')).rows[0].n).toBe(1);
+  }, 30000);
+
+  it("缺日历、种子行情、单位或环境时显式阻止，取消不遗留输入", async () => {
+    const report = await preflightStandardBacktest(db, { ...standardPlan, drawdown_circuit: true, environment_mode: "current_881" });
+    expect(report.executable).toBe(false);
+    expect(report.manifest.gaps.some(gap => gap.domain === 'environment' && gap.severity === 'error')).toBe(true);
+    await db.query("UPDATE market_bar SET volume_unit=NULL WHERE instrument_id=$1 AND bar_date='2020-01-06'", [instrumentId]);
+    const missing = await preflightStandardBacktest(db, standardPlan);
+    expect(missing.executable).toBe(false);
+    expect(missing.manifest.gaps.some(gap => gap.code === 'DATA_INVALID')).toBe(true);
+    const controller = new AbortController(); controller.abort();
+    await expect(freezeStandardBacktestInput(db, standardPlan, {plan_hash: contentHash(standardPlan), input_hash: missing.input_hash}, controller.signal)).rejects.toThrow('取消');
+    expect((await db.query('SELECT count(*)::int AS n FROM backtest_input_set')).rows[0].n).toBe(1);
+    await db.query("UPDATE market_bar SET volume_unit='shares' WHERE instrument_id=$1", [instrumentId]);
+    await db.query("DELETE FROM market_trading_day WHERE trade_date='2020-01-05'");
+    expect((await preflightStandardBacktest(db, standardPlan)).executable).toBe(false);
+  }, 20000);
+});
+
+
+describe.skipIf(!prepared)("标准回测异步运行闭环（独立库与真实子进程）",()=>{
+  let db:pg.Pool;
+  let sessionId:string;
+  let server:TestServer;
+  let runner:StandardBacktestRunner;
+  const priorEnabled=process.env.STANDARD_BACKTEST_ENABLED;
+  const plan:StandardBacktestPlan={...standardPlan,max_holding_days:2,end:"2026-01-09",benchmark_code:"000300.SH"};
+  const request=async(key:string,variant=plan)=>{
+    const report=await preflightStandardBacktest(db,variant);
+    expect(report.executable).toBe(true);
+    return {plan:variant,plan_hash:report.plan_hash,input_hash:report.input_hash,idempotency_key:key};
+  };
+  beforeAll(async()=>{
+    process.env.STANDARD_BACKTEST_ENABLED='true';
+    db=createPool(prepared!.url);await resetSchema(db);await runMigrations(db);await seedTestStrategy(db);
+    sessionId=(await createSession(db,{title:'标准运行研究',session_type:'backtest'})).id;
+    await db.query(`INSERT INTO market_instrument(code,name,kind) VALUES('600000.SH','合成股票','stock'),('000300.SH','合成基准','index')`);
+    await db.query(`INSERT INTO market_trading_day(trade_date,is_open,source)
+      SELECT d::date,extract(isodow FROM d)<6,'synthetic_test' FROM generate_series('2020-01-05'::date,'2026-01-09'::date,'1 day')d`);
+    await db.query(`INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,volume_unit,adjustment,channel)
+      SELECT i.id,'day',t.trade_date,t.trade_date::timestamp AT TIME ZONE 'UTC',10,13,9,10,100000,'shares','none','synthetic_test'
+      FROM market_instrument i CROSS JOIN market_trading_day t WHERE t.is_open`);
+    await db.query(`UPDATE market_bar SET open=10.5,close=11,volume=200000 WHERE instrument_id=(SELECT id FROM market_instrument WHERE code='600000.SH') AND bar_date='2026-01-05'`);
+    await db.query(`UPDATE market_bar SET open=11,close=11 WHERE instrument_id=(SELECT id FROM market_instrument WHERE code='600000.SH') AND bar_date>'2026-01-05'`);
+    await db.query(`UPDATE market_bar SET open=11,close=11 WHERE instrument_id=(SELECT id FROM market_instrument WHERE code='000300.SH') AND bar_date>'2026-01-05'`);
+    runner=new StandardBacktestRunner(db);server=await startTestServer(db);
+  },30000);
+  afterAll(async()=>{await runner?.stop();await server?.close();await db?.end();if(priorEnabled===undefined)delete process.env.STANDARD_BACKTEST_ENABLED;else process.env.STANDARD_BACKTEST_ENABLED=priorEnabled;});
+  it('真实子进程不继承数据库凭据、停止信号可中断，且不依赖Docker',async()=>{
+    const controller=new AbortController();const worker=createStandardWorker(controller.signal);
+    try{await worker.init(standardPlan);controller.abort();await expect(worker.finish()).rejects.toThrow();}finally{await worker.close();}
+    const source=await fs.readFile(path.join(import.meta.dirname,'../../server/backtest/executor.ts'),'utf8');
+    expect(source).not.toContain('...process.env');expect(source).not.toContain('DATABASE_URL');
+    expect(source).toContain("NODE_ENV:'production'");
+  });
+  it('排队幂等、真实运行、逐日核账、基准、分页与研究最终化',async()=>{
+    const input=await request('first');
+    const created=await startStandardBacktest(db,sessionId,input);
+    expect(created).toMatchObject({execution_status:'queued',evidence_status:'research_only'});
+    expect((await startStandardBacktest(db,sessionId,input)).id).toBe(created.id);
+    await expect(startStandardBacktest(db,sessionId,{...input,plan:{...plan,name:'冲突'},plan_hash:contentHash({...plan,name:'冲突'})})).rejects.toThrow('幂等键');
+    await runner.tick();
+    const status=(await getStandardBacktestStatus(db,created.id))!;
+    expect(status).toMatchObject({execution_status:'success',quality_status:'complete',evidence_status:'research_only',replay_status:'exact'});
+    expect(status.metrics_json!.trade_count).toBeGreaterThan(0);
+    expect(status.metrics_json!.benchmark_return).toBeCloseTo(0.1);
+    const runtime=await api(server.baseUrl,'GET',`/api/backtests/${created.id}?view=runtime`);
+    expect(runtime.status).toBe(200);expect(JSON.stringify(runtime.json)).not.toContain('lease_token');
+    const equity=await api(server.baseUrl,'GET',`/api/backtests/${created.id}?view=equity&limit=2`);
+    expect((equity.json as {items:unknown[]}).items).toHaveLength(2);
+    expect((equity.json as {next_cursor:string}).next_cursor).toBeTruthy();
+    const event=await api(server.baseUrl,'GET',`/api/backtests/${created.id}?view=events&limit=1`);
+    expect((event.json as {items:unknown[]}).items).toHaveLength(1);
+    expect((await listBacktestRuns(db)).some(r=>r.id===created.id)).toBe(false);
+    expect((await listBacktestRuns(db,{scope:'working'})).some(r=>r.id===created.id)).toBe(true);
+    await finalizeBacktest(db,{session_id:sessionId,run_id:created.id,conclusion_summary:'只读研究总结',applicability_boundary:'固定样本和日频近似'});
+    expect((await listBacktestRuns(db)).some(r=>r.id===created.id)).toBe(true);
+    const publishing=(await createSession(db,{title:'证据门槛验证',session_type:'interactive'})).id;
+    const state=(await db.query('SELECT change_seq::text,current_hash FROM strategy_state WHERE singleton=1')).rows[0];
+    const doc=(await db.query("SELECT id::text,sha256 FROM strategy_document WHERE code='test_strategy'")).rows[0];
+    await expect(createStrategyProposal(db,{session_id:publishing,base_change_seq:state.change_seq,base_strategy_hash:state.current_hash,
+      outline:'研究不能伪装正式证据',conclusion:'必须拒绝',adjustments:['保持资格边界'],summary:'测试拒绝研究证据',
+      changes:[{document_id:doc.id,base_sha256:doc.sha256,content:'# 测试候选'}],backtest_run_ids:[created.id]})).rejects.toThrow('证据');
+    expect((await api(server.baseUrl,'GET',`/api/backtests/${created.id}?view=equity&limit=0`)).status).toBe(400);
+    const rows=(await db.query('SELECT payload FROM backtest_equity_daily WHERE run_id=$1 ORDER BY trade_date',[created.id])).rows;
+    expect(rows).toHaveLength(5);
+    expect(rows.every(r=>r.payload.cash_cents+r.payload.market_value_cents===r.payload.equity_cents)).toBe(true);
+    const variant={...plan,stop_loss_pct:0.08};const second=await startStandardBacktest(db,sessionId,{...await request('variant',variant),comparison_run_ids:[created.id]});
+    await runner.tick();
+    expect((await getStandardBacktestStatus(db,second.id))!.comparisons).toEqual([{run_id:created.id,comparable:true,reasons:[],parameter_differences:['stop_loss_pct']}]);
+  },60000);
+  it('排队取消、失效租约与错误代次不能写入；重复取消不改终态',async()=>{
+    const queued=await startStandardBacktest(db,sessionId,await request('cancel'));
+    expect((await cancelStandardBacktest(db,queued.id,'用户取消',sessionId)).execution_status).toBe('cancelled');
+    expect((await cancelStandardBacktest(db,queued.id,'重复取消',sessionId)).execution_status).toBe('cancelled');
+    const input=await request('lease');const next=await startStandardBacktest(db,sessionId,input);
+    const claim=(await claimStandardRun(db))!;expect(claim.id).toBe(next.id);
+    expect(await claimStandardRun(db)).toBeNull();
+    expect(await heartbeatStandardRun(db,{...claim,lease_token:'00000000-0000-0000-0000-000000000000'})).toBe(false);
+    const frozen=await freezeStandardBacktestInput(db,plan,input);await attachStandardInput(db,claim,frozen);
+    await cancelStandardBacktest(db,claim.id,'运行中取消',sessionId);
+    await expect(appendStandardDay(db,claim,{date:plan.start,bars:[],market_recovery:null},{events:[],equity:{date:plan.start,cash_cents:1,market_value_cents:0,equity_cents:1,fees_cents:0,daily_return:0,drawdown:0,paused:false,positions:[]}})).rejects.toThrow('LEASE_LOST');
+    const expired=await startStandardBacktest(db,sessionId,await request('expire'));const lease=(await claimStandardRun(db))!;expect(lease.id).toBe(expired.id);
+    await db.query("UPDATE backtest_run SET lease_expires_at=now()-interval '1 second' WHERE id=$1",[expired.id]);
+    await expireStandardLeases(db);
+    expect((await getStandardBacktestStatus(db,expired.id))!.execution_status).toBe('failed');
+    expect(await heartbeatStandardRun(db,lease)).toBe(false);
+  },30000);
+  it('运行中真实取消与停止领取竞争均不会留下仍执行的任务',async()=>{
+    const run=await startStandardBacktest(db,sessionId,await request('live-cancel'));
+    const execution=runner.tick();
+    let running=false;
+    for(let i=0;i<100;i++){
+      const state=(await getStandardBacktestStatus(db,run.id))!;
+      if(state.execution_status==='running'){running=true;break;}
+      if(['failed','success','rejected'].includes(state.execution_status))break;
+      await new Promise(resolve=>setTimeout(resolve,50));
+    }
+    expect(running).toBe(true);
+    await cancelStandardBacktest(db,run.id,'停止真实工作器',sessionId);await execution;
+    expect((await getStandardBacktestStatus(db,run.id))!.execution_status).toBe('cancelled');
+    const race=await startStandardBacktest(db,sessionId,await request('stop-race'));
+    const other=new StandardBacktestRunner(db);const ticking=other.tick();await other.stop();await ticking;
+    expect(['queued','failed']).toContain((await getStandardBacktestStatus(db,race.id))!.execution_status);
+    await cancelStandardBacktest(db,race.id,'清理排队验证',sessionId);
+  },30000);
+  it('原始价列与前复权列并存时按计划选取，不用复权价冒充原价',async()=>{
+    const original=await preflightStandardBacktest(db,plan);
+    await db.query(`UPDATE market_bar SET open_raw=open,high_raw=high,low_raw=low,close_raw=close,
+      open=open/2,high=high/2,low=low/2,close=close/2,adjustment='forward'
+      WHERE instrument_id=(SELECT id FROM market_instrument WHERE code='600000.SH')`);
+    const raw=await preflightStandardBacktest(db,plan);
+    expect(raw.executable).toBe(true);expect(raw.input_hash).toBe(original.input_hash);
+    const forward=await preflightStandardBacktest(db,{...plan,price_mode:'forward_research'});
+    expect(forward.executable).toBe(true);expect(forward.input_hash).not.toBe(raw.input_hash);
+  },20000);
+  it('预检过期拒绝而不是读取新行情，关闭开关不创建运行',async()=>{
+    const input=await request('stale');
+    await db.query("UPDATE market_bar SET volume=volume+1 WHERE bar_date='2026-01-09'");
+    const started=await startStandardBacktest(db,sessionId,input);await runner.tick();
+    expect((await getStandardBacktestStatus(db,started.id))!).toMatchObject({execution_status:'rejected',error_message:'INPUT_CHANGED'});
+    process.env.STANDARD_BACKTEST_ENABLED='false';await expect(startStandardBacktest(db,sessionId,input)).rejects.toThrow('未开启');process.env.STANDARD_BACKTEST_ENABLED='true';
+  },30000);
+  it('父进程独立拒绝自报权益和伪造现金',()=>{
+    expect(()=>verifySettlement(plan,{date:plan.start,bars:[],market_recovery:null},{events:[],equity:{date:plan.start,cash_cents:1,market_value_cents:0,equity_cents:1,fees_cents:0,daily_return:0,drawdown:0,paused:false,positions:[]}},null,0)).toThrow('LEDGER_MISMATCH');
+  });
+});
+describe("标准组合契约", () => {
+  it("组合计划从策略集合派生标的并拒绝重叠代码", () => {
+    const strategy = { rule: "right_side_daily_v1", codes: ["600000.SH"], allocation_pct: 0.5, max_positions: 1, daily_buy_limit: 1, position_fraction: 0.2, stop_loss_pct: 0.05, max_holding_days: 20 };
+    const parsed = validateStandardPlan({ ...standardPlan, codes: ["600000.SH", "600001.SZ"], rule: "portfolio_daily_v1", strategies: [strategy, { ...strategy, rule: "swing_box_daily_v1", codes: ["600001.SZ"] }] });
+    expect(parsed.codes).toEqual(["600000.SH", "600001.SZ"]);
+    expect(parsed.strategies).toHaveLength(2);
+    expect(() => validateStandardPlan({ ...standardPlan, codes: ["600000.SH", "600001.SZ"], rule: "portfolio_daily_v1", strategies: [strategy, { ...strategy, codes: ["600000.SH"] }] })).toThrow("组合内同一标的不得重复分配给多个策略");
   });
 });

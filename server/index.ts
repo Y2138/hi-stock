@@ -1,5 +1,6 @@
 // 服务入口：建池、迁移检查、起 HTTP
 // 本机默认只绑定 127.0.0.1；容器内可绑定 0.0.0.0，但宿主端口仍只映射到 127.0.0.1。
+import { StandardBacktestRunner } from "./backtest/runner.js";
 import { loadConfig } from "./config.js";
 import { closePool, getPool } from "./db/client.js";
 import { MigrationConflictError, runMigrations } from "./db/migrate.js";
@@ -71,8 +72,10 @@ async function main(): Promise<void> {
   const scheduler = new JobScheduler({
     pool,
     databaseUrl: config.databaseUrl,
+    dailyFullMarket: config.dailyFullMarket,
   });
-  const indicatorWorker = new IndicatorWorker(pool);
+  const indicatorWorker = new IndicatorWorker(pool, config.indicatorIntervalMs);
+  const standardBacktests = new StandardBacktestRunner(pool);
   const notificationWorker = new NotificationWorker(pool);
   const server = createApiServer({ pool });
   let shuttingDown = false;
@@ -88,6 +91,7 @@ async function main(): Promise<void> {
       console.error(`调度器停止失败：${(error as Error).message}`);
       process.exitCode = 1;
     });
+    await standardBacktests.stop();
     await notificationWorker.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await closePool();
@@ -109,6 +113,7 @@ async function main(): Promise<void> {
     await scheduler.start();
     indicatorWorker.start();
     notificationWorker.start();
+    standardBacktests.start();
     console.log("作业调度器已启动：30 秒 tick，时区 Asia/Shanghai。");
     console.log("指标工作器已启动。");
     console.log("统一 Agent session 执行器已启用。");

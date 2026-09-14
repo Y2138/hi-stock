@@ -21,6 +21,15 @@ import { queryStrategyScreen } from "../modules/plans/strategy-screen.js";
 import { initializePoolOnboarding } from "../modules/pools/onboarding.js";
 import { runAgentBacktest } from "../backtest/agent-workspace.js";
 import { AGENT_BACKTEST_SDK_VERSION } from "../backtest/agent-contract.js";
+import {
+  PreflightBacktestSchema, StartStandardBacktestSchema, GetBacktestStatusSchema, CancelBacktestSchema,
+  validateRuntimeInput,
+} from "../backtest/runtime-contract.js";
+import type { Static } from "@earendil-works/pi-ai";
+import { preflightStandardBacktest } from "../modules/backtests/service.js";
+import {
+  startStandardBacktest, getStandardBacktestStatus, cancelStandardBacktest, isStandardBacktestEnabled,
+} from "../modules/backtests/runtime.js";
 import type { AgentBacktestRunSummary } from "../backtest/agent-contract.js";
 import { getVersionedBacktestSource } from "../modules/backtests/repo.js";
 import { apiErrors } from "../http/router.js";
@@ -285,12 +294,16 @@ const JOB_FLOW_ONLY_TOOLS = new Set([
   "auction_assessment_write",
 ]);
 
+const STANDARD_BACKTEST_TOOLS = new Set([
+  "preflight_backtest", "start_standard_backtest", "get_backtest_status", "cancel_backtest",
+]);
+
 function toolsForScope(tools: AgentTool[], scope: ToolScope): AgentTool[] {
   if (scope.kind === "job") {
     const bundle = Object.hasOwn(JOB_FLOW_TOOL_BUNDLES, scope.jobCode) ? JOB_FLOW_TOOL_BUNDLES[scope.jobCode] : undefined;
     if (!bundle) {
       console.warn(`agent_flow 任务 ${scope.jobCode} 未定义工具子集，回退交互工具目录`);
-      return tools.filter((tool) => !JOB_FLOW_ONLY_TOOLS.has(tool.name));
+      return tools.filter((tool) => !JOB_FLOW_ONLY_TOOLS.has(tool.name) && !STANDARD_BACKTEST_TOOLS.has(tool.name));
     }
     const allowed = new Set([...bundle, "web_search", "web_fetch"]);
     const filtered = tools.filter((tool) => allowed.has(tool.name));
@@ -306,6 +319,9 @@ function toolsForScope(tools: AgentTool[], scope: ToolScope): AgentTool[] {
 /** 构建绑定到会话的工具集：渐进式只读 + 领域写入 + 受控系统动作；按会话范围裁剪任务流程工具。 */
 export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "chat" }): AgentTool[] {
   const { pool } = deps;
+  const standardAvailability = isStandardBacktestEnabled()
+    ? "标准回测当前已启用（STANDARD_BACKTEST_ENABLED=true）"
+    : "标准回测当前未启用（STANDARD_BACKTEST_ENABLED 默认 false），start 服务会拒绝发起";
   const fetchMarket =
     deps.fetchMarket ??
     ((request, name) => fetchAndStore(pool, request, { instrumentName: name }));
@@ -695,10 +711,75 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
       }),
     },
     {
+      name: "preflight_backtest",
+      label: `标准回测预检${isStandardBacktestEnabled() ? "" : "（未启用）"}`,
+      description: `${standardAvailability}。只读检查注册规则计划和 PostgreSQL 输入覆盖，不抓取或补造数据；返回计划、哈希、覆盖摘要和缺口，不返回逐块清单。executable 仅表示数据与计划可执行，不代表开关已开启。证据始终 research_only，不能冒充 qualified；用户未明确要求运行时不得自动发起回测。`,
+      parameters: PreflightBacktestSchema,
+      execute: guard<Static<typeof PreflightBacktestSchema>>(deps, "preflight_backtest",
+        input => validateRuntimeInput("preflight_backtest", PreflightBacktestSchema, input), async (params, context) => {
+          const report = await preflightStandardBacktest(pool, params.plan, context.signal);
+          const { seed_start, start, end, row_count, day_count } = report.manifest;
+          return withAudit(deps, "preflight_backtest", params, "ok", textResult({
+            enabled: isStandardBacktestEnabled(),
+            executable: report.executable,
+            plan: report.plan,
+            plan_hash: report.plan_hash,
+            input_hash: report.input_hash,
+            evidence_status: report.evidence_status,
+            coverage: { seed_start, start, end, row_count, day_count },
+            data_gaps: report.manifest.gaps,
+          }));
+        }),
+    },
+    {
+      name: "start_standard_backtest",
+      label: `发起标准回测${isStandardBacktestEnabled() ? "" : "（未启用）"}`,
+      description: `${standardAvailability}。仅在用户明确要求运行后，提交 preflight_backtest 返回的原计划、plan_hash、input_hash 和幂等键；预检过期必须重新预检。受控系统动作经领域 service 排队后立即返回，不等待长任务；使用返回 id 查询状态，不重复发起。只支持注册规则，不接受源码；研究证据仍为 research_only，完成不代表 qualified 或正式验证。独立于旧 AGENT_BACKTEST_WORKER_ENABLED。`,
+      parameters: StartStandardBacktestSchema,
+      executionMode: "sequential",
+      execute: guard<Static<typeof StartStandardBacktestSchema>>(deps, "start_standard_backtest",
+        input => validateRuntimeInput("start_standard_backtest", StartStandardBacktestSchema, input), async (params) => {
+          if (!deps.sessionId) throw new Error("标准回测只能由有持久化 session 的 Agent 发起");
+          const sessionId = deps.sessionId;
+          const run = await withAgentMutationLock(pool, () => startStandardBacktest(pool, sessionId, params));
+          const result = await withAudit(deps, "start_standard_backtest", params, "ok", textResult(run));
+          await publishRefresh(deps, ["backtests"], `标准回测 #${run.id} 状态已更新`);
+          return result;
+        }),
+    },
+    {
+      name: "get_backtest_status",
+      label: "查询标准回测状态",
+      description: `${standardAvailability}。按 run_id 只读查询本机标准回测的进度、阶段、终态、研究指标与缺口；不推进或重新运行任务。发起后无需在同一 Agent 循环频繁轮询，按用户需要查询；evidence_status=research_only 不得解释为 qualified。`,
+      parameters: GetBacktestStatusSchema,
+      execute: guard<Static<typeof GetBacktestStatusSchema>>(deps, "get_backtest_status",
+        input => validateRuntimeInput("get_backtest_status", GetBacktestStatusSchema, input), async (params) => {
+          const run = await getStandardBacktestStatus(pool, params.run_id);
+          if (!run) throw apiErrors.notFound(`标准回测 #${params.run_id} 不存在`);
+          return withAudit(deps, "get_backtest_status", params, "ok", textResult(run));
+        }),
+    },
+    {
+      name: "cancel_backtest",
+      label: "取消标准回测",
+      description: `${standardAvailability}。仅按用户明确要求取消本机标准回测，须提供 run_id 与原因；允许从另一交互会话取消，服务审计记录来源会话。不删除历史、输入或账本，实际取消进度与终态以返回状态为准，不频繁轮询。`,
+      parameters: CancelBacktestSchema,
+      executionMode: "sequential",
+      execute: guard<Static<typeof CancelBacktestSchema>>(deps, "cancel_backtest",
+        input => validateRuntimeInput("cancel_backtest", CancelBacktestSchema, input), async (params) => {
+          if (!deps.sessionId) throw new Error("取消标准回测需要有持久化 session 的 Agent");
+          const sessionId = deps.sessionId;
+          const run = await withAgentMutationLock(pool, () => cancelStandardBacktest(pool, params.run_id, params.reason, sessionId));
+          const result = await withAudit(deps, "cancel_backtest", params, "ok", textResult(run));
+          await publishRefresh(deps, ["backtests"], `标准回测 #${run.id} 取消状态已更新`);
+          return result;
+        }),
+    },
+    {
       name: "run_backtest",
       label: "编写并运行回测",
       description:
-        "在隔离的临时 TypeScript 工作区验证一个策略思路，最多读取500000行日线和500000行涨停/跌停/炸板事件。codes 可显式指定；limit_up_universe=mainboard/all 时可留空并由区间涨停事件自动解析候选，market_event_types 选择额外注入的事件类型，自动候选模式始终注入 up。日线只读 PostgreSQL market_bar，不在回测中远程拉取；缺日线时运行标为 partial，应先用 fetch_market_data 批量补齐。source_code 必须 default export async function run(sdk)，只能使用注入 sdk：sdk.codes、start、end、initialCash、parameters、bars(code)、events(type?)、eventsOn(date,type?)、stats.mean/stdev。返回 {daily_returns, metrics, conclusion, data_gaps}：daily_returns 必须有 1–50000 个唯一日期项 {date:'YYYY-MM-DD',return}；metrics 必须是最多100项的扁平对象，键匹配 ^[a-z][a-z0-9_]{0,62}$，值只能是有限数值或 null，结构化详情写入 conclusion；conclusion 为1–16000字符非空文本；data_gaps 为最多200项的数组。系统在无网络、无数据库凭据、只读根文件系统和资源限制的独立 Node 容器运行；临时目录结束后立即删除，成功源码只暂存到最终化或超期，最终化后固化为可复用版本。失败会返回安全错误码、执行阶段和可用源码位置：STRATEGY_* 或回测结果契约错误应修正源码后最多自动重试一次，同一错误重复时停止；只有 WORKER_*、CONTAINER_* 或 INPUT_LIMIT 才表示容量或环境问题。可用 comparison_run_ids 关联历史证据，基于固化源码改造时必须填写 base_source_run_id。",
+        "仅在用户明确要求时，在隔离的临时 TypeScript 工作区研究一个策略思路；源码执行成功或最终化不代表自动正式验证，不能冒充 qualified 证据。最多读取500000行日线和500000行涨停/跌停/炸板事件。codes 可显式指定；limit_up_universe=mainboard/all 时可留空并由区间涨停事件自动解析候选，market_event_types 选择额外注入的事件类型，自动候选模式始终注入 up。日线只读 PostgreSQL market_bar，不在回测中远程拉取；缺日线时运行标为 partial，应先用 fetch_market_data 批量补齐。source_code 必须 default export async function run(sdk)，只能使用注入 sdk：sdk.codes、start、end、initialCash、parameters、bars(code)、events(type?)、eventsOn(date,type?)、stats.mean/stdev。返回 {daily_returns, metrics, conclusion, data_gaps}：daily_returns 必须有 1–50000 个唯一日期项 {date:'YYYY-MM-DD',return}；metrics 必须是最多100项的扁平对象，键匹配 ^[a-z][a-z0-9_]{0,62}$，值只能是有限数值或 null，结构化详情写入 conclusion；conclusion 为1–16000字符非空文本；data_gaps 为最多200项的数组。系统在无网络、无数据库凭据、只读根文件系统和资源限制的独立 Node 容器运行；临时目录结束后立即删除，成功源码只暂存到最终化或超期，最终化后固化为可复用版本。失败会返回安全错误码、执行阶段和可用源码位置：STRATEGY_* 或回测结果契约错误应修正源码后最多自动重试一次，同一错误重复时停止；只有 WORKER_*、CONTAINER_* 或 INPUT_LIMIT 才表示容量或环境问题。可用 comparison_run_ids 关联历史证据，基于固化源码改造时必须填写 base_source_run_id。",
       parameters: RunBacktestSchema,
       executionMode: "sequential",
       execute: guard<RunBacktestInput>(deps, "run_backtest", validateRunBacktestInput, async (params, context) => {

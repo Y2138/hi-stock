@@ -67,7 +67,120 @@ export interface StrategyProposal {
 
 // ---- Agent 自驱回测（历史一期记录只读兼容） ----
 
+// 浏览器端契约镜像：server/backtest/contracts.ts、runtime-contract.ts；不导入 Node 运行时代码。
+export type StandardExecutionStatus = "queued" | "preparing" | "running" | "success" | "failed" | "cancelled" | "rejected";
+export interface StandardStrategyPlan {
+  rule: "right_side_daily_v1" | "left_reversal_daily_v1" | "trial_start_daily_v1" | "swing_box_daily_v1";
+  codes: string[];
+  allocation_pct: number;
+  max_positions: number;
+  daily_buy_limit: number;
+  position_fraction: number;
+  stop_loss_pct?: number;
+  max_holding_days?: number;
+  defense_recovery_ma10?: number;
+}
+export interface StandardBacktestPlan {
+  benchmark_code?: string;
+  name: string;
+  hypothesis: string;
+  codes: string[];
+  start: string;
+  end: string;
+  rule: "right_side_daily_v1" | "left_reversal_daily_v1" | "trial_start_daily_v1" | "swing_box_daily_v1" | "portfolio_daily_v1";
+  strategies?: StandardStrategyPlan[];
+  defense_recovery_ma10?: number;
+  environment_mode: "none" | "current_881";
+  price_mode: "raw_research" | "forward_research";
+  initial_cash: number;
+  max_positions: number;
+  daily_buy_limit: number;
+  position_fraction: number;
+  stop_loss_pct: number;
+  max_holding_days: number;
+  drawdown_circuit: boolean;
+  stop_streak_circuit: boolean;
+  costs: {
+    label: string;
+    commission_bps: number;
+    minimum_commission: number;
+    sell_tax_bps: number;
+    slippage_bps: number;
+    volume_participation: number;
+  };
+}
+export interface BacktestGap {
+  code: "DATA_MISSING" | "POINT_IN_TIME_UNVERIFIED" | "RULE_UNSUPPORTED" | "CAPACITY_EXCEEDED" | "DATA_INVALID";
+  domain: string;
+  severity: "error" | "warning";
+  message: string;
+  instrument?: string;
+  date?: string;
+}
+export interface StandardComparison {
+  run_id: string;
+  comparable: boolean;
+  reasons: string[];
+  parameter_differences: string[];
+}
+export interface StandardRunStatus {
+  id: string;
+  name: string;
+  engine_type: "standard_daily";
+  execution_status: StandardExecutionStatus;
+  phase: string;
+  progress: number;
+  quality_status: string;
+  evidence_status: "research_only";
+  replay_status: string;
+  plan_sha256: string;
+  input_sha256: string | null;
+  execution_plan: StandardBacktestPlan;
+  metrics_json: Record<string, number | null> | null;
+  data_gaps: BacktestGap[];
+  error_message: string | null;
+  session_id: string;
+  started_at: string | null;
+  finished_at: string | null;
+  cancel_requested_at: string | null;
+  comparisons: StandardComparison[];
+  enabled: boolean;
+}
+export interface StandardEvent {
+  seq: number;
+  date: string;
+  type: "signal" | "suppressed" | "order" | "rejected" | "expired" | "fill" | "closed" | "risk_trigger" | "risk_recover";
+  code: string | null;
+  reason: string;
+  details: Record<string, string | number | boolean | null>;
+}
+export interface StandardEquity {
+  benchmark_close?: number;
+  date: string;
+  cash_cents: number;
+  market_value_cents: number;
+  equity_cents: number;
+  fees_cents: number;
+  daily_return: number;
+  drawdown: number;
+  paused: boolean;
+  positions: Array<{ code: string; quantity: number; cost_cents: number; close: number }>;
+  benchmark_equity_cents?: number;
+  benchmark_return?: number;
+}
+export interface StandardPage<T> { items: T[]; next_cursor: string | null }
+
 export interface BacktestRun {
+  engine_type?: "legacy" | "standard_daily";
+  execution_plan?: StandardBacktestPlan | null;
+  quality_status?: string;
+  evidence_status?: "legacy_unverified" | "research_only" | "qualified";
+  replay_status?: string;
+  phase?: string;
+  input_set_id?: string | null;
+  plan_sha256?: string | null;
+  input_sha256?: string | null;
+  output_sha256?: string | null;
   id: string;
   name: string;
   kind: string;
@@ -87,7 +200,7 @@ export interface BacktestRun {
   metrics_json: Record<string, unknown> | null;
   conclusion_md: string | null;
   data_gaps: unknown[];
-  execution_status: "legacy" | "queued" | "running" | "success" | "partial" | "failed";
+  execution_status: "legacy" | "partial" | StandardExecutionStatus;
   progress: number;
   error_message: string | null;
   execution_origin: "legacy" | "service" | "agent_workspace";

@@ -18,6 +18,10 @@ export interface BacktestRunRow {
   report_path: string | null;
   status: string;
   execution_status: string;
+  engine_type: string;
+  evidence_status: string;
+  quality_status: string;
+  output_sha256: string | null;
   started_at: string | null;
   finished_at: string | null;
   metrics: unknown;
@@ -122,15 +126,23 @@ export async function cleanupStaleBacktestSourceCandidates(db: Db, ttlHours = 24
   return result.rowCount ?? 0;
 }
 
+function publicBacktestRun(row: BacktestRunRow): BacktestRunRow {
+  const { lease_token: _leaseToken, ...safe } = row as BacktestRunRow & { lease_token?: unknown };
+  return safe;
+}
+
 /** 用户历史只展示每个研究过程晋升后的当前最终结论。 */
-export async function listBacktestRuns(db: Db): Promise<BacktestRunListItem[]> {
+export async function listBacktestRuns(db: Db, options: {scope?: "final" | "working" | "all"; limit?: number; before?: string} = {}): Promise<BacktestRunListItem[]> {
+  const scope = options.scope ?? "final";
   const r = await db.query<BacktestRunRow>(
     `SELECT ${RUN_SELECT} FROM backtest_run r
-      WHERE r.conclusion_status = 'final'
-      ORDER BY (r.kind = 'formal' AND r.status = 'active') DESC, r.finalized_at DESC, r.id DESC`,
+      WHERE ($1='all' OR ($1='final' AND r.conclusion_status='final') OR ($1='working' AND r.conclusion_status='working'))
+        AND ($2::bigint IS NULL OR r.id<$2::bigint)
+      ORDER BY ${options.scope ? "r.id DESC" : "(r.kind = 'formal' AND r.status = 'active') DESC, r.finalized_at DESC, r.id DESC"} LIMIT $3`,
+    [scope,options.before??null,options.limit??100],
   );
   return r.rows.map((row) => ({
-    ...row,
+    ...publicBacktestRun(row),
     is_active_anchor: row.kind === "formal" && row.status === "active",
   }));
 }
@@ -141,7 +153,7 @@ export async function getBacktestRunDetail(
   id: string,
 ): Promise<(BacktestRunListItem & { comparisons: BacktestComparison[] }) | null> {
   const r = await db.query<BacktestRunRow>(
-    `SELECT ${RUN_SELECT} FROM backtest_run r WHERE r.id = $1 AND r.conclusion_status = 'final'`,
+    `SELECT ${RUN_SELECT} FROM backtest_run r WHERE r.id = $1 AND (r.conclusion_status = 'final' OR r.engine_type='standard_daily')`,
     [id],
   );
   const run = r.rows[0];
@@ -158,7 +170,7 @@ export async function getBacktestRunDetail(
     [id],
   );
   return {
-    ...run,
+    ...publicBacktestRun(run),
     is_active_anchor: run.kind === "formal" && run.status === "active",
     comparisons: comparisons.rows,
   };
@@ -186,6 +198,9 @@ export async function finalizeBacktest(
     if (!run) throw apiErrors.badRequest("只能确认当前 Agent 会话中的回测运行");
     if (!['success','partial'].includes(run.execution_status)) {
       throw apiErrors.badRequest("只有已完成的 success/partial 回测可以晋升为最终结论");
+    }
+    if (run.engine_type === "standard_daily" && (run.execution_status !== "success" || run.quality_status !== "complete" || !run.output_sha256)) {
+      throw apiErrors.badRequest("标准回测必须完成账本核验后才能固化研究结论");
     }
     await client.query(
       `UPDATE backtest_run_source

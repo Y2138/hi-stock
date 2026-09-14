@@ -21,6 +21,10 @@ const READABLE_TABLES = [
   "agent_memory_artifact",
   "backtest_run",
   "backtest_run_comparison",
+  "backtest_event",
+  "backtest_equity_daily",
+  "backtest_input_set",
+  "backtest_input_chunk",
   "daily_plan_auction_assessment",
   "daily_plan_playbook",
   "fundamental_snapshot",
@@ -51,7 +55,9 @@ const READABLE_TABLES = [
 
 const SENSITIVE_COLUMNS = new Map<string, Set<string>>([
   ["agent_memory_artifact", new Set(["content"])],
-  ["backtest_run", new Set(["engine_path", "output_dir", "report_path", "config_snapshot", "request_json"])],
+  ["backtest_input_chunk", new Set(["payload"])],
+  ["backtest_input_set", new Set(["manifest"])],
+  ["backtest_run", new Set(["engine_path", "output_dir", "report_path", "config_snapshot", "request_json", "lease_token"])],
   ["fundamental_snapshot", new Set(["raw_summary"])],
   ["job_run", new Set(["log", "artifacts", "result_md"])],
   ["job_run_output", new Set(["markdown"])],
@@ -157,13 +163,33 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   backtest_run: {
     domain: "回测",
     description: "Agent 自驱回测的研究大纲、假设、策略快照、源码继承关系、输入摘要、指标、结论、缺口与终态。",
-    write_policy: "只允许 run_backtest 在隔离临时工作区创建运行；历史记录只读。",
+    write_policy: "只允许 run_backtest 或 start_standard_backtest 经领域 service 创建运行，cancel_backtest 请求取消；Agent 只读历史与状态。",
     constraints: ["代码正文只进入 backtest_run_source；不保存补丁、stdout/stderr、中间文件或临时路径。"],
   },
   backtest_run_comparison: {
     domain: "回测",
     description: "本次 Agent 回测与历史回测之间的对比关系。",
-    write_policy: "只允许 run_backtest 随新运行创建；Agent 和页面只读。",
+    write_policy: "只允许回测领域 service 随新运行创建；Agent 和页面只读。",
+  },
+  backtest_event: {
+    domain: "回测",
+    description: "标准回测的研究事件与交易账本；不是本机真实成交或合格发布证据。",
+    write_policy: "仅由标准回测领域 service 与工作器写入；Agent 只读。",
+  },
+  backtest_equity_daily: {
+    domain: "回测",
+    description: "标准回测每日权益结算与研究统计。",
+    write_policy: "仅由标准回测领域 service 与工作器写入；Agent 只读。",
+  },
+  backtest_input_set: {
+    domain: "回测",
+    description: "不可变冻结输入集的哈希、容量与时间元数据；逐块清单不向通用工具开放。",
+    write_policy: "仅由标准回测领域 service 冻结；Agent 只读元数据，不得更新或删除。",
+  },
+  backtest_input_chunk: {
+    domain: "回测",
+    description: "冻结输入块的日期、顺序、哈希与行数元数据；隐藏压缩二进制 payload。",
+    write_policy: "仅由标准回测领域 service 冻结；Agent 只读元数据，不得读取 payload 或更新输入块。",
   },
   backtest_run_source: {
     domain: "回测",

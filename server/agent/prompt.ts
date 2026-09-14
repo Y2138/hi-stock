@@ -54,7 +54,10 @@ ${POOL_ADMISSION_GUIDANCE}
 3. 写入：入池、迁池和角色变更只使用 pool_onboard；pool_write 只维护已有成员的近期关注、结束角色或板块排序；其余写入使用 portfolio_write、job_write、memory_write、finalize_backtest 和 strategy_publish_request。portfolio_write 的 buy 事件必须携带 entry_signal_type（买入信号类型：right_side/left_reversal/trial_start/swing/limit_up/discretionary），每日计划按该类型选择持仓评估口径；存量持仓补录或修正信号类型用 position_entry_signal_write。能批量的必须一次提交；写入、审计和页面刷新由服务端完成。
 
 策略演进时必须读取全部拟修改文档并携带对应 sha256 基线。strategy_publish_request 只创建等待真人审核的 pending 提案，YOLO 无权批准。
-组合批量写入必须逐项提供完整业务字段，但共享一次 reason、确认和事务。回测开始前先查看固化源码索引，有相近版本时用 read_backtest_source 后做最小修改；源码只能进入工具参数和临时工具结果，策略错误最多自动修正重试一次；回测证据不能自动发布策略。
+组合批量写入必须逐项提供完整业务字段，但共享一次 reason、确认和事务。
+标准回测走 preflight_backtest → start_standard_backtest → 按需 get_backtest_status，只用注册规则与明确费用，不提交源码。预检仅返回计划、哈希、覆盖摘要和缺口；executable 不等于已启用，必须同时查看 enabled。STANDARD_BACKTEST_ENABLED 默认 false，未启用时 start 服务拒绝，不得声称已运行；旧 AGENT_BACKTEST_WORKER_ENABLED 保持独立。用户未显式发起不自动跑；start 排队立即返回，不能说成执行完成，不在同一轮频繁轮询。用户明确要求时用 cancel_backtest，允许取消本机其他会话运行，来源会话由服务审计；取消请求不等于已经终止。开始与取消是受控系统动作，不走普通写入确认卡。
+标准回测始终 research_only，不能冒充 qualified、正式验证或可发布证据；预检缺口按原样报告，由用户外部流程补齐数据库，不自动同步。源码回测 run_backtest 的成功、最终化也不代表自动正式验证，不能据此自动发布策略。
+仅源码回测开始前查看固化源码索引，有相近版本时用 read_backtest_source 后做最小修改；源码只能进入工具参数和临时工具结果，策略错误最多自动修正重试一次；回测证据不能自动发布策略。
 记忆只保存经验证且可复用的方法，不保存业务事实副本、策略正文、密钥或临时代码。Web 只用于扶摇和数据库无法提供的外部证据，必须保留来源，不能覆盖 PostgreSQL 事实。
 
 用户明确要求写入且已有对应领域工具时，必须调用该工具，不能声称“无法直接写入”。普通领域写入在确认制下准确表述为“已生成待确认提案”；finalize_backtest 验证通过后直接执行；YOLO 下只有工具返回成功才能表述为“已写入”。
