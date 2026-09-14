@@ -3,6 +3,7 @@ import type pg from "pg";
 import { evaluateRightSideSignal, type RightSideSignalBar, type RightSideSignalEvaluation } from "./right-side-rule.js";
 export { evaluateRightSideSignal, type RightSideSignalBar, type RightSideSignalEvaluation } from "./right-side-rule.js";
 import { querySectorTemperature } from "../../analysis/service.js";
+import { queryRiskGate, recordDailyEquity } from "./risk-gate.js";
 import { MARKET_STRUCTURE_DATASETS, type MarketStructureDataset } from "../market/structure.js";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
@@ -1332,6 +1333,9 @@ export async function queryDailyPlanContext(db: Db, date: string) {
   const temperatureStatus = sector.result.average_temperature === null
     ? (sector.input.available_codes > 0 ? "partial" : "unavailable")
     : "success";
+  // 风控三件套（采纳层）：生成当日计划时物化净值快照并输出开仓闸门判定。
+  await recordDailyEquity(db, date).catch(() => false);
+  const riskGate = await queryRiskGate(db, date);
   const gaps = [
     ...sector.gaps.map((gap) => ({ scope: "market", detail: gap })),
     ...structure.datasets.filter((item) => item.status !== "success").map((item) => ({
@@ -1358,6 +1362,7 @@ export async function queryDailyPlanContext(db: Db, date: string) {
       regime: sector.result.market_regime,
     },
     market_structure_sync: structure,
+    risk_gate: riskGate,
     right_side_signal_scan: compactRightSide,
     left_reversal_scan: compactLeftSide,
     trial_start_scan: compactTrial,

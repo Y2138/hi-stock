@@ -176,7 +176,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const manifest = await readPortableManifest(exported.payloadPath);
     expect(manifest.version).toBe(5);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(95);
+    expect(manifest.migration_max).toBe(96);
     expect(manifest.tables.strategy_document).toBeGreaterThan(0);
     expect(manifest.tables.strategy_document_revision).toBeUndefined();
     expect(manifest.tables.strategy_score_benchmark).toBe(1);

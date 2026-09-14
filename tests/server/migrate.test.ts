@@ -90,6 +90,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "pool_membership",
       "portfolio_account_snapshot",
       "portfolio_account_state",
+      "portfolio_equity_daily",
       "portfolio_position",
       "portfolio_position_change",
       "portfolio_position_snapshot_daily",
