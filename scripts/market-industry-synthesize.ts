@@ -150,7 +150,9 @@ async function main(): Promise<void> {
       const code = board.board_code;
       const rows = byBoard.get(code) ?? [];
       if (!rows.length) continue;
-      const firstDate = rows[0]!.bar_date;
+      // 序列统一从全局日历首日开始：首个有效聚合日之前按零收益补平线，
+      // 保证每个板块在完整日历上逐日有行（回测环境输入对板块缺行零容忍）。
+      const firstDate = calendar[0]!;
       const rets = new Map(rows.map(row => [row.bar_date, row]));
       const bars: SyntheticBar[] = [];
       let index = 1000;

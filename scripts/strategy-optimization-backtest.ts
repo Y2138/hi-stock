@@ -50,6 +50,10 @@ const WINDOWS = {
    *  熔断与行业闸门不可用，回撤控制由 drawdown_scale_max（连续缩仓，无环境依赖）承担。 */
   longTrain: { start: "2016-10-10", end: "2021-12-31", sampleStart: "2016-10-10", env: "none" },
   longTest: { start: "2022-01-04", end: "2026-08-31", sampleStart: "2016-10-10", env: "none" },
+  /** 周期股长窗（第十轮追加）：2017 起覆盖 2018 熊、2019-20 成长牛（周期弱）、2021 周期大年、2022 熊；
+   *  2017-2021 无真实 881，统一用合成行业环境（与 2023-2026 同一口径跑完全程）。 */
+  longEarly: { start: "2017-01-03", end: "2022-12-30", env: "synthetic_881" },
+  longFull: { start: "2017-01-03", end: "2026-08-31", env: "synthetic_881" },
 } as const;
 type WindowName = keyof typeof WINDOWS;
 
@@ -432,22 +436,34 @@ const CYCLICAL_BOARDS = ["881105.TI", "881107.TI", "881108.TI", "881112.TI", "88
   "881148.TI", "881168.TI", "881169.TI", "881170.TI", "881180.TI", "881264.TI", "881267.TI"];
 /** 周期行业分组（行业动量闸门的计划载荷：board → 成员代码），由 selectByCharacter 动态填充。 */
 const CYCLICAL_GROUPS: Array<{ board: string; codes: string[] }> = CYCLICAL_BOARDS.map(board => ({ board, codes: [] }));
-async function selectByCharacter(kind: "hype" | "cyclical" | "calm"): Promise<string[]> {
+/** since 传入时启用长窗口径：上市须覆盖 since（首根 ≤ since）、坏行筛查扩到六年种子期。 */
+async function selectByCharacter(kind: "hype" | "cyclical" | "calm", since?: string): Promise<string[]> {
   const pool = getPool(loadConfig().databaseUrl);
   if (kind === "cyclical") {
+    const screenStart = since ? standardSeed(since) : "2017-01-03";
+    const spanJoin = since
+      ? `JOIN span s ON s.code = i.code AND s.first_day <= $5::date`
+      : "";
+    const spanCte = since
+      ? `, span AS (SELECT i.code, min(b.bar_date) AS first_day FROM market_bar b JOIN market_instrument i ON i.id=b.instrument_id
+          WHERE i.kind='stock' AND b.freq='day' AND i.code ~ '^\\d{6}\\.(SH|SZ)$' GROUP BY i.code)`
+      : "";
     const { rows } = await pool.query<{ code: string; board: string }>(
       `WITH boards AS (SELECT i.id, i.code AS board_code FROM market_instrument i WHERE i.code = ANY($1::text[])),
          bad AS (SELECT i.code FROM market_bar b JOIN market_instrument i ON i.id=b.instrument_id
-                 WHERE i.kind='stock' AND b.freq='day' AND b.bar_date BETWEEN '2017-01-03' AND '2026-08-31'
+                 WHERE i.kind='stock' AND b.freq='day' AND b.bar_date BETWEEN $4 AND '2026-08-31'
                    AND (b.low IS NULL OR b.low <= 0 OR b.low > LEAST(b.open, b.close) OR b.high < GREATEST(b.open, b.close))
-                 GROUP BY i.code),
+                 GROUP BY i.code)${spanCte},
          px AS (SELECT i.code, count(*)::int AS n FROM market_bar b JOIN market_instrument i ON i.id=b.instrument_id
                 WHERE i.kind='stock' AND b.freq='day' AND b.bar_date BETWEEN $2 AND $3 AND b.volume > 0 AND b.close > 0 GROUP BY i.code)
        SELECT DISTINCT i.code AS code, bd.board_code AS board FROM market_board_membership m
        JOIN boards bd ON bd.id = m.board_instrument_id
        JOIN market_instrument i ON i.id = m.member_instrument_id
-       JOIN px ON px.code = i.code
-       WHERE m.effective_to IS NULL AND px.n >= 200 AND i.code NOT IN (SELECT code FROM bad) AND i.code ~ '^\\d{6}\\.(SH|SZ)$' ORDER BY i.code`, [CYCLICAL_BOARDS, CHARACTER_WINDOW.start, CHARACTER_WINDOW.end]);
+       JOIN px ON px.code = i.code${spanJoin ? " " + spanJoin.trim() : ""}
+       WHERE m.effective_to IS NULL AND px.n >= 200 AND i.code NOT IN (SELECT code FROM bad) AND i.code ~ '^\\d{6}\\.(SH|SZ)$' ORDER BY i.code`,
+      since
+        ? [CYCLICAL_BOARDS, CHARACTER_WINDOW.start, CHARACTER_WINDOW.end, screenStart, since]
+        : [CYCLICAL_BOARDS, CHARACTER_WINDOW.start, CHARACTER_WINDOW.end, screenStart]);
     if (rows.length < 50) throw new Error(`周期行业分层过小：${rows.length}`);
     const excludedC = (await smallExclusion) ?? new Set<string>();
     const codes = applyExclusion(rows.map(row => row.code), excludedC);
@@ -556,6 +572,9 @@ function cyclicalSignalExperiments(): Experiment[] {
     { name: "信号_去MACD加速", question: "屏蔽 macd_accelerating：加速条件贡献", overrides: { ...base, ...disable("macd_accelerating") } },
     { name: "信号_MACD加速_0.05bp", question: "阈值敏感性：MACD增量门槛 0.1%→0.05%", overrides: { ...base, right_side_params: { macd_delta_min: 0.0005 } } },
     { name: "信号_MACD加速_0.2bp", question: "阈值敏感性：0.1%→0.2%", overrides: { ...base, right_side_params: { macd_delta_min: 0.002 } } },
+    { name: "信号_MACD加速_0.03bp", question: "剂量响应：0.05%→0.03%（更松）", overrides: { ...base, right_side_params: { macd_delta_min: 0.0003 } } },
+    { name: "信号_MACD加速_0.07bp", question: "剂量响应：0.05%与0.1%之间的0.07%", overrides: { ...base, right_side_params: { macd_delta_min: 0.0007 } } },
+    { name: "信号_MACD加速_0.15bp", question: "剂量响应：0.1%与0.2%之间的0.15%", overrides: { ...base, right_side_params: { macd_delta_min: 0.0015 } } },
     { name: "信号_量比_1.0", question: "阈值敏感性：放量门槛 1.2→1.0 倍", overrides: { ...base, right_side_params: { volume_ratio_min: 1.0 } } },
     { name: "信号_量比_1.5", question: "阈值敏感性：1.2→1.5 倍", overrides: { ...base, right_side_params: { volume_ratio_min: 1.5 } } },
     { name: "信号_阳线_0.5", question: "阈值敏感性：阳线实体 1%→0.5%", overrides: { ...base, right_side_params: { body_min_pct: 0.005 } } },
@@ -792,9 +811,13 @@ if (regimeMode) {
   if (strataArg) {
     const names = strataArg.split(",").map(name => name.trim());
     for (const name of names) {
-      const codes = await selectByCharacter(name as "hype" | "cyclical" | "calm");
+      const outerCodes = await selectByCharacter(name as "hype" | "cyclical" | "calm");
       const label = name === "hype" ? "炒作型" : name === "cyclical" ? "周期行业" : `未知分层(${name})`;
       if (name === "cyclical" && signalsMode) {
+        const longWindow = window.startsWith("long");
+        const codes = longWindow
+          ? await selectByCharacter("cyclical", WINDOWS[window].start)
+          : outerCodes;
         const spec: WindowSpec = { ...windowSpec(window), warmup: 130 };
         const experiments = cyclicalSignalExperiments().map(exp => ({
           ...exp,
@@ -807,10 +830,10 @@ if (regimeMode) {
       if (name === "cyclical" && (closeMode || ablateBoards.length)) {
         // 收口/消融：剔除指定板块的股票与分组，环境预热加长覆盖绝对动量窗口。
         const ablated = new Set(ablateBoards);
-        const keptCodes = ablated.size ? codes.filter(code => {
+        const keptCodes = ablated.size ? outerCodes.filter((code: string) => {
           const group = CYCLICAL_GROUPS.find(g => g.codes.includes(code));
           return !group || !ablated.has(group.board);
-        }) : codes;
+        }) : outerCodes;
         const keptGroups = CYCLICAL_GROUPS.filter(g => !ablated.has(g.board) && g.codes.length > 0);
         const removed = CYCLICAL_GROUPS.filter(g => ablated.has(g.board));
         for (const group of keptGroups) group.codes = group.codes.filter(code => keptCodes.includes(code));
@@ -825,10 +848,10 @@ if (regimeMode) {
           `周期行业 ${keptGroups.length}/13 类成分 ${keptCodes.length} 只${ablated.size ? `；已剔除 ${removed.map(g => g.board).join("、")}` : ""}${excludeSmall ? "；CH-3 换手代理剔除最小30%" : ""}；环境预热130日（绝对动量120窗口）`);
         continue;
       }
-      const note = name === "hype" ? `2021-22 涨停次数 Top ${codes.length}（股性=快拉且波动大口径）` :
-        name === "cyclical" ? `当前 881 周期行业 13 类成分 ${codes.length} 只（归属回看近似）` :
-          `2021-22 日均振幅 <3% 的 ${codes.length} 只`;
-      await runBatch(windowSpec(window), codes, stratumExperiments(), `分层-${label}`, note);
+      const note = name === "hype" ? `2021-22 涨停次数 Top ${outerCodes.length}（股性=快拉且波动大口径）` :
+        name === "cyclical" ? `当前 881 周期行业 13 类成分 ${outerCodes.length} 只（归属回看近似）` :
+          `2021-22 日均振幅 <3% 的 ${outerCodes.length} 只`;
+      await runBatch(windowSpec(window), outerCodes, stratumExperiments(), `分层-${label}`, note);
     }
   } else {
     const longWindow = window.startsWith("long");
