@@ -249,7 +249,9 @@ const PositionChangeSchema = strictObject({
   change_date: DateSchema,
   decision_origin: Type.Optional(DecisionOriginSchema),
   execution_compliance: Type.Optional(ExecutionComplianceSchema),
+  strategy_code: Type.Optional(IdentifierSchema),
   entry_signal_type: Type.Optional(EntrySignalTypeSchema),
+  entry_signal_id: Type.Optional(Type.String({ pattern: "^[0-9]+$" })),
   plan_output_id: Type.Optional(Type.String({ pattern: "^[0-9]+$" })),
   attribution_note: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
   deviation_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
@@ -817,11 +819,11 @@ export function validatePortfolioWriteInput(input: unknown): PortfolioWriteInput
       if ((decisionOrigin === "unplanned_exception" || executionCompliance === "deviated") && !change.deviation_reason?.trim()) {
         throw new Error(`${change.code} 计划外例外或执行偏离必须提供 deviation_reason`);
       }
-      if (change.kind === "buy" && !change.entry_signal_type) {
-        throw new Error(`${change.code} buy 必须提供 entry_signal_type（right_side/left_reversal/two_year_reversal/trial_start/swing/limit_up/discretionary）`);
+      if (change.kind === "buy" && !change.strategy_code) {
+        throw new Error(`${change.code} buy 必须提供 strategy_code（持仓管理策略）`);
       }
-      if (change.kind !== "buy" && change.entry_signal_type !== undefined) {
-        throw new Error(`${change.code} entry_signal_type 仅 buy 事件可以填写`);
+      if (change.kind !== "buy" && (change.strategy_code !== undefined || change.entry_signal_type !== undefined || change.entry_signal_id !== undefined)) {
+        throw new Error(`${change.code} strategy_code、entry_signal_type 和 entry_signal_id 仅 buy 事件可以填写`);
       }
       const normalized: PositionChangePortfolioWriteInput = {
         ...change,

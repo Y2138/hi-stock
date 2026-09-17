@@ -12,7 +12,7 @@ import type {
   PositionChange,
   RealizedPnlSummary,
 } from "../api/types";
-import { CHANGE_KIND_LABELS, DECISION_ORIGIN_LABELS, ENTRY_SIGNAL_TYPE_LABELS, EXECUTION_COMPLIANCE_LABELS } from "../api/types";
+import { CHANGE_KIND_LABELS, DECISION_ORIGIN_LABELS, EXECUTION_COMPLIANCE_LABELS } from "../api/types";
 import StateBlock from "../components/StateBlock.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
@@ -179,7 +179,7 @@ function hideAttributionTooltip(event: MouseEvent | FocusEvent): void {
 
 function recordWithAgent(): void {
   askAi(
-    "请帮我记录一笔持仓变化。先询问并核对标的代码、方向、数量、价格、日期、决策来源、执行符合度和关联计划；买入必须确定买入信号类型（右侧主升/左侧反转/试盘启动/波段/打板/自主决策），缺少字段不得猜测。核对完成后使用 portfolio_write 生成结构化确认提案。",
+    "请帮我记录一笔持仓变化。先询问并核对标的代码、方向、数量、价格、日期、决策来源、执行符合度和关联计划；买入必须确定管理策略（波段/两年结构反转/打板/自主决策等），已有持仓只能沿用同一策略加仓，缺少字段不得猜测。核对完成后使用 portfolio_write 生成结构化确认提案。",
     "记录持仓变化",
     { confirmation: "打开 Agent 记录持仓变化？\n\nAgent 会先核对事实和归因，页面不会直接写入持仓。" },
   );
@@ -337,7 +337,7 @@ onMounted(reloadPositionsData);
                 <th>浮动盈亏</th>
                 <th>收益率</th>
                 <th>占比</th>
-                <th>信号口径</th>
+                <th>管理策略</th>
                 <th>本轮持仓归因构成</th>
               </tr>
             </thead>
@@ -375,8 +375,9 @@ onMounted(reloadPositionsData);
                      : `${((p.market_value / totalMarketValue) * 100).toFixed(1)}%` }}
                 </td>
                 <td>
-                  <span v-if="p.entry_signal_type" class="badge accent">{{ ENTRY_SIGNAL_TYPE_LABELS[p.entry_signal_type] ?? p.entry_signal_type }}</span>
-                  <span v-else class="missing">未记录</span>
+                  <span v-if="p.strategy_code" class="badge accent">{{ p.strategy_name ?? p.strategy_code }}</span>
+                  <span v-else class="missing">待归因</span>
+                  <div v-if="p.fallback_strategy_code" class="code-sub">兜底：{{ p.fallback_strategy_name ?? p.fallback_strategy_code }}</div>
                 </td>
                 <td class="attribution-cell">{{ attributionText(p.attribution_breakdown) }}</td>
               </tr>
@@ -423,8 +424,8 @@ onMounted(reloadPositionsData);
                 <td><RouterLink :to="{ path: '/market', query: { code: c.code, view: 'detail' } }">{{ c.name }}</RouterLink> <span class="num code-sub">{{ c.code }}</span></td>
                 <td>
                   <span class="badge" :class="{ accent: c.kind === 'buy', warn: c.kind === 'sell' }">{{ CHANGE_KIND_LABELS[c.kind] ?? c.kind }}</span>
-                  <span v-if="c.kind === 'buy' && c.entry_signal_type" class="badge accent">{{ ENTRY_SIGNAL_TYPE_LABELS[c.entry_signal_type] ?? c.entry_signal_type }}</span>
-                  <span v-else-if="c.kind === 'buy'" class="missing">信号未记录</span>
+                  <span v-if="c.kind === 'buy' && c.strategy_code" class="badge accent">{{ c.strategy_code }}</span>
+                  <span v-else-if="c.kind === 'buy'" class="missing">策略未记录</span>
                 </td>
                 <td class="num">{{ c.quantity === null ? "—" : fmtNum(c.quantity) }}</td>
                 <td class="num">{{ fmtPrice(c.price) ?? "—" }}</td>

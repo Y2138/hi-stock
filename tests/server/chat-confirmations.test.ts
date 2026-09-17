@@ -52,6 +52,7 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
           quantity: 10,
           price: 12.5,
           change_date: "2026-08-17",
+          strategy_code: "discretionary",
           entry_signal_type: "discretionary",
           decision_origin: "strategy_signal",
           execution_compliance: "matched",

@@ -178,7 +178,7 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await recordPositionChange(pool, {
       code: "600487.SH", kind: "buy", quantity: 600, price: 60, change_date: "2026-08-14",
       source: "chat", source_session_id: sessionId, decision_origin: "strategy_signal",
-      execution_compliance: "matched", entry_signal_type: "right_side", attribution_note: "按当日已确认信号记录",
+      execution_compliance: "matched", strategy_code: "swing", entry_signal_type: "swing", attribution_note: "按当日已确认信号记录",
     });
     const partialSell = await recordPositionChange(pool, {
       code: "600487.SH", kind: "sell", quantity: 200, price: 65, change_date: "2026-08-15",
@@ -222,23 +222,23 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await expect(recordPositionChange(pool, {
       code: "000021.SZ", kind: "buy", quantity: 100, price: 40, change_date: "2026-08-14",
       source: "chat", source_session_id: sessionId, decision_origin: "unplanned_exception",
-      execution_compliance: "deviated", entry_signal_type: "discretionary",
+      execution_compliance: "deviated", strategy_code: "discretionary", entry_signal_type: "discretionary",
     })).rejects.toThrow("deviation_reason");
     expect(Number((await pool.query("SELECT count(*) FROM portfolio_position_change WHERE decision_origin = 'unplanned_exception'")).rows[0]!.count)).toBe(0);
   });
 
-  it("买入必须声明信号类型，事件与持仓行同步维护口径，修正走留痕事件", async () => {
+  it("买入必须声明管理策略，跨策略加仓被拒绝，修正走留痕事件", async () => {
     await expect(recordPositionChange(pool, {
       code: "000021.SZ", kind: "buy", quantity: 100, price: 40, change_date: "2026-08-14",
       source: "chat", source_session_id: sessionId, decision_origin: "unplanned_exception",
       execution_compliance: "matched", deviation_reason: "盘中临时决策",
-    })).rejects.toThrow("entry_signal_type");
+    })).rejects.toThrow("strategy_code");
 
     const buy = await recordPositionChange(pool, {
       code: "000021.SZ", kind: "buy", quantity: 100, price: 40, change_date: "2026-08-14",
       source: "chat", source_session_id: sessionId, decision_origin: "unplanned_exception",
       execution_compliance: "matched", deviation_reason: "盘中临时决策",
-      entry_signal_type: "discretionary",
+      strategy_code: "discretionary", entry_signal_type: "discretionary",
     });
     expect(buy.change).toMatchObject({ kind: "buy", entry_signal_type: "discretionary" });
     expect((await pool.query<{ entry_signal_type: string | null }>(
@@ -246,16 +246,16 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
       [buy.change.instrument_id],
     )).rows[0]).toEqual({ entry_signal_type: "discretionary" });
 
-    // 加仓携带新类型时，当前管理口径切换为最近一笔买入的类型。
-    await recordPositionChange(pool, {
+    // 同一持仓禁止跨策略加仓，原管理策略保持不变。
+    await expect(recordPositionChange(pool, {
       code: "000021.SZ", kind: "buy", quantity: 100, price: 42, change_date: "2026-08-15",
       source: "chat", source_session_id: sessionId, decision_origin: "strategy_signal",
-      execution_compliance: "matched", entry_signal_type: "swing",
-    });
-    expect((await pool.query<{ entry_signal_type: string | null }>(
-      "SELECT entry_signal_type FROM portfolio_position WHERE instrument_id = $1",
+      execution_compliance: "matched", strategy_code: "swing", entry_signal_type: "swing",
+    })).rejects.toThrow("跨策略加仓");
+    expect((await pool.query<{ entry_signal_type: string | null; strategy_code: string | null }>(
+      "SELECT entry_signal_type, strategy_code FROM portfolio_position WHERE instrument_id = $1",
       [buy.change.instrument_id],
-    )).rows[0]).toEqual({ entry_signal_type: "swing" });
+    )).rows[0]).toEqual({ entry_signal_type: "discretionary", strategy_code: "discretionary" });
 
     // 卖出事件不允许携带信号类型。
     await expect(recordPositionChange(pool, {
@@ -268,14 +268,14 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
       code: "000021.SZ", entry_signal_type: "swing", reason: "核对当日波段四条件证据后修正",
       source: "chat", source_session_id: sessionId,
     });
-    expect(corrected.previous_type).toBe("swing");
-    expect(corrected.position).toMatchObject({ code: "000021.SZ", entry_signal_type: "swing" });
+    expect(corrected.previous_type).toBe("discretionary");
+    expect(corrected.position).toMatchObject({ code: "000021.SZ", entry_signal_type: "swing", strategy_code: "swing" });
     const buys = await pool.query<{ entry_signal_type: string | null }>(
       `SELECT entry_signal_type FROM portfolio_position_change
         WHERE instrument_id = $1 AND kind = 'buy' ORDER BY change_date, id`,
       [buy.change.instrument_id],
     );
-    expect(buys.rows.map((row) => row.entry_signal_type)).toEqual(["discretionary", "swing"]);
+    expect(buys.rows.map((row) => row.entry_signal_type)).toEqual(["swing"]);
     const note = await pool.query<{ decision_origin: string; attribution_note: string }>(
       `SELECT decision_origin, attribution_note FROM portfolio_position_change
         WHERE instrument_id = $1 AND kind = 'note'`,
@@ -439,7 +439,7 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await recordPositionChange(pool, {
       code: "600487.SH", kind: "buy", quantity: 100, price: 60, change_date: "2026-08-18",
       source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
-      execution_compliance: "matched", entry_signal_type: "right_side",
+      execution_compliance: "matched", strategy_code: "discretionary", entry_signal_type: "discretionary",
     });
     const entries = (await pool.query<{ source_job: string }>(
       `SELECT entry.source_job

@@ -277,6 +277,14 @@ export interface Position {
   cost_basis: string | null;
   opened_at: string | null;
   entry_signal_type: EntrySignalType | null;
+  strategy_code: string | null;
+  strategy_name: string | null;
+  strategy_status: string | null;
+  strategy_runtime_version: number | null;
+  entry_signal_id: string | null;
+  fallback_strategy_code: string | null;
+  fallback_strategy_name: string | null;
+  exit_policy_mode: "dedicated" | "fallback_only" | "dedicated_plus_fallback" | null;
   updated_at: string;
   close: number | null;
   close_date: string | null;
@@ -351,6 +359,11 @@ export interface PositionChange {
   plan_target_date: string | null;
   entry_auction_assessment_id: string | null;
   entry_signal_type: EntrySignalType | null;
+  strategy_code: string | null;
+  strategy_runtime_version: number | null;
+  entry_signal_id: string | null;
+  fallback_strategy_code: string | null;
+  exit_policy_mode: "dedicated" | "fallback_only" | "dedicated_plus_fallback" | null;
   entry_signal_date: string | null;
   entry_assessment_date: string | null;
   entry_signal_review_type: string | null;

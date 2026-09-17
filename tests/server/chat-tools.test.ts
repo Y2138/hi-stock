@@ -1357,14 +1357,15 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         decision_origin: "strategy_signal",
         execution_compliance: "matched",
       }),
-    ).rejects.toThrow("buy 必须提供 entry_signal_type");
+    ).rejects.toThrow("buy 必须提供 strategy_code");
     await expect(
       change.execute("tc-missing-quantity", {
         reason: "买入缺少数量与价格必须拒绝",
         code: "990002.SZ",
         kind: "buy",
         change_date: "2026-08-17",
-        entry_signal_type: "right_side",
+        strategy_code: "swing",
+        entry_signal_type: "swing",
         decision_origin: "strategy_signal",
         execution_compliance: "matched",
       }),

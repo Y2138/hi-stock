@@ -688,6 +688,7 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
               quantity: 10,
               price: 12,
               change_date: "2026-08-17",
+              strategy_code: "discretionary",
               entry_signal_type: "discretionary",
               decision_origin: "strategy_signal",
               execution_compliance: "matched",
@@ -1230,7 +1231,7 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
     const conf = await createConfirmation(pool, {
       session_id: session.id,
       tool_name: "portfolio_write",
-      payload: { reason: "事件通道测试", code: "990003.SZ", kind: "buy", quantity: 1, price: 1, change_date: "2026-08-14", entry_signal_type: "discretionary", decision_origin: "strategy_signal", execution_compliance: "matched" },
+      payload: { reason: "事件通道测试", code: "990003.SZ", kind: "buy", quantity: 1, price: 1, change_date: "2026-08-14", strategy_code: "discretionary", entry_signal_type: "discretionary", decision_origin: "strategy_signal", execution_compliance: "matched" },
     });
     const approved = await api(
       server.baseUrl,

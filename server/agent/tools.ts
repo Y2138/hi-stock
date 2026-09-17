@@ -301,14 +301,14 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     {
       name: "portfolio_write",
       label: "批量维护持仓",
-      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。买入事件必须声明 entry_signal_type（right_side/left_reversal/two_year_reversal/trial_start/swing/limit_up/discretionary），每日计划按该类型选择评估口径。持仓与近期关注独立，买入不会创建关注，只会消费同标的已有的每日计划自动关注并保留人工关注。服务端统一经过持仓 service；不能直接指定表或字段。",
+      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。买入事件必须声明 strategy_code（swing/two_year_reversal/limit_up/discretionary 等）；服务端校验策略状态并双写兼容 entry_signal_type，已有持仓只允许同策略加仓。持仓与近期关注独立，买入不会创建关注，只会消费同标的已有的每日计划自动关注并保留人工关注。服务端统一经过持仓 service；不能直接指定表或字段。",
       parameters: PortfolioWriteSchema,
       validate: validatePortfolioWriteInput,
     },
     {
       name: "position_entry_signal_write",
       label: "修正持仓买入信号类型",
-      description: "修正当前持仓的买入信号类型（评估口径）：同步覆盖最近一笔买入事件与持仓行，并插入一条事实校正留痕事件；不改数量与成本。用于存量持仓补录信号类型或录错后的修正。当前正常买入必须在 portfolio_write 的 buy 事件里直接携带 entry_signal_type，不要事后用本工具补。",
+      description: "修正当前持仓的策略归因（兼容买入信号类型）：同步覆盖最近一笔买入事件与持仓行，并插入一条事实校正留痕事件；不改数量与成本。用于存量持仓补录信号类型或录错后的修正。当前正常买入必须在 portfolio_write 的 buy 事件里直接携带 strategy_code，不要事后用本工具补。",
       parameters: PositionEntrySignalWriteSchema,
       validate: validatePositionEntrySignalWriteInput,
     },
