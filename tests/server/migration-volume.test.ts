@@ -38,13 +38,13 @@ async function seedPrivateRunFixture(pool: pg.Pool): Promise<void> {
     [instrument],
   );
   await pool.query(
-    `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
-     VALUES ($1, 'daily_plan_flow', 'qualified', 'FROZEN_INPUT_MUST_NOT_EXPORT', '[]'::jsonb, '2026-01-05')`,
+    `INSERT INTO pool_attention_entry (instrument_id, source_type, strategy_code, source_job, status, reason, missing_signals, valid_from)
+     VALUES ($1, 'strategy', 'swing', 'daily_plan_flow', 'qualified', 'FROZEN_INPUT_MUST_NOT_EXPORT', '[]'::jsonb, '2026-01-05')`,
     [instrument],
   );
   await pool.query(
-    `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
-     VALUES ($1, 'manual', 'manual', 'RUNTIME_EVENT_MUST_NOT_EXPORT', '[]'::jsonb, '2026-01-05')`,
+    `INSERT INTO pool_attention_entry (instrument_id, source_type, strategy_code, source_job, status, reason, missing_signals, valid_from)
+     VALUES ($1, 'manual', NULL, 'manual', 'manual', 'RUNTIME_EVENT_MUST_NOT_EXPORT', '[]'::jsonb, '2026-01-05')`,
     [instrument],
   );
 }
@@ -139,7 +139,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const manifest = await readPortableManifest(exported.payloadPath);
     expect(manifest.version).toBe(7);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(117);
+    expect(manifest.migration_max).toBe(118);
     expect(manifest.tables.strategy_document).toBeGreaterThan(0);
     expect(manifest.tables.strategy_definition).toBeGreaterThan(0);
     expect(manifest.tables.strategy_score_benchmark).toBe(1);

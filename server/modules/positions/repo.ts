@@ -568,8 +568,8 @@ export async function recordPositionChange(
             USING pool_membership membership
            WHERE entry.instrument_id = membership.instrument_id
              AND membership.instrument_id = $1 AND membership.effective_to IS NULL
-             AND entry.source_job <> 'manual'`,
-          [instrumentId],
+             AND entry.source_type = 'strategy' AND entry.strategy_code = $2`,
+          [instrumentId, attribution!.code],
         );
       } else if (input.kind === "sell") {
         const oldQty = Number(existing!.quantity);

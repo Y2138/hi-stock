@@ -402,7 +402,15 @@ export const EXECUTION_COMPLIANCE_LABELS: Record<string, string> = {
 // ---- 标的池（server/modules/pools） ----
 
 export interface PoolAttentionEntry {
+  id: string;
+  source_type: "manual" | "strategy";
+  strategy_code: string | null;
+  strategy_name: string | null;
   source_job: string;
+  source_evaluation_run_id: string | null;
+  last_evaluated_at: string | null;
+  data_date: string | null;
+  stale_reason: string | null;
   status: "qualified" | "approaching" | "manual";
   reason: string;
   missing_signals: string[];

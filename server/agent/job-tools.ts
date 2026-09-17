@@ -41,10 +41,10 @@ async function associatedRunningJob(
   pool: pg.Pool,
   sessionId: string | null,
   codes: readonly string[],
-): Promise<{ id: string; code: string }> {
+): Promise<{ id: string; code: string; strategy_code: string | null }> {
   if (!sessionId) throw new Error(`${codes.join("/")} 结构化写入需要持久化 Agent 会话`);
-  const result = await pool.query<{ id: string; code: string }>(
-    `SELECT run.id::text, definition.code
+  const result = await pool.query<{ id: string; code: string; strategy_code: string | null }>(
+    `SELECT run.id::text, definition.code, definition.strategy_code
        FROM job_run run
        JOIN job_definition definition ON definition.id = run.job_id
       WHERE run.session_id = $1
@@ -70,14 +70,16 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
     name: "pool_attention_write",
     label: "批量维护关注池自动关注",
     description:
-      "一次提交本轮应保留的全部自动关注并在同一事务按任务来源对账。items 中的 mark 是本任务来源的完整保留集合，遗漏的本来源历史关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧本来源关注；其他任务来源与人工关注互不影响、不得覆盖。只维护已在关注池中的标的，不得新增标的、改变角色或研究属性。qualified 表示信号已成立，不得有缺失条件；approaching 必须在 missing_signals 中逐项列出尚未成立的信号和次日确认标准（包含策略名称与实际阈值，只使用查询证据，不得臆造）。不同任务来源的关注在页面并列展示，不合成统一质量分。",
+      "一次提交本轮应保留的全部自动关注并在同一事务按策略来源对账。items 中的 mark 是本任务来源的完整保留集合，遗漏的本策略历史关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧本来源关注；其他策略来源与人工关注互不影响、不得覆盖。只维护已在关注池中的标的，不得新增标的、改变角色或研究属性。qualified 表示信号已成立，不得有缺失条件；approaching 必须在 missing_signals 中逐项列出尚未成立的信号和次日确认标准（包含策略名称与实际阈值，只使用查询证据，不得臆造）。不同策略来源的关注在页面并列展示，不合成统一质量分。",
     parameters: ScheduledPoolAttentionSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {
       try {
         if (signal?.aborted) throw new Error("关注池维护已中断");
         const input = validateScheduledPoolAttentionInput(rawInput);
-        const { code: jobCode } = await associatedRunningJob(deps.pool, deps.sessionId, POOL_ATTENTION_JOBS);
+        const { code: jobCode, strategy_code: boundStrategyCode } = await associatedRunningJob(deps.pool, deps.sessionId, POOL_ATTENTION_JOBS);
+        const strategyCode = boundStrategyCode ?? (jobCode === "daily_plan_flow" ? "swing" : null);
+        if (!strategyCode) throw new Error(`任务 ${jobCode} 未绑定关注策略`);
         const outcome = await withAgentMutationLock(deps.pool, async (client) => {
           const items = [];
           const kept = new Set<string>();
@@ -111,7 +113,7 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
             if (item.action === "mark" && held) {
               if (existing.rows[0]) {
                 const write = await setPoolAttentionEntry(client, {
-                  code: item.code, source_job: jobCode, status: item.attention_status!,
+                  code: item.code, source_job: jobCode, strategy_code: strategyCode, status: item.attention_status!,
                   reason: null,
                 });
                 items.push({
@@ -128,6 +130,9 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
             const write = await setPoolAttentionEntry(client, {
               code: item.code,
               source_job: jobCode,
+              strategy_code: strategyCode,
+              data_date: input.data_date ?? null,
+              stale_reason: null,
               status: item.action === "mark" ? item.attention_status! : "qualified",
               reason: item.action === "mark" ? item.attention_reason! : null,
               missing_signals: item.action === "mark" ? item.missing_signals ?? [] : [],
@@ -143,18 +148,26 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
               attention_until: write.after?.valid_until ?? null,
             });
           }
-          const stale = await client.query<{ code: string }>(
+          if (input.evaluation_status === "partial") {
+            await client.query(
+              `UPDATE pool_attention_entry SET stale_reason=$2, updated_at=now()
+                WHERE source_type='strategy' AND strategy_code=$1
+                  AND NOT (instrument_id IN (SELECT id FROM market_instrument WHERE code = ANY($3::text[])))`,
+              [strategyCode, input.reason, [...kept]],
+            );
+          }
+          const stale = input.evaluation_status === "success" ? await client.query<{ code: string }>(
             `SELECT instrument.code
                FROM pool_attention_entry entry
                JOIN market_instrument instrument ON instrument.id = entry.instrument_id
-              WHERE entry.source_job = $1
+              WHERE entry.source_type = 'strategy' AND entry.strategy_code = $1
                 AND NOT (instrument.code = ANY($2::text[]))
               ORDER BY instrument.code`,
-            [jobCode, [...kept]],
-          );
+            [strategyCode, [...kept]],
+          ) : { rows: [] as Array<{ code: string }> };
           for (const item of stale.rows) {
             const write = await setPoolAttentionEntry(client, {
-              code: item.code, source_job: jobCode, status: "qualified", reason: null,
+              code: item.code, source_job: jobCode, strategy_code: strategyCode, status: "qualified", reason: null,
             });
             items.push({
               code: item.code, action: "clear",
@@ -162,7 +175,7 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
               reconciled: true,
             });
           }
-          const summary = { source_job: jobCode, total: items.length, items };
+          const summary = { source_job: jobCode, strategy_code: strategyCode, evaluation_status: input.evaluation_status, total: items.length, items };
           await insertToolAudit(client, {
             session_id: deps.sessionId,
             tool_name: "pool_attention_write",

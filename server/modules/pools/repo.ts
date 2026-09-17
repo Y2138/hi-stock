@@ -14,7 +14,15 @@ export interface PoolAttentionSignal {
 }
 
 export interface PoolAttentionEntry {
+  id: string;
+  source_type: "manual" | "strategy";
+  strategy_code: string | null;
+  strategy_name: string | null;
   source_job: string;
+  source_evaluation_run_id: string | null;
+  last_evaluated_at: string | null;
+  data_date: string | null;
+  stale_reason: string | null;
   status: "qualified" | "approaching" | "manual";
   reason: string;
   missing_signals: string[];
@@ -98,11 +106,16 @@ LEFT JOIN LATERAL (
 ) latest_close ON true
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(jsonb_build_object(
-           'source_job', entry.source_job, 'status', entry.status, 'reason', entry.reason,
-           'missing_signals', entry.missing_signals,
-           'valid_from', entry.valid_from::text, 'valid_until', entry.valid_until::text
-         ) ORDER BY entry.source_job) AS entries
+           'id', entry.id::text, 'source_type', entry.source_type,
+           'strategy_code', entry.strategy_code, 'strategy_name', strategy.name,
+           'source_job', entry.source_job, 'source_evaluation_run_id', entry.source_evaluation_run_id::text,
+           'status', entry.status, 'reason', entry.reason, 'missing_signals', entry.missing_signals,
+           'valid_from', entry.valid_from::text, 'valid_until', entry.valid_until::text,
+           'last_evaluated_at', entry.last_evaluated_at::text, 'data_date', entry.data_date::text,
+           'stale_reason', entry.stale_reason
+         ) ORDER BY entry.source_type, COALESCE(strategy.name, entry.source_job)) AS entries
     FROM pool_attention_entry entry
+    LEFT JOIN strategy_definition strategy ON strategy.code = entry.strategy_code
    WHERE entry.instrument_id = membership.instrument_id
      AND entry.valid_from <= $2::date
      AND (entry.valid_until IS NULL OR entry.valid_until >= $2::date)
@@ -192,6 +205,10 @@ export interface PoolChangeInput {
 export interface PoolAttentionEntryInput {
   code: string;
   source_job: string;
+  strategy_code?: string | null;
+  source_evaluation_run_id?: string | null;
+  data_date?: string | null;
+  stale_reason?: string | null;
   status: "qualified" | "approaching" | "manual";
   reason: string | null;
   missing_signals?: string[];
@@ -236,7 +253,7 @@ function validateEntryInput(input: PoolAttentionEntryInput): { reason: string; m
   return { reason, missing, from, until };
 }
 
-/** 关注条目按来源独立维护：写入或更新同来源条目，reason 为空时删除该来源条目。 */
+/** 关注条目按人工或策略身份独立维护；任务来源只作审计。 */
 export async function setPoolAttentionEntry(
   db: TransactionDb,
   input: PoolAttentionEntryInput,
@@ -253,64 +270,94 @@ export async function setPoolAttentionEntry(
       [instrument.rows[0].id, WATCH_POOL],
     );
     if (!membership.rows[0]) throw new Error(`标的 ${input.code} 不在关注池中`);
+    const manual = input.source_job === MANUAL_ATTENTION_SOURCE || input.status === "manual";
+    let strategyCode: string | null = input.strategy_code ?? null;
+    if (!manual && !strategyCode) {
+      if (input.source_job === "daily_plan_flow") strategyCode = "swing";
+      else {
+        strategyCode = (await client.query<{ strategy_code: string | null }>(
+          "SELECT strategy_code FROM job_definition WHERE code = $1",
+          [input.source_job],
+        )).rows[0]?.strategy_code ?? null;
+      }
+    }
+    if (!manual && !strategyCode) throw new Error("自动关注必须关联运行时策略");
     const current = await client.query<PoolAttentionEntry>(
-      `SELECT source_job, status, reason, missing_signals, valid_from::text, valid_until::text
-         FROM pool_attention_entry
-        WHERE instrument_id = $1 AND source_job = $2`,
-      [instrument.rows[0].id, input.source_job],
+      `SELECT entry.id::text, entry.source_type, entry.strategy_code, strategy.name AS strategy_name,
+              entry.source_job, entry.source_evaluation_run_id::text, entry.status, entry.reason,
+              entry.missing_signals, entry.valid_from::text, entry.valid_until::text,
+              entry.last_evaluated_at::text, entry.data_date::text, entry.stale_reason
+         FROM pool_attention_entry entry
+         LEFT JOIN strategy_definition strategy ON strategy.code = entry.strategy_code
+        WHERE entry.instrument_id = $1
+          AND (($2::boolean AND entry.source_type = 'manual')
+               OR (NOT $2::boolean AND entry.source_type = 'strategy' AND entry.strategy_code = $3))`,
+      [instrument.rows[0].id, manual, strategyCode],
     );
     const before = current.rows[0] ?? null;
     const parsed = validateEntryInput(input);
     if (!parsed.reason) {
-      await client.query(
-        "DELETE FROM pool_attention_entry WHERE instrument_id = $1 AND source_job = $2",
-        [instrument.rows[0].id, input.source_job],
-      );
+      if (before) await client.query("DELETE FROM pool_attention_entry WHERE id = $1", [before.id]);
       return { before, after: null };
     }
-    await client.query(
-      `INSERT INTO pool_attention_entry
-         (instrument_id, source_job, status, reason, missing_signals, valid_from, valid_until, updated_at)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7, now())
-       ON CONFLICT (instrument_id, source_job) DO UPDATE SET
-         status = EXCLUDED.status, reason = EXCLUDED.reason, missing_signals = EXCLUDED.missing_signals,
-         valid_from = EXCLUDED.valid_from, valid_until = EXCLUDED.valid_until, updated_at = now()`,
-      [
-        instrument.rows[0].id, input.source_job, input.status, parsed.reason,
-        JSON.stringify(parsed.missing), parsed.from, parsed.until,
-      ],
-    );
+    if (before) {
+      await client.query(
+        `UPDATE pool_attention_entry SET source_job=$2, status=$3, reason=$4, missing_signals=$5::jsonb,
+                valid_from=$6, valid_until=$7, source_evaluation_run_id=$8, data_date=$9,
+                stale_reason=$10, last_evaluated_at=CASE WHEN source_type='strategy' THEN now() ELSE NULL END,
+                updated_at=now() WHERE id=$1`,
+        [before.id, input.source_job, input.status, parsed.reason, JSON.stringify(parsed.missing), parsed.from,
+         parsed.until, input.source_evaluation_run_id ?? null, input.data_date ?? null, input.stale_reason ?? null],
+      );
+    } else {
+      await client.query(
+        `INSERT INTO pool_attention_entry
+           (instrument_id, source_type, strategy_code, source_job, source_evaluation_run_id, status,
+            reason, missing_signals, valid_from, valid_until, last_evaluated_at, data_date, stale_reason, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,CASE WHEN $2='strategy' THEN now() ELSE NULL END,$11,$12,now())`,
+        [instrument.rows[0].id, manual ? "manual" : "strategy", manual ? null : strategyCode,
+         input.source_job, input.source_evaluation_run_id ?? null, input.status, parsed.reason,
+         JSON.stringify(parsed.missing), parsed.from, parsed.until, input.data_date ?? null, input.stale_reason ?? null],
+      );
+    }
     const afterRows = await client.query<PoolAttentionEntry>(
-      `SELECT source_job, status, reason, missing_signals, valid_from::text, valid_until::text
-         FROM pool_attention_entry WHERE instrument_id = $1 AND source_job = $2`,
-      [instrument.rows[0].id, input.source_job],
+      `SELECT entry.id::text, entry.source_type, entry.strategy_code, strategy.name AS strategy_name,
+              entry.source_job, entry.source_evaluation_run_id::text, entry.status, entry.reason,
+              entry.missing_signals, entry.valid_from::text, entry.valid_until::text,
+              entry.last_evaluated_at::text, entry.data_date::text, entry.stale_reason
+         FROM pool_attention_entry entry LEFT JOIN strategy_definition strategy ON strategy.code=entry.strategy_code
+        WHERE entry.instrument_id=$1 AND (($2::boolean AND entry.source_type='manual')
+          OR (NOT $2::boolean AND entry.source_type='strategy' AND entry.strategy_code=$3))`,
+      [instrument.rows[0].id, manual, strategyCode],
     );
     return { before, after: afterRows.rows[0] ?? null };
   });
 }
 
-/** 用户从池页面手动移除某个来源的近期关注；人工页面移除只清人工条目。 */
+/** 用户从池页面移除指定策略来源；未指定策略时只清人工关注。 */
 export async function clearPoolAttention(
   db: TransactionDb,
-  input: { code: string; source_job?: string },
+  input: { code: string; strategy_code?: string },
 ): Promise<{ before: PoolAttentionEntry | null; after: PoolAttentionEntry | null } | null> {
   return inServiceTransaction(db, async (client) => {
-    const source = input.source_job ?? MANUAL_ATTENTION_SOURCE;
     const instrument = await client.query<{ id: string }>(
       "SELECT id::text FROM market_instrument WHERE code = $1",
       [input.code],
     );
     if (!instrument.rows[0]) return null;
+    const strategyCode = input.strategy_code ?? null;
     const current = await client.query<PoolAttentionEntry>(
-      `SELECT source_job, status, reason, missing_signals, valid_from::text, valid_until::text
-         FROM pool_attention_entry WHERE instrument_id = $1 AND source_job = $2`,
-      [instrument.rows[0].id, source],
+      `SELECT entry.id::text, entry.source_type, entry.strategy_code, strategy.name AS strategy_name,
+              entry.source_job, entry.source_evaluation_run_id::text, entry.status, entry.reason,
+              entry.missing_signals, entry.valid_from::text, entry.valid_until::text,
+              entry.last_evaluated_at::text, entry.data_date::text, entry.stale_reason
+         FROM pool_attention_entry entry LEFT JOIN strategy_definition strategy ON strategy.code=entry.strategy_code
+        WHERE entry.instrument_id=$1 AND (($2::text IS NULL AND entry.source_type='manual')
+          OR ($2::text IS NOT NULL AND entry.source_type='strategy' AND entry.strategy_code=$2))`,
+      [instrument.rows[0].id, strategyCode],
     );
     if (!current.rows[0]) return null;
-    await client.query(
-      "DELETE FROM pool_attention_entry WHERE instrument_id = $1 AND source_job = $2",
-      [instrument.rows[0].id, source],
-    );
+    await client.query("DELETE FROM pool_attention_entry WHERE id = $1", [current.rows[0].id]);
     return { before: current.rows[0], after: null };
   });
 }

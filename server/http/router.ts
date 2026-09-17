@@ -294,8 +294,8 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("DELETE", "/api/pools/:code/attention", async ({ params, query }) => {
       const code = params.code?.trim().toUpperCase() ?? "";
       if (!/^[A-Z0-9._-]{1,32}$/u.test(code)) throw apiErrors.badRequest("标的代码无效");
-      const source = query.get("source") ?? undefined;
-      const result = await clearPoolAttention(pool, { code, source_job: source });
+      const strategyCode = query.get("strategy") ?? undefined;
+      const result = await clearPoolAttention(pool, { code, strategy_code: strategyCode });
       if (!result) throw apiErrors.notFound(`标的 ${code} 在关注池中没有可移除的关注`);
       // 返回被移除的条目快照；移除后该来源已不存在。
       return { data: { code, removed: result.before } };

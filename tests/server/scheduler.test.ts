@@ -878,13 +878,13 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     );
     // 人工来源条目与上一轮每日计划遗留的自动来源条目并存。
     await pool.query(
-      `INSERT INTO pool_attention_entry (instrument_id,source_job,status,reason,missing_signals,valid_from,valid_until)
-       SELECT instrument.id,'manual','manual','人工持续跟踪','[]'::jsonb,'2026-08-17','2026-08-25'
+      `INSERT INTO pool_attention_entry (instrument_id,source_type,strategy_code,source_job,status,reason,missing_signals,valid_from,valid_until)
+       SELECT instrument.id,'manual',NULL,'manual','manual','人工持续跟踪','[]'::jsonb,'2026-08-17','2026-08-25'
          FROM market_instrument instrument WHERE code='990086.SZ'`,
     );
     await pool.query(
-      `INSERT INTO pool_attention_entry (instrument_id,source_job,status,reason,missing_signals,valid_from,valid_until)
-       SELECT instrument.id,'daily_plan_flow','approaching','上一计划遗留','["右侧：放量站稳关键位"]'::jsonb,'2026-08-17','2026-08-25'
+      `INSERT INTO pool_attention_entry (instrument_id,source_type,strategy_code,source_job,status,reason,missing_signals,valid_from,valid_until)
+       SELECT instrument.id,'strategy','swing','daily_plan_flow','approaching','上一计划遗留','["右侧：放量站稳关键位"]'::jsonb,'2026-08-17','2026-08-25'
          FROM market_instrument instrument WHERE code='990087.SZ'`,
     );
     await pool.query(
@@ -927,6 +927,27 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       { code: "990086.SZ", source_job: "manual", reason: "人工持续跟踪" },
     ]);
 
+    const partialResult = await tool.execute("tc-attention-partial", {
+      reason: "部分标的行情未完成",
+      evaluation_status: "partial",
+      data_date: "2026-08-18",
+      items: [],
+    });
+    expect(partialResult.details).toMatchObject({ strategy_code: "swing", evaluation_status: "partial" });
+    expect((await pool.query(
+      `SELECT stale_reason FROM pool_attention_entry entry JOIN market_instrument instrument ON instrument.id=entry.instrument_id
+        WHERE instrument.code='990088.SZ' AND entry.strategy_code='swing'`,
+    )).rows[0]!.stale_reason).toBe("部分标的行情未完成");
+    await tool.execute("tc-attention-failed", {
+      reason: "本轮评估失败",
+      evaluation_status: "failed",
+      items: [],
+    });
+    expect((await pool.query(
+      `SELECT reason, stale_reason FROM pool_attention_entry entry JOIN market_instrument instrument ON instrument.id=entry.instrument_id
+        WHERE instrument.code='990088.SZ' AND entry.strategy_code='swing'`,
+    )).rows[0]).toEqual({ reason: "仍缺放量站稳关键位", stale_reason: "部分标的行情未完成" });
+
     const heldResult = await tool.execute("tc-attention-held", {
       reason: "已持仓标的不进入自动关注",
       items: [{
@@ -961,8 +982,8 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     )).rows[0]?.reason).toBeUndefined();
     // 人工条目不能被自动作业清除：clear 只作用于本任务来源。
     await pool.query(
-      `INSERT INTO pool_attention_entry (instrument_id,source_job,status,reason,missing_signals,valid_from)
-       SELECT instrument.id,'manual','manual','人工持续跟踪','[]'::jsonb,'2026-08-18'
+      `INSERT INTO pool_attention_entry (instrument_id,source_type,strategy_code,source_job,status,reason,missing_signals,valid_from)
+       SELECT instrument.id,'manual',NULL,'manual','manual','人工持续跟踪','[]'::jsonb,'2026-08-18'
          FROM market_instrument instrument WHERE code='990088.SZ'`,
     );
     await tool.execute("tc-attention-clear-manual-safe", {

@@ -135,7 +135,7 @@ function markAttentionWithAgent(member: PoolMember): void {
 }
 
 async function removeAttention(member: PoolMember, entry: PoolAttentionEntry): Promise<void> {
-  const key = `${member.code}:${entry.source_job}`;
+  const key = `${member.code}:${entry.strategy_code ?? 'manual'}`;
   if (removingAttention.value) return;
   if (!window.confirm(
     `确认移除 ${member.name}（${member.code}）的${attentionSourceLabel(entry)}关注？\n\n标的仍保留在关注池，角色和研究属性不会改变。`,
@@ -143,7 +143,7 @@ async function removeAttention(member: PoolMember, entry: PoolAttentionEntry): P
 
   removingAttention.value = key;
   try {
-    const query = entry.source_job === "manual" ? "" : `?source=${encodeURIComponent(entry.source_job)}`;
+    const query = entry.strategy_code ? `?strategy=${encodeURIComponent(entry.strategy_code)}` : "";
     const result = await apiClient.delete<PoolMember>(
       `/api/pools/${encodeURIComponent(member.code)}/attention${query}`,
     );
@@ -311,7 +311,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                   </td>
                   <td class="attention-cell">
                     <template v-if="isAttention(member)">
-                      <div v-for="entry in member.attention_entries" :key="entry.source_job" class="attention-entry">
+                      <div v-for="entry in member.attention_entries" :key="entry.id" class="attention-entry">
                         <div class="attention-entry-head">
                           <span class="badge signal-status" :class="entry.status">{{ attentionStatusLabel(entry) }}</span>
                           <span class="muted source-tag">{{ attentionSourceLabel(entry) }}</span>
@@ -361,7 +361,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           <section class="detail-section">
             <h3>近期关注</h3>
             <template v-if="isAttention(detailMember)">
-              <div v-for="entry in detailMember.attention_entries" :key="entry.source_job" class="attention-entry">
+              <div v-for="entry in detailMember.attention_entries" :key="entry.id" class="attention-entry">
                 <div class="attention-entry-head">
                   <span class="badge signal-status" :class="entry.status">{{ attentionStatusLabel(entry) }}</span>
                   <span class="muted source-tag">{{ attentionSourceLabel(entry) }}</span>
@@ -373,7 +373,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                 <p>{{ entry.reason }}</p>
                 <div class="muted">{{ fmtDate(entry.valid_from) ?? "现在" }}–{{ fmtDate(entry.valid_until) ?? "持续" }}</div>
                 <div class="detail-attention-actions">
-                  <button class="btn compact remove-attention" type="button" :disabled="removingAttention === `${detailMember.code}:${entry.source_job}`" @click="removeAttention(detailMember, entry)">{{ removingAttention === `${detailMember.code}:${entry.source_job}` ? "移除中" : "移除关注" }}</button>
+                  <button class="btn compact remove-attention" type="button" :disabled="removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}`" @click="removeAttention(detailMember, entry)">{{ removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}` ? "移除中" : "移除关注" }}</button>
                 </div>
               </div>
             </template>

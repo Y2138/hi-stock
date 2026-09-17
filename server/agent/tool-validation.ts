@@ -349,10 +349,17 @@ const ScheduledPoolAttentionItemSchema = strictObject({
 });
 export const ScheduledPoolAttentionSchema = strictObject({
   reason: ReasonSchema,
+  evaluation_status: Type.Optional(Type.Union([Type.Literal("success"), Type.Literal("partial"), Type.Literal("failed")])),
+  data_date: Type.Optional(DateSchema),
   items: Type.Array(ScheduledPoolAttentionItemSchema, { maxItems: 100 }),
 });
 export type ScheduledPoolAttentionItem = Static<typeof ScheduledPoolAttentionItemSchema>;
-export type ScheduledPoolAttentionInput = { reason: string; items: ScheduledPoolAttentionItem[] };
+export type ScheduledPoolAttentionInput = {
+  reason: string;
+  evaluation_status: "success" | "partial" | "failed";
+  data_date?: string;
+  items: ScheduledPoolAttentionItem[];
+};
 
 /** 每日计划盯防预案行：持仓次日执行预案 + 打板机会，写入后由任务成功激活。 */
 const PlaybookTextSchema = Type.String({ minLength: 1, maxLength: 2_000 });
@@ -949,7 +956,7 @@ export function validateScheduledPoolAttentionInput(input: unknown): ScheduledPo
     }
     return { ...item, code: item.code.trim() };
   });
-  return { reason: reason.trim(), items: normalized };
+  return { reason: reason.trim(), evaluation_status: parsed.evaluation_status ?? "success", ...(parsed.data_date ? { data_date: parsed.data_date } : {}), items: normalized };
 }
 
 function validTimestamp(value: string): boolean {

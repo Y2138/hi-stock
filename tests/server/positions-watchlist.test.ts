@@ -391,12 +391,12 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     });
     const view = await api(server!.baseUrl, "GET", "/api/pools?date=2026-08-18");
     const viewMembers = (view.json as unknown as { members: Array<{ code: string; attention_entries: Array<{ source_job: string; status: string; reason: string; missing_signals: string[] }> }> }).members;
-    expect(viewMembers.find((member) => member.code === "600487.SH")!.attention_entries).toEqual([
-      { source_job: "daily_plan_flow", status: "approaching", reason: "等待右侧量价确认", missing_signals: ["右侧：放量站稳关键位"], valid_from: "2026-08-18", valid_until: "2026-08-25" },
-      { source_job: "manual", status: "manual", reason: "人工持续跟踪", missing_signals: [], valid_from: "2026-08-18", valid_until: null },
-    ]);
+    expect(viewMembers.find((member) => member.code === "600487.SH")!.attention_entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source_type: "strategy", strategy_code: "swing", source_job: "daily_plan_flow", status: "approaching", reason: "等待右侧量价确认", missing_signals: ["右侧：放量站稳关键位"] }),
+      expect.objectContaining({ source_type: "manual", strategy_code: null, source_job: "manual", status: "manual", reason: "人工持续跟踪", missing_signals: [] }),
+    ]));
     // 按来源移除：只清指定来源，另一来源保留。
-    const removed = await api(server!.baseUrl, "DELETE", "/api/pools/600487.SH/attention?source=daily_plan_flow");
+    const removed = await api(server!.baseUrl, "DELETE", "/api/pools/600487.SH/attention?strategy=swing");
     expect(removed).toMatchObject({ status: 200, json: { code: "600487.SH", removed: { source_job: "daily_plan_flow" } } });
     const afterRemove = await api(server!.baseUrl, "GET", "/api/pools?date=2026-08-18");
     expect((afterRemove.json as unknown as { members: Array<{ code: string; attention_entries: Array<{ source_job: string }> }> })
@@ -427,10 +427,14 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     expect(cleared.after).toBeNull();
   });
 
-  it("买入成交清除全部任务来源关注并保留人工关注", async () => {
+  it("买入成交只消费对应策略关注并保留其他策略与人工关注", async () => {
     await setPoolAttentionEntry(pool, {
       code: "600487.SH", source_job: "daily_plan_flow", status: "qualified",
       reason: "已符合：等待买入", valid_from: "2026-08-18", valid_until: "2026-08-19",
+    });
+    await setPoolAttentionEntry(pool, {
+      code: "600487.SH", source_job: "daily_plan_flow", strategy_code: "discretionary", status: "qualified",
+      reason: "自主决策等待买入", valid_from: "2026-08-18", valid_until: "2026-08-19",
     });
     await setPoolAttentionEntry(pool, {
       code: "600487.SH", source_job: "manual", status: "manual",
@@ -447,7 +451,7 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
          JOIN market_instrument instrument ON instrument.id = entry.instrument_id
         WHERE instrument.code = '600487.SH'`,
     )).rows.map((row) => row.source_job);
-    expect(entries).toEqual(["manual"]);
+    expect(entries.sort()).toEqual(["daily_plan_flow", "manual"]);
   });
 
   it("旧账户快照和资金摘要 API 已退役", async () => {

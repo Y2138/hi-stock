@@ -323,31 +323,27 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     }
   });
 
-  it("关注条目表结构约束：approaching 必须携带缺口，来源联合主键", async () => {
+  it("关注条目按策略唯一：approaching 必须携带缺口，人工来源独立", async () => {
     await pool.query("INSERT INTO market_instrument (code, name, kind) VALUES ('990081.SZ', '条目测试标的', 'stock')");
     const id = (await pool.query<{ id: string }>("SELECT id::text FROM market_instrument WHERE code = '990081.SZ'")).rows[0]!.id;
     await pool.query(
       `INSERT INTO pool_membership (instrument_id, pool, role, effective_from) VALUES ($1, 'watch', '关注', '2026-09-09')`, [id],
     );
     await expect(pool.query(
-      `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
-       VALUES ($1, 'daily_plan_flow', 'approaching', '等待确认', '[]'::jsonb, '2026-09-09')`, [id],
+      `INSERT INTO pool_attention_entry (instrument_id, source_type, strategy_code, source_job, status, reason, missing_signals, valid_from)
+       VALUES ($1, 'strategy', 'swing', 'daily_plan_flow', 'approaching', '等待确认', '[]'::jsonb, '2026-09-09')`, [id],
     )).rejects.toThrow(/check|missing_signals/i);
     await pool.query(
-      `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
-       VALUES ($1, 'daily_plan_flow', 'approaching', '等待确认', '["右侧：放量确认"]'::jsonb, '2026-09-09')`, [id],
+      `INSERT INTO pool_attention_entry (instrument_id, source_type, strategy_code, source_job, status, reason, missing_signals, valid_from)
+       VALUES ($1, 'strategy', 'swing', 'daily_plan_flow', 'approaching', '等待确认', '["波段：缩量确认"]'::jsonb, '2026-09-09')`, [id],
     );
-    // 同来源重复写入走 UPSERT，不产生重复行；不同来源可并存。
+    await expect(pool.query(
+      `INSERT INTO pool_attention_entry (instrument_id, source_type, strategy_code, source_job, status, reason, missing_signals, valid_from)
+       VALUES ($1, 'strategy', 'swing', 'nightly_sector_opportunity_scan', 'qualified', '重复策略来源', '[]'::jsonb, '2026-09-09')`, [id],
+    )).rejects.toThrow(/unique|duplicate/i);
     await pool.query(
-      `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
-       VALUES ($1, 'daily_plan_flow', 'qualified', '已确认', '[]'::jsonb, '2026-09-09')
-       ON CONFLICT (instrument_id, source_job) DO UPDATE SET status = EXCLUDED.status, reason = EXCLUDED.reason,
-         missing_signals = EXCLUDED.missing_signals`,
-      [id],
-    );
-    await pool.query(
-      `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
-       VALUES ($1, 'manual', 'manual', '人工关注', '[]'::jsonb, '2026-09-09')`, [id],
+      `INSERT INTO pool_attention_entry (instrument_id, source_type, strategy_code, source_job, status, reason, missing_signals, valid_from)
+       VALUES ($1, 'manual', NULL, 'manual', 'manual', '人工关注', '[]'::jsonb, '2026-09-09')`, [id],
     );
     expect((await pool.query(
       "SELECT count(*)::int AS count FROM pool_attention_entry WHERE instrument_id = $1", [id],

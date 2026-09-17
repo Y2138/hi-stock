@@ -1,7 +1,7 @@
-import type { PoolAttentionEntry, PoolMember } from "../api/types";
+import type { PoolAttentionEntry } from "../api/types";
 
-type AttentionEntryLike = Pick<PoolAttentionEntry, "status" | "reason" | "missing_signals" | "valid_from" | "valid_until" | "source_job">;
-type AttentionMember = Pick<PoolMember, "attention_entries" | "code">;
+type AttentionEntryLike = Pick<PoolAttentionEntry, "status" | "reason" | "missing_signals" | "valid_from" | "valid_until" | "source_job"> & Partial<Pick<PoolAttentionEntry, "source_type" | "strategy_code" | "strategy_name">>;
+type AttentionMember = { attention_entries: AttentionEntryLike[]; code: string };
 
 const STATUS_RANK: Record<AttentionEntryLike["status"], number> = {
   qualified: 0,
@@ -23,7 +23,8 @@ export function attentionStatusLabel(entry: AttentionEntryLike): string {
 }
 
 export function attentionSourceLabel(entry: AttentionEntryLike): string {
-  if (entry.source_job === "manual") return "人工";
+  if (entry.source_type === "manual" || entry.source_job === "manual") return "人工";
+  if (entry.strategy_name || entry.strategy_code) return entry.strategy_name ?? entry.strategy_code!;
   if (entry.source_job === "daily_plan_flow") return "每日计划";
   if (entry.source_job === "nightly_sector_opportunity_scan") return "夜间板块";
   if (entry.source_job === "value_anchor_opportunity_scan") return "价值错杀";
