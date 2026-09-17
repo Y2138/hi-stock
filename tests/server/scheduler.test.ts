@@ -860,7 +860,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       .resolves.toEqual({ action: "skip", reason: "目标日 2026-08-22 为非交易日" });
   });
 
-  it("共享工具目录可维护自动关注并自动绑定当前计划运行", async () => {
+  it("共享工具目录可维护自动关注并自动绑定当前策略任务运行", async () => {
     await pool.query(
       `INSERT INTO market_instrument (code,name,kind) VALUES
          ('990086.SZ','人工关注测试','stock'),
@@ -880,15 +880,15 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     );
     await pool.query(
       `INSERT INTO pool_attention_entry (instrument_id,source_type,strategy_code,source_job,status,reason,missing_signals,valid_from,valid_until)
-       SELECT instrument.id,'strategy','swing','daily_plan_flow','approaching','上一计划遗留','["右侧：放量站稳关键位"]'::jsonb,'2026-08-17','2026-08-25'
+       SELECT instrument.id,'strategy','value_anchor','value_anchor_opportunity_scan','approaching','上一计划遗留','["右侧：放量站稳关键位"]'::jsonb,'2026-08-17','2026-08-25'
          FROM market_instrument instrument WHERE code='990087.SZ'`,
     );
     await pool.query(
       `INSERT INTO portfolio_position (instrument_id,quantity,cost_price)
        SELECT id,100,10 FROM market_instrument WHERE code='990089.SZ'`,
     );
-    const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-18");
-    const tools = buildChatTools({ pool, sessionId: run.session_id! }, { kind: "job", jobCode: "daily_plan_flow" });
+    const run = await queueManualJob(pool, "value_anchor_opportunity_scan", "2026-08-18");
+    const tools = buildChatTools({ pool, sessionId: run.session_id! }, { kind: "job", jobCode: "value_anchor_opportunity_scan" });
     const tool = tools.find((item) => item.name === "pool_attention_write")!;
     await tool.execute("tc-attention-mark", {
       reason: "每日计划识别出接近完整条件",
@@ -908,7 +908,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
          FROM pool_attention_entry entry JOIN market_instrument instrument ON instrument.id=entry.instrument_id
         WHERE instrument.code='990088.SZ'`,
     )).rows[0]).toEqual({
-      source_job: "daily_plan_flow",
+      source_job: "value_anchor_opportunity_scan",
       status: "approaching",
       reason: "仍缺放量站稳关键位",
       missing_signals: ["右侧信号：放量站稳关键位"],
@@ -929,10 +929,10 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       data_date: "2026-08-18",
       items: [],
     });
-    expect(partialResult.details).toMatchObject({ strategy_code: "swing", evaluation_status: "partial" });
+    expect(partialResult.details).toMatchObject({ strategy_code: "value_anchor", evaluation_status: "partial" });
     expect((await pool.query(
       `SELECT stale_reason FROM pool_attention_entry entry JOIN market_instrument instrument ON instrument.id=entry.instrument_id
-        WHERE instrument.code='990088.SZ' AND entry.strategy_code='swing'`,
+        WHERE instrument.code='990088.SZ' AND entry.strategy_code='value_anchor'`,
     )).rows[0]!.stale_reason).toBe("部分标的行情未完成");
     await tool.execute("tc-attention-failed", {
       reason: "本轮评估失败",
@@ -941,7 +941,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     });
     expect((await pool.query(
       `SELECT reason, stale_reason FROM pool_attention_entry entry JOIN market_instrument instrument ON instrument.id=entry.instrument_id
-        WHERE instrument.code='990088.SZ' AND entry.strategy_code='swing'`,
+        WHERE instrument.code='990088.SZ' AND entry.strategy_code='value_anchor'`,
     )).rows[0]).toEqual({ reason: "仍缺放量站稳关键位", stale_reason: "部分标的行情未完成" });
 
     const heldResult = await tool.execute("tc-attention-held", {
@@ -956,7 +956,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       }],
     });
     expect(heldResult.details).toMatchObject({
-      source_job: "daily_plan_flow",
+      source_job: "value_anchor_opportunity_scan",
       items: [
         { code: "990089.SZ", action: "skip", suppressed_by: "existing_position" },
         { code: "990088.SZ", action: "clear", reconciled: true },
@@ -974,7 +974,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect((await pool.query(
       `SELECT entry.reason FROM pool_attention_entry entry
         JOIN market_instrument instrument ON instrument.id=entry.instrument_id
-       WHERE instrument.code='990088.SZ' AND entry.source_job='daily_plan_flow'`,
+       WHERE instrument.code='990088.SZ' AND entry.source_job='value_anchor_opportunity_scan'`,
     )).rows[0]?.reason).toBeUndefined();
     // 人工条目不能被自动作业清除：clear 只作用于本任务来源。
     await pool.query(
@@ -992,18 +992,6 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
        WHERE instrument.code='990088.SZ' AND entry.source_job='manual'`,
     )).rows[0]!.reason).toBe("人工持续跟踪");
 
-    await tools.find((item) => item.name === "daily_plan_write")!.execute("tc-plan-write", {
-      items: [{
-        item_kind: "position_action",
-        code: "990089.SZ",
-        action: "hold",
-        trigger_kind: "open",
-        headline: "继续观察",
-      }],
-    });
-    expect((await pool.query<{ source_job_run_id: string }>(
-      "SELECT source_job_run_id::text FROM daily_plan_playbook WHERE code='990089.SZ'",
-    )).rows[0]!.source_job_run_id).toBe(run.id);
   });
 
   it("调度器最多并行三个任务，且 datasource 保持单路执行", async () => {

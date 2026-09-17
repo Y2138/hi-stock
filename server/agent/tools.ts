@@ -223,7 +223,6 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "strategy_document_query",
     "job_context_query",
     "daily_plan_strategy_query",
-    "pool_attention_write",
     "daily_plan_write",
   ],
   copper_inventory_signal_review: [

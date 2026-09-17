@@ -235,12 +235,12 @@ export function buildDailyPlanStrategyTool(deps: {
   };
 }
 
-/** 每日计划的机械计算与覆盖门禁读取器。 */
+/** 旧每日计划兼容上下文：保留交互排障和结果对比，正式每日计划使用 daily_plan_strategy_query。 */
 export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
   return {
     name: "daily_plan_context_query",
-    label: "查询每日计划确定性上下文",
-    description: "按目标日一次性返回完整881一级行业市场状态与温度、七类市场结构同步、关注池逐只右侧六条件存活与试盘形态推进的评估性证据；同时返回每笔持仓的 entry_signal_type 与 evaluation_basis：波段持仓的 swing_triggers（观察期、灾难止损、常规止损、箱顶目标、到期）、存量左侧反转持仓的 left_reversal_triggers（初始止损、6%/16%分批、10日到期）、其余持仓的止损档位、冷却期、止盈/止损位、退出候选，以及 MA10 护盘收回率。右侧与试盘只用于持有和概率评估，不产生开仓信号；开仓信号只认 swing_signal_query。只返回结论和必要数值证据，不返回原始行情序列；每日计划不得再用通用数据库工具手算。",
+    label: "查询旧每日计划兼容上下文",
+    description: "按目标日一次性返回完整881一级行业市场状态与温度、七类市场结构同步、关注池逐只右侧六条件存活与试盘形态推进的评估性证据；同时返回每笔持仓的 entry_signal_type 与 evaluation_basis：波段持仓的 swing_triggers（观察期、灾难止损、常规止损、箱顶目标、到期）、存量左侧反转持仓的 left_reversal_triggers（初始止损、6%/16%分批、10日到期）、其余持仓的止损档位、冷却期、止盈/止损位、退出候选，以及 MA10 护盘收回率。右侧与试盘只用于持有和概率评估，不产生开仓信号；开仓信号只认 swing_signal_query。只返回结论和必要数值证据，不返回原始行情序列；正式每日计划使用 daily_plan_strategy_query；本工具仅供兼容查询和排障，不得用通用数据库工具手算。",
     parameters: DailyPlanContextSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof DailyPlanContextSchema>>("daily_plan_context_query", DailyPlanContextSchema, raw);

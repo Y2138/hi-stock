@@ -455,7 +455,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "daily_plan_strategy_query",
       "web_search",
       "web_fetch",
-      "pool_attention_write",
       "daily_plan_write",
     ]);
     // 每周评分与周中检查已随评分机制退役：不再有专属工具子集，与未知任务一样回退到完整交互目录。
@@ -1627,9 +1626,8 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "hithink_catalog",
       "hithink_query",
       "indicator_query",
-      "daily_plan_context_query",
-      "swing_signal_query",
-      "limit_up_signal_query",
+      "daily_plan_strategy_query",
+      "strategy_evaluation_query",
     ]) {
       expect(normal).toContain(tool);
     }

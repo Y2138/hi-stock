@@ -151,7 +151,7 @@ const TABLE_BUSINESS: Record<string, BusinessMeta> = {
   pool_attention_entry: {
     domain: "关注池",
     description: "近期关注多来源条目：每个定时任务与人工各自维护，qualified/approaching/manual 状态与缺失条件。",
-    write_policy: "自动来源只允许对应任务的 pool_attention_write 按来源对账；pool_write 维护人工条目。",
+    write_policy: "自动来源按策略唯一，由统一评估编排或对应策略任务对账；pool_write 只维护人工条目。",
     constraints: ["来源之间互不清除；已持仓标的不得写入自动关注。"],
   },
   pool_board_preference: {
