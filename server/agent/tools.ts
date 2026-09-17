@@ -37,6 +37,7 @@ import { persistAndPublishSessionEvent } from "./events.js";
 import { sha256Json } from "./hash.js";
 import {
   buildDailyPlanContextTool,
+  buildDailyPlanStrategyTool,
   buildStrategyEvaluationTool,
   buildLimitUpSignalTool,
   buildMarketDomainTools,
@@ -221,9 +222,7 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
   daily_plan_flow: [
     "strategy_document_query",
     "job_context_query",
-    "daily_plan_context_query",
-    "swing_signal_query",
-    "limit_up_signal_query",
+    "daily_plan_strategy_query",
     "pool_attention_write",
     "daily_plan_write",
   ],
@@ -259,6 +258,7 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
 
 /** 任务流程工具只挂到绑定任务会话；交互会话中它们本就无法通过运行期守卫。 */
 const JOB_FLOW_ONLY_TOOLS = new Set([
+  "daily_plan_strategy_query",
   "auction_context_query",
   "pool_attention_write",
   "daily_plan_write",
@@ -491,6 +491,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     ...buildHithinkTools({ pool, sessionId: deps.sessionId, query: deps.queryHithink }),
     ...buildMarketDomainTools({ pool, sessionId: deps.sessionId }),
     buildDailyPlanContextTool({ pool, sessionId: deps.sessionId }),
+    buildDailyPlanStrategyTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined }),
     buildStrategyEvaluationTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined }),
     buildValueRankTool({ pool, sessionId: deps.sessionId }),
     buildValueAnchorSignalTool({ pool, sessionId: deps.sessionId }),

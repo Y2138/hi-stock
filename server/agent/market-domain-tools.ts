@@ -23,6 +23,7 @@ import { queryStockResearch } from "../modules/market/research.js";
 import { queryValueRank } from "../modules/value-ranking/service.js";
 import { executeStrategyEvaluator } from "../modules/strategy-runtime/registry.js";
 import { ensureStrategyEvaluation } from "../modules/strategy-runtime/service.js";
+import { queryDailyPlanStrategyContext } from "../modules/strategy-runtime/daily-plan.js";
 import { strategyForSession } from "./business-context-tools.js";
 import { insertToolAudit } from "./repo.js";
 import { sha256Json } from "./hash.js";
@@ -62,6 +63,7 @@ const MarketEventSchema = strict({
 });
 const LimitUpSignalSchema = strict({ date: DateString });
 const DailyPlanContextSchema = strict({ date: DateString });
+const DailyPlanStrategySchema = strict({ date: DateString });
 const SwingSignalSchema = strict({ date: DateString });
 const CopperInventorySignalSchema = strict({ date: DateString });
 const LithiumWarehouseSignalSchema = strict({ date: DateString });
@@ -199,6 +201,36 @@ export function buildStrategyEvaluationTool(deps: {
           strategy_code: strategyCode!, phase: input.phase, target_date: input.date,
           requested_by_job_run_id: requestedByJobRunId,
         }));
+    },
+  };
+}
+
+export function buildDailyPlanStrategyTool(deps: {
+  pool: pg.Pool;
+  sessionId: string | null;
+  jobCode?: string;
+}): AgentTool {
+  return {
+    name: "daily_plan_strategy_query",
+    label: "查询每日计划策略统筹",
+    description: "按目标日自动发现入场、观察、组合叠加、持仓主策略和兜底策略，执行或复用结构化评估运行，按策略维护关注集合，并返回服务端合并后的持仓动作、覆盖门禁和可原样写入的 playbook_items。不得再逐工具手工拼装每日计划。",
+    parameters: DailyPlanStrategySchema,
+    execute: async (_id, raw) => {
+      const input = validateToolInput<Static<typeof DailyPlanStrategySchema>>(
+        "daily_plan_strategy_query", DailyPlanStrategySchema, raw,
+      );
+      if (deps.jobCode !== "daily_plan_flow") throw new Error("daily_plan_strategy_query 只允许每日计划任务使用");
+      let runId: string | null = null;
+      if (deps.sessionId && deps.jobCode === "daily_plan_flow") {
+        runId = (await deps.pool.query<{ id: string }>(
+          `SELECT run.id::text FROM job_run run JOIN job_definition definition ON definition.id=run.job_id
+            WHERE run.session_id=$1 AND definition.code='daily_plan_flow' AND run.status IN ('queued','running')
+            ORDER BY run.id DESC LIMIT 1`, [deps.sessionId],
+        )).rows[0]?.id ?? null;
+      }
+      return audited(deps, "daily_plan_strategy_query", input, () => queryDailyPlanStrategyContext(deps.pool, {
+        date: input.date, requested_by_job_run_id: runId,
+      }));
     },
   };
 }

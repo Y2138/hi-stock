@@ -433,6 +433,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(databaseQuery.label).toContain("低优先级");
     expect(databaseQuery.description).toContain("最多 5 项、每项 100 行");
     expect(tools.at(-1)?.name).toBe("database_query");
+    expect(tools.map((tool) => tool.name)).not.toContain("daily_plan_strategy_query");
   });
 
   it("任务会话按提示词声明集裁剪并保留 Web，未知任务不获得专属写入", async () => {
@@ -451,9 +452,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(dailyPlan.map((tool) => tool.name)).toEqual([
       "job_context_query",
       "strategy_document_query",
-      "daily_plan_context_query",
-      "swing_signal_query",
-      "limit_up_signal_query",
+      "daily_plan_strategy_query",
       "web_search",
       "web_fetch",
       "pool_attention_write",

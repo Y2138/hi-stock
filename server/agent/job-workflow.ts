@@ -2,7 +2,7 @@
 import type { AgentCoreFrame } from "./core/loop.js";
 
 const REQUIRED_READS: Record<string, readonly string[]> = {
-  daily_plan_flow: ["strategy_document_query", "daily_plan_context_query", "swing_signal_query", "limit_up_signal_query"],
+  daily_plan_flow: ["strategy_document_query", "daily_plan_strategy_query"],
   copper_inventory_signal_review: ["strategy_document_query", "copper_inventory_signal_query"],
   lithium_warehouse_signal_review: ["strategy_document_query", "lithium_warehouse_signal_query"],
   value_anchor_opportunity_scan: ["strategy_document_query", "value_anchor_signal_query"],
@@ -18,7 +18,7 @@ const REQUIRED_READS: Record<string, readonly string[]> = {
   ],
 };
 const TARGET_DATE_TOOLS = new Set([
-  "daily_plan_context_query", "swing_signal_query", "auction_context_query", "copper_inventory_signal_query", "lithium_warehouse_signal_query",
+  "daily_plan_strategy_query", "daily_plan_context_query", "swing_signal_query", "auction_context_query", "copper_inventory_signal_query", "lithium_warehouse_signal_query",
   "value_anchor_signal_query", "two_year_reversal_signal_query", "strategy_evaluation_query",
 ]);
 
@@ -57,14 +57,12 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
     },
     missing(): string[] {
       const required = [...(Object.hasOwn(REQUIRED_READS, jobCode) ? REQUIRED_READS[jobCode]! : [])];
-      if (jobCode === "daily_plan_flow" || jobCode === "nightly_sector_opportunity_scan"
-        || jobCode === "value_anchor_opportunity_scan") {
+      if (jobCode === "daily_plan_flow") {
+        const items = results.get("daily_plan_strategy_query")?.playbook_items;
+        if (Array.isArray(items) && items.length > 0) required.push("daily_plan_write");
+      }
+      if (jobCode === "nightly_sector_opportunity_scan" || jobCode === "value_anchor_opportunity_scan") {
         required.push("pool_attention_write");
-        const positions = object(results.get("daily_plan_context_query")?.positions);
-        const signals = results.get("limit_up_signal_query")?.signals;
-        if (Number(positions.position_count) > 0 || (Array.isArray(signals) && signals.length > 0)) {
-          required.push("daily_plan_write");
-        }
       }
       if (jobCode === "auction_opportunity_assessment") {
         required.push("auction_context_query");
@@ -76,6 +74,16 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
         }
       }
       const missing = required.filter((name) => !results.has(name));
+      if (jobCode === "daily_plan_flow" && results.has("daily_plan_strategy_query")
+        && results.has("strategy_document_query")) {
+        const requiredDocs = results.get("daily_plan_strategy_query")?.required_strategy_documents;
+        const docs = results.get("strategy_document_query")?.documents;
+        if (Array.isArray(requiredDocs) && Array.isArray(docs)) {
+          const loaded = new Set(docs.map((item) => String(object(item).code)));
+          const absent = requiredDocs.map(String).filter((code) => !loaded.has(code));
+          if (absent.length) missing.push(`strategy_document_query（缺少统一编排要求的策略正文：${absent.join("、")}）`);
+        }
+      }
       if (jobCode === "two_year_reversal_scan" && results.has("strategy_document_query")) {
         const docs = results.get("strategy_document_query")?.documents;
         if (!Array.isArray(docs) || !docs.some((item) => object(item).code === "two_year_reversal_strategy")
@@ -100,14 +108,11 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
         }
       }
       if (jobCode === "daily_plan_flow" && results.has("daily_plan_write")) {
-        const expected = object(results.get("daily_plan_context_query")?.positions).items;
+        const expected = results.get("daily_plan_strategy_query")?.playbook_items;
         const submitted = successfulArgs.get("daily_plan_write")?.items;
-        if (Array.isArray(expected) && Array.isArray(submitted)) {
-          const held = new Set(expected.map((item) => object(item).code));
-          const written = submitted.filter((item) => object(item).item_kind === "position_action");
-          if (held.size !== written.length || written.some((item) => !held.has(object(item).code))) {
-            missing.push("daily_plan_write（必须完整覆盖本次查询的真实持仓）");
-          }
+        if (Array.isArray(expected) && Array.isArray(submitted)
+          && JSON.stringify(expected) !== JSON.stringify(submitted)) {
+          missing.push("daily_plan_write（必须原样提交统一策略编排生成的 playbook_items）");
         }
       }
       if (jobCode === "auction_opportunity_assessment" && results.has("auction_assessment_write")

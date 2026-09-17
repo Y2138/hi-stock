@@ -34,15 +34,16 @@ const prepared = await prepareTestDb();
 
 function dailyReadCalls() {
   return [
-    fauxToolCall("strategy_document_query", { codes: ["test_strategy", "limit_up_board"] }),
-    fauxToolCall("daily_plan_context_query", { date: "2026-08-17" }),
-    fauxToolCall("swing_signal_query", { date: "2026-08-17" }),
-    fauxToolCall("limit_up_signal_query", { date: "2026-08-17" }),
+    fauxToolCall("strategy_document_query", { codes: [
+      "test_strategy", "daily_plan_strategy", "limit_up_board", "two_year_reversal_strategy",
+      "copper_inventory_strategy", "lithium_warehouse_strategy",
+    ] }),
+    fauxToolCall("daily_plan_strategy_query", { date: "2026-08-17" }),
   ];
 }
 
 function dailyWriteResponse() {
-  return fauxAssistantMessage([fauxToolCall("pool_attention_write", { reason: "完整扫描后无新增候选", items: [] })], { stopReason: "toolUse" });
+  return fauxAssistantMessage([fauxText("统一策略编排读取完成")]);
 }
 
 it("任务完成门禁只接受本次正确日期的工具结果，并按真实持仓要求结构化写入", () => {
@@ -52,21 +53,16 @@ it("任务完成门禁只接受本次正确日期的工具结果，并按真实�
     gate.observe({ type: "tool_end", data: { toolCallId: name, name, isError, result: { details } } });
   }
   observed("strategy_document_query", { codes: ["test_strategy"] }, {});
-  observed("daily_plan_context_query", { date: "2026-08-16" }, { positions: { position_count: 1 } });
-  observed("swing_signal_query", { date: "2026-08-17" }, {});
-  observed("limit_up_signal_query", { date: "2026-08-17" }, { signals: [] });
-  observed("pool_attention_write", { items: [] }, {}, true);
-  expect(gate.missing()).toEqual(["daily_plan_context_query", "pool_attention_write"]);
-  observed("daily_plan_context_query", { date: "2026-08-17" }, {
-    positions: { position_count: 1, items: [{ code: "600000.SH" }] },
-  });
-  observed("pool_attention_write", { items: [] }, {});
+  observed("daily_plan_strategy_query", { date: "2026-08-16" }, { playbook_items: [] });
+  expect(gate.missing()).toEqual(["daily_plan_strategy_query"]);
+  const generated = [{ code: "600000.SH", item_kind: "position_action", action: "hold" }];
+  observed("daily_plan_strategy_query", { date: "2026-08-17" }, { playbook_items: generated });
   expect(gate.missing()).toEqual(["daily_plan_write"]);
   observed("daily_plan_write", { items: [] }, {});
-  expect(gate.missing()[0]).toContain("必须完整覆盖");
-  observed("daily_plan_write", { items: [{ code: "600000.SH", item_kind: "position_action" }] }, {});
+  expect(gate.missing()[0]).toContain("原样提交");
+  observed("daily_plan_write", { items: generated }, {});
   expect(gate.missing()).toEqual([]);
-  expect(createJobCompletionGate("daily_plan_flow", "2026-08-17").missing()).toContain("pool_attention_write");
+  expect(createJobCompletionGate("daily_plan_flow", "2026-08-17").missing()).toContain("daily_plan_strategy_query");
   expect(createJobCompletionGate("constructor", "2026-08-17").missing()).toEqual([]);
 
   const copper = createJobCompletionGate("copper_inventory_signal_review", "2026-08-17");
@@ -257,22 +253,22 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
     const agentFlow = vi.fn(async () => {
       await pool.query(`INSERT INTO daily_plan_playbook
-        (source_job_run_id,target_date,item_kind,instrument_id,code,name,grade,priority,action,trigger_kind,headline,auction_md,intraday_md,evidence_md,missing_md,invalidation_md,risk_md)
+        (source_job_run_id,target_date,item_kind,instrument_id,code,name,grade,priority,action,trigger_kind,headline,auction_md,intraday_md,evidence_md,missing_md,invalidation_md,risk_md,effective_action,evaluation_status)
         VALUES
-        ($1,'2026-08-17','position_action',$2,'600000.SH','持仓样本',NULL,100,'reduce','condition','满足条件后减仓',NULL,'价格<10且成交量>100，跌破支撑且反抽失败后才评估',NULL,NULL,'反抽站回支撑则失效','未触发不得执行'),
-        ($1,'2026-08-17','position_action',$4,'600100.SH','精简样本',NULL,1,'exit','open','跌破12.5元清仓',NULL,NULL,NULL,NULL,NULL,NULL),
-        ($1,'2026-08-17','off_pool_opportunity',$3,'002001.SZ','打板样本','A',1,'observe','condition','竞价转强后按打板预案复核','高开幅度与封单同时达标','回封确认后才评估','连板、龙虎榜与板块聚集共振','仍缺竞价确认','竞价转弱或开板不回封','高位分歧风险')`,
+        ($1,'2026-08-17','position_action',$2,'600000.SH','持仓样本',NULL,100,'reduce','condition','满足条件后减仓',NULL,'价格<10且成交量>100，跌破支撑且反抽失败后才评估',NULL,NULL,'反抽站回支撑则失效','未触发不得执行','reduce','success'),
+        ($1,'2026-08-17','position_action',$4,'600100.SH','精简样本',NULL,1,'exit','open','跌破12.5元清仓',NULL,NULL,NULL,NULL,NULL,NULL,'exit','success'),
+        ($1,'2026-08-17','off_pool_opportunity',$3,'002001.SZ','打板样本','A',1,'observe','condition','竞价转强后按打板预案复核','高开幅度与封单同时达标','回封确认后才评估','连板、龙虎榜与板块聚集共振','仍缺竞价确认','竞价转弱或开板不回封','高位分歧风险',NULL,NULL)`,
         [run.id, ids['600000.SH'], ids['002001.SZ'], ids['600100.SH']]);
       await pool.query(`INSERT INTO daily_plan_playbook
-        (source_job_run_id,target_date,item_kind,instrument_id,code,name,grade,priority,action,trigger_kind,headline,auction_md,intraday_md,evidence_md,missing_md,invalidation_md,risk_md)
+        (source_job_run_id,target_date,item_kind,instrument_id,code,name,grade,priority,action,trigger_kind,headline,auction_md,intraday_md,evidence_md,missing_md,invalidation_md,risk_md,effective_action,evaluation_status)
         SELECT $1::bigint,'2026-08-17'::date,'position_action',instrument.id,instrument.code,instrument.name,NULL,100+n,'hold','condition',
-          repeat('持仓条件预案',20),repeat('竞价观察条件',20),repeat('盘中复核条件',20),NULL,NULL,repeat('持仓失效条件',20),repeat('持仓风险提示',20)
+          repeat('持仓条件预案',20),repeat('竞价观察条件',20),repeat('盘中复核条件',20),NULL,NULL,repeat('持仓失效条件',20),repeat('持仓风险提示',20),'hold','success'
         FROM generate_series(1,8) n JOIN market_instrument instrument
           ON instrument.code='610' || lpad(n::text,3,'0') || '.SH'
         UNION ALL
         SELECT $1::bigint,'2026-08-17'::date,'off_pool_opportunity',instrument.id,instrument.code,instrument.name,'B',1+n,'observe','condition',
           repeat('打板条件预案',20),repeat('竞价确认条件',20),repeat('盘中回封条件',20),repeat('机会证据摘要',20),
-          repeat('尚缺确认条件',20),repeat('机会失效条件',20),repeat('机会风险提示',20)
+          repeat('尚缺确认条件',20),repeat('机会失效条件',20),repeat('机会风险提示',20),NULL,NULL
         FROM generate_series(1,9) n JOIN market_instrument instrument
           ON instrument.code='003' || lpad(n::text,3,'0') || '.SZ'`, [run.id]);
       const extraSignals = Array.from({ length: 12 }, (_, index) => ({
@@ -560,8 +556,8 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const nightlyPrompt = prompts.rows.find((row) => row.code === "nightly_sector_opportunity_scan")!.content;
     const copperPrompt = prompts.rows.find((row) => row.code === "copper_inventory_signal_review")!.content;
     const lithiumPrompt = prompts.rows.find((row) => row.code === "lithium_warehouse_signal_review")!.content;
-    expect(dailyPrompt).toContain("pool_attention_write");
-    expect(dailyPrompt).toContain("daily_plan_context_query");
+    expect(dailyPrompt).toContain("daily_plan_strategy_query");
+    expect(dailyPrompt).not.toContain("pool_attention_write");
     expect(dailyPrompt.length).toBeLessThan(4_000);
     expect(nightlyPrompt).toContain('"analysis_type":"sector_temperature"');
     expect(nightlyPrompt).toContain("不得传 `codes`");
@@ -1487,7 +1483,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       releaseFinal();
       const finished = await execution;
       expect(runningMessages.map((row) => row.role)).toEqual([
-        "user", "assistant", "tool", "assistant", ...Array(5).fill("tool"), "assistant", "tool",
+        "user", "assistant", "tool", "assistant", ...Array(3).fill("tool"), "assistant", "user",
       ]);
       expect(runningStatus).toBe("running");
       const toolErrors = await pool.query("SELECT content->>'toolName' AS tool, content->'content' AS error FROM chat_message WHERE session_id=$1 AND role='tool' AND content->>'isError'='true'", [run.session_id]);
@@ -1535,7 +1531,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       faux.setResponses([
         (context) => {
           expect(context.tools?.map((tool) => tool.name)).toEqual(expect.arrayContaining([
-            "daily_plan_context_query", "swing_signal_query", "pool_attention_write",
+            "daily_plan_strategy_query", "daily_plan_write",
           ]));
           return fauxAssistantMessage(dailyReadCalls(), { stopReason: "toolUse" });
         },
@@ -1554,10 +1550,11 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         [run.session_id],
       );
       const userMessages = messages.rows.filter((row) => row.role === "user");
-      expect(userMessages).toHaveLength(3);
+      expect(userMessages).toHaveLength(4);
       expect(userMessages[1]!.text).toContain("已有的完整工具结果继续");
       expect(userMessages[2]!.text).toContain("已有的完整工具结果继续");
-      expect(userMessages[2]!.text).toContain("本次尚未成功完成的必需工具：无");
+      expect(userMessages[3]!.text).toContain("已有的完整工具结果继续");
+      expect(userMessages[3]!.text).toContain("本次尚未成功完成的必需工具：无");
       expect(messages.rows.every((row) => !row.text?.includes("任务将在计划时间自动重试"))).toBe(true);
       const output = (await pool.query<{ markdown: string }>(
         "SELECT markdown FROM job_run_output WHERE run_id = $1",

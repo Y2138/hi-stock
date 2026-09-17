@@ -389,6 +389,16 @@ const DailyPlanPlaybookItemSchema = strictObject({
   missing_md: Type.Optional(PlaybookTextSchema),
   invalidation_md: Type.Optional(PlaybookTextSchema),
   risk_md: Type.Optional(PlaybookTextSchema),
+  strategy_code: Type.Optional(IdentifierSchema),
+  strategy_runtime_version: Type.Optional(Type.Integer({ minimum: 1 })),
+  primary_evaluation_run_id: Type.Optional(Type.Union([Type.String({ pattern: "^[0-9]+$" }), Type.Null()])),
+  fallback_evaluation_run_id: Type.Optional(Type.Union([Type.String({ pattern: "^[0-9]+$" }), Type.Null()])),
+  primary_action: Type.Optional(Type.Union([Type.Union([Type.Literal("hold"), Type.Literal("observe"), Type.Literal("reduce"), Type.Literal("exit")]), Type.Null()])),
+  fallback_action: Type.Optional(Type.Union([Type.Union([Type.Literal("hold"), Type.Literal("observe"), Type.Literal("reduce"), Type.Literal("exit")]), Type.Null()])),
+  effective_action: Type.Optional(Type.Union([Type.Literal("hold"), Type.Literal("observe"), Type.Literal("reduce"), Type.Literal("exit")])),
+  evaluation_status: Type.Optional(Type.Union([Type.Literal("success"), Type.Literal("partial"), Type.Literal("failed"), Type.Literal("waiting")])),
+  evaluation_data_date: Type.Optional(Type.Union([DateSchema, Type.Null()])),
+  evaluation_missing: Type.Optional(Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 50 })),
 });
 export const DailyPlanWriteSchema = strictObject({
   items: Type.Array(DailyPlanPlaybookItemSchema, { minItems: 1, maxItems: 60 }),
@@ -1062,6 +1072,12 @@ export function validateDailyPlanWriteInput(input: unknown): DailyPlanWriteRawIn
     if (item.item_kind === "position_action") {
       if (item.grade !== undefined) throw new Error(`daily_plan_write 持仓预案 ${item.code} 不接受打板评级字段`);
       if (item.priority !== undefined) throw new Error(`daily_plan_write 持仓预案 ${item.code} 不接受 priority，排序由持仓表顺序决定`);
+      if (item.effective_action !== undefined && item.effective_action !== item.action) {
+        throw new Error(`daily_plan_write 持仓预案 ${item.code} 的 action 必须等于服务端 effective_action`);
+      }
+      if (item.strategy_code && !item.strategy_runtime_version) {
+        throw new Error(`daily_plan_write 持仓预案 ${item.code} 有策略时必须提供 strategy_runtime_version`);
+      }
     }
   }
   if (explicitPriorities.length > 4) throw new Error("daily_plan_write 打板机会最多 4 只");

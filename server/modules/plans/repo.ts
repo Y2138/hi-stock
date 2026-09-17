@@ -53,6 +53,16 @@ export interface PlaybookItemInput {
   missing_md?: string;
   invalidation_md?: string;
   risk_md?: string;
+  strategy_code?: string;
+  strategy_runtime_version?: number;
+  primary_evaluation_run_id?: string | null;
+  fallback_evaluation_run_id?: string | null;
+  primary_action?: "hold" | "observe" | "reduce" | "exit" | null;
+  fallback_action?: "hold" | "observe" | "reduce" | "exit" | null;
+  effective_action?: "hold" | "observe" | "reduce" | "exit";
+  evaluation_status?: "success" | "partial" | "failed" | "waiting";
+  evaluation_data_date?: string | null;
+  evaluation_missing?: string[];
 }
 
 export interface ReplacePlaybookInput {
@@ -78,6 +88,16 @@ export interface PlaybookItemRow {
   missing_md: string | null;
   invalidation_md: string | null;
   risk_md: string | null;
+  strategy_code: string | null;
+  strategy_runtime_version: number | null;
+  primary_evaluation_run_id: string | null;
+  fallback_evaluation_run_id: string | null;
+  primary_action: string | null;
+  fallback_action: string | null;
+  effective_action: string | null;
+  evaluation_status: string | null;
+  evaluation_data_date: string | null;
+  evaluation_missing: string[];
   target_date: string;
   auction_assessment: AuctionAssessmentRow | null;
 }
@@ -160,8 +180,11 @@ export async function replaceDraftPlaybook(
         `INSERT INTO daily_plan_playbook
            (source_job_run_id, target_date, item_kind, instrument_id, code, name,
             grade, priority, action, trigger_kind, price_lower, price_upper,
-            headline, auction_md, intraday_md, evidence_md, missing_md, invalidation_md, risk_md)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+            headline, auction_md, intraday_md, evidence_md, missing_md, invalidation_md, risk_md,
+            strategy_code,strategy_runtime_version,primary_evaluation_run_id,fallback_evaluation_run_id,
+            primary_action,fallback_action,effective_action,evaluation_status,evaluation_data_date,evaluation_missing)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+                 $20,$21,$22,$23,$24,$25,$26,$27,$28,$29::jsonb)`,
         [
           input.source_job_run_id,
           targetDate,
@@ -182,6 +205,16 @@ export async function replaceDraftPlaybook(
           item.missing_md ?? null,
           item.invalidation_md ?? null,
           item.risk_md ?? null,
+          item.strategy_code ?? null,
+          item.strategy_runtime_version ?? null,
+          item.primary_evaluation_run_id ?? null,
+          item.fallback_evaluation_run_id ?? null,
+          item.primary_action ?? null,
+          item.fallback_action ?? null,
+          item.effective_action ?? item.action,
+          item.evaluation_status ?? "success",
+          item.evaluation_data_date ?? null,
+          JSON.stringify(item.evaluation_missing ?? []),
         ],
       );
     }
@@ -393,6 +426,16 @@ function toRow(row: Record<string, unknown>): PlaybookItemRow {
     missing_md: (row.missing_md as string | null) ?? null,
     invalidation_md: (row.invalidation_md as string | null) ?? null,
     risk_md: (row.risk_md as string | null) ?? null,
+    strategy_code: (row.strategy_code as string | null) ?? null,
+    strategy_runtime_version: row.strategy_runtime_version === null || row.strategy_runtime_version === undefined ? null : Number(row.strategy_runtime_version),
+    primary_evaluation_run_id: row.primary_evaluation_run_id === null || row.primary_evaluation_run_id === undefined ? null : String(row.primary_evaluation_run_id),
+    fallback_evaluation_run_id: row.fallback_evaluation_run_id === null || row.fallback_evaluation_run_id === undefined ? null : String(row.fallback_evaluation_run_id),
+    primary_action: (row.primary_action as string | null) ?? null,
+    fallback_action: (row.fallback_action as string | null) ?? null,
+    effective_action: (row.effective_action as string | null) ?? null,
+    evaluation_status: (row.evaluation_status as string | null) ?? null,
+    evaluation_data_date: row.evaluation_data_date === null || row.evaluation_data_date === undefined ? null : String(row.evaluation_data_date),
+    evaluation_missing: Array.isArray(row.evaluation_missing) ? row.evaluation_missing.map(String) : [],
     target_date: String(row.target_date),
     auction_assessment: row.auction_assessment_id === null || row.auction_assessment_id === undefined
       ? null
@@ -423,7 +466,9 @@ export async function queryHistoricalPlanItems(db: Db, outputId: string, offset 
   const result = await db.query<Record<string, unknown>>(
     `SELECT id::text, item_kind, code, name, grade, priority, action, trigger_kind,
             price_lower, price_upper, headline, auction_md, intraday_md, evidence_md,
-            missing_md, invalidation_md, risk_md, target_date::text
+            missing_md, invalidation_md, risk_md, strategy_code,strategy_runtime_version,
+            primary_evaluation_run_id::text,fallback_evaluation_run_id::text,primary_action,fallback_action,
+            effective_action,evaluation_status,evaluation_data_date::text,evaluation_missing,target_date::text
        FROM daily_plan_playbook
       WHERE plan_output_id = $1 AND status <> 'draft'
       ORDER BY priority, id LIMIT 100 OFFSET $2`,
@@ -456,7 +501,9 @@ export async function getLatestDailyPlanBoard(pool: Db): Promise<DailyPlanBoard>
     `SELECT item.id, item.item_kind, item.code, item.name, item.grade, item.priority,
             item.action, item.trigger_kind, item.price_lower, item.price_upper,
             item.headline, item.auction_md, item.intraday_md, item.evidence_md,
-            item.missing_md, item.invalidation_md, item.risk_md, item.target_date::text,
+            item.missing_md, item.invalidation_md, item.risk_md, item.strategy_code,item.strategy_runtime_version,
+            item.primary_evaluation_run_id::text,item.fallback_evaluation_run_id::text,item.primary_action,item.fallback_action,
+            item.effective_action,item.evaluation_status,item.evaluation_data_date::text,item.evaluation_missing,item.target_date::text,
             assessment.id::text AS auction_assessment_id,
             assessment.assessment_output_id::text AS auction_output_id,
             assessment.conclusion AS auction_conclusion,
