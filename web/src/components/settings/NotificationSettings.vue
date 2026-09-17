@@ -61,7 +61,7 @@ onMounted(load);
 <template>
   <div class="card notification-settings">
     <div class="notification-head">
-      <div><div class="card-title">飞书消息推送</div><p class="card-desc">将 Agent 任务的最终结论发送到指定群，支持每日计划、竞价复核、周中检查、周复盘等任务。</p></div>
+      <div><div class="card-title">飞书消息推送</div><p class="card-desc">将 Agent 任务的最终结论发送到指定群，支持每日计划、夜间板块筛选、价值错杀扫描、竞价复核、商品防守评估等任务。</p></div>
       <RouterLink class="btn" to="/settings/notifications/history">通知记录 →</RouterLink>
     </div>
     <p v-if="!settings">{{ error || '正在读取推送设置…' }}</p>

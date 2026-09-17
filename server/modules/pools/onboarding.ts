@@ -9,22 +9,19 @@ import {
 import { resolveRemoteTicker, upsertTickerIdentities } from "../../datasource/catalog-service.js";
 import { recomputeIndicatorSeries, type IndicatorRunResult } from "../../indicators/service.js";
 import { STOCK_CHARACTER_CALCULATION_VERSION, type StockCharacterProfile } from "../../indicators/formulas.js";
-import type { PoolChangeInput, PoolKind } from "./repo.js";
+import { WATCH_POOL, WATCH_POOL_ROLE, type PoolChangeInput, type PoolKind } from "./repo.js";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
-export type PoolOnboardRole = "短线" | "波段" | "长线";
 
 export interface PoolOnboardRequest {
   instrument: string;
   requested_pool?: PoolKind;
-  requested_role?: PoolOnboardRole;
   reason: string;
 }
 
 export interface PoolOnboardCommitInput {
   code: string;
   requested_pool?: PoolKind;
-  requested_role?: PoolOnboardRole;
   reason: string;
   effective_from: string;
   profile_as_of: string;
@@ -46,8 +43,6 @@ interface ProfileRow {
   indicator_status: string;
   stock_character_profile: StockCharacterProfile;
   stage: string | null;
-  research_score: number | null;
-  grade: string | null;
   stock_character: string | null;
   tags: string[];
 }
@@ -104,7 +99,7 @@ async function findProfile(
             metric.as_of_date::text, metric.calculation_version, run.input_sha256,
             metric.input_row_count, run.input_start_date::text, run.input_end_date::text,
             run.status AS indicator_status, metric.stock_character_profile,
-            metric.stage, metric.research_score, metric.grade, metric.stock_character, metric.tags
+            metric.stage, metric.stock_character, metric.tags
        FROM market_instrument instrument
        JOIN market_stock_character_metric metric ON metric.instrument_id = instrument.id
        JOIN market_indicator_run run ON run.id = metric.indicator_run_id
@@ -155,36 +150,19 @@ async function ensureInstrument(pool: pg.Pool, query: string): Promise<{ id: str
 }
 
 function requestedSelection(
-  input: Pick<PoolOnboardRequest, "requested_pool" | "requested_role">,
+  input: Pick<PoolOnboardRequest, "requested_pool">,
   profile: ProfileRow,
-  fundamental: SnapshotRow | null,
 ) {
-  if (input.requested_role) {
-    return {
-      pool: input.requested_role === "短线" ? "short" as const : "long" as const,
-      role: input.requested_role,
-      source: "user" as const,
-      reason: "遵从用户明确指定的策略角色",
-    };
-  }
-  if (input.requested_pool === "short") {
-    return { pool: "short" as const, role: "短线" as const, source: "user" as const, reason: "遵从用户明确指定的短线池" };
-  }
   const dimensions = profile.stock_character_profile.dimensions;
-  const strongFundamental = profile.kind === "stock" && fundamental !== null &&
-    Number(fundamental.net_profit) > 0 && Number(fundamental.operating_cashflow) > 0 && Number(fundamental.roe) > 0;
-  if (input.requested_pool === "long") {
-    return strongFundamental
-      ? { pool: "long" as const, role: "长线" as const, source: "user" as const, reason: "用户指定长线池且基本面满足长期跟踪口径" }
-      : { pool: "long" as const, role: "波段" as const, source: "user" as const, reason: "用户指定长线池，当前资料更适合波段跟踪" };
-  }
-  if (strongFundamental && dimensions.volatility.score < 60 && (profile.research_score ?? 0) >= 60) {
-    return { pool: "long" as const, role: "长线" as const, source: "calculation" as const, reason: "基本面为正、波动可控且研究评分达到长期跟踪阈值" };
-  }
-  if (["主升", "上升"].includes(profile.stage ?? "") && dimensions.markup.score >= 60) {
-    return { pool: "short" as const, role: "短线" as const, source: "calculation" as const, reason: "趋势与拉升维度更适合短周期持续扫描" };
-  }
-  return { pool: "long" as const, role: "波段" as const, source: "calculation" as const, reason: "未指定池别时按中周期股性归入波段持续扫描" };
+  const reason = ["主升", "上升"].includes(profile.stage ?? "")
+    ? `当前处于${profile.stage}阶段，拉升维度得分 ${Math.round(dimensions.markup.score)}，适合纳入关注池持续跟踪`
+    : `当前处于${profile.stage ?? "未判定"}阶段，波动维度得分 ${Math.round(dimensions.volatility.score)}，按当前股性纳入关注池持续跟踪`;
+  return {
+    pool: WATCH_POOL,
+    role: WATCH_POOL_ROLE,
+    source: input.requested_pool ? ("user" as const) : ("calculation" as const),
+    reason,
+  };
 }
 
 async function profileFacts(db: Db, profile: ProfileRow, lock = false) {
@@ -212,7 +190,7 @@ async function profileFacts(db: Db, profile: ProfileRow, lock = false) {
     [profile.instrument_id],
   );
   const current = await db.query<Record<string, unknown>>(
-    `SELECT id::text, pool, role, grade, score::float8, profile_as_of::text,
+    `SELECT id::text, pool, role, profile_as_of::text,
             profile_calculation_version, profile_input_sha256, effective_from::text
        FROM pool_membership WHERE instrument_id = $1 AND effective_to IS NULL
       ORDER BY id DESC LIMIT 1${lock ? " FOR UPDATE" : ""}`,
@@ -233,8 +211,7 @@ export async function resolvePoolOnboarding(
 ): Promise<ResolvedPoolOnboarding> {
   const profile = await findProfile(db, input.code, input, lock);
   if (!profile) throw new Error("入池画像已变化或不存在，请重新执行 pool_onboard 初始化");
-  if (profile.indicator_status !== "success" || profile.input_row_count < 120 || !profile.stage ||
-      profile.research_score === null || !profile.grade || !profile.stock_character) {
+  if (profile.indicator_status !== "success" || profile.input_row_count < 120 || !profile.stage || !profile.stock_character) {
     throw new Error("正式日线不足120条或五维画像未完整生成，不能创建入池提案");
   }
   const facts = await profileFacts(db, profile, lock);
@@ -244,7 +221,7 @@ export async function resolvePoolOnboarding(
   if (profile.kind === "stock" && (!facts.fundamental || !facts.valuation)) {
     throw new Error("A股最新财务或估值快照缺失，不能创建入池提案");
   }
-  const selection = requestedSelection(input, profile, facts.fundamental);
+  const selection = requestedSelection(input, profile);
   const profileValue = profile.stock_character_profile;
   const industryText = facts.industries.map((item) => item.name).join("、") || "不适用";
   const financialText = profile.kind === "stock"
@@ -253,7 +230,7 @@ export async function resolvePoolOnboarding(
   const evaluationSummary = [
     `数据截至${profile.as_of_date}`,
     `五维股性${profile.stock_character}`,
-    `阶段${profile.stage}，研究评分${profile.research_score}（${profile.grade}）`,
+    `阶段${profile.stage}`,
     `官方行业${industryText}`,
     financialText,
     `角色来源：${selection.reason}`,
@@ -261,10 +238,8 @@ export async function resolvePoolOnboarding(
   const change: PoolChangeInput = {
     action: facts.current ? "update" : "add",
     code: profile.code,
-    pool: selection.pool,
-    role: selection.role,
-    grade: profile.grade,
-    score: profile.research_score,
+    pool: WATCH_POOL,
+    role: WATCH_POOL_ROLE,
     tags: profile.tags,
     stock_character: profile.stock_character,
     stock_character_profile: profileValue,
@@ -280,8 +255,6 @@ export async function resolvePoolOnboarding(
     instrument: { code: profile.code, name: profile.name, kind: profile.kind },
     action: change.action,
     recommendation: selection,
-    grade: profile.grade,
-    score: profile.research_score,
     stage: profile.stage,
     stock_character: profile.stock_character,
     dimensions: profileValue.dimensions,
@@ -336,7 +309,6 @@ export async function initializePoolOnboarding(
   const commit: PoolOnboardCommitInput = {
     code: instrument.code,
     requested_pool: input.requested_pool,
-    requested_role: input.requested_role,
     reason: input.reason,
     effective_from: effectiveFrom,
     profile_as_of: profile.as_of_date,

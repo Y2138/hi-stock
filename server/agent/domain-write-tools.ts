@@ -5,7 +5,6 @@ import type pg from "pg";
 import { applyPoolChange, setPoolBoardOrder } from "../modules/pools/repo.js";
 import { resolvePoolOnboarding } from "../modules/pools/onboarding.js";
 import { recordPositionChange, updatePositionEntrySignalType } from "../modules/positions/repo.js";
-import { finalizeBacktest } from "../modules/backtests/repo.js";
 import { applyMemoryChange } from "../modules/memory/repo.js";
 import { createJobDefinition, updateJobDefinition } from "../scheduler/repo.js";
 import {
@@ -16,14 +15,12 @@ import {
 } from "../modules/job-prompts/repo.js";
 import {
   validateJobWriteInput,
-  validateFinalizeBacktestInput,
   validateMemoryWriteInput,
   validatePoolOnboardCommitInput,
   validatePoolWriteInput,
   validatePortfolioWriteInput,
   validatePositionEntrySignalWriteInput,
   type JobWriteInput,
-  type FinalizeBacktestInput,
   type MemoryWriteInput,
   type PoolOnboardCommitInput,
   type PoolWriteOperation,
@@ -40,7 +37,6 @@ export type DomainWriteToolName =
   | "pool_onboard"
   | "pool_write"
   | "job_write"
-  | "finalize_backtest"
   | "memory_write";
 
 export type DomainWriteInput =
@@ -49,7 +45,6 @@ export type DomainWriteInput =
   | PoolOnboardCommitInput
   | PoolWriteInput
   | JobWriteInput
-  | FinalizeBacktestInput
   | MemoryWriteInput;
 
 function validateDomainInput(toolName: DomainWriteToolName, input: unknown): DomainWriteInput {
@@ -59,7 +54,6 @@ function validateDomainInput(toolName: DomainWriteToolName, input: unknown): Dom
     case "pool_onboard": return validatePoolOnboardCommitInput(input);
     case "pool_write": return validatePoolWriteInput(input);
     case "job_write": return validateJobWriteInput(input);
-    case "finalize_backtest": return validateFinalizeBacktestInput(input);
     case "memory_write": return validateMemoryWriteInput(input);
   }
 }
@@ -156,40 +150,21 @@ async function poolState(client: pg.PoolClient, input: PoolWriteOperation, lock:
   if (!instrument) throw new Error(`未知标的代码：${input.code}`);
   const current = await oneRow(
     client,
-    `SELECT id::text, pool, role, grade, score::text, tags, stock_character,
+    `SELECT id::text, pool, role, tags, stock_character,
             stock_character_profile, stage, evaluation_summary, profile_as_of::text,
-            profile_calculation_version, profile_input_sha256, attention_signal, attention_reason,
-            attention_from::text, attention_until::text, effective_from::text, effective_to::text, note
+            profile_calculation_version, profile_input_sha256, effective_from::text, effective_to::text, note
        FROM pool_membership
       WHERE instrument_id = $1 AND effective_to IS NULL
       ORDER BY id DESC LIMIT 1${lock ? " FOR UPDATE" : ""}`,
     [instrument.id],
   );
   if ((input.action === "update" || input.action === "remove") && !current) {
-    throw new Error(`标的 ${input.code} 在 ${input.pool} 池没有当前角色行`);
+    throw new Error(`标的 ${input.code} 在关注池没有当前角色行`);
   }
   if (input.action === "update" && current?.pool !== input.pool) {
     throw new Error("pool_write 不负责迁池；请使用 pool_onboard");
   }
   return { instrument, current };
-}
-
-async function backtestState(client: pg.PoolClient, input: FinalizeBacktestInput, lock: boolean, sessionId?: string | null): Promise<unknown> {
-  if (!sessionId) throw new Error("finalize_backtest 必须绑定持久化 Agent 会话");
-  const run = await oneRow(client,
-    `SELECT id::text, session_id::text, execution_status, conclusion_status, finished_at,
-            conclusion_summary, applicability_boundary
-       FROM backtest_run WHERE id = $1 AND session_id = $2${lock ? " FOR UPDATE" : ""}`,
-    [input.run_id, sessionId],
-  );
-  if (!run) throw new Error("只能确认当前 Agent 会话中的回测运行");
-  const currentFinal = await oneRow(client,
-    `SELECT id::text, conclusion_summary, applicability_boundary, finalized_at
-       FROM backtest_run WHERE session_id = $1 AND conclusion_status = 'final'
-       ORDER BY id DESC LIMIT 1${lock ? " FOR UPDATE" : ""}`,
-    [sessionId],
-  );
-  return { run, current_final: currentFinal };
 }
 
 async function memoryState(client: pg.PoolClient, input: MemoryWriteInput, lock: boolean): Promise<unknown> {
@@ -272,7 +247,6 @@ async function targetState(
   toolName: DomainWriteToolName,
   input: DomainWriteInput,
   lock: boolean,
-  sessionId?: string | null,
 ): Promise<unknown> {
   switch (toolName) {
     case "portfolio_write": {
@@ -301,7 +275,6 @@ async function targetState(
       return states;
     }
     case "job_write": return jobState(client, input as JobWriteInput, lock);
-    case "finalize_backtest": return backtestState(client, input as FinalizeBacktestInput, lock, sessionId);
     case "memory_write": return memoryState(client, input as MemoryWriteInput, lock);
   }
 }
@@ -321,7 +294,6 @@ const DOMAIN_LABELS: Record<DomainWriteToolName, string> = {
   pool_onboard: "标的入池初始化",
   pool_write: "标的池",
   job_write: "作业",
-  finalize_backtest: "回测最终结论",
   memory_write: "Agent 记忆",
 };
 
@@ -372,10 +344,6 @@ function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput, s
     if (value.action === "create_prompt") return { code: value.code, name: value.name };
     return { prompt_id: value.prompt_id, action: value.action };
   }
-  if (toolName === "finalize_backtest") {
-    const value = input as FinalizeBacktestInput;
-    return { run_id: value.run_id, conclusion_summary: value.conclusion_summary, applicability_boundary: value.applicability_boundary };
-  }
   if (toolName === "memory_write") {
     const value = input as MemoryWriteInput;
     return {
@@ -396,7 +364,7 @@ export async function previewDomainWrite(
   options: { lock?: boolean; sessionId?: string | null } = {},
 ): Promise<DomainWritePreview> {
   const input = validateDomainInput(toolName, rawInput);
-  return buildDomainWritePreview(client, toolName, input, options.lock === true, options.sessionId);
+  return buildDomainWritePreview(client, toolName, input, options.lock === true);
 }
 
 async function buildDomainWritePreview(
@@ -404,9 +372,8 @@ async function buildDomainWritePreview(
   toolName: DomainWriteToolName,
   input: DomainWriteInput,
   lock: boolean,
-  sessionId?: string | null,
 ): Promise<DomainWritePreview> {
-  const state = await targetState(client, toolName, input, lock, sessionId);
+  const state = await targetState(client, toolName, input, lock);
   const action = toolName === "portfolio_write" || toolName === "pool_write"
     ? "batch"
     : "action" in input ? String(input.action) : toolName;
@@ -441,7 +408,7 @@ export async function executeDomainWriteInTransaction(
   options: { expectedStateHash?: string | null; sessionId?: string | null } = {},
 ): Promise<unknown> {
   const input = validateDomainInput(toolName, rawInput);
-  const preview = await buildDomainWritePreview(client, toolName, input, true, options.sessionId);
+  const preview = await buildDomainWritePreview(client, toolName, input, true);
   if (options.expectedStateHash && options.expectedStateHash !== preview._state_hash) {
     throw new DomainWriteConflictError();
   }
@@ -492,16 +459,13 @@ export async function executeDomainWriteInTransaction(
       const items = [];
       for (const operation of value.operations) {
         if (operation.action === "set_board_order") {
-          items.push(await setPoolBoardOrder(client, operation.pool, operation.board_codes!));
+          items.push(await setPoolBoardOrder(client, operation.board_codes!));
           continue;
         }
         items.push(await applyPoolChange(client, {
           action: operation.action,
           code: operation.code!,
           pool: operation.pool,
-          attention_reason: operation.attention_reason,
-          attention_from: operation.attention_from,
-          attention_until: operation.attention_until,
           effective_from: operation.effective_from!,
           note: operation.note,
           evaluation_session_id: options.sessionId,
@@ -520,6 +484,9 @@ export async function executeDomainWriteInTransaction(
           config: value.config,
           prompt_id: value.prompt_id,
           model_id: value.model_id,
+          purpose: value.purpose,
+          phase: value.phase,
+          priority: value.priority,
           enabled: value.enabled,
         });
       }
@@ -554,16 +521,6 @@ export async function executeDomainWriteInTransaction(
         base_revision_id: value.base_revision_id,
         target_revision_id: value.target_revision_id,
         change_summary: value.change_summary,
-      });
-    }
-    case "finalize_backtest": {
-      if (!options.sessionId) throw new Error("finalize_backtest 必须绑定持久化 Agent 会话");
-      const value = input as FinalizeBacktestInput;
-      return finalizeBacktest(client, {
-        session_id: options.sessionId,
-        run_id: value.run_id,
-        conclusion_summary: value.conclusion_summary,
-        applicability_boundary: value.applicability_boundary,
       });
     }
     case "memory_write": {

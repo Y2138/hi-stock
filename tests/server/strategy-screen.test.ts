@@ -68,11 +68,11 @@ describe.skipIf(!prepared)("策略条件参考筛选（stock_test 真实库）",
   it("缺日线时逐规则返回缺口并指引批量补拉后重跑", async () => {
     const result = await queryStrategyScreen(pool, {
       codes: ["990101.SZ"],
-      rules: ["short_right", "short_left", "trial", "swing"],
+      rules: ["short_right", "trial", "swing"],
       date: "2026-07-31",
     });
     expect(result.status).toBe("partial");
-    expect(result.data_gaps).toHaveLength(4);
+    expect(result.data_gaps).toHaveLength(3);
     for (const gap of result.data_gaps) {
       expect(gap.reason).toContain("根日线");
     }

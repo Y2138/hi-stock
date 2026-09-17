@@ -8,9 +8,8 @@
 | 状态 | T1–T49 已确认；跨电脑固定资产同步已收敛；外部 CLI 桥暂缓 |
 | 更新日期 | 2026-08-21 |
 | 关联 PRD | `docs/product/Stock_策略演进系统_产品方案_v2.0.md`（v2.29，E1–E38） |
-| 前置设计 | `Stock_策略演进系统_技术设计_v1.0.md`（一期，已交付，保留为历史） |
 
-> 本文按 `设计文档模板_v1.0.md` 裁剪：模板中与交易事实写入、计划状态机、成交校验相关章节在二期仍不适用（系统不产生交易执行），删除并在此注明。一期设计文档中的 Schema v1、迁移策略、错误格式约定继续有效，本文在其上扩展。
+> 本文是当前技术与数据契约入口。历史 Schema v1、迁移策略和错误格式以不可改写的迁移文件及当前代码为准，本文在其上描述当前实现。
 
 ---
 
@@ -229,31 +228,7 @@ CREATE TABLE portfolio_position_change (
   created_at     timestamptz NOT NULL DEFAULT now()
 );
 
--- 退役历史表：保留存量数据，不参与生产读写或 Agent 查询
-CREATE TABLE portfolio_position_snapshot_daily (
-  id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  snap_date      date NOT NULL,
-  instrument_id  bigint NOT NULL REFERENCES market_instrument(id),
-  quantity       numeric NOT NULL,
-  cost_price     numeric NOT NULL,
-  close          numeric,
-  market_value   numeric,
-  pnl_amount     numeric,
-  stop_price     numeric,                        -- 执行位结果值（不含公式）
-  target_price   numeric,
-  UNIQUE (snap_date, instrument_id)
-);
-CREATE TABLE portfolio_account_snapshot (
-  snap_date      date PRIMARY KEY,
-  total_asset    numeric,
-  market_value   numeric,
-  cash           numeric,
-  raw_text       text,                           -- 原始文本（保留约数标记）
-  precision      text NOT NULL DEFAULT 'exact' CHECK (precision IN ('exact','approx')),
-  source         text NOT NULL DEFAULT 'ingest'  -- ingest / job / form
-);
-
--- portfolio_account_state 同属退役历史表；旧表及其存量数据不做物理删除
+-- 旧账户快照与持仓日快照已由 0112 物理删除；portfolio_account_state 仅保留内部现金台账。
 
 -- 行情唯一数据源
 CREATE TABLE market_bar (
@@ -295,39 +270,7 @@ CREATE TABLE volume_snapshot (
   kind       text NOT NULL DEFAULT 'scheduled' CHECK (kind IN ('scheduled','manual'))
 );
 
--- 策略文档与脚本版本（同构）
-CREATE TABLE strategy_doc (
-  id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  path text NOT NULL UNIQUE,                     -- 仓库相对路径
-  name text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE strategy_version (
-  id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  doc_id         bigint NOT NULL REFERENCES strategy_doc(id) ON DELETE CASCADE,
-  version_no     int NOT NULL,
-  sha256         text NOT NULL,
-  content        text NOT NULL,
-  change_summary text,
-  synced_at      timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (doc_id, version_no)
-);
-CREATE TABLE script_registry (
-  id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  path text NOT NULL UNIQUE,
-  name text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE script_version (
-  id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  script_id      bigint NOT NULL REFERENCES script_registry(id) ON DELETE CASCADE,
-  version_no     int NOT NULL,
-  sha256         text NOT NULL,
-  content        text NOT NULL,
-  change_summary text,
-  synced_at      timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (script_id, version_no)
-);
+-- 旧 strategy_doc/strategy_version 与 script_registry/script_version 已由 0112 物理删除。
 
 -- 回测引擎版本哈希
 ALTER TABLE backtest_run ADD COLUMN engine_sha256 text;
@@ -382,17 +325,6 @@ CREATE TABLE agent_tool_audit (
   status      text NOT NULL,         -- ok/error/blocked/pending
   created_at  timestamptz NOT NULL DEFAULT now()
 );
-CREATE TABLE agent_external_cli_run (
-  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  session_id  bigint,
-  agent       text NOT NULL CHECK (agent IN ('codex','claude')),
-  prompt      text NOT NULL,
-  exit_code   int,
-  output_sha256 text,
-  timed_out   boolean NOT NULL DEFAULT false,
-  started_at  timestamptz NOT NULL DEFAULT now(),
-  finished_at timestamptz
-);
 ```
 
 ### 4.3 `0004_llm_config.sql`（M2 优化）
@@ -445,10 +377,7 @@ CREATE TABLE llm_setting (
 | `fetch_run` | `market_fetch_run` | 行情获取 |
 | `position` | `portfolio_position` | 组合持仓 |
 | `position_change` | `portfolio_position_change` | 组合持仓 |
-| `position_snapshot_daily` | `portfolio_position_snapshot_daily` | 退役历史数据 |
-| `account_snapshot` | `portfolio_account_snapshot` | 退役历史数据 |
 | `confirmation` | `agent_confirmation` | agent 确认制 |
-| `external_cli_run` | `agent_external_cli_run` | agent 委派审计 |
 
 其余表已具有领域前缀，不重命名。旧 `database_change` 记录与 pending 提案不做兼容执行，必须按新领域工具重新发起。
 
@@ -475,7 +404,6 @@ CREATE TABLE job_definition (
 CREATE TABLE job_run (
   id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   job_id      bigint NOT NULL REFERENCES job_definition(id),
-  task_run_id bigint REFERENCES task_run(id) ON DELETE SET NULL,
   target_date date NOT NULL,
   trigger_kind text NOT NULL CHECK (trigger_kind IN ('cron','manual')),
   scheduled_for timestamptz,
@@ -497,15 +425,13 @@ CREATE UNIQUE INDEX job_run_scheduled_once
 
 `market_fetch_run.job_run_id` 在 0007 增加到 `job_run(id)` 的外键。初始作业由迁移插入；当前 datasource 的 config 只保存 pipeline，agent_flow 通过 `prompt_id` 绑定数据库提示词，不在 config 保存模板路径或策略参数。`job_definition.model_id` 只允许 Agent 任务使用：空值在创建运行会话时继承系统当前模型，非空值固定本次运行及其自动重试的模型；模型不可用或缺少 API Key 时明确失败，不静默切换。`job_definition`、`job_run` 是 Agent 通用数据库工具的保护表，只可通过作业专用 API 与 `trigger_job` 维护。
 
-一期 `task_run` 只读保留历史记录；当前系统调度统一写 `job_run`，新 Runner 不再为 agent_flow 复制登记 `task_run`。
+`task_definition`、`task_run` 及 `job_run.task_run_id` 已由 0112 删除；当前系统调度只使用 `job_definition`、`job_run` 和 `job_run_output`。
 
 ### 4.7 `0008_content_jobs.sql`（M3.5 内容与提示词事实源）
 
-- `content_document(code, title, content_type, status, legacy_path, current_revision_id, created_at, updated_at)`：`content_type` 限定 `strategy | guidance | trading_plan | archive`；常规内容操作不物理删除，0014 的固定迁移清理是一次性例外。
-- `content_revision(document_id, revision_no, content, sha256, source, base_revision_id, change_summary, created_at)`：唯一 `(document_id, revision_no)` 与 `(document_id, sha256)`；`source` 限定 `legacy_import | user | agent | rollback`。服务层在同一事务锁定文档行并校验 `base_revision_id = current_revision_id`。
 - `job_prompt(code, name, status, current_revision_id, created_at, updated_at)` 与 `job_prompt_revision(prompt_id, revision_no, content, sha256, source, base_revision_id, change_summary, created_at)`：同样只追加版本。
 - `job_definition.prompt_id` 新增可空外键；`job_run.prompt_revision_id` 新增可空外键。Runner 只认外键，缺失即失败，不回退文件；0012 清除初始作业遗留的 `config.template_path`，0013 继续清除不再使用的 `task_code`。
-- 既有 `strategy_doc/strategy_version` 迁入 `content_*`，以原 path 与 sha 去重；0008 创建三个稳定提示词身份并绑定现有 agent_flow 作业，0012 直接追加数据库原生正文。迁移完成后旧导入器删除，避免重新引入文件副本。
+- 0008 完成历史内容迁入和提示词建库；当前策略已收敛到 `strategy_document`，旧内容库及旧策略/脚本版本表由 0112 物理删除。
 
 ### 4.8 `0009_analysis_backtest.sql`（M3.5 分析与回测结论）
 
@@ -516,10 +442,10 @@ CREATE UNIQUE INDEX job_run_scheduled_once
 
 ### 4.9 `0010`–`0014`（退役账户字段、数据库原生 Flow 与单一事实源）
 
-- 0010 增加的账户字段随 `portfolio_account_snapshot` 退役保留；当前没有账户快照写入 service。0043 只在迁移时复制一次 `closed_pnl` 历史基线，运行时不再读取旧账户表。
+- 0010 增加的账户字段曾用于历史快照；0043 已把 `closed_pnl` 固化为历史基线，0112 随后物理删除旧账户快照表。
 - 0011 把指引类内容纠正为 `guidance`，并临时归档已由结构化表或作业提示词接管的旧内容条目。
 - 0012 为三个内置 agent_flow 追加数据库原生提示词版本，原子切换 `current_revision_id` 并清除旧文件配置；历史提示词版本继续保留。
-- 0013 清除 agent_flow 的 `task_code`，新运行结果只保存到 `job_run`，不再复制登记一期 `task_run`。
+- 0013 清除 agent_flow 的 `task_code`，新运行结果只保存到 `job_run`；0112 物理删除一期 `task_run`。
 - 0014 删除短线/长线标的池、三个任务模板和 2026 年 7/8 月持仓流水共 7 份内容文档、正文版本及对应迁移证据。迁移只按固定 `legacy_path` 命中，保留策略、指引、当前计划和计划归档。
 
 ### 4.10 `0015`（会话级模型）
@@ -564,7 +490,7 @@ CREATE UNIQUE INDEX job_run_scheduled_once
 
 ### 4.16 `0020_portfolio_account_state.sql`（退役资金台账）
 
-- `portfolio_account_state`、`portfolio_account_snapshot` 与 `portfolio_position_snapshot_daily` 只保留存量历史数据，安全初始化包继续排除，完整私有备份继续保留。
+- `portfolio_account_state` 仅保留风险门禁和组合净值所需的内部现金台账；`portfolio_account_snapshot` 与 `portfolio_position_snapshot_daily` 已由 0112 物理删除。
 - `portfolio_write` 不再接受 `upsert_account_snapshot`；`record_position_change` 不读取、锁定、校验或联动遗留资金状态，只在同一事务维护持仓事件和当前投影。
 - `/api/account/snapshots` 与 `/api/account/summary` 不再注册并返回 404。三张退役表不进入 Agent 表索引，避免被误用为当前事实。
 
@@ -645,8 +571,8 @@ CREATE UNIQUE INDEX job_run_scheduled_once
 
 ### 4.29 `0076_重写其余Agent任务提示词.sql`（内置任务提示词收敛）
 
-- 每日计划、周中检查和每周评分的当前提示词均为完整正文，不拼接历史规则、替代段或表级查询教程；旧 revision 只保留不可变审计。
-- 每日计划固定按需加载三类确定性扫描与两个结构化写工具；周中检查复用短线池摘要和每日计划确定性扫描；每周评分先以池摘要覆盖全集，只对变化项展开研究属性，并分别复用短线、波段和长线估值工具。
+- 各 Agent 任务的当前提示词均为完整正文，不拼接历史规则、替代段或表级查询教程；旧 revision 只保留不可变审计。
+- 每日计划按需加载确定性扫描与结构化写工具，并读取《每日计划策略》；其余任务各自读取对应的任务策略文档后再解释工具结果。
 - 任务结果保留全部成员或候选覆盖计数、互斥分类和逐项缺口，Markdown 对普通筛除项只汇总原因，避免重复展开工具已经给出的原始证据。
 
 ### 4.30 `0077_移除标的池止损档位.sql`、`0078_标的入池确定性画像.sql`（入池初始化收敛）
@@ -663,9 +589,23 @@ CREATE UNIQUE INDEX job_run_scheduled_once
 - 把当前修订正文内联进 `strategy_document.content`/`sha256`，并删除没有当前正文的占位文档；系统此后只保存当前最终策略，不再保存任何历史正文。
 - `strategy_score_benchmark` 的外键由 `document_revision_id` 改为 `document_id`（原列重命名，唯一约束改为按文档唯一），评分基准直接绑定策略文档；正文更新不重建基准。
 - `chat_session` 移除 `strategy_state_revision`/`strategy_state_sha256`：会话不再固化历史策略，任务与对话一律读取当前策略。
-- 删除 `strategy_document_revision` 表、`strategy_document.current_revision_id` 与 `legacy_content_document_id`；`job_run`/`job_run_output`/`backtest_run`/`portfolio_position_change` 等运行记录里的策略序号和集合哈希保留为归因标签，不再用于回放。
+- 删除 `strategy_document_revision` 表、`strategy_document.current_revision_id` 与旧内容关联；0112 继续移除 `job_run_output.legacy_content_document_id`。运行记录里的策略序号和集合哈希保留为归因标签，不再用于回放。
 - 按内联正文重算 `strategy_state.current_hash`，口径与运行时 `calculateStrategyHash`（按注入序聚合 `code:sha256`）一致。
 - 可移植包格式由 v4 升到 v5，白名单只含 `strategy_document`（当前正文）等表，不再导出修订表；`restorePayload` 删除“恢复后回填基准”的特例。v4 旧包按格式版本明确拒绝。
+
+### 4.32 `0107`–`0110`（关注池统一、信号收敛、策略文档重组与回测下线）
+
+- `0107`：`pool_membership.pool` 收敛为单一 `watch`、`role` 固定为“关注”，删除 `score`/`grade` 与五维画像上的评分列（保留股性画像、阶段、标签、关键位）；新增 `pool_attention_entry`，每个来源（任务 code 或 `manual`）各自维护一条关注，来源之间互不清除。
+- `0108`：每日计划只保留波段为唯一开仓信号，右侧六条件退为持有评估、试盘退为上涨概率评估；全市场左侧反转任务停用，每周评分停用；各定时评估任务接入任务级策略文档与关注池。
+- `0109`：策略文档按“总策略 + 按任务类型文档”重组，`strategy_document` 新增 `role='task'` 与 `job_code`；策略演进摘要与回测→策略变更审核流程退役。可移植包格式随之升到 **v6**（`strategy_document` 增加 `job_code`，`strategy_evolution_log` 不再导出）。
+- `0110`：回测执行完全迁出系统，删除 `backtest_*` 运行、输入冻结、事件与净值表；本地研究脚本改为引用 `scripts/lib/backtest-*.ts` 的纯计算内核，内置 Agent 不再有回测与策略发布工具。
+
+### 4.33 `0111_任务特征标注与废弃任务清理.sql`、`0112_清理废弃表.sql`（任务与历史结构收口）
+
+- 作业定义增加 `purpose`（职责与产出）、`phase`（盘前/盘中/盘后/夜间/周末）和 `priority`（重要性排序权重）；任务清单按优先级升序展示，数据链路先于研判、盘中复核先于低频深度研究。
+- 每周评分、周中检查和全市场左侧扫描连同结果、运行和提示词物理删除；任务定义从 19 个收敛到 16 个。
+- `pool_membership` 同时承接系统信号与用户自选观察，来源按 `(instrument_id, source_job)` 独立维护。没有任何关注条目的成员仍可能是用户自选或待观察标的，因此 0112 只做结构清理，**不按“有无关注条目”删除池成员**。
+- 旧内容库、一期任务表、旧策略/脚本版本库、账户与持仓快照、系统跟踪、Agent 评测和 CLI 占位表全部物理删除；运行时类型、API、恢复清理列表和测试同步移除兼容字段。
 
 ## 五、datasource 模块（E11，M1 核心）
 
@@ -751,7 +691,7 @@ await agent.prompt(text, images);   // images: ImageContent[]（base64 + mimeTyp
 
 ### 6.2 工具注册（T12、T14、T16、T18、T24、T43）
 
-服务端先构造当前会话有权使用的工具注册表；交互会话初始只暴露 `tool_catalog` 及名称、标签元信息，内置定时任务预加载其固定领域工具。模型每次最多选择 8 个工具，下一轮注入所选原工具的完整描述和参数 schema；同一 session 已成功加载的名称从持久化 `tool_catalog` 结果恢复，并与当前授权目录取交集，因此后续消息、服务重启和上下文压缩后可直接复用而不扩大权限。加载过程不改变权限、执行函数、二次校验、确认、写锁或审计边界。市场研究与 Web 能力常驻授权目录，横向数据库能力用于纵向工具未覆盖的只读探索或排障；未知任务采用交互工具目录，不获得任务专属写入。任务验收及研究路由见[智能助手工具设计与验收](../智能助手工具设计与验收.md)。
+服务端先构造当前会话有权使用的工具注册表；交互会话初始只暴露 `tool_catalog` 及名称、标签元信息，内置定时任务预加载其固定领域工具。模型每次最多选择 8 个工具，下一轮注入所选原工具的完整描述和参数 schema；同一 session 已成功加载的名称从持久化 `tool_catalog` 结果恢复，并与当前授权目录取交集，因此后续消息、服务重启和上下文压缩后可直接复用而不扩大权限。加载过程不改变权限、执行函数、二次校验、确认、写锁或审计边界。市场研究与 Web 能力常驻授权目录，横向数据库能力用于纵向工具未覆盖的只读探索或排障；未知任务采用交互工具目录，不获得任务专属写入。任务验收及研究路由见[智能助手工具设计与验收](智能助手工具设计与验收.md)。
 
 | 工具 | 契约 |
 |------|------|
@@ -842,11 +782,11 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 
 ### 6.5 外部 CLI 桥（M4 暂缓）
 
-以下只保留后续设计，不进入当前生产实现。当前没有 `agent/bridge/cli.ts`、CLI 可用性探测、`delegate_to_cli` 工具注册或 `agent_external_cli_run` 新写入。
+以下只保留后续设计，不进入当前生产实现。当前没有 CLI 桥代码、工具、审计接口或占位表；未来重新立项必须新增迁移。
 
 - `delegate_to_cli(agent, prompt, timeout)`：`spawn('codex', ['exec', ...])` / `spawn('claude', ['-p', '--output-format', 'stream-json', ...])`，cwd=仓库根，超时默认 10 分钟上限 30，stdout 截断 200KB，并发信号量 2。
 - 输出分片经 `onUpdate` 回流为工具 partial result → SSE `tool_update` 帧。
-- 全部写 `agent_external_cli_run`；设置页探测走 `codex --version` / `claude --version` / `pi --version`。
+- 若未来重新启用，必须重新定义审计表；设置页探测可使用 `codex --version` / `claude --version` / `pi --version`。
 
 ### 6.6 页面 AI 解读、工作台与外观（M4/T28；第二阶段按 T34 重构）
 
@@ -881,10 +821,9 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 
 ## 七、内容库（M3.5）
 
-- 旧内容 API 已删除；冻结内容表只保留迁移审计与可移植初始化包兼容数据。“当前策略”页面只展示最终正文和简要演进，不提供历史全文时间线或回滚入口。
-- `modules/job-prompts/` 以同样的只追加模型维护 Agent Flow 提示词；`job_run.prompt_revision_id` 固化每次实际执行版本。
-- 内容范围只包含策略、指引、当前交易计划和交易计划归档。持仓/资金/流水、标的池、行情、作业提示词/结果、分析和回测均使用各自结构化事实源；0014 已删除对应内容副本。
-- 旧导入器与文档同步运行入口已删除。`strategy_*`、`script_*` 和 `content_legacy_import` 仅保留历史迁移审计，不注册生产路由、不参与 Agent Flow 或内容展示，且不进入 Agent 表索引。
+- 旧内容 API、旧内容库、旧策略/脚本版本库和迁移映射表均已删除。
+- Agent Flow 提示词只由 `job_prompt` / `job_prompt_revision` 维护，`job_run.prompt_revision_id` 固化每次实际执行版本。
+- 当前策略只存在于 `strategy_document` / `strategy_state`；任务结果只存在于 `job_run_output`。
 
 ## 八、调度器（M3，`scheduler/`）
 

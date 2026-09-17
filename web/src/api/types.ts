@@ -14,8 +14,9 @@ export interface StrategyDocument {
   id: string;
   code: string;
   title: string;
-  role: "portfolio" | "short" | "long" | "guidance";
+  role: "portfolio" | "task" | "guidance";
   injection_order: number;
+  job_code: string | null;
   sha256: string;
   content: string;
   updated_at: string;
@@ -24,241 +25,6 @@ export interface StrategyDocument {
 export interface CurrentStrategy {
   state: StrategyState;
   documents: StrategyDocument[];
-}
-
-export interface StrategyEvolution {
-  id: string;
-  session_id: string | null;
-  outline: string;
-  conclusion: string;
-  adjustments: string[];
-  adoption_status: "pending" | "adopted" | "rejected";
-  strategy_hash_before: string;
-  strategy_hash_after: string | null;
-  backtest_run_ids: string[];
-  created_at: string;
-  decided_at: string | null;
-}
-
-export interface StrategyProposalChange {
-  document_id: string;
-  base_sha256: string;
-  content: string;
-}
-
-export interface StrategyProposal {
-  id: string;
-  session_id: string;
-  evolution_id: string;
-  base_change_seq: string;
-  base_strategy_hash: string;
-  summary: string;
-  proposed_changes: StrategyProposalChange[] | null;
-  status: "pending" | "approved" | "rejected" | "expired" | "conflict";
-  requires_human: true;
-  decided_by: string | null;
-  decision_note: string | null;
-  created_at: string;
-  decided_at: string | null;
-  outline?: string;
-  conclusion?: string;
-  adjustments?: string[];
-}
-
-// ---- Agent 自驱回测（历史一期记录只读兼容） ----
-
-// 浏览器端契约镜像：server/backtest/contracts.ts、runtime-contract.ts；不导入 Node 运行时代码。
-export type StandardExecutionStatus = "queued" | "preparing" | "running" | "success" | "failed" | "cancelled" | "rejected";
-export interface StandardStrategyPlan {
-  rule: "right_side_daily_v1" | "left_reversal_daily_v1" | "trial_start_daily_v1" | "swing_box_daily_v1";
-  codes: string[];
-  allocation_pct: number;
-  max_positions: number;
-  daily_buy_limit: number;
-  position_fraction: number;
-  stop_loss_pct?: number;
-  max_holding_days?: number;
-  defense_recovery_ma10?: number;
-}
-export interface StandardBacktestPlan {
-  benchmark_code?: string;
-  name: string;
-  hypothesis: string;
-  codes: string[];
-  start: string;
-  end: string;
-  rule: "right_side_daily_v1" | "left_reversal_daily_v1" | "trial_start_daily_v1" | "swing_box_daily_v1" | "portfolio_daily_v1";
-  strategies?: StandardStrategyPlan[];
-  defense_recovery_ma10?: number;
-  environment_mode: "none" | "current_881";
-  price_mode: "raw_research" | "forward_research";
-  initial_cash: number;
-  max_positions: number;
-  daily_buy_limit: number;
-  position_fraction: number;
-  stop_loss_pct: number;
-  max_holding_days: number;
-  drawdown_circuit: boolean;
-  stop_streak_circuit: boolean;
-  costs: {
-    label: string;
-    commission_bps: number;
-    minimum_commission: number;
-    sell_tax_bps: number;
-    slippage_bps: number;
-    volume_participation: number;
-  };
-}
-export interface BacktestGap {
-  code: "DATA_MISSING" | "POINT_IN_TIME_UNVERIFIED" | "RULE_UNSUPPORTED" | "CAPACITY_EXCEEDED" | "DATA_INVALID";
-  domain: string;
-  severity: "error" | "warning";
-  message: string;
-  instrument?: string;
-  date?: string;
-}
-export interface StandardComparison {
-  run_id: string;
-  comparable: boolean;
-  reasons: string[];
-  parameter_differences: string[];
-}
-export interface StandardRunStatus {
-  id: string;
-  name: string;
-  engine_type: "standard_daily";
-  execution_status: StandardExecutionStatus;
-  phase: string;
-  progress: number;
-  quality_status: string;
-  evidence_status: "research_only";
-  replay_status: string;
-  plan_sha256: string;
-  input_sha256: string | null;
-  execution_plan: StandardBacktestPlan;
-  metrics_json: Record<string, number | null> | null;
-  data_gaps: BacktestGap[];
-  error_message: string | null;
-  session_id: string;
-  started_at: string | null;
-  finished_at: string | null;
-  cancel_requested_at: string | null;
-  comparisons: StandardComparison[];
-  enabled: boolean;
-}
-export interface StandardEvent {
-  seq: number;
-  date: string;
-  type: "signal" | "suppressed" | "order" | "rejected" | "expired" | "fill" | "closed" | "risk_trigger" | "risk_recover";
-  code: string | null;
-  reason: string;
-  details: Record<string, string | number | boolean | null>;
-}
-export interface StandardEquity {
-  benchmark_close?: number;
-  date: string;
-  cash_cents: number;
-  market_value_cents: number;
-  equity_cents: number;
-  fees_cents: number;
-  daily_return: number;
-  drawdown: number;
-  paused: boolean;
-  positions: Array<{ code: string; quantity: number; cost_cents: number; close: number }>;
-  benchmark_equity_cents?: number;
-  benchmark_return?: number;
-}
-export interface StandardPage<T> { items: T[]; next_cursor: string | null }
-
-export interface BacktestRun {
-  engine_type?: "legacy" | "standard_daily";
-  execution_plan?: StandardBacktestPlan | null;
-  quality_status?: string;
-  evidence_status?: "legacy_unverified" | "research_only" | "qualified";
-  replay_status?: string;
-  phase?: string;
-  input_set_id?: string | null;
-  plan_sha256?: string | null;
-  input_sha256?: string | null;
-  output_sha256?: string | null;
-  id: string;
-  name: string;
-  kind: string;
-  engine_path: string | null;
-  engine_git_commit: string | null;
-  config_snapshot: unknown;
-  input_manifest: unknown[];
-  output_dir: string | null;
-  report_path: string | null;
-  status: string;
-  started_at: string | null;
-  finished_at: string | null;
-  metrics: unknown;
-  request_json: Record<string, unknown> | null;
-  input_summary: Record<string, unknown>;
-  service_version: string | null;
-  metrics_json: Record<string, unknown> | null;
-  conclusion_md: string | null;
-  data_gaps: unknown[];
-  execution_status: "legacy" | "partial" | StandardExecutionStatus;
-  progress: number;
-  error_message: string | null;
-  execution_origin: "legacy" | "service" | "agent_workspace";
-  session_id: string | null;
-  strategy_change_seq: string | null;
-  strategy_snapshot_hash: string | null;
-  research_outline: string | null;
-  hypothesis: string | null;
-  worker_version: string | null;
-  sdk_version: string | null;
-  source_sha256: string | null;
-  source_size_bytes: number | null;
-  base_source_run_id: string | null;
-  source_retention_status: "none" | "candidate" | "versioned";
-  code_cleanup_status: "not_applicable" | "deleted" | "cleanup_failed";
-  conclusion_status: "working" | "final" | "superseded";
-  conclusion_summary: string | null;
-  applicability_boundary: string | null;
-  finalized_at: string | null;
-  superseded_by_run_id: string | null;
-  comparison_run_ids: string[];
-  notes: string | null;
-  created_at: string;
-}
-
-export interface BacktestListItem extends BacktestRun {
-  is_active_anchor: boolean;
-}
-
-export interface BacktestDetail extends BacktestListItem {
-  comparisons: Array<{
-    id: string;
-    name: string;
-    kind: string;
-    execution_status: string;
-    strategy_change_seq: string | null;
-    strategy_snapshot_hash: string | null;
-    research_outline: string | null;
-    hypothesis: string | null;
-    metrics_json: Record<string, unknown> | null;
-    conclusion_md: string | null;
-    created_at: string;
-  }>;
-}
-
-export interface BacktestSourceVersion {
-  backtest_run_id: string;
-  name: string;
-  source_code: string;
-  source_sha256: string;
-  source_size_bytes: number;
-  base_source_run_id: string | null;
-  strategy_change_seq: string | null;
-  strategy_snapshot_hash: string | null;
-  worker_version: string | null;
-  sdk_version: string | null;
-  conclusion_status: "final" | "superseded";
-  versioned_at: string;
 }
 
 // ---- 二期 M3：系统调度作业 ----
@@ -290,6 +56,12 @@ export interface JobDefinition {
   prompt_id: string | null;
   /** Agent 任务固定模型；为空时创建运行会话时跟随系统当前模型。 */
   model_id: string | null;
+  /** 任务职责与产出：读取哪些事实、做出什么判断、留下什么结果。 */
+  purpose: string | null;
+  /** 调度时段特征：盘前/盘中/盘后/夜间/周末。 */
+  phase: JobPhase | null;
+  /** 重要性排序权重：数值越小越靠前。 */
+  priority: number | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -297,9 +69,11 @@ export interface JobDefinition {
   next_run: string | null;
 }
 
+export type JobPhase = "盘前" | "盘中" | "盘后" | "夜间" | "周末";
+export const JOB_PHASES: readonly JobPhase[] = ["盘前", "盘中", "盘后", "夜间", "周末"];
+
 export interface JobRun extends JobRunSummary {
   job_id: string;
-  task_run_id: string | null;
   prompt_revision_id: string | null;
   next_retry_at: string | null;
   log: string;
@@ -323,7 +97,6 @@ export interface JobRunOutput {
   supersedes_output_id: string | null;
   strategy_change_seq: string | null;
   strategy_snapshot_hash: string | null;
-  legacy_content_document_id: string | null;
   created_at: string;
 }
 
@@ -483,13 +256,14 @@ export type MarketStructureDataset =
 export type EntrySignalType =
   | "right_side"
   | "left_reversal"
+  | "two_year_reversal"
   | "trial_start"
   | "swing"
   | "limit_up"
   | "discretionary";
 
 export const ENTRY_SIGNAL_TYPE_LABELS: Record<string, string> = {
-  right_side: "右侧主升", left_reversal: "左侧反转", trial_start: "试盘启动",
+  right_side: "右侧主升", left_reversal: "旧左侧反转", two_year_reversal: "两年结构反转", trial_start: "试盘启动",
   swing: "波段", limit_up: "打板", discretionary: "自主决策",
 };
 
@@ -614,12 +388,19 @@ export const EXECUTION_COMPLIANCE_LABELS: Record<string, string> = {
 
 // ---- 标的池（server/modules/pools） ----
 
+export interface PoolAttentionEntry {
+  source_job: string;
+  status: "qualified" | "approaching" | "manual";
+  reason: string;
+  missing_signals: string[];
+  valid_from: string;
+  valid_until: string | null;
+}
+
 export interface PoolMember {
   id: string;
-  pool: "short" | "long";
+  pool: "watch";
   role: string;
-  grade: string | null;
-  score: number | null;
   tags: string[];
   stock_character: string | null;
   stock_character_profile: Record<string, unknown>;
@@ -631,10 +412,7 @@ export interface PoolMember {
   effective_from: string;
   effective_to: string | null;
   note: string | null;
-  attention_signal: { status: "qualified" | "approaching"; missing_signals: string[] } | null;
-  attention_reason: string | null;
-  attention_from: string | null;
-  attention_until: string | null;
+  attention_entries: PoolAttentionEntry[];
   code: string;
   name: string;
   kind: string;
@@ -661,7 +439,7 @@ export interface PoolBoard {
 }
 
 export interface PoolViewData {
-  pool: "short" | "long";
+  pool: "watch";
   members: PoolMember[];
   boards: PoolBoard[];
   attention_count: number;
@@ -836,7 +614,7 @@ export interface ChatSession {
   archived: boolean;
   /** 本会话固定模型；模型被删除后为 null，发送时回退全局当前模型。 */
   model_id: string | null;
-  session_type: "interactive" | "job" | "backtest" | "strategy_evolution";
+  session_type: "interactive" | "job";
   session_status: "idle" | "queued" | "running" | "waiting_confirmation" | "success" | "partial" | "failed" | "cancelled";
   source: "user" | "cron" | "manual_job" | "agent";
   parent_session_id: string | null;
@@ -865,7 +643,6 @@ export type UiRefreshTarget =
   | "pools"
   | "market"
   | "strategies"
-  | "backtests"
   | "memories"
   | "datasync"
   | "status";
@@ -971,12 +748,10 @@ export const TOOL_LABELS: Record<string, string> = {
   portfolio_write: "维护持仓",
   pool_onboard: "标的入池初始化",
   pool_write: "维护标的池",
-  finalize_backtest: "固化回测结论",
   memory_query: "查询 Agent 记忆",
   memory_write: "维护 Agent 记忆",
   job_write: "维护系统作业",
   analysis_run: "运行复合分析",
-  run_backtest: "编写并运行回测",
   query_positions: "查询持仓",
   query_market_bars: "查询K线",
   query_pool: "查询标的池",

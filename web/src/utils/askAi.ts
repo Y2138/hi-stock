@@ -7,13 +7,11 @@ export interface AskAiRequest {
   prompt?: string;
   contextLabel?: string;
   sessionId?: string;
-  sessionType?: "interactive" | "backtest" | "strategy_evolution";
   parentSessionId?: string | null;
   title?: string;
 }
 
 export interface AskAiOptions {
-  sessionType?: "interactive" | "backtest" | "strategy_evolution";
   parentSessionId?: string | null;
   title?: string;
   confirmation?: string;
@@ -33,7 +31,6 @@ export function askAi(prompt: string, contextLabel: string, options: AskAiOption
         kind: "new_prefilled",
         prompt,
         contextLabel,
-        sessionType: options.sessionType ?? "interactive",
         parentSessionId: options.parentSessionId ?? null,
         title: options.title ?? contextLabel,
       },

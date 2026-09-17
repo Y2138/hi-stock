@@ -8,7 +8,6 @@ import type {
   DailyPlanBoard,
   JobDefinition,
   MarketCoverage,
-  PoolMember,
   PoolViewData,
   Position,
 } from "../api/types";
@@ -34,8 +33,7 @@ const coverage = useResource<MarketCoverage[]>(() =>
 );
 const jobs = useResource<JobDefinition[]>(() => apiClient.get<JobDefinition[]>("/api/jobs"));
 const positions = useResource<Position[]>(() => apiClient.get<Position[]>("/api/positions"));
-const shortPool = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools/short"));
-const longPool = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools/long"));
+const watchPool = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools"));
 const dailyPlan = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>("/api/plans/latest"));
 
 // 打板机会：仪表盘只汇总数量，明细在市场结构页展示。404 = 计划尚未生成结构化预案，不算错误。
@@ -53,26 +51,11 @@ const planPendingReview = computed(() =>
 );
 const planDataGap = computed(() => opportunities.value.filter((item) => item.grade === null).length);
 
-const today = () => new Date().toISOString().slice(0, 10);
-const isRecentAttention = (member: PoolMember) => Boolean(
-  member.attention_reason &&
-  (!member.attention_from || member.attention_from <= today()) &&
-  (!member.attention_until || member.attention_until >= today()),
+const recentAttentionCount = computed(() =>
+  (watchPool.data.value?.members ?? []).filter((member) => member.attention_entries.length > 0).length,
 );
-const recentAttentionGroups = computed(() => [
-  {
-    label: "短线标的",
-    to: "/short-pool",
-    members: (shortPool.data.value?.members ?? []).filter(isRecentAttention),
-  },
-  {
-    label: "长线标的",
-    to: "/long-pool",
-    members: (longPool.data.value?.members ?? []).filter(isRecentAttention),
-  },
-]);
-const recentAttentionLoading = computed(() => shortPool.loading.value || longPool.loading.value);
-const recentAttentionError = computed(() => shortPool.error.value ?? longPool.error.value);
+const recentAttentionLoading = computed(() => watchPool.loading.value);
+const recentAttentionError = computed(() => watchPool.error.value);
 
 const dayCoverage = computed(() => coverage.data.value?.find((c) => c.freq === "day") ?? null);
 
@@ -245,8 +228,7 @@ function reloadAll(): void {
     coverage.reload(),
     jobs.reload(),
     positions.reload(),
-    shortPool.reload(),
-    longPool.reload(),
+    watchPool.reload(),
     dailyPlan.reload(),
   ]);
 }
@@ -264,7 +246,7 @@ onMounted(reloadAll);
       </div>
       <div class="head-actions" aria-label="常用操作">
         <button class="btn primary agent-entry" type="button" @click="maintainFactsWithAgent">通过 Agent 记录变化</button>
-        <button class="btn" type="button" @click="router.push('/short-pool')">查看短线池</button>
+        <button class="btn" type="button" @click="router.push('/pools')">查看关注池</button>
         <button class="btn" type="button" @click="router.push('/jobs')">运行任务</button>
       </div>
     </header>
@@ -382,10 +364,10 @@ onMounted(reloadAll);
     <article class="card dashboard-card recent-attention-card">
       <div class="card-heading">
         <div>
-          <span class="section-label">标的池</span>
+          <span class="section-label">关注池</span>
           <h2>近期关注</h2>
         </div>
-        <RouterLink to="/short-pool">进入标的池</RouterLink>
+        <RouterLink to="/pools">进入关注池</RouterLink>
       </div>
       <StateBlock
         :loading="recentAttentionLoading"
@@ -394,15 +376,10 @@ onMounted(reloadAll);
         @retry="reloadAll"
       >
         <div class="overview-grid">
-          <RouterLink
-            v-for="group in recentAttentionGroups"
-            :key="group.to"
-            :to="group.to"
-            class="overview-item link"
-          >
-            <span class="overview-label">{{ group.label }}</span>
-            <strong class="num">{{ group.members.length }}</strong>
-            <small>处于近期关注 · 点击查看明细</small>
+          <RouterLink to="/pools" class="overview-item link">
+            <span class="overview-label">关注标的</span>
+            <strong class="num">{{ recentAttentionCount }}</strong>
+            <small>各任务来源关注 · 点击查看明细</small>
           </RouterLink>
         </div>
       </StateBlock>

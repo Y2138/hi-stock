@@ -22,16 +22,23 @@ export interface JobDefinitionRow {
   prompt_id: string | null;
   /** Agent 任务固定模型；空值表示创建运行会话时跟随系统当前模型。 */
   model_id: string | null;
+  /** 任务职责与产出：说明读取哪些事实、做出什么判断、留下什么结果。 */
+  purpose: string | null;
+  /** 调度时段特征：盘前/盘中/盘后/夜间/周末；用于任务分组，不参与调度计算。 */
+  phase: JobPhase | null;
+  /** 重要性排序权重：数值越小越靠前。 */
+  priority: number | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
 }
 
+export const JOB_PHASES = ["盘前", "盘中", "盘后", "夜间", "周末"] as const;
+export type JobPhase = (typeof JOB_PHASES)[number];
+
 export interface JobRunRow {
   id: string;
   job_id: string;
-  /** 一期历史关联，只读兼容；新 Runner 永远保持 null。 */
-  task_run_id: string | null;
   prompt_revision_id: string | null;
   session_id: string | null;
   strategy_change_seq: string | null;
@@ -65,7 +72,6 @@ export interface JobRunOutputRow {
   supersedes_output_id: string | null;
   strategy_change_seq: string | null;
   strategy_snapshot_hash: string | null;
-  legacy_content_document_id: string | null;
   created_at: string;
 }
 
@@ -79,7 +85,11 @@ export type DatasourcePipeline =
   | "market_catalog_sync"
   | "board_membership_sync"
   | "daily_market_structure"
-  | "full_market_indicator_refresh";
+  | "full_market_indicator_refresh"
+  | "commodity_copper_sync"
+  | "commodity_copper_inventory_sync"
+  | "commodity_lithium_warehouse_sync"
+  | "value_candidate_sync";
 
 export interface DatasourceJobConfig {
   pipeline: DatasourcePipeline;
@@ -87,8 +97,8 @@ export interface DatasourceJobConfig {
 }
 
 export interface AnalysisJobConfig {
-  analysis_type: "sector_temperature" | "key_levels" | "long_valuation";
-  request?: { codes?: string[]; as_of?: string; lookback?: number };
+  analysis_type: "sector_temperature" | "key_levels" | "long_valuation" | "value_monthly_rank";
+  request?: { codes?: string[]; as_of?: string; lookback?: number; force?: boolean };
 }
 
 export type AgentFlowJobConfig = Record<string, never>;

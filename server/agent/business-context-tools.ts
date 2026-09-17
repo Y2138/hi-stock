@@ -74,10 +74,9 @@ async function audited<T>(
   }
 }
 
-export function strategyDocumentPurpose(document: { role: string; title: string }): string {
+export function strategyDocumentPurpose(document: { role: string; title: string; job_code?: string | null }): string {
   if (document.role === "portfolio") return "组合层、市场状态与风险预算的总约束";
-  if (document.role === "short") return "短线资格、入场、持有与退出规则";
-  if (document.role === "long") return "长线资格、估值、持有与退出规则";
+  if (document.role === "task") return `执行任务 ${document.job_code ?? ""} 的专属策略规则，运行该任务的会话必须读取`;
   return `需要执行“${document.title}”对应专项判断时读取`;
 }
 
@@ -143,48 +142,40 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "pool_context_query",
       label: "查询标的池业务上下文",
       description:
-        "返回短线池、长线池当前成员全集。未传 codes 时每只成员只返回角色、评分、阶段、关注、行情和一级行业摘要；传 codes 时才返回对应标的完整研究属性。只有需要板块总览时才开启 include_boards。",
+        "返回关注池成员全集。未传 codes 时每只成员只返回角色、阶段、关注、行情和一级行业摘要；传 codes 时才返回对应标的完整研究属性。date 指定关注有效性的判定日（缺省为今天）。只有需要板块总览时才开启 include_boards。",
       parameters: PoolContextQuerySchema,
       execute: async (_id, raw) => audited<PoolContextQueryInput>(
         deps, "pool_context_query", raw, validatePoolContextQueryInput, async (input) => {
-          const pools = input.pools ?? ["short", "long"];
-          const views = await Promise.all(pools.map(async (pool) => {
-            const view = await listPoolView(deps.pool, pool);
-            const members = input.codes?.length
-              ? view.members.filter((member) => input.codes!.includes(member.code))
-              : view.members;
-            const memberRows = input.codes?.length
-              ? members
-              : members.map((member) => ({
-                  code: member.code,
-                  name: member.name,
-                  kind: member.kind,
-                  role: member.role,
-                  grade: member.grade,
-                  score: member.score,
-                  stage: member.stage,
-                  attention_signal: member.attention_signal,
-                  attention_reason: member.attention_reason,
-                  attention_from: member.attention_from,
-                  attention_until: member.attention_until,
-                  last: member.last,
-                  change_pct: member.change_pct,
-                  quote_time: member.quote_time,
-                  primary_boards: member.boards
-                    .filter((board) => board.level === "primary")
-                    .map((board) => ({ code: board.code, name: board.name })),
-                  detail_available: true,
-                }));
-            return {
-              pool,
-              member_count: members.length,
-              attention_count: members.filter((member) => member.attention_reason !== null).length,
-              detail_level: input.codes?.length ? "full" : "summary",
-              members: memberRows,
-              ...(input.include_boards ? { boards: view.boards } : {}),
-            };
-          }));
-          return { pools: views };
+          const asOf = (input as { date?: string }).date;
+          const view = await listPoolView(deps.pool, asOf);
+          const members = input.codes?.length
+            ? view.members.filter((member) => input.codes!.includes(member.code))
+            : view.members;
+          const memberRows = input.codes?.length
+            ? members
+            : members.map((member) => ({
+                code: member.code,
+                name: member.name,
+                kind: member.kind,
+                role: member.role,
+                stage: member.stage,
+                attention_entries: member.attention_entries,
+                last: member.last,
+                change_pct: member.change_pct,
+                quote_time: member.quote_time,
+                primary_boards: member.boards
+                  .filter((board) => board.level === "primary")
+                  .map((board) => ({ code: board.code, name: board.name })),
+                detail_available: true,
+              }));
+          return {
+            pool: view.pool,
+            member_count: members.length,
+            attention_count: members.filter((member) => member.attention_entries.length > 0).length,
+            detail_level: input.codes?.length ? "full" : "summary",
+            members: memberRows,
+            ...(input.include_boards ? { boards: view.boards } : {}),
+          };
         },
       ),
     },
@@ -268,7 +259,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "strategy_document_query",
       label: "按需读取本轮策略文档",
       description:
-        "按系统提示词中的策略文档 code 一次读取最多 20 份本轮策略快照正文，并返回同一策略基线。只读取完成当前任务必要的文档；提交策略发布提案前必须读取所有拟修改文档。",
+        "按系统提示词中的策略文档 code 一次读取最多 20 份当前策略正文，并返回同一策略基线。任务会话必须读取本任务 job_code 对应的任务策略文档与组合总策略；只读取完成当前任务必要的文档。",
       parameters: StrategyDocumentQuerySchema,
       execute: async (_id, raw) => audited<StrategyDocumentQueryInput>(
         deps, "strategy_document_query", raw, validateStrategyDocumentQueryInput, async (input) => {

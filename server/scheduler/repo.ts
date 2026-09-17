@@ -12,7 +12,9 @@ import type {
   JobRunRow,
   JobRunOutputRow,
   JobType,
+  JobPhase,
 } from "./types.js";
+import { JOB_PHASES } from "./types.js";
 
 const CODE_RE = /^[a-z][a-z0-9_]{0,62}$/;
 
@@ -34,9 +36,35 @@ function validationError(error: unknown): never {
   throw apiErrors.badRequest((error as Error).message);
 }
 
+function assertPurpose(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") throw apiErrors.badRequest("purpose 必须是字符串或 null");
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > 500) throw apiErrors.badRequest("purpose 不得超过 500 字符");
+  return trimmed;
+}
+
+function assertPhase(value: unknown): JobPhase | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !(JOB_PHASES as readonly string[]).includes(value)) {
+    throw apiErrors.badRequest(`phase 只能是：${JOB_PHASES.join("、")}`);
+  }
+  return value as JobPhase;
+}
+
+function assertPriority(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 999) {
+    throw apiErrors.badRequest("priority 必须是 1–999 的整数或 null");
+  }
+  return value;
+}
+
 export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLatest[]> {
   const result = await db.query<JobDefinitionRow & { latest_run: Partial<JobRunRow> | null }>(
-    `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text, to_jsonb(d)->>'model_id' AS model_id, d.enabled,
+    `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text, to_jsonb(d)->>'model_id' AS model_id,
+            d.purpose, d.phase, d.priority, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
             (SELECT json_build_object(
@@ -49,7 +77,8 @@ export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLates
                       'started_at', r.started_at, 'finished_at', r.finished_at)
                FROM job_run r WHERE r.job_id = d.id
               ORDER BY r.id DESC LIMIT 1) AS latest_run
-       FROM job_definition d ORDER BY d.code`,
+       FROM job_definition d
+      ORDER BY d.priority NULLS LAST, d.code`,
   );
   return result.rows.map((row) => ({
     ...row,
@@ -60,7 +89,7 @@ export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLates
 export async function findJobByCode(db: Db, code: string): Promise<JobDefinitionRow | null> {
   const result = await db.query<JobDefinitionRow>(
     `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text,
-            to_jsonb(d)->>'model_id' AS model_id, d.enabled,
+            to_jsonb(d)->>'model_id' AS model_id, d.purpose, d.phase, d.priority, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
        FROM job_definition d WHERE d.code = $1`,
@@ -71,7 +100,11 @@ export async function findJobByCode(db: Db, code: string): Promise<JobDefinition
 
 export async function createJobDefinition(
   db: Db,
-  input: { code: unknown; name: unknown; cron: unknown; job_type: unknown; config: unknown; prompt_id?: unknown; model_id?: unknown; enabled?: unknown },
+  input: {
+    code: unknown; name: unknown; cron: unknown; job_type: unknown; config: unknown;
+    prompt_id?: unknown; model_id?: unknown; enabled?: unknown;
+    purpose?: unknown; phase?: unknown; priority?: unknown;
+  },
 ): Promise<JobDefinitionRow> {
   const code = assertCode(input.code);
   const name = assertName(input.name);
@@ -88,15 +121,18 @@ export async function createJobDefinition(
   if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
     throw apiErrors.badRequest("enabled 必须是布尔值");
   }
+  const purpose = assertPurpose(input.purpose);
+  const phase = assertPhase(input.phase);
+  const priority = assertPriority(input.priority);
   const promptId = await validatePromptBinding(db, jobType, input.prompt_id);
   const modelId = await validateModelBinding(db, jobType, input.model_id);
   const result = await db.query<JobDefinitionRow>(
-    `INSERT INTO job_definition (code, name, cron, job_type, config, prompt_id, model_id, enabled)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, enabled,
+    `INSERT INTO job_definition (code, name, cron, job_type, config, prompt_id, model_id, purpose, phase, priority, enabled)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority, enabled,
                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
-    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, input.enabled ?? true],
+    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, purpose, phase, priority, input.enabled ?? true],
   );
   return result.rows[0]!;
 }
@@ -106,7 +142,7 @@ export async function updateJobDefinition(
   code: string,
   patch: Record<string, unknown>,
 ): Promise<JobDefinitionRow> {
-  const allowed = ["name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "base_updated_at"];
+  const allowed = ["name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "purpose", "phase", "priority", "base_updated_at"];
   const unknown = Object.keys(patch).filter((key) => !allowed.includes(key));
   if (unknown.length > 0) throw apiErrors.badRequest(`包含未知字段：${unknown.join(", ")}`);
   if (Object.keys(patch).length === 0) throw apiErrors.badRequest("缺少可更新字段");
@@ -136,6 +172,9 @@ export async function updateJobDefinition(
   const baseUpdatedAt = patch.base_updated_at === undefined
     ? null
     : sameTimestampVersion(current.updated_at, patch.base_updated_at) ? current.updated_at : patch.base_updated_at;
+  const purpose = patch.purpose === undefined ? current.purpose : assertPurpose(patch.purpose);
+  const phase = patch.phase === undefined ? current.phase : assertPhase(patch.phase);
+  const priority = patch.priority === undefined ? current.priority : assertPriority(patch.priority);
   const promptId = await validatePromptBinding(
     db,
     jobType,
@@ -149,13 +188,14 @@ export async function updateJobDefinition(
   const result = await db.query<JobDefinitionRow>(
     `UPDATE job_definition
         SET name = $2, cron = $3, job_type = $4, config = $5,
-            prompt_id = $6, model_id = $7, enabled = $8, updated_at = now()
+            prompt_id = $6, model_id = $7, enabled = $8,
+            purpose = $9, phase = $10, priority = $11, updated_at = now()
       WHERE code = $1
-        AND ($9::timestamptz IS NULL OR updated_at = $9::timestamptz)
-      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, enabled,
+        AND ($12::timestamptz IS NULL OR updated_at = $12::timestamptz)
+      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority, enabled,
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
-    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, patch.enabled ?? current.enabled, baseUpdatedAt],
+    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, patch.enabled ?? current.enabled, purpose, phase, priority, baseUpdatedAt],
   );
   if (!result.rows[0]) throw apiErrors.conflict("作业定义已被其他会话更新，请刷新后重试");
   return result.rows[0];
@@ -194,7 +234,7 @@ async function validatePromptBinding(db: Db, jobType: JobType, value: unknown): 
 
 export async function listJobRuns(db: Db, jobId: string, limit: number, targetDate?: string): Promise<JobRunRow[]> {
   const result = await db.query<JobRunRow>(
-    `SELECT id::text, job_id::text, task_run_id::text, prompt_revision_id::text,
+    `SELECT id::text, job_id::text, prompt_revision_id::text,
             session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
             target_date::text, trigger_kind,
             scheduled_for, status, attempt_count, next_retry_at, log, artifacts, data_gaps,
@@ -208,7 +248,7 @@ export async function listJobRuns(db: Db, jobId: string, limit: number, targetDa
 
 export async function findJobRunById(db: Db, id: string): Promise<(JobRunRow & { job: JobDefinitionRow }) | null> {
   const result = await db.query<JobRunRow & { job: JobDefinitionRow }>(
-    `SELECT r.id::text, r.job_id::text, r.task_run_id::text, r.prompt_revision_id::text,
+    `SELECT r.id::text, r.job_id::text, r.prompt_revision_id::text,
             r.session_id::text, r.strategy_change_seq::text, r.strategy_snapshot_hash,
             r.target_date::text,
             r.trigger_kind, r.scheduled_for, r.status, r.attempt_count, r.next_retry_at,
@@ -228,7 +268,7 @@ export async function findJobRunById(db: Db, id: string): Promise<(JobRunRow & {
 const OUTPUT_SELECT = `SELECT id::text, job_id::text, run_id::text, session_id::text,
   output_type, target_date::text, markdown, sha256, status, source,
   supersedes_output_id::text, strategy_change_seq::text, strategy_snapshot_hash,
-  legacy_content_document_id::text, created_at FROM job_run_output`;
+  created_at FROM job_run_output`;
 
 export async function listJobOutputs(
   db: Db,
@@ -260,7 +300,7 @@ export async function findJobOutputById(
     `SELECT o.id::text, o.job_id::text, o.run_id::text, o.session_id::text,
             o.output_type, o.target_date::text, o.markdown, o.sha256, o.status, o.source,
             o.supersedes_output_id::text, o.strategy_change_seq::text, o.strategy_snapshot_hash,
-            o.legacy_content_document_id::text, o.created_at,
+            o.created_at,
             json_build_object('id', d.id::text, 'code', d.code, 'name', d.name,
               'cron', d.cron, 'job_type', d.job_type, 'config', d.config,
               'prompt_id', d.prompt_id::text, 'model_id', to_jsonb(d)->>'model_id', 'enabled', d.enabled,
@@ -307,7 +347,7 @@ export async function queueManualJob(
     const result = await client.query<JobRunRow>(
       `INSERT INTO job_run (job_id, target_date, trigger_kind)
        VALUES ($1, $2, 'manual')
-       RETURNING id::text, job_id::text, task_run_id::text, prompt_revision_id::text,
+       RETURNING id::text, job_id::text, prompt_revision_id::text,
                  session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
                  target_date::text, trigger_kind,
                  scheduled_for, status, attempt_count, next_retry_at, log, artifacts, data_gaps,
@@ -351,7 +391,7 @@ export async function insertScheduledJobRun(
                CASE WHEN $4 = 'missed' THEN now() ELSE NULL END,
                CASE WHEN $4 = 'missed' THEN '服务停机期间错过计划时刻；未自动补跑。' ELSE '' END)
        ON CONFLICT (job_id, scheduled_for) WHERE scheduled_for IS NOT NULL DO NOTHING
-       RETURNING id::text, job_id::text, task_run_id::text, prompt_revision_id::text,
+       RETURNING id::text, job_id::text, prompt_revision_id::text,
                  session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
                  target_date::text, trigger_kind,
                  scheduled_for, status, attempt_count, next_retry_at, log, artifacts, data_gaps,

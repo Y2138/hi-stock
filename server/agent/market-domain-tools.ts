@@ -21,6 +21,11 @@ import { queryLimitUpSignals } from "../modules/market/limit-up-signals.js";
 import { queryDailyPlanContext } from "../modules/plans/daily-context.js";
 import { querySwingSignals } from "../modules/plans/swing-signals.js";
 import { queryStockResearch } from "../modules/market/research.js";
+import { queryCopperInventorySignal } from "../modules/market/copper-inventory-signal.js";
+import { queryLithiumWarehouseSignal } from "../modules/market/lithium-warehouse-signal.js";
+import { queryValueRank } from "../modules/value-ranking/service.js";
+import { queryValueAnchorSignals } from "../modules/plans/value-anchor-signal.js";
+import { queryTwoYearReversalSignals } from "../modules/plans/two-year-reversal-signal.js";
 import { strategyForSession } from "./business-context-tools.js";
 import { insertToolAudit } from "./repo.js";
 import { sha256Json } from "./hash.js";
@@ -61,6 +66,11 @@ const MarketEventSchema = strict({
 const LimitUpSignalSchema = strict({ date: DateString });
 const DailyPlanContextSchema = strict({ date: DateString });
 const SwingSignalSchema = strict({ date: DateString });
+const CopperInventorySignalSchema = strict({ date: DateString });
+const LithiumWarehouseSignalSchema = strict({ date: DateString });
+const ValueRankSchema = strict({ as_of: Type.Optional(DateString), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })), codes: Type.Optional(Type.Array(Code, { maxItems: 50, uniqueItems: true })) });
+const ValueAnchorSignalSchema = strict({ date: DateString });
+const TwoYearReversalSignalSchema = strict({ date: DateString });
 const IndicatorSchema = strict({
   codes: Type.Array(Code, { minItems: 1, maxItems: 20 }),
   freq: Type.Optional(Type.Union([Type.Literal("day"), Type.Literal("30m"), Type.Literal("futures_day")])),
@@ -142,7 +152,7 @@ export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: stri
   return {
     name: "daily_plan_context_query",
     label: "查询每日计划确定性上下文",
-    description: "按目标日一次性返回完整881一级行业市场状态与温度、七类市场结构同步、短线池逐只右侧六条件、左侧反转质量分与ATR止损、试盘启动分阶段证据，以及右侧>左侧>试盘的唯一信号选择；同时返回每笔持仓的 entry_signal_type 与 evaluation_basis：波段持仓的 swing_triggers（观察期、灾难止损、常规止损、箱顶目标、60日到期）、左侧反转持仓的 left_reversal_triggers（初始止损、6%/16%分批、10日到期）、右侧/试盘持仓的止损档位、冷却期、止盈/止损位、退出候选，以及 MA10 护盘收回率。只返回结论和必要数值证据，不返回原始行情序列；每日计划不得再用通用数据库工具手算。",
+    description: "按目标日一次性返回完整881一级行业市场状态与温度、七类市场结构同步、关注池逐只右侧六条件存活与试盘形态推进的评估性证据；同时返回每笔持仓的 entry_signal_type 与 evaluation_basis：波段持仓的 swing_triggers（观察期、灾难止损、常规止损、箱顶目标、到期）、存量左侧反转持仓的 left_reversal_triggers（初始止损、6%/16%分批、10日到期）、其余持仓的止损档位、冷却期、止盈/止损位、退出候选，以及 MA10 护盘收回率。右侧与试盘只用于持有和概率评估，不产生开仓信号；开仓信号只认 swing_signal_query。只返回结论和必要数值证据，不返回原始行情序列；每日计划不得再用通用数据库工具手算。",
     parameters: DailyPlanContextSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof DailyPlanContextSchema>>("daily_plan_context_query", DailyPlanContextSchema, raw);
@@ -156,11 +166,47 @@ export function buildSwingSignalTool(deps: { pool: pg.Pool; sessionId: string | 
   return {
     name: "swing_signal_query",
     label: "查询波段确定性信号",
-    description: "按目标日逐只扫描长线池中的波段角色，返回40日箱体、缩量/反转形态/RSI14/预期盈亏比四条件、T+1突破与价格上限、已有持仓抑制、正式信号、接近候选和逐只数据缺口；不得再用通用查询手算。",
+    description: "按目标日逐只扫描关注池全部成员，返回40日箱体、缩量/反转形态/RSI14/预期盈亏比四条件、T+1突破与价格上限、已有持仓抑制、正式信号、接近候选和逐只数据缺口；波段是当前唯一开仓信号，不得再用通用查询手算。",
     parameters: SwingSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof SwingSignalSchema>>("swing_signal_query", SwingSignalSchema, raw);
       return audited(deps, "swing_signal_query", input, () => querySwingSignals(deps.pool, input.date));
+    },
+  };
+}
+
+export function buildValueRankTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+  return {
+    name: "value_rank_query", label: "查询月度价值排名",
+    description: "读取当前或指定日期已生效的月度价值Top5/Top10/Top50及质量分、价值分、总分和缺口；只读，不入池、不写持仓。",
+    parameters: ValueRankSchema,
+    execute: async (_id, raw) => {
+      const input = validateToolInput<Static<typeof ValueRankSchema>>("value_rank_query", ValueRankSchema, raw);
+      return audited(deps, "value_rank_query", input, () => queryValueRank(deps.pool, input));
+    },
+  };
+}
+
+export function buildValueAnchorSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+  return {
+    name: "value_anchor_signal_query", label: "查询A级价值错杀",
+    description: "按目标日读取当前月度Top50并执行固定的A级价值错杀条件，返回正式、接近、筛除项、建议10%增配比例和第20个交易日复核日期；研究只读，不入池、不写持仓。",
+    parameters: ValueAnchorSignalSchema,
+    execute: async (_id, raw) => {
+      const input = validateToolInput<Static<typeof ValueAnchorSignalSchema>>("value_anchor_signal_query", ValueAnchorSignalSchema, raw);
+      return audited(deps, "value_anchor_signal_query", input, () => queryValueAnchorSignals(deps.pool, input.date));
+    },
+  };
+}
+
+export function buildTwoYearReversalSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+  return {
+    name: "two_year_reversal_signal_query", label: "查询两年结构反转新开仓信号",
+    description: "按目标日由服务端固定规则扫描881一级行业与所属股票，返回覆盖、正式新开仓信号、接近候选和缺口；只读，供人工决策。",
+    parameters: TwoYearReversalSignalSchema,
+    execute: async (_id, raw) => {
+      const input = validateToolInput<Static<typeof TwoYearReversalSignalSchema>>("two_year_reversal_signal_query", TwoYearReversalSignalSchema, raw);
+      return audited(deps, "two_year_reversal_signal_query", input, () => queryTwoYearReversalSignals(deps.pool, input.date));
     },
   };
 }
@@ -190,6 +236,30 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
         const input = validateToolInput<Static<typeof StockResearchSchema>>("stock_research_query", StockResearchSchema, raw);
         const codes = [...new Set(input.codes.map((code) => code.toUpperCase()))];
         return audited(deps, "stock_research_query", { codes }, () => queryStockResearch(deps.pool, codes));
+      },
+    },
+    {
+      name: "copper_inventory_signal_query",
+      label: "查询铜库存防守仓位信号",
+      description: "按目标日使用服务端固定的《铜库存防守仓位一版》公式，返回SHFE铜库存4周变化、历史逆百分位、原始目标仓位、最近已执行调仓、待执行调仓、五只核心生产商等权目标与数据缺口。Agent不得自行重算、改公式或把研究目标仓位解释为交易指令。",
+      parameters: CopperInventorySignalSchema,
+      execute: async (_id, raw) => {
+        const input = validateToolInput<Static<typeof CopperInventorySignalSchema>>(
+          "copper_inventory_signal_query", CopperInventorySignalSchema, raw,
+        );
+        return audited(deps, "copper_inventory_signal_query", input, () => queryCopperInventorySignal(deps.pool, input.date));
+      },
+    },
+    {
+      name: "lithium_warehouse_signal_query",
+      label: "查询碳酸锂低暴露防守信号",
+      description: "按目标日使用服务端固定的《碳酸锂仓单防守仓位一版》公式，返回仓单4周变化、历史逆百分位、10个百分点缓冲、五只固定核心公司和最近已执行调仓；Agent不得自行重算、改公司名单或改参数。",
+      parameters: LithiumWarehouseSignalSchema,
+      execute: async (_id, raw) => {
+        const input = validateToolInput<Static<typeof LithiumWarehouseSignalSchema>>(
+          "lithium_warehouse_signal_query", LithiumWarehouseSignalSchema, raw,
+        );
+        return audited(deps, "lithium_warehouse_signal_query", input, () => queryLithiumWarehouseSignal(deps.pool, input.date));
       },
     },
     {

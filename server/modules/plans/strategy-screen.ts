@@ -4,11 +4,8 @@
 import type pg from "pg";
 import { recomputeIndicatorSeries, type IndicatorRunResult } from "../../indicators/service.js";
 import {
-  evaluateLeftSideSignal,
   evaluateRightSideSignal,
   evaluateTrialStartSignal,
-  type LeftSideSignalBar,
-  type LeftSideSignalEvaluation,
   type RightSideSignalBar,
   type RightSideSignalEvaluation,
   type TrialBar,
@@ -38,7 +35,6 @@ interface InstrumentRow {
 type RuleOutcome =
   | ({ status: "evaluated" } & (
       | { rule: "short_right"; evaluation: RightSideSignalEvaluation }
-      | { rule: "short_left"; evaluation: LeftSideSignalEvaluation }
       | { rule: "trial"; evaluation: TrialStartEvaluation }
       | { rule: "swing"; evaluation: SwingSignalEvaluation; metric_date: string | null }
     ))
@@ -97,8 +93,8 @@ async function loadBars(
   instrumentIds: string[],
   date: string,
   window: number,
-): Promise<Map<string, Array<RightSideSignalBar & LeftSideSignalBar & SwingSignalBar>>> {
-  const bars = await db.query<RightSideSignalBar & LeftSideSignalBar & SwingSignalBar>(
+): Promise<Map<string, Array<RightSideSignalBar & SwingSignalBar>>> {
+  const bars = await db.query<RightSideSignalBar & SwingSignalBar>(
     `WITH ranked AS (
        SELECT instrument.code, bar.bar_date::text,
               bar.open::float8, bar.high::float8, bar.low::float8, bar.close::float8,
@@ -122,7 +118,7 @@ async function loadBars(
        FROM ranked WHERE row_no <= $3::int ORDER BY code, bar_date`,
     [instrumentIds, date, window],
   );
-  const byCode = new Map<string, Array<RightSideSignalBar & LeftSideSignalBar & SwingSignalBar>>();
+  const byCode = new Map<string, Array<RightSideSignalBar & SwingSignalBar>>();
   for (const bar of bars.rows) byCode.set(bar.code, [...(byCode.get(bar.code) ?? []), bar]);
   return byCode;
 }
@@ -160,7 +156,7 @@ async function loadDefenseRecovery(
 
 function evaluateRule(
   rule: StrategyScreenRule,
-  rows: Array<RightSideSignalBar & LeftSideSignalBar & SwingSignalBar>,
+  rows: Array<RightSideSignalBar & SwingSignalBar>,
   kind: string,
   defenseRecovery: { metric_date: string | null; metric_status: string | null; defense_recovery_ma10: number | null },
 ): RuleOutcome {
@@ -198,9 +194,7 @@ function evaluateRule(
     if (!evaluation) return { rule, status: "gap", reason: "右侧六条件缺少可信MA/MACD/OHLCV输入" };
     return { rule, status: "evaluated", evaluation };
   }
-  const evaluation = evaluateLeftSideSignal(windowed as LeftSideSignalBar[]);
-  if (!evaluation) return { rule, status: "gap", reason: "左侧反转缺少可信RSI14/MA20/OHLCV或ATR14输入" };
-  return { rule, status: "evaluated", evaluation };
+  throw new Error(`未知的筛选规则：${rule}`);
 }
 
 export async function queryStrategyScreen(

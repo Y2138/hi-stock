@@ -2,14 +2,10 @@
 // - fetch_market_data 一次调用顺序处理多项并汇报聚合进度
 import type { AgentContext } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../server/db/migrate.js";
 import { validateScheduledPoolAttentionInput } from "../../server/agent/tool-validation.js";
-import { buildChatTools, JOB_FLOW_TOOL_BUNDLES } from "../../server/agent/tools.js";
-import * as standardRuntime from "../../server/modules/backtests/runtime.js";
-import * as standardService from "../../server/modules/backtests/service.js";
-import type { StandardBacktestPlan } from "../../server/backtest/contracts.js";
-import type { StandardRunStatus } from "../../server/backtest/runtime-contract.js";
+import { buildChatTools } from "../../server/agent/tools.js";
 import { acquireAgentMutationLock } from "../../server/agent/mutation-lock.js";
 import { appendMessage, createSession } from "../../server/agent/repo.js";
 import { buildSystemPrompt } from "../../server/agent/prompt.js";
@@ -17,13 +13,11 @@ import { createOnDemandToolSet, loadedToolNamesFromMessages } from "../../server
 import { HITHINK_CAPABILITIES } from "../../server/datasource/hithink-capabilities.js";
 import { processHithinkResult } from "../../server/agent/hithink-result-processor.js";
 import { queryLimitUpSignals } from "../../server/modules/market/limit-up-signals.js";
-import { persistAndPublishSessionEvent } from "../../server/agent/events.js";
 import { createDeepSeekWebResearchProvider } from "../../server/agent/web-research-provider.js";
 import { createSafeWebFetchProvider, WEB_FETCH_CONTRACT_LIMITS } from "../../server/agent/web-fetch-provider.js";
 import { storeBars } from "../../server/datasource/service.js";
 import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
 import {
-  evaluateLeftSideSignal,
   evaluateRightSideSignal,
   evaluateTrialStartSignal,
   findTrialStartMatch,
@@ -34,9 +28,9 @@ import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
 
 const prepared = await prepareTestDb();
 
-it("每日关注必须明确临近信号缺口，已成立与清除不接受缺口", () => {
+it("关注写入必须明确临近信号缺口，已成立与清除不接受缺口", () => {
   const mark = {
-    action: "mark", code: "600487.SH", pool: "short", attention_status: "approaching",
+    action: "mark", code: "600487.SH", attention_status: "approaching",
     attention_reason: "等待确认", attention_from: "2026-09-09", attention_until: "2026-09-10",
   };
   const validate = (item: Record<string, unknown>) => validateScheduledPoolAttentionInput({ reason: "次日观察", items: [item] });
@@ -46,9 +40,10 @@ it("每日关注必须明确临近信号缺口，已成立与清除不接受缺�
     .toEqual(["右侧：放量站稳关键位"]);
   expect(() => validate({ ...mark, attention_status: "qualified", missing_signals: ["仍缺放量"] })).toThrow("不得包含缺失条件");
   expect(validate({ ...mark, attention_status: "qualified" }).items[0]?.missing_signals).toEqual([]);
-  expect(() => validate({ action: "clear", code: mark.code, pool: mark.pool, missing_signals: [] })).toThrow("clear");
-  expect(validateScheduledPoolAttentionInput({ reason: "兼容单条写入", ...mark, missing_signals: ["右侧：放量站稳关键位"] }).items[0]?.missing_signals)
-    .toEqual(["右侧：放量站稳关键位"]);
+  expect(() => validate({ action: "clear", code: mark.code, missing_signals: [] })).toThrow("clear");
+  // 旧单条写入格式已退役：必须提交 items 完整对账集合。
+  expect(() => validateScheduledPoolAttentionInput({ reason: "旧格式", ...mark, missing_signals: ["右侧：放量站稳关键位"] }))
+    .toThrow("参数校验失败");
 });
 
 it("扶摇研究筛选不把未披露估值视为低估，并区分上游响应与全量覆盖", () => {
@@ -65,169 +60,6 @@ it("扶摇研究筛选不把未披露估值视为低估，并区分上游响应�
   expect(processHithinkResult(definition, sparse, { where: [{ field: "roe", op: "gt", value: 10 }] }).matched_count).toBe(1);
 });
 
-const standardToolNames = ["preflight_backtest", "start_standard_backtest", "get_backtest_status", "cancel_backtest"];
-const standardPlan: StandardBacktestPlan = {
-  name: "标准回测工具测试", hypothesis: "仅验证工具边界", codes: ["000001.SZ"],
-  start: "2026-01-05", end: "2026-01-16", rule: "right_side_daily_v1",
-  environment_mode: "none", price_mode: "raw_research", initial_cash: 100000,
-  max_positions: 1, daily_buy_limit: 1, position_fraction: 0.2, stop_loss_pct: 0.08,
-  max_holding_days: 20, drawdown_circuit: false, stop_streak_circuit: false,
-  costs: { label: "测试费用", commission_bps: 3, minimum_commission: 5, sell_tax_bps: 5, slippage_bps: 2, volume_participation: 0.01 },
-};
-const standardStart = { plan: standardPlan, plan_hash: "a".repeat(64), input_hash: "b".repeat(64), idempotency_key: "tool-test" };
-const standardStatus: StandardRunStatus = {
-  id: "123", name: standardPlan.name, engine_type: "standard_daily", execution_status: "queued",
-  phase: "queued", progress: 0, quality_status: "pending", evidence_status: "research_only", replay_status: "pending",
-  plan_sha256: standardStart.plan_hash, input_sha256: standardStart.input_hash, execution_plan: standardPlan,
-  metrics_json: null, data_gaps: [], error_message: null, session_id: "1", started_at: null,
-  finished_at: null, cancel_requested_at: null, comparisons: [], enabled: true,
-};
-
-describe("标准回测工具边界（无数据库）", () => {
-  afterEach(() => { vi.restoreAllMocks(); });
-
-  function fixture(sessionId: string | null = "2", acquired = true) {
-    const query = vi.fn(async (_sql: string, _values?: unknown[]) => ({ rows: [{
-      id: "1", session_id: sessionId, event_type: "ui_refresh", data: {}, created_at: "2026-09-11T00:00:00Z",
-    }] }));
-    const lockQuery = vi.fn(async (_sql: string, _values?: unknown[]) => ({ rows: [{ acquired }] }));
-    const release = vi.fn();
-    const connect = vi.fn(async () => ({ query: lockQuery, release }));
-    const pool = { query, connect } as unknown as pg.Pool;
-    const enabled = vi.spyOn(standardRuntime, "isStandardBacktestEnabled").mockReturnValue(false);
-    const start = vi.spyOn(standardRuntime, "startStandardBacktest").mockResolvedValue(standardStatus);
-    const status = vi.spyOn(standardRuntime, "getStandardBacktestStatus").mockResolvedValue(standardStatus);
-    const cancel = vi.spyOn(standardRuntime, "cancelStandardBacktest").mockResolvedValue({ ...standardStatus, cancel_requested_at: "2026-09-11T00:00:00Z" });
-    const preflight = vi.spyOn(standardService, "preflightStandardBacktest").mockResolvedValue({
-      executable: true, plan: standardPlan, plan_hash: standardStart.plan_hash, input_hash: standardStart.input_hash,
-      evidence_status: "research_only", estimated_compressed_bytes: 1000000,
-      manifest: {
-        version: "standard-input-v2", data_request_hash: "c".repeat(64), environment_codes: [], codes: standardPlan.codes,
-        seed_start: "2020-01-05", start: standardPlan.start, end: standardPlan.end, row_count: 2000, day_count: 2000,
-        gaps: [{ code: "POINT_IN_TIME_UNVERIFIED", domain: "input", severity: "warning", message: "仅研究证据" }],
-        chunks: Array.from({ length: 2000 }, () => ({ date: standardPlan.start, sha256: "d".repeat(64), bytes: 1000, rows: 1 })),
-      },
-    });
-    const tools = buildChatTools({ pool, sessionId });
-    const tool = (name: string) => tools.find(item => item.name === name)!;
-    return { pool, query, lockQuery, connect, release, enabled, start, status, cancel, preflight, tools, tool };
-  }
-
-  it("仅交互目录开放新增工具，默认未启用可发现，已知及未知任务均不扩权", () => {
-    const f = fixture();
-    expect(f.tools.filter(tool => standardToolNames.includes(tool.name)).map(tool => tool.name)).toEqual(standardToolNames);
-    expect(f.tool("start_standard_backtest").label).toContain("未启用");
-    expect(f.tool("preflight_backtest").description).toContain("默认 false");
-    expect(f.tool("run_backtest").description).toContain("不代表自动正式验证");
-    for (const jobCode of [...Object.keys(JOB_FLOW_TOOL_BUNDLES), "unknown_flow", "constructor"]) {
-      const names = buildChatTools({ pool: f.pool, sessionId: "2" }, { kind: "job", jobCode }).map(tool => tool.name);
-      expect(names.some(name => standardToolNames.includes(name))).toBe(false);
-    }
-    expect(f.query).not.toHaveBeenCalled();
-  });
-
-  it("预检返回精简白名单，content/details 均无逐块清单且不获取写锁", async () => {
-    const f = fixture();
-    const result = await f.tool("preflight_backtest").execute("preflight", { plan: standardPlan });
-    const data = JSON.parse(result.content.find(item => item.type === "text")!.text!);
-    expect(Object.keys(data).sort()).toEqual(["enabled", "executable", "plan", "plan_hash", "input_hash", "evidence_status", "coverage", "data_gaps"].sort());
-    expect(data).toMatchObject({ enabled: false, executable: true, evidence_status: "research_only",
-      coverage: { seed_start: "2020-01-05", start: standardPlan.start, end: standardPlan.end, row_count: 2000, day_count: 2000 },
-      data_gaps: [{ message: "仅研究证据" }],
-    });
-    expect(result.details).toEqual(data);
-    expect(JSON.stringify(result)).not.toMatch(/chunks|manifest|estimated_compressed_bytes/);
-    expect(JSON.stringify(result).length).toBeLessThan(5000);
-    expect(f.connect).not.toHaveBeenCalled();
-    expect(f.start).not.toHaveBeenCalled();
-  });
-
-  it("四个入口拒绝未知字段、源码、非法编号及非严格计划，错误审计仅留哈希", async () => {
-    const f = fixture();
-    for (const [name, input] of [
-      ["preflight_backtest", { plan: standardPlan, source_code: "secret-sentinel" }],
-      ["preflight_backtest", { plan: { ...standardPlan, costs: { ...standardPlan.costs, extra: true } } }],
-      ["start_standard_backtest", { ...standardStart, plan_hash: "invalid" }],
-      ["start_standard_backtest", { ...standardStart, source_code: "secret-sentinel" }],
-      ["get_backtest_status", { run_id: "0" }],
-      ["get_backtest_status", { run_id: "123", sql: "secret-sentinel" }],
-      ["cancel_backtest", { run_id: "123", reason: "" }],
-      ["cancel_backtest", { run_id: "123", reason: "用户取消", session_id: "1" }],
-    ] as const) await expect(f.tool(name).execute("invalid", input)).rejects.toThrow();
-    expect(f.preflight).not.toHaveBeenCalled();
-    expect(f.start).not.toHaveBeenCalled();
-    expect(f.status).not.toHaveBeenCalled();
-    expect(f.cancel).not.toHaveBeenCalled();
-    expect(f.connect).not.toHaveBeenCalled();
-    expect(f.query).toHaveBeenCalledTimes(8);
-    for (const [sql, values] of f.query.mock.calls) {
-      expect(sql).toContain("INSERT INTO agent_tool_audit");
-      expect(JSON.parse(String(values![2]))).toEqual({ redacted: true, args_sha256: expect.any(String) });
-      expect(values![4]).toBe("error");
-    }
-    expect(JSON.stringify(f.query.mock.calls)).not.toContain("secret-sentinel");
-  });
-
-  it("发起排队立即返回并审计刷新，不轮询；取消传来源会话且允许跨会话", async () => {
-    const f = fixture();
-    f.enabled.mockReturnValue(true);
-    const started = await f.tool("start_standard_backtest").execute("start", standardStart);
-    expect(started.details).toMatchObject({ id: "123", execution_status: "queued", evidence_status: "research_only" });
-    expect(f.start).toHaveBeenCalledExactlyOnceWith(f.pool, "2", standardStart);
-    expect(f.status).not.toHaveBeenCalled();
-    const cancelled = await f.tool("cancel_backtest").execute("cancel", { run_id: "123", reason: "用户要求停止" });
-    expect(cancelled.details).toMatchObject({ session_id: "1", cancel_requested_at: expect.any(String) });
-    expect(f.cancel).toHaveBeenCalledExactlyOnceWith(f.pool, "123", "用户要求停止", "2");
-    expect(f.connect).toHaveBeenCalledTimes(2);
-    expect(f.lockQuery.mock.calls.filter(([sql]) => sql.includes("pg_try_advisory_xact_lock"))).toHaveLength(2);
-    expect(f.lockQuery.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(2);
-    expect(f.release).toHaveBeenCalledTimes(2);
-    const audits = f.query.mock.calls.filter(([sql]) => sql.includes("INSERT INTO agent_tool_audit"));
-    expect(audits.map(([, values]) => [values![0], values![1], values![4]])).toEqual([
-      ["2", "start_standard_backtest", "ok"], ["2", "cancel_backtest", "ok"],
-    ]);
-    expect(f.query.mock.calls.filter(([sql]) => sql.includes("INSERT INTO chat_session_event"))).toHaveLength(2);
-    expect(f.query.mock.calls.every(([sql]) => /INSERT INTO (agent_tool_audit|chat_session_event)/.test(sql))).toBe(true);
-  });
-
-  it("只读状态无需同源会话或写锁，找不到运行显式失败", async () => {
-    const f = fixture();
-    expect((await f.tool("get_backtest_status").execute("status", { run_id: "123" })).details).toEqual(standardStatus);
-    expect(f.status).toHaveBeenCalledExactlyOnceWith(f.pool, "123");
-    f.status.mockResolvedValue(null);
-    await expect(f.tool("get_backtest_status").execute("missing", { run_id: "456" })).rejects.toThrow("不存在");
-    expect(f.connect).not.toHaveBeenCalled();
-    expect(f.start).not.toHaveBeenCalled();
-    expect(f.cancel).not.toHaveBeenCalled();
-    expect(f.query.mock.calls.every(([sql]) => sql.includes("INSERT INTO agent_tool_audit"))).toBe(true);
-  });
-
-  it("无持久会话、数据库写锁冲突时拒绝发起与取消", async () => {
-    const f = fixture(null);
-    for (const [name, input] of [["start_standard_backtest", standardStart], ["cancel_backtest", { run_id: "123", reason: "用户取消" }]] as const) {
-      await expect(f.tool(name).execute("no-session", input)).rejects.toThrow("session");
-    }
-    expect(f.connect).not.toHaveBeenCalled();
-    expect(f.start).not.toHaveBeenCalled();
-    expect(f.cancel).not.toHaveBeenCalled();
-    const busy = fixture("2", false);
-    await expect(busy.tool("start_standard_backtest").execute("busy", standardStart)).rejects.toThrow("另一对话");
-    await expect(busy.tool("cancel_backtest").execute("busy", { run_id: "123", reason: "用户取消" })).rejects.toThrow("另一对话");
-    expect(busy.start).not.toHaveBeenCalled();
-    expect(busy.cancel).not.toHaveBeenCalled();
-    expect(busy.lockQuery.mock.calls.filter(([sql]) => sql === "ROLLBACK")).toHaveLength(2);
-  });
-
-  it("关闭时保留服务拒绝结果，不伪报排队成功或刷新", async () => {
-    const f = fixture();
-    f.start.mockRejectedValue(new Error("标准回测未启用"));
-    await expect(f.tool("start_standard_backtest").execute("disabled", standardStart)).rejects.toThrow("未启用");
-    expect(f.query.mock.calls).toHaveLength(1);
-    expect(f.query.mock.calls[0]![1]![4]).toBe("error");
-    expect(f.lockQuery.mock.calls.map(([sql]) => sql)).toContain("ROLLBACK");
-  });
-});
-
 describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test 真实库）", () => {
   let pool: pg.Pool;
   let sessionId: string;
@@ -242,7 +74,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     );
     await pool.query(
       `INSERT INTO pool_membership (instrument_id, pool, role, effective_from)
-       SELECT id, 'short', '观察', '2026-08-01' FROM market_instrument WHERE code = '990002.SZ'`,
+       SELECT id, 'watch', '关注', '2026-08-01' FROM market_instrument WHERE code = '990002.SZ'`,
     );
     const session = await createSession(pool, "只读测试");
     sessionId = session.id;
@@ -290,6 +122,61 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     await expect(tool.execute("research-invalid", { codes: ["990071.SZ"], sql: "select 1" } as never)).rejects.toThrow("参数校验失败");
   });
 
+  it("铜库存防守仓位工具只返回服务端固定公式与目标日点时信号", async () => {
+    await pool.query(
+      `INSERT INTO market_factor_series
+         (series_code,commodity_code,market,metric_code,frequency,unit,source,revision_policy)
+       VALUES ('shfe.cu.inventory.total','CU','SHFE','inventory','weekly','吨','test','revisable')
+       ON CONFLICT (series_code) DO NOTHING`,
+    );
+    const seriesId = (await pool.query<{ id: string }>(
+      "SELECT id::text FROM market_factor_series WHERE series_code='shfe.cu.inventory.total'",
+    )).rows[0]!.id;
+    const inventoryDates = ["2026-07-03", "2026-07-10", "2026-07-17", "2026-07-24", "2026-07-31", "2026-08-07"];
+    for (const [index, value] of [100, 110, 120, 130, 90, 80].entries()) {
+      const date = inventoryDates[index]!;
+      await pool.query(
+        `INSERT INTO market_factor_observation
+           (series_id,period_start,period_end,published_at,revision_no,value,source_ref)
+         VALUES ($1,$2,$2,($2::date + time '23:59:59') AT TIME ZONE 'Asia/Shanghai',0,$3,$4)
+         ON CONFLICT DO NOTHING`,
+        [seriesId, date, value, `test://inventory/${date}`],
+      );
+    }
+    for (const [index, code] of ["990081.SZ", "990082.SZ", "990083.SZ"].entries()) {
+      await pool.query(
+        `INSERT INTO market_instrument (code,name,kind) VALUES ($1,$2,'stock') ON CONFLICT (code) DO NOTHING`,
+        [code, `铜信号测试${index + 1}`],
+      );
+      await pool.query(
+        `INSERT INTO company_commodity_profile
+           (instrument_id,commodity_code,role,effective_from,published_at,source_ref)
+         SELECT id,'CU','integrated','2026-01-01','2026-01-02T00:00:00+08:00',$2
+           FROM market_instrument WHERE code=$1
+         ON CONFLICT DO NOTHING`,
+        [code, `test://profile/${code}`],
+      );
+    }
+    await pool.query(
+      `INSERT INTO market_trading_day (trade_date,is_open,source)
+       SELECT day,true,'test' FROM generate_series('2026-07-01'::date,'2026-08-31'::date,interval '1 day') day
+        WHERE extract(isodow FROM day) BETWEEN 1 AND 5
+       ON CONFLICT (trade_date) DO UPDATE SET is_open=true`,
+    );
+    const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "copper_inventory_signal_query")!;
+    const result = textOf(await tool.execute("copper-signal", { date: "2026-08-17" })) as {
+      status: string; rule_version: string; latest_observation: { action: string; inventory_4w_change: number };
+      current_target: { stock_exposure: number; per_stock_exposure: number; codes: unknown[] }; gaps: string[];
+    };
+    expect(result).toMatchObject({ status: "ready", rule_version: "铜库存防守仓位一版", gaps: [] });
+    expect(result.latest_observation.inventory_4w_change).toBeLessThan(0);
+    expect(result.current_target.codes).toHaveLength(3);
+    expect(result.current_target.stock_exposure).toBeGreaterThanOrEqual(0.5);
+    expect(result.current_target.per_stock_exposure).toBeCloseTo(result.current_target.stock_exposure / 3, 9);
+    await expect(tool.execute("copper-signal-invalid", { date: "2026-08-17", sql: "select 1" } as never))
+      .rejects.toThrow("参数校验失败");
+  });
+
   it("试盘启动按近10日试盘、缩量回调和放量突破逐只确定性匹配", () => {
     const rows = Array.from({ length: 15 }, (_, index) => ({
       code: "990003.SZ",
@@ -324,45 +211,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       stage: "pullback_low",
       conditions: { pullback_above_trial_low: false },
     });
-  });
-
-  it("左侧反转返回基础条件、形态质量分、确认窗口与ATR止损证据", () => {
-    const rows = Array.from({ length: 21 }, (_, index) => ({
-      code: "990003.SZ",
-      bar_date: `2026-08-${String(index + 1).padStart(2, "0")}`,
-      open: index === 20 ? 8.8 : index === 19 ? 9.05 : 10,
-      high: index === 20 ? 9.2 : index === 19 ? 9.1 : 10.2,
-      low: index === 20 ? 8.5 : index === 19 ? 8.8 : 9.8,
-      close: index === 20 ? 9 : index === 19 ? 9 : 10,
-      volume: index === 20 ? 50 : 100,
-      ma20: 10,
-      rsi14: index === 20 ? 27.5 : 45,
-      indicator_status: "ready" as const,
-    }));
-    const evaluation = evaluateLeftSideSignal(rows);
-    expect(evaluation).toMatchObject({
-      price_signal: true,
-      stage: "matched",
-      pattern: "缩量长下影",
-      quality_factor: expect.any(Number),
-      conditions: {
-        five_day_decline: true,
-        rsi_oversold: true,
-        below_ma20: true,
-        selloff_absorbed: true,
-        long_lower_shadow: true,
-      },
-      evidence: {
-        confirmation_must_exceed: 9.2,
-        confirmation_price_cap: 9.27,
-        confirmation_window_available: true,
-      },
-    });
-    expect(evaluation!.evidence.five_day_return).toBeCloseTo(-0.1);
-    expect(evaluation!.evidence.ma20_deviation).toBeCloseTo(-0.1);
-    expect(evaluation!.quality_score).toBeCloseTo(60.98, 1);
-    expect(evaluation!.evidence.atr14).toBeCloseTo(6.7 / 14);
-    expect(evaluation!.evidence.initial_stop_at_price_cap).toBeLessThan(9.27);
   });
 
   it("右侧六条件与旧短线止损档位由服务层返回确定性结论", () => {
@@ -428,7 +276,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       const instrumentId = instrument.rows[0]!.id;
       await pool.query(
         `INSERT INTO pool_membership (instrument_id, pool, role, effective_from)
-         VALUES ($1, 'long', '波段', '2026-07-01')`,
+         VALUES ($1, 'watch', '关注', '2026-07-01')`,
         [instrumentId],
       );
       await storeBars(pool, instrumentId, "day", rows.map((row) => ({
@@ -458,7 +306,9 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         signal_count: number;
         signals: Array<{ code: string; passed_count: number }>;
       };
-      expect(signal).toMatchObject({ status: "success", member_count: 1, completed_count: 1, signal_count: 1 });
+      // 关注池统一后扫描范围是全部成员（含 seed 的 990002.SZ），合格信号仍只有本用例标的。
+      // 关注池统一后扫描全部成员：990002.SZ 无日线计入缺口，合格信号仍只有本用例标的。
+      expect(signal).toMatchObject({ status: "partial", member_count: 2, completed_count: 1, signal_count: 1 });
       expect(signal.signals).toContainEqual(expect.objectContaining({ code, passed_count: 4 }));
 
       await pool.query(
@@ -497,11 +347,16 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "hithink_query",
       "instrument_search",
       "stock_research_query",
+      "copper_inventory_signal_query",
+      "lithium_warehouse_signal_query",
       "market_snapshot_query",
       "board_query",
       "market_event_query",
       "indicator_query",
       "daily_plan_context_query",
+      "value_rank_query",
+      "value_anchor_signal_query",
+      "two_year_reversal_signal_query",
       "swing_signal_query",
       "limit_up_signal_query",
       "memory_query",
@@ -512,17 +367,9 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "position_entry_signal_write",
       "pool_write",
       "job_write",
-      "finalize_backtest",
       "memory_write",
-      "strategy_publish_request",
       "analysis_run",
       "strategy_screen_query",
-      "read_backtest_source",
-      "preflight_backtest",
-      "start_standard_backtest",
-      "get_backtest_status",
-      "cancel_backtest",
-      "run_backtest",
       "fetch_market_data",
       "fetch_hithink_data",
       "trigger_job",
@@ -552,18 +399,9 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(portfolioSchema.required).toEqual(["reason", "changes"]);
     expect(
       tools
-        .filter((tool) => ["pool_onboard", "portfolio_write", "pool_write", "job_write", "finalize_backtest", "memory_write", "pool_attention_write", "daily_plan_write", "auction_assessment_write", "strategy_publish_request", "analysis_run", "strategy_screen_query", "start_standard_backtest", "cancel_backtest", "run_backtest", "fetch_market_data", "fetch_hithink_data", "hithink_query", "trigger_job"].includes(tool.name))
+        .filter((tool) => ["pool_onboard", "portfolio_write", "pool_write", "job_write", "memory_write", "pool_attention_write", "daily_plan_write", "auction_assessment_write", "analysis_run", "strategy_screen_query", "fetch_market_data", "fetch_hithink_data", "hithink_query", "trigger_job"].includes(tool.name))
         .every((tool) => tool.executionMode === "sequential"),
     ).toBe(true);
-    const runBacktest = tools.find((tool) => tool.name === "run_backtest")!;
-    expect(runBacktest.description).toContain("daily_returns 必须有 1–50000 个唯一日期项");
-    expect(runBacktest.description).toContain("metrics 必须是最多100项的扁平对象");
-    expect(runBacktest.description).toContain("limit_up_universe=mainboard/all");
-    expect(runBacktest.description).toContain("eventsOn(date,type?)");
-    expect(Object.keys((runBacktest.parameters as { properties?: Record<string, unknown> }).properties ?? {}))
-      .toEqual(expect.arrayContaining(["market_event_types", "limit_up_universe"]));
-    expect((runBacktest.parameters as { properties?: { source_code?: { description?: string } } })
-      .properties?.source_code?.description).toContain("必须返回非空 daily_returns");
     expect(tools.find((tool) => tool.name === "pool_onboard")!.description)
       .toContain("当前买入信号不参与入池");
     const poolWriteFields = Object.keys((tools.find((tool) => tool.name === "pool_write")!.parameters as {
@@ -619,29 +457,28 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "pool_attention_write",
       "daily_plan_write",
     ]);
-    const midweek = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "midweek_check" });
-    expect(midweek.map((tool) => tool.name)).toEqual([
-      "pool_context_query",
-      "job_context_query",
-      "strategy_document_query",
-      "daily_plan_context_query",
-      "web_search",
-      "web_fetch",
+    // 每周评分与周中检查已随评分机制退役：不再有专属工具子集，与未知任务一样回退到完整交互目录。
+    for (const retired of ["midweek_check", "weekly_review"]) {
+      expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: retired }).map((tool) => tool.name))
+        .toEqual(full.map((tool) => tool.name));
+    }
+    // 防守评估任务接入任务级策略文档，必须能读取本任务策略正文。
+    const copper = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "copper_inventory_signal_review" });
+    expect(copper.map((tool) => tool.name)).toEqual([
+      "strategy_document_query", "copper_inventory_signal_query", "web_search", "web_fetch",
     ]);
-    const weekly = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "weekly_review" });
-    expect(weekly.map((tool) => tool.name)).toEqual([
-      "portfolio_context_query",
-      "pool_context_query",
-      "strategy_document_query",
-      "daily_plan_context_query",
-      "swing_signal_query",
-      "web_search",
-      "web_fetch",
-      "analysis_run",
-    ]);
+    // 左侧任务已停用：即使会话仍指定该 jobCode，也只回退到通用目录，不再获得专属工具。
+    const leftReversal = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "left_reversal_opportunity_scan" });
+    expect(leftReversal.map((tool) => tool.name)).not.toContain("left_reversal_opportunity_query");
+    expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "two_year_reversal_scan" }).map((tool) => tool.name).sort())
+      .toEqual(["strategy_document_query", "two_year_reversal_signal_query", "web_search", "web_fetch"].sort());
+    const valueAnchor = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "value_anchor_opportunity_scan" });
+    expect(valueAnchor.map((tool) => tool.name).sort()).toEqual([
+      "pool_attention_write", "strategy_document_query", "value_anchor_signal_query", "web_fetch", "web_search",
+    ].sort());
     const nightly = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "nightly_sector_opportunity_scan" });
     const nightlyNames = nightly.map((tool) => tool.name);
-    expect(nightlyNames).toEqual([
+    expect([...nightlyNames].sort()).toEqual([
       "strategy_document_query",
       "stock_research_query",
       "market_snapshot_query",
@@ -652,12 +489,13 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "web_fetch",
       "analysis_run",
       "strategy_screen_query",
-    ]);
+      "pool_attention_write",
+    ].sort());
     for (const forbidden of ["database_query", "database_schema", "job_write", "portfolio_write", "pool_write"]) {
       expect(nightlyNames).not.toContain(forbidden);
     }
     const fallback = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "unknown_flow" });
-    const fallbackNames = full.map((tool) => tool.name).filter(name => !standardToolNames.includes(name));
+    const fallbackNames = full.map((tool) => tool.name);
     expect(fallback.map((tool) => tool.name)).toEqual(fallbackNames);
     expect(fallback.map((tool) => tool.name)).not.toContain("daily_plan_write");
     expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "constructor" }).map((tool) => tool.name))
@@ -910,18 +748,19 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(portfolio.summary.position_count).toBe(1);
 
     const pools = textOf(await tools.find((tool) => tool.name === "pool_context_query")!
-      .execute("tc-pool-context", { pools: ["short"], codes: ["990002.SZ"] })) as {
-        pools: Array<{ members: Array<{ code: string }> }>;
+      .execute("tc-pool-context", { codes: ["990002.SZ"] })) as {
+        pool: string; members: Array<{ code: string }>;
       };
-    expect(pools.pools[0]!.members).toContainEqual(expect.objectContaining({ code: "990002.SZ" }));
+    expect(pools.pool).toBe("watch");
+    expect(pools.members).toContainEqual(expect.objectContaining({ code: "990002.SZ" }));
 
     const poolSummary = textOf(await tools.find((tool) => tool.name === "pool_context_query")!
-      .execute("tc-pool-context-summary", { pools: ["short"] })) as {
-        pools: Array<{ detail_level: string; members: Array<Record<string, unknown>> }>;
+      .execute("tc-pool-context-summary", {})) as {
+        detail_level: string; members: Array<Record<string, unknown>>;
       };
-    expect(poolSummary.pools[0]!.detail_level).toBe("summary");
-    expect(poolSummary.pools[0]!.members[0]).toMatchObject({ detail_available: true });
-    expect(poolSummary.pools[0]!.members[0]).not.toHaveProperty("evaluation_summary");
+    expect(poolSummary.detail_level).toBe("summary");
+    expect(poolSummary.members[0]).toMatchObject({ detail_available: true });
+    expect(poolSummary.members[0]).not.toHaveProperty("evaluation_summary");
 
     const jobs = textOf(await tools.find((tool) => tool.name === "job_context_query")!
       .execute("tc-job-context", { job_codes: ["daily_plan_flow"], recent_runs_per_job: 2 })) as {
@@ -1217,6 +1056,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     const candidateNames = [
       "instrument_search",
       "stock_research_query",
+      "copper_inventory_signal_query",
       "market_snapshot_query",
       "board_query",
       "market_event_query",
@@ -1247,9 +1087,8 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(tableNames).toContain("agent_memory_artifact");
     expect(tableNames).not.toContain("watchlist_entry");
     expect(tableNames).not.toEqual(expect.arrayContaining([
-      "portfolio_position_snapshot_daily",
-      "portfolio_account_snapshot",
       "portfolio_account_state",
+      "notification_delivery",
     ]));
 
     const search = tools.find((tool) => tool.name === "instrument_search")!;
@@ -1316,45 +1155,32 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       [instrumentId],
     );
     const dailyContextResult = textOf(await dailyContext.execute("tc-daily-context", { date: "2026-08-18" })) as {
-      trial_start_scan: {
+      trial_evaluation: {
         stock_member_count: number;
         completed_count: number;
         matches: unknown[];
         near_candidates: unknown[];
         screened_out: unknown[];
+        evaluation_note: string;
       };
-      right_side_signal_scan: { stock_member_count: number; completed_count: number };
-      left_reversal_scan: {
-        stock_member_count: number;
-        completed_count: number;
-        matches: unknown[];
-        near_candidates: unknown[];
-        screened_out: unknown[];
-        gaps: Array<{ code: string }>;
-      };
-      signal_selection: { priority: string[]; selected_count: number };
+      right_side_evaluation: { stock_member_count: number; completed_count: number; matched_count: number };
       positions: {
         stop_loss_strategy_count: number;
         items: Array<{ code: string; stop_loss_mode: string; stop_loss_mode_source: string }>;
       };
       market_structure_sync: { datasets: Array<{ dataset: string; valid_empty: boolean }> };
     };
-    expect(dailyContextResult.trial_start_scan).toMatchObject({ stock_member_count: 1, completed_count: 1 });
+    // 试盘与右侧已退为评估性输出：只描述形态推进与条件存活，不产生开仓信号。
+    expect(dailyContextResult.trial_evaluation.evaluation_note).toContain("不是开仓信号");
+    expect(dailyContextResult.trial_evaluation.completed_count).toBeGreaterThan(0);
     expect([
-      ...dailyContextResult.trial_start_scan.matches,
-      ...dailyContextResult.trial_start_scan.near_candidates,
-      ...dailyContextResult.trial_start_scan.screened_out,
-    ]).toHaveLength(dailyContextResult.trial_start_scan.completed_count);
-    expect(dailyContextResult.right_side_signal_scan).toMatchObject({ stock_member_count: 1, completed_count: 0 });
-    expect(dailyContextResult.left_reversal_scan).toMatchObject({ stock_member_count: 1, completed_count: 1 });
-    expect([
-      ...dailyContextResult.left_reversal_scan.matches,
-      ...dailyContextResult.left_reversal_scan.near_candidates,
-      ...dailyContextResult.left_reversal_scan.screened_out,
-    ]).toHaveLength(dailyContextResult.left_reversal_scan.completed_count);
-    expect(dailyContextResult.left_reversal_scan.gaps).toEqual([]);
-    expect(dailyContextResult.signal_selection.priority).toEqual(["right_side", "left_reversal", "trial_start"]);
-    expect(dailyContextResult.signal_selection.selected_count).toBe(0);
+      ...dailyContextResult.trial_evaluation.matches,
+      ...dailyContextResult.trial_evaluation.near_candidates,
+      ...dailyContextResult.trial_evaluation.screened_out,
+    ]).toHaveLength(dailyContextResult.trial_evaluation.completed_count);
+    expect(dailyContextResult.right_side_evaluation).toMatchObject({ matched_count: 0 });
+    expect(dailyContextResult).not.toHaveProperty("left_reversal_scan");
+    expect(dailyContextResult).not.toHaveProperty("signal_selection");
     expect(dailyContextResult.positions.stop_loss_strategy_count).toBe(1);
     expect(dailyContextResult.positions.items).toContainEqual(expect.objectContaining({
       code: "990002.SZ",
@@ -1389,7 +1215,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     for (const row of seeded.rows) {
       await pool.query(
         `INSERT INTO pool_membership (instrument_id, pool, role, effective_from)
-         VALUES ($1, 'short', '短线', '2026-07-01')`,
+         VALUES ($1, 'watch', '关注', '2026-07-01')`,
         [row.id],
       );
     }
@@ -1475,7 +1301,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         box_floor_stop: 8.73,
         regular_stop: 9,
         target_price: 11.4,
-        entry_pool_mismatch: true,
         next_open_exit_candidate: "disaster_stop",
       }),
     }));
@@ -1644,10 +1469,8 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     await expect(tool.execute("tc-hidden-import", {
       operation: "list_tables",
       tables: [
-        "content_legacy_import",
-        "portfolio_position_snapshot_daily",
-        "portfolio_account_snapshot",
         "portfolio_account_state",
+        "notification_delivery",
       ],
     })).rejects.toThrow("不在 Agent 排障读取清单");
     const indexResult = await tool.execute("tc-q1-index", {
@@ -1691,30 +1514,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       tables: [{ table: "portfolio_position", schema_hash: "0".repeat(64) }],
     })) as { tables: Array<{ table: string }> };
     expect(legacyHash.tables[0]!.table).toBe("portfolio_position");
-  });
-
-  it("标准回测隐藏执行令牌、压缩载荷与逐块清单，拒绝读取及筛选排序", async () => {
-    const tools = buildChatTools({ pool, sessionId });
-    const schemaTool = tools.find(tool => tool.name === "database_schema")!;
-    const queryTool = tools.find(tool => tool.name === "database_query")!;
-    const names = ["backtest_run", "backtest_event", "backtest_equity_daily", "backtest_input_set", "backtest_input_chunk"];
-    const data = textOf(await schemaTool.execute("standard-schema", {
-      operation: "describe_tables", tables: names.map(table => ({ table })),
-    })) as { tables: Array<{ table: string; write_policy: string; columns: Array<{ name: string }> }> };
-    expect(data.tables.map(table => table.table).sort()).toEqual([...names].sort());
-    expect(data.tables.every(table => table.write_policy.includes("只读"))).toBe(true);
-    expect(JSON.stringify(data)).not.toContain("lease_token");
-    for (const [table, hidden] of [["backtest_run", "lease_token"], ["backtest_input_chunk", "payload"], ["backtest_input_set", "manifest"]]) {
-      expect(data.tables.find(item => item.table === table)!.columns.map(column => column.name)).not.toContain(hidden);
-      for (const query of [
-        { table, columns: [hidden] },
-        { table, mode: "count", filters: [{ column: hidden, op: "is_null", value: null }] },
-        { table, columns: [table === "backtest_input_chunk" ? "input_set_id" : "id"], order_by: [{ column: hidden }] },
-      ]) await expect(queryTool.execute("hidden-input", { queries: [query] })).rejects.toThrow("属于敏感凭据");
-    }
-    expect(textOf(await queryTool.execute("input-meta", { queries: [
-      { table: "backtest_input_chunk", columns: ["input_set_id", "seq", "trade_date", "sha256", "row_count"], limit: 1 },
-    ] }))).toMatchObject({ total_queries: 1 });
   });
 
   it("database_query 一次批量查询多个领域", async () => {
@@ -1784,11 +1583,8 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "portfolio_write",
       "pool_write",
       "job_write",
-      "finalize_backtest",
       "memory_write",
-      "strategy_publish_request",
       "analysis_run",
-      "read_backtest_source",
       "fetch_market_data",
       "fetch_hithink_data",
       "hithink_catalog",
@@ -1826,8 +1622,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(normal).toContain("单一事实源");
     expect(normal).toContain("目标日交易计划只对它标注的交易日有效");
     expect(normal).toContain("标的入池初始化指引");
-    expect(normal).toContain("当前无右侧、左侧、试盘或波段信号不得阻止入池");
-    expect(normal).toContain("已明确的可选池别/角色");
+    expect(normal).toContain("统一入关注池");
     expect(normal).toContain("用 tool_catalog 只加载 pool_onboard，然后调用一次");
     expect(normal).toContain("不得再用行情、指标、分析或 pool_write 拼装入池流程");
     expect(normal).toContain("database_schema/database_query 是受控只读兜底");
@@ -1839,17 +1634,15 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(normal).toContain("迁移证据不是业务事实");
     expect(normal).toContain("不能声称“无法直接写入”");
     expect(normal).toContain("实盘例外");
-    expect(normal).toContain("源码只能进入工具参数");
-    expect(normal).toContain("YOLO 无权批准");
+    expect(normal).toContain("策略正文只读");
+    expect(normal).toContain("回测已完全迁出系统");
     expect(normal).toContain("当前持仓摘要（数据库事实，共 1 只）");
     expect(normal).toContain("持仓市值 120 元，浮动盈亏 20 元，收益率 20.00%");
     expect(normal).toContain("当前持仓组合汇总（由上述同一批数据库事实派生）：持仓 1 只，持仓市值 120 元，浮动盈亏 20 元，缺行情 0 只");
     expect(normal).toContain("累计已实现盈亏（历史基线 + 后续卖出事件，未计手续费和税费）");
     expect(normal).not.toContain("当前资金摘要");
     expect(normal).not.toContain("upsert_account_snapshot");
-    expect(normal).not.toContain("portfolio_account_snapshot｜");
     expect(normal).not.toContain("portfolio_account_state｜");
-    expect(normal).not.toContain("content_legacy_import｜");
 
     await pool.query("UPDATE agent_setting SET yolo_mode = true WHERE singleton = true");
     try {
@@ -1859,152 +1652,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     } finally {
       await pool.query("UPDATE agent_setting SET yolo_mode = false WHERE singleton = true");
     }
-  });
-
-  it("run_backtest 只把源码哈希写入审计，消息与事件持久化边界递归脱敏", async () => {
-    const sentinel = "BACKTEST_SOURCE_MUST_NOT_PERSIST";
-    const sourceCode = `export default async function run(){ const x='${sentinel}'; return x; }`;
-    const tool = buildChatTools({
-      pool,
-      sessionId,
-      runAgentBacktest: async () => ({
-        id: "88",
-        name: "脱敏测试",
-        kind: "research",
-        execution_status: "success",
-        strategy_change_seq: "0",
-        strategy_snapshot_hash: "a".repeat(64),
-        research_outline: "脱敏",
-        hypothesis: "源码不落库",
-        comparison_run_ids: [],
-        input_summary: { bar_count: 1 },
-        metrics_json: { total_return_pct: 1 },
-        conclusion_md: "# 结论",
-        data_gaps: [],
-        worker_version: "worker-test",
-        sdk_version: "sdk-test",
-        source_sha256: "b".repeat(64),
-        source_size_bytes: Buffer.byteLength(sourceCode),
-        base_source_run_id: null,
-        source_retention_status: "candidate",
-        code_cleanup_status: "deleted",
-        error_message: null,
-      }),
-    }).find((item) => item.name === "run_backtest")!;
-    const result = await tool.execute("tc-agent-backtest", {
-      name: "脱敏测试",
-      research_outline: "脱敏",
-      hypothesis: "源码不落库",
-      codes: ["990002.SZ"],
-      start: "2026-08-01",
-      end: "2026-08-18",
-      source_code: sourceCode,
-    });
-    expect(JSON.stringify(result)).not.toContain(sentinel);
-    const audit = await pool.query<{ args: unknown }>(
-      "SELECT args FROM agent_tool_audit WHERE tool_name='run_backtest' ORDER BY id DESC LIMIT 1",
-    );
-    expect(audit.rows[0]!.args).toMatchObject({
-      source_code_sha256: "b".repeat(64),
-      source_size_bytes: Buffer.byteLength(sourceCode),
-      source_code_persisted_in_chat: false,
-    });
-    expect(JSON.stringify(audit.rows[0]!.args)).not.toContain(sentinel);
-
-    await appendMessage(pool, {
-      session_id: sessionId,
-      seq: 99,
-      role: "assistant",
-      json: {
-        role: "assistant",
-        content: [
-          { type: "text", text: `准备运行 ${sentinel}` },
-          { type: "toolCall", id: "tc", name: "run_backtest", arguments: { source_code: sourceCode } },
-        ],
-        api: "openai-responses",
-        provider: "test",
-        model: "test",
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: "toolUse",
-        timestamp: Date.now(),
-      },
-    });
-    await persistAndPublishSessionEvent(pool, {
-      session_id: sessionId,
-      event_type: "tool_start",
-      data: { name: "run_backtest", args: { source_code: sourceCode } },
-    });
-    const persisted = await pool.query<{ content: string; data: string }>(
-      `SELECT m.content::text, e.data::text
-         FROM chat_message m CROSS JOIN chat_session_event e
-        WHERE m.session_id=$1 AND m.seq=99 AND e.session_id=$1
-        ORDER BY e.id DESC LIMIT 1`,
-      [sessionId],
-    );
-    expect(persisted.rows[0]!.content).not.toContain(sentinel);
-    expect(persisted.rows[0]!.content).toContain("source_code_persisted");
-    expect(persisted.rows[0]!.data).not.toContain(sentinel);
-    expect(persisted.rows[0]!.data).toContain("source_code_sha256");
-  });
-
-  it("固化回测无需真人批准，源码只对当前 Agent 工具结果可见", async () => {
-    const sentinel = "VERSIONED_SOURCE_TOOL_SENTINEL";
-    const run = await pool.query<{ id: string }>(
-      `INSERT INTO backtest_run
-         (name, kind, status, execution_status, progress, execution_origin, session_id,
-          source_sha256, source_size_bytes, code_cleanup_status, conclusion_status)
-       VALUES ('直接固化测试', 'research', 'archived', 'success', 100, 'agent_workspace', $1,
-               repeat('c', 64), $2, 'deleted', 'working')
-       RETURNING id::text`,
-      [sessionId, sentinel.length],
-    );
-    await pool.query(
-      "INSERT INTO backtest_run_source (backtest_run_id, source_code) VALUES ($1, $2)",
-      [run.rows[0]!.id, `export default async function run(){ return '${sentinel}'; }`],
-    );
-
-    const tools = buildChatTools({ pool, sessionId });
-    const finalizedResult = await tools.find((item) => item.name === "finalize_backtest")!.execute(
-      "tc-finalize-direct",
-      {
-        run_id: run.rows[0]!.id,
-        reason: "验证完成后固化可复用源码",
-        conclusion_summary: "已验证源码可作为后续基线",
-        applicability_boundary: "仅用于源码固化链路测试",
-      },
-    );
-    expect(textOf(finalizedResult)).toMatchObject({ mode: "direct" });
-    expect((await pool.query(
-      "SELECT count(*)::int AS count FROM agent_confirmation WHERE tool_name = 'finalize_backtest' AND payload->>'run_id' = $1",
-      [run.rows[0]!.id],
-    )).rows[0]!.count).toBe(0);
-
-    const readResult = await tools.find((item) => item.name === "read_backtest_source")!
-      .execute("tc-read-source", { run_id: run.rows[0]!.id });
-    expect(JSON.stringify(readResult)).toContain(sentinel);
-    await appendMessage(pool, {
-      session_id: sessionId,
-      seq: 100,
-      role: "tool",
-      json: {
-        role: "toolResult",
-        toolCallId: "tc-read-source",
-        toolName: "read_backtest_source",
-        isError: false,
-        content: readResult.content,
-        details: readResult.details,
-        timestamp: Date.now(),
-      },
-    });
-    const stored = await pool.query<{ content: string }>(
-      "SELECT content::text FROM chat_message WHERE session_id=$1 AND seq=100",
-      [sessionId],
-    );
-    expect(stored.rows[0]!.content).not.toContain(sentinel);
-    expect(stored.rows[0]!.content).toContain("源码不会保存到会话");
-    expect(JSON.stringify((await pool.query(
-      "SELECT args FROM agent_tool_audit WHERE tool_name='read_backtest_source' ORDER BY id DESC LIMIT 1",
-    )).rows[0]!.args)).not.toContain(sentinel);
   });
 
   it("database_query 非法表写 error 审计", async () => {

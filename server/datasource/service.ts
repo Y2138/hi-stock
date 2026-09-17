@@ -9,6 +9,7 @@ import {
   fetchValuationSnapshots,
   snapshotDate,
   type HithinkDeps,
+  type CorporateActionQuote,
   type SnapshotKind,
   type SnapshotQuote,
 } from "./hithink.js";
@@ -127,6 +128,7 @@ export async function storeBars(
          (instrument_id, freq, earliest_date, generation, reason, updated_at)
        SELECT $1, $2, min(bar_date), 1, '行情写入或历史修订', now() FROM written
        WHERE $14::boolean
+       HAVING count(*) > 0
        ON CONFLICT (instrument_id, freq) DO UPDATE SET
          earliest_date = LEAST(market_indicator_dirty.earliest_date, EXCLUDED.earliest_date),
          generation = market_indicator_dirty.generation + 1,
@@ -226,6 +228,37 @@ export interface FetchStoreOutcome {
   fetchRunId: string;
   firstDate: string;
   lastDate: string;
+}
+
+export async function storeCorporateActions(
+  db: Db,
+  code: string,
+  actions: CorporateActionQuote[],
+  status: "success" | "empty" = actions.length ? "success" : "empty",
+): Promise<number> {
+  const instrumentId = await ensureInstrument(db, code, undefined, "day");
+  let written = 0;
+  for (const action of actions) {
+    const result = await db.query(
+      `INSERT INTO market_corporate_action
+        (instrument_id,ex_date,dividend_per_share,bonus_per_share,rights_ratio,rights_price,source,raw_summary,fetched_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'hithink',$7,now())
+       ON CONFLICT (instrument_id,ex_date) DO UPDATE SET dividend_per_share=EXCLUDED.dividend_per_share,
+         bonus_per_share=EXCLUDED.bonus_per_share,rights_ratio=EXCLUDED.rights_ratio,
+         rights_price=EXCLUDED.rights_price,source=EXCLUDED.source,raw_summary=EXCLUDED.raw_summary,fetched_at=now()`,
+      [instrumentId, action.exDate, action.dividendPerShare, action.bonusPerShare,
+        action.rightsRatio, action.rightsPrice, JSON.stringify(action.rawSummary)],
+    );
+    written += result.rowCount ?? 0;
+  }
+  await db.query(
+    `INSERT INTO market_corporate_action_sync_state (instrument_id,last_checked_at,latest_ex_date,status,last_error)
+     VALUES ($1,now(),$2,$3,NULL) ON CONFLICT (instrument_id) DO UPDATE SET last_checked_at=now(),
+       latest_ex_date=GREATEST(market_corporate_action_sync_state.latest_ex_date,EXCLUDED.latest_ex_date),
+       status=EXCLUDED.status,last_error=NULL,updated_at=now()`,
+    [instrumentId, actions.at(-1)?.exDate ?? null, status],
+  );
+  return written;
 }
 
 export interface FinancialFetchRequest {

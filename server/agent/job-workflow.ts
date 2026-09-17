@@ -3,8 +3,10 @@ import type { AgentCoreFrame } from "./core/loop.js";
 
 const REQUIRED_READS: Record<string, readonly string[]> = {
   daily_plan_flow: ["strategy_document_query", "daily_plan_context_query", "swing_signal_query", "limit_up_signal_query"],
-  midweek_check: ["strategy_document_query", "pool_context_query", "daily_plan_context_query"],
-  weekly_review: ["strategy_document_query", "pool_context_query", "portfolio_context_query", "daily_plan_context_query", "swing_signal_query"],
+  copper_inventory_signal_review: ["strategy_document_query", "copper_inventory_signal_query"],
+  lithium_warehouse_signal_review: ["strategy_document_query", "lithium_warehouse_signal_query"],
+  value_anchor_opportunity_scan: ["strategy_document_query", "value_anchor_signal_query"],
+  two_year_reversal_scan: ["strategy_document_query", "two_year_reversal_signal_query"],
   nightly_sector_opportunity_scan: [
     "strategy_document_query",
     "analysis_run",
@@ -15,7 +17,10 @@ const REQUIRED_READS: Record<string, readonly string[]> = {
     "stock_research_query",
   ],
 };
-const TARGET_DATE_TOOLS = new Set(["daily_plan_context_query", "swing_signal_query", "auction_context_query"]);
+const TARGET_DATE_TOOLS = new Set([
+  "daily_plan_context_query", "swing_signal_query", "auction_context_query", "copper_inventory_signal_query", "lithium_warehouse_signal_query",
+  "value_anchor_signal_query", "two_year_reversal_signal_query",
+]);
 
 function object(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -25,7 +30,6 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
   const calls = new Map<string, Record<string, unknown>>();
   const results = new Map<string, Record<string, unknown>>();
   const successfulArgs = new Map<string, Record<string, unknown>>();
-  const fullPools = new Map<string, Record<string, unknown>>();
   return {
     observe(frame: AgentCoreFrame) {
       const name = String(frame.data.name);
@@ -43,14 +47,18 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
       else {
         results.set(name, details);
         successfulArgs.set(name, args);
-        if (name === "pool_context_query" && args.codes === undefined && Array.isArray(details.pools)) {
-          for (const pool of details.pools) fullPools.set(String(object(pool).pool), object(pool));
-        }
       }
+    },
+    unavailableGaps(): unknown[] {
+      const signal = results.get("two_year_reversal_signal_query");
+      return jobCode === "two_year_reversal_scan" && signal
+        && (signal.status === "unavailable" || signal.data_date !== targetDate) && Array.isArray(signal.gaps)
+        ? signal.gaps : [];
     },
     missing(): string[] {
       const required = [...(Object.hasOwn(REQUIRED_READS, jobCode) ? REQUIRED_READS[jobCode]! : [])];
-      if (jobCode === "daily_plan_flow") {
+      if (jobCode === "daily_plan_flow" || jobCode === "nightly_sector_opportunity_scan"
+        || jobCode === "value_anchor_opportunity_scan") {
         required.push("pool_attention_write");
         const positions = object(results.get("daily_plan_context_query")?.positions);
         const signals = results.get("limit_up_signal_query")?.signals;
@@ -67,12 +75,14 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
           if (Array.isArray(context.opportunities) && context.opportunities.length > 0) required.push("auction_assessment_write");
         }
       }
-      if (jobCode === "weekly_review") {
-        if (Number(fullPools.get("long")?.member_count) > 0) {
-          required.push("analysis_run");
+      const missing = required.filter((name) => !results.has(name));
+      if (jobCode === "two_year_reversal_scan" && results.has("strategy_document_query")) {
+        const docs = results.get("strategy_document_query")?.documents;
+        if (!Array.isArray(docs) || !docs.some((item) => object(item).code === "two_year_reversal_strategy")
+          || !docs.some((item) => object(item).role === "portfolio")) {
+          missing.push("strategy_document_query（必须读取本任务策略和投资总策略）");
         }
       }
-      const missing = required.filter((name) => !results.has(name));
       if (jobCode === "nightly_sector_opportunity_scan" && results.has("analysis_run")) {
         const items = results.get("analysis_run")?.items;
         const requests = successfulArgs.get("analysis_run")?.requests;
@@ -89,10 +99,6 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
           missing.push("analysis_run（需要目标日完整 881 一级行业板块温度扫描或明确缺口）");
         }
       }
-      const neededPools = jobCode === "weekly_review" ? ["short", "long"] : jobCode === "midweek_check" ? ["short"] : [];
-      if (neededPools.some((pool) => !fullPools.has(pool))) {
-        missing.push(`pool_context_query（需要 ${neededPools.join("、")} 池完整摘要，不能只查询部分代码）`);
-      }
       if (jobCode === "daily_plan_flow" && results.has("daily_plan_write")) {
         const expected = object(results.get("daily_plan_context_query")?.positions).items;
         const submitted = successfulArgs.get("daily_plan_write")?.items;
@@ -102,13 +108,6 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
           if (held.size !== written.length || written.some((item) => !held.has(object(item).code))) {
             missing.push("daily_plan_write（必须完整覆盖本次查询的真实持仓）");
           }
-        }
-      }
-      if (jobCode === "weekly_review" && results.has("analysis_run")) {
-        const items = results.get("analysis_run")?.items;
-        if (!Array.isArray(items) || !items.some((item) => object(item).analysis_type === "long_valuation"
-          && ["success", "partial"].includes(String(object(item).status)))) {
-          missing.push("analysis_run（需要长线估值结果或明确缺口）");
         }
       }
       if (jobCode === "auction_opportunity_assessment" && results.has("auction_assessment_write")

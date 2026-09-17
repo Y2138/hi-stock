@@ -9,6 +9,7 @@ import { buildSystemPrompt } from "../agent/prompt.js";
 import { appendMessage, nextMessageSeq, updateSessionStatus } from "../agent/repo.js";
 import { runAgentSessionTurn } from "../agent/session-runner.js";
 import { createJobCompletionGate } from "../agent/job-workflow.js";
+import { queryTwoYearReversalCoverage } from "../modules/plans/two-year-reversal-signal.js";
 import {
   activateAuctionAssessmentsForRun,
   activatePlaybookForRun,
@@ -38,6 +39,14 @@ import {
 import { exportVolume, type VolumeExportResult } from "../volume/export.js";
 import { validateJobConfig } from "./config.js";
 import { findJobRunById } from "./repo.js";
+import { syncGfexLithiumWarehouse } from "../datasource/gfex-service.js";
+import { syncValueCandidates, type ValueCandidateSyncSummary } from "../modules/value-ranking/service.js";
+import {
+  syncShfeCopperWeeklyInventory,
+  syncShfeFuturesDaily,
+  type ShfeDailySyncResult,
+  type ShfeInventorySyncResult,
+} from "../datasource/shfe-service.js";
 import { dailyMarketGate, type DailyMarketMode } from "./time.js";
 import type {
   AgentFlowJobConfig,
@@ -108,6 +117,10 @@ export interface RunnerDeps {
     targetDate: string,
     jobRunId: string,
   ) => Promise<{ datasets: SpecialSyncSummary[]; gaps: unknown[] }>;
+  commodityCopperSync?: (targetDate: string, jobRunId: string) => Promise<ShfeDailySyncResult>;
+  commodityCopperInventorySync?: (targetDate: string, jobRunId: string) => Promise<ShfeInventorySyncResult>;
+  lithiumWarehouseSync?: (targetDate: string, jobRunId: string) => Promise<import("../datasource/gfex-service.js").GfexLithiumWarehouseSyncResult>;
+  valueCandidateSync?: (targetDate: string, jobRunId: string) => Promise<ValueCandidateSyncSummary>;
   volumeExport?: () => Promise<VolumeExportResult>;
   analysisRun?: (request: AnalysisRequest) => Promise<{ id: string; status: string; data_gaps: unknown[] }>;
   agentFlow?: (
@@ -339,7 +352,7 @@ async function runAgentFlow(
   strategy: StrategyBundle,
   jobCode: string,
   targetDate: string,
-): Promise<string> {
+): Promise<{ markdown: string; unavailableGaps: unknown[] }> {
   const systemPrompt = await buildSystemPrompt(pool, strategy);
   const completion = createJobCompletionGate(jobCode, targetDate);
   const turn = await runAgentSessionTurn({
@@ -365,7 +378,7 @@ async function runAgentFlow(
   }
   const markdown = normalizeAgentFlowMarkdown(textOfAssistant(turn.lastAssistant));
   if (!markdown) throw new Error("agent_flow 未产生带完成标记的最终 Markdown");
-  return markdown;
+  return { markdown, unavailableGaps: completion.unavailableGaps() };
 }
 
 /**
@@ -473,6 +486,46 @@ async function executeDatasource(
           `30分钟 ${summary.minute30Rows} 行，缺口 ${gaps.length} 项。`,
         dataGaps: gaps,
       };
+    } else if (config.pipeline === "commodity_copper_sync") {
+      const summary = deps.commodityCopperSync
+        ? await deps.commodityCopperSync(run.target_date, run.id)
+        : await syncShfeFuturesDaily(deps.pool, run.target_date, "CU", { jobRunId: run.id });
+      result = {
+        status: summary.gaps.length > 0 ? "partial" : "success",
+        log: `铜期货同步完成：真实合约 ${summary.contractCount} 个，主力 ${summary.mainContractCode ?? "无"}，缺口 ${summary.gaps.length}。`,
+        artifacts: [{ kind: "market_fetch_run", id: summary.fetchRunId }],
+        dataGaps: summary.gaps,
+      };
+    } else if (config.pipeline === "commodity_copper_inventory_sync") {
+      const summary = deps.commodityCopperInventorySync
+        ? await deps.commodityCopperInventorySync(run.target_date, run.id)
+        : await syncShfeCopperWeeklyInventory(deps.pool, run.target_date, { jobRunId: run.id });
+      result = {
+        status: summary.gaps.length > 0 ? "partial" : "success",
+        log: `铜库存周报同步完成：本周 ${summary.inventory} 吨，上周 ${summary.previousInventory} 吨，缺口 ${summary.gaps.length}。`,
+        artifacts: [{ kind: "market_fetch_run", id: summary.fetchRunId }],
+        dataGaps: summary.gaps,
+      };
+    } else if (config.pipeline === "commodity_lithium_warehouse_sync") {
+      const summary = deps.lithiumWarehouseSync
+        ? await deps.lithiumWarehouseSync(run.target_date, run.id)
+        : await syncGfexLithiumWarehouse(deps.pool, run.target_date, { jobRunId: run.id });
+      result = {
+        status: summary.gaps.length > 0 ? "partial" : "success",
+        log: `碳酸锂仓单同步完成：${summary.quantity ?? "无数据"} 张，缺口 ${summary.gaps.length}。`,
+        artifacts: [{ kind: "market_fetch_run", id: summary.fetchRunId }],
+        dataGaps: summary.gaps,
+      };
+    } else if (config.pipeline === "value_candidate_sync") {
+      const summary = deps.valueCandidateSync
+        ? await deps.valueCandidateSync(run.target_date, run.id)
+        : await syncValueCandidates(deps.pool, run.target_date, { jobRunId: run.id });
+      result = {
+        status: summary.gaps.length > 0 ? "partial" : "success",
+        log: `价值候选同步完成：来源 ${summary.sourceCount}、正式 ${summary.formalCount}、日线 ${summary.barSynced ?? 0}、财务 ${summary.financialSynced}、估值 ${summary.valuationSynced}、公司行动 ${summary.corporateActionSynced}、缺口 ${summary.gaps.length}。`,
+        artifacts: summary.fetchRunIds.map((id) => ({ kind: "market_fetch_run", id })),
+        dataGaps: summary.gaps,
+      };
     } else if (config.pipeline === "market_catalog_sync") {
       const summary = deps.catalogSync
         ? await deps.catalogSync(run.id)
@@ -536,14 +589,14 @@ async function executeDatasource(
   });
 }
 
-async function executeAnalysisJob(deps: RunnerDeps, config: AnalysisJobConfig): Promise<JobExecutionResult> {
-  const request = { analysis_type: config.analysis_type, ...(config.request ?? {}) } as AnalysisRequest;
-  const run = deps.analysisRun ? await deps.analysisRun(request) : await executeAnalysis(deps.pool, request);
+async function executeAnalysisJob(deps: RunnerDeps, run: JobRunRow, config: AnalysisJobConfig): Promise<JobExecutionResult> {
+  const request = { analysis_type: config.analysis_type, as_of: run.target_date, ...(config.request ?? {}) } as AnalysisRequest;
+  const analysis = deps.analysisRun ? await deps.analysisRun(request) : await executeAnalysis(deps.pool, request);
   return {
-    status: run.status === "partial" ? "partial" : "success",
-    log: `服务内分析 ${config.analysis_type} 完成，analysis_run #${run.id}，缺口 ${run.data_gaps.length} 项。`,
-    artifacts: [{ kind: "analysis_run", id: run.id, analysis_type: config.analysis_type }],
-    dataGaps: run.data_gaps,
+    status: analysis.status === "partial" ? "partial" : "success",
+    log: `服务内分析 ${config.analysis_type} 完成，analysis_run #${analysis.id}，缺口 ${analysis.data_gaps.length} 项。`,
+    artifacts: [{ kind: "analysis_run", id: analysis.id, analysis_type: config.analysis_type }],
+    dataGaps: analysis.data_gaps,
   };
 }
 
@@ -560,23 +613,38 @@ async function executeAgentFlow(
   const strategy = await pinJobStrategySnapshot(deps.pool, run);
   const revision = await pinJobPromptRevision(deps.pool, run, definition);
   const prompt = buildAgentJobPrompt(revision.content, run, definition);
+  if (definition.code === "two_year_reversal_scan") {
+    const coverage = await queryTwoYearReversalCoverage(deps.pool, run.target_date);
+    if (!coverage) {
+      const reason = "近30个确认交易日无股票覆盖达近期峰值80%且881一级行业覆盖达80个的共同数据日";
+      return {
+        status: "partial", log: `扫描数据门禁未通过：${reason}`,
+        dataGaps: [reason],
+        resultMd: `${RESULT_BANNER}\n\n# 两年结构反转新开仓信号扫描\n\n目标日：${run.target_date}\n\n数据门禁未通过：${reason}\n\n## 结论摘要\n未产生正式新开仓信号；缺数不可视为市场无机会。`,
+      };
+    }
+  }
   let markdown: string;
+  let unavailableGaps: unknown[] = [];
   if (deps.agentFlow) {
     await appendConversationMessage(deps.pool, run.session_id, "user", prompt);
     markdown = await deps.agentFlow(config, run, definition);
     markdown = markdown.startsWith(RESULT_BANNER) ? markdown : `${RESULT_BANNER}\n\n${markdown}`;
     await appendConversationMessage(deps.pool, run.session_id, "assistant", markdown);
   } else {
-    markdown = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, definition.code, run.target_date);
+    const result = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, definition.code, run.target_date);
+    markdown = result.markdown;
+    unavailableGaps = result.unavailableGaps;
   }
   return {
-    status: "success",
+    status: unavailableGaps.length ? "partial" : "success",
     log: `agent_flow 已生成 ${markdown.length} 字符 Markdown，结果将关联当前任务运行保存。`,
+    dataGaps: unavailableGaps,
     resultMd: markdown,
   };
 }
 
-const RUN_RETURNING = `id::text, job_id::text, task_run_id::text, prompt_revision_id::text,
+const RUN_RETURNING = `id::text, job_id::text, prompt_revision_id::text,
   session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
   target_date::text, trigger_kind, scheduled_for, status, attempt_count, next_retry_at,
   log, artifacts, data_gaps, result_md, started_at, finished_at, created_at`;
@@ -740,7 +808,7 @@ export async function executeJobRun(deps: RunnerDeps, runId: string): Promise<Jo
     if (detail.job.job_type === "datasource") {
       result = await executeDatasource(deps, run, config as DatasourceJobConfig);
     } else if (detail.job.job_type === "analysis") {
-      result = await executeAnalysisJob(deps, config as AnalysisJobConfig);
+      result = await executeAnalysisJob(deps, run, config as AnalysisJobConfig);
     } else {
       result = await executeAgentFlow(deps, run, detail.job, config as AgentFlowJobConfig);
     }

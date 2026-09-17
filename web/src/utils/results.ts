@@ -1,8 +1,6 @@
 export type ResultType =
   | "job-output"
-  | "backtest-result"
   | "memory"
-  | "strategy-proposal"
   | "position-change"
   | "pool-member"
   | "job-definition";
@@ -16,15 +14,13 @@ export const RESULT_OPEN_EVENT = "stock:open-result";
 
 const RESULT_TYPES = new Set<ResultType>([
   "job-output",
-  "backtest-result",
   "memory",
-  "strategy-proposal",
   "position-change",
   "pool-member",
   "job-definition",
 ]);
 
-const PREVIEW_TYPES = new Set<ResultType>(["job-output", "backtest-result", "memory"]);
+const PREVIEW_TYPES = new Set<ResultType>(["job-output", "memory"]);
 
 export function serializeResultRef(result: ResultRef): string {
   return `${result.type}:${result.id}`;
@@ -63,15 +59,12 @@ export function isPreviewResult(result: ResultRef): boolean {
 
 export function resultRoute(result: ResultRef): { path: string; query: Record<string, string> } | null {
   switch (result.type) {
-    case "strategy-proposal":
-      return { path: "/strategies", query: { proposal: result.id } };
     case "position-change":
       return { path: "/positions", query: { change: result.id } };
     case "pool-member": {
       const separator = result.id.indexOf(":");
-      const pool = separator > 0 ? result.id.slice(0, separator) : "short";
       const member = separator > 0 ? result.id.slice(separator + 1) : result.id;
-      return { path: pool === "long" ? "/long-pool" : "/short-pool", query: { member } };
+      return { path: "/pools", query: { member } };
     }
     case "job-definition":
       return { path: "/jobs", query: { job: result.id } };
@@ -83,9 +76,7 @@ export function resultRoute(result: ResultRef): { path: string; query: Record<st
 export function resultLabel(result: ResultRef): string {
   switch (result.type) {
     case "job-output": return `查看任务结果 #${result.id}`;
-    case "backtest-result": return `查看回测结论 #${result.id}`;
     case "memory": return `查看 Agent 记忆 #${result.id}`;
-    case "strategy-proposal": return `查看策略提案 #${result.id}`;
     case "position-change": return `定位持仓变化 #${result.id}`;
     case "pool-member": return "定位标的池结果";
     case "job-definition": return `查看任务 ${result.id}`;
@@ -125,14 +116,8 @@ export function resultRefsOfTool(tool: ToolResultLike): ResultRef[] {
   const result = parsedToolResult(tool);
   if (!result) return [];
 
-  if (tool.name === "finalize_backtest" && typeof result.id === "string") {
-    return [{ type: "backtest-result", id: result.id }];
-  }
   if (tool.name === "memory_write" && typeof result.id === "string") {
     return [{ type: "memory", id: result.id }];
-  }
-  if (tool.name === "strategy_publish_request" && typeof result.proposal_id === "string") {
-    return [{ type: "strategy-proposal", id: result.proposal_id }];
   }
   if (tool.name === "portfolio_write") {
     const change = record(result.change);

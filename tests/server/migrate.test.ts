@@ -34,28 +34,18 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     );
     expect(tables.rows.map((r: { tablename: string }) => r.tablename)).toEqual([
       "agent_confirmation",
-      "agent_evaluation_run",
-      "agent_external_cli_run",
       "agent_memory_artifact",
       "agent_run_metric",
       "agent_setting",
       "agent_tool_audit",
       "agent_tool_metric",
       "analysis_run",
-      "backtest_equity_daily",
-      "backtest_event",
-      "backtest_input_chunk",
-      "backtest_input_set",
-      "backtest_run",
-      "backtest_run_comparison",
-      "backtest_run_source",
       "chat_attachment",
       "chat_message",
       "chat_session",
       "chat_session_event",
-      "content_document",
-      "content_legacy_import",
-      "content_revision",
+      "company_commodity_metric",
+      "company_commodity_profile",
       "daily_plan_auction_assessment",
       "daily_plan_playbook",
       "fundamental_snapshot",
@@ -71,8 +61,15 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "market_bar",
       "market_board",
       "market_board_membership",
+      "market_corporate_action",
+      "market_corporate_action_sync_state",
       "market_dragon_tiger_entry",
+      "market_factor_observation",
+      "market_factor_series",
       "market_fetch_run",
+      "market_futures_contract",
+      "market_futures_daily_detail",
+      "market_futures_roll",
       "market_indicator_dirty",
       "market_indicator_run",
       "market_indicator_value",
@@ -82,34 +79,24 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "market_limit_ladder_snapshot",
       "market_special_sync_run",
       "market_stock_character_metric",
-      "market_system_tracking",
       "market_trading_day",
       "notification_delivery",
       "notification_setting",
+      "pool_attention_entry",
       "pool_board_preference",
       "pool_membership",
-      "portfolio_account_snapshot",
       "portfolio_account_state",
       "portfolio_equity_daily",
       "portfolio_position",
       "portfolio_position_change",
-      "portfolio_position_snapshot_daily",
       "portfolio_realized_pnl_baseline",
       "schema_migrations",
-      "script_registry",
-      "script_version",
-      "strategy_doc",
       "strategy_document",
-      "strategy_evolution_backtest",
-      "strategy_evolution_log",
-      "strategy_publish_proposal",
       "strategy_score_benchmark",
       "strategy_state",
-      "strategy_version",
       "system_setting",
-      "task_definition",
-      "task_run",
       "valuation_snapshot",
+      "value_rank_snapshot",
       "volume_snapshot",
     ]);
     const undocumented = await pool.query<{ object_name: string }>(
@@ -167,7 +154,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       `SELECT prompt.code, revision.content
          FROM job_prompt prompt
          JOIN job_prompt_revision revision ON revision.id = prompt.current_revision_id
-        WHERE prompt.code IN ('daily_plan_flow', 'midweek_check', 'weekly_review', 'nightly_sector_opportunity_scan')
+        WHERE prompt.code IN ('daily_plan_flow', 'nightly_sector_opportunity_scan')
         ORDER BY prompt.code`,
     );
     const promptByCode = new Map(prompts.rows.map((row) => [row.code, row.content]));
@@ -177,7 +164,8 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(dailyPlan).toContain("swing_signal_query(date=目标日)");
     expect(dailyPlan).toContain("limit_up_signal_query(date=实际市场结构数据日)");
     expect(dailyPlan).toContain("每日最多 4 只");
-    expect(dailyPlan).toContain("右侧 > 左侧 > 试盘");
+    expect(dailyPlan).toContain("右侧与试盘是评估性输出，不是开仓信号");
+    expect(dailyPlan).toContain("左侧反转（left_reversal）为存量口径");
     expect(dailyPlan).toContain("当日无新增波段信号");
     expect(dailyPlan).toContain("无候选也提交空数组");
     expect(dailyPlan).toContain("不得加入持仓、池外标的或覆盖人工关注");
@@ -194,19 +182,11 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(dailyPlan).not.toContain("## 策略模拟账户信号");
     expect(dailyPlan).not.toContain("paper_trade_signal_write");
     expect(dailyPlan).not.toContain("预期校对");
-    const midweek = promptByCode.get("midweek_check")!;
-    expect(midweek).toContain("pool_context_query(pools=[\"short\"])");
-    expect(midweek).toContain("daily_plan_context_query(date=目标日)");
-    expect(midweek).toContain("最近一份成功的 `job_run_output`");
-    expect(midweek.length).toBeLessThan(1_200);
-    expect(midweek).not.toContain("indicator_query");
-    expect(midweek).not.toContain("database_query");
-    const weekly = promptByCode.get("weekly_review")!;
-    expect(weekly).toContain("portfolio_context_query");
-    expect(weekly).toContain("swing_signal_query(date=目标日)");
-    expect(weekly).toContain("analysis_run(long_valuation)");
-    expect(weekly.length).toBeLessThan(1_200);
-    expect(weekly).not.toContain("database_query");
+    const retiredJobs = await pool.query<{ code: string }>(
+      `SELECT code FROM job_definition
+        WHERE code IN ('weekly_review', 'midweek_check', 'left_reversal_opportunity_scan')`,
+    );
+    expect(retiredJobs.rows).toEqual([]);
     const nightly = promptByCode.get("nightly_sector_opportunity_scan")!;
     expect(nightly).toContain('"analysis_type":"sector_temperature"');
     expect(nightly).toContain("不得传 `codes`");
@@ -286,6 +266,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       context_window: 1_000_000,
       max_tokens: 128_000,
     });
+    const leftPromptGone = (await pool.query<{ code: string }>(
+      `SELECT code FROM job_prompt WHERE code='left_reversal_opportunity_scan'`,
+    )).rows[0];
+    expect(leftPromptGone).toBeUndefined();
     const retiredTables = await pool.query<{ name: string | null }>(
       `SELECT to_regclass(name)::text AS name
          FROM unnest(ARRAY[
@@ -294,38 +278,92 @@ describe.skipIf(!prepared)("迁移运行器", () => {
          ]) AS name`,
     );
     expect(retiredTables.rows.every((row) => row.name === null)).toBe(true);
+  }, 15_000);
+
+  it("关注条目表结构约束：approaching 必须携带缺口，来源联合主键", async () => {
+    await pool.query("INSERT INTO market_instrument (code, name, kind) VALUES ('990081.SZ', '条目测试标的', 'stock')");
+    const id = (await pool.query<{ id: string }>("SELECT id::text FROM market_instrument WHERE code = '990081.SZ'")).rows[0]!.id;
+    await pool.query(
+      `INSERT INTO pool_membership (instrument_id, pool, role, effective_from) VALUES ($1, 'watch', '关注', '2026-09-09')`, [id],
+    );
+    await expect(pool.query(
+      `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
+       VALUES ($1, 'daily_plan_flow', 'approaching', '等待确认', '[]'::jsonb, '2026-09-09')`, [id],
+    )).rejects.toThrow(/check|missing_signals/i);
+    await pool.query(
+      `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
+       VALUES ($1, 'daily_plan_flow', 'approaching', '等待确认', '["右侧：放量确认"]'::jsonb, '2026-09-09')`, [id],
+    );
+    // 同来源重复写入走 UPSERT，不产生重复行；不同来源可并存。
+    await pool.query(
+      `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
+       VALUES ($1, 'daily_plan_flow', 'qualified', '已确认', '[]'::jsonb, '2026-09-09')
+       ON CONFLICT (instrument_id, source_job) DO UPDATE SET status = EXCLUDED.status, reason = EXCLUDED.reason,
+         missing_signals = EXCLUDED.missing_signals`,
+      [id],
+    );
+    await pool.query(
+      `INSERT INTO pool_attention_entry (instrument_id, source_job, status, reason, missing_signals, valid_from)
+       VALUES ($1, 'manual', 'manual', '人工关注', '[]'::jsonb, '2026-09-09')`, [id],
+    );
+    expect((await pool.query(
+      "SELECT count(*)::int AS count FROM pool_attention_entry WHERE instrument_id = $1", [id],
+    )).rows[0]!.count).toBe(2);
   });
 
-  it("近期关注迁移保留历史状态，不猜测缺口或人工关注信号", async () => {
-    const client = await pool.connect();
+  it("清理无来源关注池成员并删除废弃表", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "stock-cleanup-migrations-"));
     try {
-      await client.query("BEGIN");
-      await client.query("ALTER TABLE pool_membership DROP COLUMN attention_signal");
-      for (const [code, reason] of [
-        ["990081.SZ", "每日计划·已符合：已确认"],
-        ["990082.SZ", "每日计划·即将符合：等待放量"],
-        ["990083.SZ", "人工持续跟踪"],
-      ]) {
-        await client.query("INSERT INTO market_instrument (code, name, kind) VALUES ($1, '迁移测试标的', 'stock')", [code]);
-        await client.query(
-          `INSERT INTO pool_membership (instrument_id, pool, role, effective_from, attention_reason)
-           SELECT id, 'short', '短线', '2026-09-09', $2 FROM market_instrument WHERE code = $1`, [code, reason],
-        );
+      const sourceDir = path.join(import.meta.dirname, "../../server/migrations");
+      const files = (await fs.readdir(sourceDir)).filter((file) => /^\d{4}_.+\.sql$/.test(file));
+      for (const file of files.filter((file) => Number(file.slice(0, 4)) <= 112)) {
+        await fs.copyFile(path.join(sourceDir, file), path.join(tmpDir, file));
       }
-      const sql = await fs.readFile(path.join(import.meta.dirname, "../../server/migrations/0084_近期关注信号状态与缺口.sql"), "utf8");
-      await client.query(sql);
-      expect((await client.query(
-        `SELECT instrument.code, membership.attention_signal
-         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-         WHERE instrument.code IN ('990081.SZ', '990082.SZ', '990083.SZ') ORDER BY instrument.code`,
-      )).rows).toEqual([
-        { code: "990081.SZ", attention_signal: { status: "qualified", missing_signals: [] } },
-        { code: "990082.SZ", attention_signal: { status: "approaching", missing_signals: [] } },
-        { code: "990083.SZ", attention_signal: null },
-      ]);
+      await resetSchema(pool);
+      await runMigrations(pool, tmpDir);
+      await pool.query(
+        `INSERT INTO market_instrument (code, name, kind) VALUES
+          ('990091.SZ', '有来源标的', 'stock'),
+          ('990092.SZ', '无来源标的', 'stock'),
+          ('990093.SZ', '过期来源标的', 'stock')`,
+      );
+      await pool.query(
+        `INSERT INTO pool_membership (instrument_id, pool, role, effective_from)
+         SELECT id, 'watch', '关注', CURRENT_DATE FROM market_instrument WHERE code LIKE '99009_.SZ'`,
+      );
+      await pool.query(
+        `INSERT INTO pool_attention_entry
+          (instrument_id, source_job, status, reason, missing_signals, valid_from, valid_until)
+         SELECT id, 'daily_plan_flow', 'qualified', '当前有效来源', '[]'::jsonb, CURRENT_DATE, CURRENT_DATE
+           FROM market_instrument WHERE code = '990091.SZ'`,
+      );
+      await pool.query(
+        `INSERT INTO pool_attention_entry
+          (instrument_id, source_job, status, reason, missing_signals, valid_from, valid_until)
+         SELECT id, 'daily_plan_flow', 'qualified', '已过期来源', '[]'::jsonb,
+                CURRENT_DATE - 2, CURRENT_DATE - 1
+           FROM market_instrument WHERE code = '990093.SZ'`,
+      );
+
+      const cleanupFile = files.find((file) => file.startsWith('0113_'))!;
+      await fs.copyFile(path.join(sourceDir, cleanupFile), path.join(tmpDir, cleanupFile));
+      expect((await runMigrations(pool, tmpDir)).applied).toEqual([113]);
+      expect((await pool.query<{ code: string }>(
+        `SELECT instrument.code FROM pool_membership membership
+           JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+          ORDER BY instrument.code`,
+      )).rows).toEqual([{ code: '990091.SZ' }]);
+      const removed = await pool.query<{ name: string | null }>(
+        `SELECT to_regclass(name)::text AS name FROM unnest(ARRAY[
+          'agent_evaluation_run','agent_external_cli_run','content_document','content_legacy_import',
+          'content_revision','market_system_tracking','portfolio_account_snapshot',
+          'portfolio_position_snapshot_daily','script_registry','script_version','strategy_doc',
+          'strategy_version','task_definition','task_run'
+        ]) AS name`,
+      );
+      expect(removed.rows.every((row) => row.name === null)).toBe(true);
     } finally {
-      await client.query("ROLLBACK");
-      client.release();
+      await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
 

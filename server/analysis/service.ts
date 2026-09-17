@@ -1,9 +1,10 @@
 import crypto from "node:crypto";
 import type pg from "pg";
 import { apiErrors } from "../http/router.js";
+import { generateValueMonthlyRank } from "../modules/value-ranking/service.js";
 
 export const ANALYSIS_SERVICE_VERSION = "analysis-v2";
-export const ANALYSIS_TYPES = ["sector_temperature", "key_levels", "long_valuation"] as const;
+export const ANALYSIS_TYPES = ["sector_temperature", "key_levels", "long_valuation", "value_monthly_rank"] as const;
 export type AnalysisType = (typeof ANALYSIS_TYPES)[number];
 type Db = Pick<pg.Pool, "query">;
 
@@ -12,6 +13,7 @@ export interface AnalysisRequest {
   codes?: string[];
   as_of?: string;
   lookback?: number;
+  force?: boolean;
 }
 
 export interface AnalysisRunRow {
@@ -364,7 +366,7 @@ async function longValuation(db: Db, request: AnalysisRequest) {
   if (!codes.length) {
     const result = await db.query<{ code: string }>(
       `SELECT DISTINCT i.code FROM pool_membership p JOIN market_instrument i ON i.id = p.instrument_id
-        WHERE p.pool = 'long' AND p.effective_to IS NULL ORDER BY i.code`,
+        WHERE p.effective_to IS NULL ORDER BY i.code`,
     );
     codes = result.rows.map((row) => row.code);
   }
@@ -420,11 +422,45 @@ export async function executeAnalysis(db: Db, raw: AnalysisRequest): Promise<Ana
   const id = inserted.rows[0]!.id;
   await db.query("UPDATE analysis_run SET status = 'running', started_at = now() WHERE id = $1", [id]);
   try {
-    const outcome = request.analysis_type === "sector_temperature"
-      ? await querySectorTemperature(db, request)
-      : request.analysis_type === "key_levels"
-        ? await keyLevels(db, request)
-        : await longValuation(db, request);
+    let outcome;
+    if (request.analysis_type === "sector_temperature") outcome = await querySectorTemperature(db, request);
+    else if (request.analysis_type === "key_levels") outcome = await keyLevels(db, request);
+    else if (request.analysis_type === "long_valuation") outcome = await longValuation(db, request);
+    else {
+      const target = request.as_of ?? new Date().toISOString().slice(0, 10);
+      const calendar = await db.query<{ open: boolean | null; next_open: string | null; previous_open: string | null }>(
+        `SELECT (SELECT is_open FROM market_trading_day WHERE trade_date=$1::date) AS open,
+                (SELECT min(trade_date)::text FROM market_trading_day
+                  WHERE is_open AND trade_date>$1::date) AS next_open,
+                (SELECT max(trade_date)::text FROM market_trading_day
+                  WHERE is_open AND trade_date<$1::date) AS previous_open`, [target],
+      );
+      const day = calendar.rows[0];
+      const previousMonthClosed = day?.previous_open && day.previous_open.slice(0, 7) !== target.slice(0, 7);
+      const rankDate = request.force || (day?.next_open && day.next_open.slice(0, 7) !== target.slice(0, 7))
+        ? target : previousMonthClosed ? day.previous_open! : null;
+      if (day?.open !== true) {
+        outcome = { result: { status: "unavailable", target_date: target },
+          gaps: [{ domain: "calendar", reason: "目标交易日未确认，拒绝生成排名" }], input: { skipped: true } };
+      } else if (!rankDate) {
+        outcome = { result: { status: "skipped", target_date: target, reason: "尚未确认月末交易日" },
+          gaps: [], input: { skipped: true } };
+      } else {
+        const previous = !request.force && await db.query<AnalysisRunRow>(
+          `SELECT run.* FROM analysis_run run JOIN value_rank_snapshot snapshot ON snapshot.analysis_run_id=run.id
+            WHERE run.analysis_type='value_monthly_rank' AND run.status IN ('success','partial')
+              AND snapshot.rank_date=$1::date
+            ORDER BY run.id DESC LIMIT 1`, [rankDate],
+        );
+        if (previous && previous.rows[0]) {
+          const existing = previous.rows[0];
+          outcome = { result: { status: "skipped", rank_date: rankDate, existing_run_id: existing.id }, gaps: [],
+            input: { reused_analysis_run_id: existing.id, target_date: target } };
+        } else {
+          outcome = await generateValueMonthlyRank(db, String(id), rankDate);
+        }
+      }
+    }
     const status = outcome.gaps.length ? "partial" : "success";
     const resultHash = crypto.createHash("sha256").update(JSON.stringify(outcome.result)).digest("hex");
     const updated = await db.query<AnalysisRunRow>(

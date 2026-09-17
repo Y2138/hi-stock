@@ -356,6 +356,45 @@ export async function fetchValuationSnapshots(
   }));
 }
 
+export interface CorporateActionQuote {
+  code: string;
+  exDate: string;
+  dividendPerShare: number;
+  bonusPerShare: number;
+  rightsRatio: number;
+  rightsPrice: number;
+  rawSummary: Record<string, unknown>;
+}
+
+/** 查询股票公司行动；调用方按 ex_date 幂等落库，不得在除权日前使用。 */
+export async function fetchCorporateActions(
+  code: string,
+  from: string,
+  to: string,
+  deps: HithinkDeps = {},
+): Promise<CorporateActionQuote[]> {
+  if (!A_SHARE_CODE_RE.test(code)) throw new Error(`公司行动代码必须是 A 股完整代码：${code}`);
+  const data = (await hithinkGet(
+    "/api/a-share/corporate-actions/adjustment-factors",
+    { thscode: code, from, to },
+    deps,
+  )) as { item?: unknown };
+  if (!Array.isArray(data?.item)) throw new Error("公司行动响应中的 item 格式异常");
+  return (data.item as Record<string, unknown>[]).map((row) => {
+    const timestamp = nullableNumber(row.ex_date_ms);
+    if (timestamp === null) throw new Error(`公司行动缺少 ex_date_ms：${code}`);
+    return {
+      code,
+      exDate: msToDate(timestamp),
+      dividendPerShare: nullableNumber(row.dividend_per_share) ?? 0,
+      bonusPerShare: nullableNumber(row.per_share_bonus) ?? 0,
+      rightsRatio: nullableNumber(row.rights_ratio) ?? 0,
+      rightsPrice: nullableNumber(row.rights_price) ?? 0,
+      rawSummary: { ...row },
+    };
+  }).sort((left, right) => left.exDate.localeCompare(right.exDate));
+}
+
 interface FinancialStatementItem extends Record<string, unknown> {
   period_end_ms?: number;
   report_date_ms?: number;

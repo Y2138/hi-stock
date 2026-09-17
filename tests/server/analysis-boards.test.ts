@@ -3,6 +3,8 @@ import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../server/db/migrate.js";
 import { executeAnalysis } from "../../server/analysis/service.js";
+import { listValueCandidates, queryValueRank } from "../../server/modules/value-ranking/service.js";
+import { queryValueAnchorSignals } from "../../server/modules/plans/value-anchor-signal.js";
 import { prepareTestDb, resetSchema } from "./helpers";
 
 const prepared = await prepareTestDb();
@@ -129,4 +131,83 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
       `UPDATE market_board SET active = true WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = '881103.TI')`,
     );
   });
+  it("价值排名缺交易日历时拒绝激活，候选以行业与沪深300并集且保留流动性资格", async () => {
+    const missingCalendar = await executeAnalysis(pool, { analysis_type: "value_monthly_rank", as_of: "2026-01-29" });
+    expect(missingCalendar.status).toBe("partial");
+    expect((missingCalendar.result_json as { status: string }).status).toBe("unavailable");
+    expect((await pool.query("SELECT count(*)::int AS n FROM value_rank_snapshot")).rows[0].n).toBe(0);
+
+    await pool.query(`INSERT INTO market_instrument(code,name,kind,lifecycle_status)
+      VALUES ('881145.TI','电力','board','active'),('000300.SH','沪深300','index','active'),
+        ('600001.SH','稳定股票','stock','active'),('600002.SH','大盘股票','stock','active')`);
+    await pool.query(`INSERT INTO market_board(instrument_id,board_type,source,active)
+      SELECT id, CASE WHEN code='000300.SH' THEN 'special' ELSE 'industry' END,'hithink',true
+        FROM market_instrument WHERE code IN ('881145.TI','000300.SH')`);
+    await pool.query(`INSERT INTO market_board_membership(board_instrument_id,member_instrument_id,effective_from)
+      SELECT board.id,member.id,'2026-01-01' FROM market_instrument board CROSS JOIN market_instrument member
+       WHERE (board.code='881145.TI' AND member.code='600001.SH')
+          OR (board.code='000300.SH' AND member.code='600002.SH')`);
+    const candidates = await listValueCandidates(pool, "2026-01-29");
+    expect(candidates.map((item) => [item.code, item.formal])).toEqual([
+      ["600001.SH", false], ["600002.SH", true],
+    ]);
+    expect((await queryValueRank(pool, { asOf: "2026-01-29" })).status).toBe("missing");
+  });
+
+  it("月末全路径仅在次一开市日生效，缺失行情不激活且扫描不误报", async () => {
+    await pool.query(`INSERT INTO market_trading_day(trade_date,is_open,source)
+      VALUES ('2026-01-30',true,'test'),('2026-02-02',true,'test')`);
+    for (const code of ["600001.SH", "600002.SH"]) {
+      await pool.query(`WITH instrument AS (SELECT id FROM market_instrument WHERE code=$1),
+        points AS (SELECT generate_series(0,249) AS n)
+        INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,turnover,channel)
+        SELECT instrument.id,'day',date '2026-01-30'-points.n,
+          (date '2026-01-30'-points.n)::timestamp AT TIME ZONE 'UTC',10,10,10,10,1000,
+          CASE WHEN $1='600001.SH' THEN 200000000 ELSE 100000000 END,'test'
+        FROM instrument CROSS JOIN points ON CONFLICT DO NOTHING`, [code]);
+      await pool.query(`INSERT INTO fundamental_snapshot(instrument_id,as_of_date,report_period,net_profit,roe,operating_cashflow,debt_ratio,source)
+        SELECT id,'2026-01-15','2025-12-31',100,12,150,40,'hithink' FROM market_instrument WHERE code=$1`, [code]);
+      await pool.query(`INSERT INTO valuation_snapshot(instrument_id,as_of_date,pe_ttm,pb,ps_ttm,source)
+        SELECT id,'2026-01-30',10,1,2,'hithink' FROM market_instrument WHERE code=$1`, [code]);
+    }
+    await pool.query(`INSERT INTO market_corporate_action(instrument_id,ex_date,dividend_per_share,source)
+      SELECT instrument.id,dividend.ex_date,0.5,'test' FROM market_instrument instrument
+      CROSS JOIN (VALUES (date '2023-06-01'),(date '2024-06-01'),(date '2025-06-01')) dividend(ex_date)
+      WHERE instrument.code='600001.SH'`);
+    // 先拒绝缺目标日行情，不生成任何可供扫描的 Top。
+    await pool.query(`DELETE FROM market_bar WHERE instrument_id=(SELECT id FROM market_instrument WHERE code='600002.SH') AND bar_date='2026-01-30'`);
+    await expect(executeAnalysis(pool, { analysis_type: "value_monthly_rank", as_of: "2026-01-30" }))
+      .rejects.toThrow("月末行情覆盖不足");
+    expect((await pool.query("SELECT count(*)::int AS n FROM value_rank_snapshot")).rows[0].n).toBe(0);
+    await pool.query(`INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,turnover,channel)
+      SELECT id,'day','2026-01-30','2026-01-30'::timestamp AT TIME ZONE 'UTC',10,10,10,10,1000,100000000,'test'
+      FROM market_instrument WHERE code='600002.SH'`);
+    const run = await executeAnalysis(pool, { analysis_type: "value_monthly_rank", as_of: "2026-01-30" });
+    expect(run.status).toBe("success");
+    expect((await queryValueRank(pool, { asOf: "2026-01-30" })).status).toBe("missing");
+    const rank = await queryValueRank(pool, { asOf: "2026-02-02" });
+    expect(rank.status).toBe("success");
+    expect(rank.items).toHaveLength(2);
+    const duplicate = await executeAnalysis(pool, { analysis_type: "value_monthly_rank", as_of: "2026-02-02" });
+    expect((duplicate.result_json as { status: string }).status).toBe("skipped");
+    await pool.query(`INSERT INTO market_trading_day(trade_date,is_open,source)
+      SELECT date '2026-02-02'+n,true,'test' FROM generate_series(1,20) n ON CONFLICT DO NOTHING`);
+    await pool.query(`INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,turnover,channel)
+      SELECT id,'day','2026-02-02','2026-02-02'::timestamp AT TIME ZONE 'UTC',10,10,10,10,1000,200000000,'test'
+      FROM market_instrument WHERE code IN ('600001.SH','600002.SH')`);
+    await pool.query(`INSERT INTO market_corporate_action_sync_state(instrument_id,last_checked_at,latest_ex_date,status)
+      SELECT id,'2026-02-02'::timestamptz,'2025-06-01','success' FROM market_instrument WHERE code='600001.SH'`);
+    const scan = await queryValueAnchorSignals(pool, "2026-02-02");
+    expect(scan.qualified).toEqual([]);
+    expect(scan.status).toBe("partial"); // 无公司行动同步状态的大盘股仅报告缺口，不误发信号。
+    expect(scan.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ code: "600002.SH" })]));
+    await pool.query("DELETE FROM market_trading_day WHERE trade_date > '2026-02-02'");
+    const missingReviewDate = await queryValueAnchorSignals(pool, "2026-02-02");
+    expect(missingReviewDate.status).toBe("partial");
+    expect(missingReviewDate.scanned_count).toBe(2);
+    expect(missingReviewDate.gaps).toEqual(expect.arrayContaining([
+      expect.objectContaining({ domain: "calendar" }),
+    ]));
+  });
+
 });

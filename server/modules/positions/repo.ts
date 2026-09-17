@@ -33,7 +33,7 @@ export const DECISION_ORIGINS = ["strategy_signal", "planned_discretionary", "un
 export type DecisionOrigin = (typeof DECISION_ORIGINS)[number];
 export const EXECUTION_COMPLIANCE = ["matched", "deviated", "not_applicable", "unknown"] as const;
 export type ExecutionCompliance = (typeof EXECUTION_COMPLIANCE)[number];
-export const ENTRY_SIGNAL_TYPES = ["right_side", "left_reversal", "trial_start", "swing", "limit_up", "discretionary"] as const;
+export const ENTRY_SIGNAL_TYPES = ["right_side", "left_reversal", "two_year_reversal", "trial_start", "swing", "limit_up", "discretionary"] as const;
 export type EntrySignalType = (typeof ENTRY_SIGNAL_TYPES)[number];
 
 export interface PositionChangeRow {
@@ -457,12 +457,13 @@ export async function recordPositionChange(
             [instrumentId, newQty, newCost, input.entry_signal_type!],
           );
         }
-        // 每日计划自动关注用于等待入场，买入成交后已经完成使命；人工关注继续保留。
+        // 定时任务自动关注用于等待入场，买入成交后已经完成使命；人工关注继续保留。
         await client.query(
-          `UPDATE pool_membership
-              SET attention_reason = NULL, attention_from = NULL, attention_until = NULL, attention_signal = NULL
-            WHERE instrument_id = $1 AND effective_to IS NULL
-              AND attention_reason LIKE '每日计划·%'`,
+          `DELETE FROM pool_attention_entry entry
+            USING pool_membership membership
+           WHERE entry.instrument_id = membership.instrument_id
+             AND membership.instrument_id = $1 AND membership.effective_to IS NULL
+             AND entry.source_job <> 'manual'`,
           [instrumentId],
         );
       } else if (input.kind === "sell") {

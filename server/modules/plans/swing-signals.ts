@@ -1,4 +1,4 @@
-// 波段入场确定性扫描：只负责长线池“波段”角色的四条件、执行窗口与数据缺口。
+// 波段入场确定性扫描：关注池唯一开仓信号，负责四条件、执行窗口与数据缺口。
 import type pg from "pg";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
@@ -147,7 +147,7 @@ export async function querySwingSignals(db: Db, date: string) {
           ORDER BY current.as_of_date DESC, current.computed_at DESC LIMIT 1
        ) metric ON true
        LEFT JOIN market_indicator_run metric_run ON metric_run.id = metric.indicator_run_id
-      WHERE membership.pool = 'long' AND membership.role = '波段' AND membership.effective_to IS NULL
+      WHERE membership.pool = 'watch' AND membership.effective_to IS NULL
       ORDER BY instrument.code`,
     [date],
   );
@@ -156,7 +156,7 @@ export async function querySwingSignals(db: Db, date: string) {
        FROM pool_membership membership
        JOIN market_bar bar ON bar.instrument_id = membership.instrument_id
                           AND bar.freq = 'day' AND bar.bar_date <= $1::date
-      WHERE membership.pool = 'long' AND membership.role = '波段' AND membership.effective_to IS NULL`,
+      WHERE membership.pool = 'watch' AND membership.effective_to IS NULL`,
     [date],
   );
   const dataDate = latest.rows[0]?.data_date ?? null;
@@ -192,7 +192,7 @@ export async function querySwingSignals(db: Db, date: string) {
          LEFT JOIN market_indicator_value indicator
            ON indicator.instrument_id = bar.instrument_id AND indicator.freq = bar.freq
           AND indicator.bar_date = bar.bar_date AND indicator.bar_time = bar.bar_time
-        WHERE membership.pool = 'long' AND membership.role = '波段' AND membership.effective_to IS NULL
+        WHERE membership.pool = 'watch' AND membership.effective_to IS NULL
      )
      SELECT code, bar_date, open, high, low, close, volume, rsi14, indicator_status
        FROM ranked WHERE row_no <= 40 ORDER BY code, bar_date`,

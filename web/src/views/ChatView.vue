@@ -63,8 +63,6 @@ const activeSession = computed(() => sessions.value.find((s) => s.id === activeI
 const SESSION_TYPE_LABELS: Record<ChatSession["session_type"], string> = {
   interactive: "对话",
   job: "任务",
-  backtest: "回测",
-  strategy_evolution: "策略演进",
 };
 const SESSION_STATUS_LABELS: Record<ChatSession["session_status"], string> = {
   idle: "可继续",
@@ -622,7 +620,6 @@ async function consumeWorkspaceRequest(request: AskAiRequest): Promise<void> {
       if (!request.prompt) return;
       const created = await apiClient.post<ChatSession>("/api/chat/sessions", {
         title: request.title ?? request.contextLabel ?? "新会话",
-        session_type: request.sessionType ?? "interactive",
         parent_session_id: request.parentSessionId ?? null,
       });
       if (!created.ok) {
@@ -1193,7 +1190,7 @@ onBeforeUnmount(() => {
             <div v-if="conversationTurns.length === 0" class="chat-empty">
               <p>开始提问吧，例如：</p>
               <p class="hint">「我现在有哪些持仓？一句话列一下」</p>
-              <p class="hint">「完整评估格林美，符合条件就加入短线池」</p>
+              <p class="hint">「完整评估格林美，符合条件就加入关注池」</p>
             </div>
             <template v-for="turn in conversationTurns" :key="turn.key">
               <div v-if="turn.role === 'user'" class="msg user">

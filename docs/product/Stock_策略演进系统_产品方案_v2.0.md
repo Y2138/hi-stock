@@ -6,7 +6,6 @@
 | 产品版本 | 二期（策略演进工作台） |
 | 状态 | E1–E38 已确认；跨电脑固定资产同步已收敛；外部 CLI 桥继续暂缓 |
 | 决策日期 | 2026-08-15（E1–E4）、2026-08-16（E5–E11）、2026-08-17（E12–E18）、2026-08-18（E19–E34）、2026-08-19（E35–E36）、2026-08-20（E37）、2026-08-21（E38） |
-| 前置文档 | `Stock_策略演进系统_产品方案_v1.0.md`（一期，已交付，保留为历史） |
 
 > **范围声明**：本文是策略演进系统二期的唯一产品范围入口，取代 v1.0 成为当前有效方案。v1.0 已交付的一期能力（任务运行、回测台账、数据集登记）保留沿用。本文不改变既有交易策略内容；Agent 负责理解用户意图、完成业务校验并通过领域工具写入，但不自主形成或执行买卖决定，策略事实仍以 PostgreSQL 当前策略为准。
 >
@@ -345,7 +344,7 @@ Agent 不占用左侧业务导航项，也不再以悬浮层遮挡主页面。�
 | 调用形式 | `delegate_to_cli(agent: 'codex' \| 'claude', prompt, timeout?)`；spawn `codex exec` / `claude -p` |
 | 约束 | cwd 锁定仓库根；默认超时 10 分钟（上限 30 分钟）；输出截断上限；并发上限 2 |
 | 回流 | 输出流式回流到对话（委派卡片内滚动）；完成后附摘要 |
-| 审计 | 每次委派写 `agent_external_cli_run`：agent、prompt、参数、起止、退出码、输出哈希 |
+| 审计 | 当前不保留 CLI 占位表或接口；未来重新立项时必须新增迁移和审计契约 |
 | 探测 | 设置页显示三个 CLI 的可用性与版本（`--version` 探测） |
 | 边界 | CLI 自身的文件写权限不在本系统约束内，委派卡片明示"该 agent 可修改仓库文件"；涉及事实源文件的修改仍走 Git 审查 |
 
@@ -357,7 +356,7 @@ Agent 不占用左侧业务导航项，也不再以悬浮层遮挡主页面。�
 | 演进记录 | 每次只保存演进大纲、验证结论、调整点、是否采纳、时间和关联回测；不保存回测代码或旧策略全文 |
 | 技术历史 | 底层不可变修订可继续用于基线冲突、审计和故障恢复，但不升级为用户可见业务版本体系 |
 | 发布审核 | Agent 只能创建待发布提案；主页面默认展示摘要并允许展开统一 diff。只有真实用户可批准，YOLO 不生效；批准后原子更新全部受影响当前文档 |
-| 领域边界 | 每日计划、周中检查和复盘归 `job_run_output`；回测归 `backtest_run`；session 只引用这些领域记录。现有 `content_*` 在第三阶段前继续兼容，切换后旧 API 适配读取新事实源 |
+| 领域边界 | 每日计划、夜间板块筛选、价值错杀扫描与竞价复核归 `job_run_output`；回测归 `backtest_run`；session 只引用这些领域记录。现有 `content_*` 在第三阶段前继续兼容，切换后旧 API 适配读取新事实源 |
 
 ### 6.6 持仓
 
@@ -372,7 +371,7 @@ Agent 不占用左侧业务导航项，也不再以悬浮层遮挡主页面。�
 
 买入按加权平均成本建立或更新当前投影；卖出校验不超卖，以卖出前成本计算本笔已实现毛盈亏，部分卖出只减少数量，完全卖出删除当前持仓行；调整只修正用户确认的数量或成本，备注只追加事件。所有变化与当前投影在同一事务内维护，历史由事件流追溯。
 
-总资金和可用资金没有可对账的数据源，页面与 Agent 不展示、不估算。累计已实现盈亏采用“迁移时固化的历史清仓收益基线 + 基线后的卖出事件”口径，未计手续费和税费；无法可靠还原的卖出保持缺口，不猜测。`portfolio_account_snapshot`、`portfolio_account_state` 和 `portfolio_position_snapshot_daily` 只保留历史数据，不参与生产读写且不向 Agent 开放；物理清理需另行确认。
+总资金和可用资金没有可对账的数据源，页面与 Agent 不展示、不估算。累计已实现盈亏采用“迁移时固化的历史清仓收益基线 + 基线后的卖出事件”口径，未计手续费和税费；无法可靠还原的卖出保持缺口，不猜测。`portfolio_account_state` 仅作为风险门禁和组合净值的内部现金台账；旧账户快照与持仓日快照已物理删除。
 
 ### 6.7 定时任务系统
 
@@ -435,11 +434,10 @@ M4 非 CLI 阶段已将打样令牌铺到全量页面、弹层、Markdown、diff
 
 | 表 | 用途 |
 |----|------|
-| `content_document` / `content_revision` | 策略、指引、当前计划与计划归档的不可变版本 |
-| `content_legacy_import` | 一次性迁移审计；不进入 Agent 表索引，不作为业务事实 |
-| `market_instrument` / `pool_membership` / `pool_board_preference` | 标的档案、完整池内研究角色（生效区间版本化）与短线/长线池板块展示偏好 |
+| `strategy_document` / `strategy_state` | 当前最终策略正文及其整体序号、清单哈希；不保留历史正文 |
+| `market_instrument` / `pool_membership` / `pool_attention_entry` / `pool_board_preference` | 标的档案、统一关注池成员、多来源近期关注和板块展示偏好；0113 按迁移日当前有效来源一次性清理无来源成员 |
 | `portfolio_position` / `portfolio_position_change` | 当前持仓与成交/调整事件流；事件固化决策来源、执行符合度、策略快照、计划和会话归因 |
-| `portfolio_position_snapshot_daily` / `portfolio_account_snapshot` / `portfolio_account_state` | 退役历史表：停止生产读写并向 Agent 隐藏；存量个人数据仅由完整私有备份保留 |
+| `portfolio_account_state` / `portfolio_equity_daily` | 风险门禁使用的内部现金台账与每日组合净值；不作为用户账户总资产事实 |
 | `market_bar` | **行情唯一数据源**（历史迁移 + datasource 每日追加；含 adjustment/volume_unit 口径字段、来源通道与获取时间） |
 | `market_fetch_run` | 每次数据获取记录（通道、范围、行数、降级原因、耗时），供对账与审计 |
 | `fundamental_snapshot` / `valuation_snapshot` | 三表共同报告期的财务快照与点时估值 |
@@ -450,17 +448,16 @@ M4 非 CLI 阶段已将打样令牌铺到全量页面、弹层、Markdown、diff
 | `llm_provider` / `llm_model` / `llm_setting` | LLM 厂商与凭据、模型目录、唯一当前模型；查询接口不返回密钥本体 |
 | `agent_tool_audit` | 工具调用审计（参数、结果哈希、确认动作） |
 | `agent_confirmation` | agent 写入提案、用户决策状态与执行结果 |
-| `agent_external_cli_run` | 外部 CLI 委派审计 |
 | `agent_setting` | Agent 全局执行设置；当前保存 `yolo_mode`，默认关闭 |
 | `job_definition` / `job_run` | 调度作业定义与运行记录 |
-| `job_run_output` | 第三阶段新增：每日计划、周中检查、每周复盘等任务领域结果，必须关联具体运行；历史导入不得伪造运行 |
+| `job_run_output` | 第三阶段新增：每日计划、夜间板块筛选、价值错杀扫描、竞价复核和防守评估等任务领域结果，必须关联具体运行；历史导入不得伪造运行 |
 | `job_prompt` / `job_prompt_revision` | agent_flow 提示词与不可变版本 |
 | `analysis_run` | 板块温度、关键位、长线估值的请求、输入摘要、结论和缺口 |
-| `backtest_run` / `backtest_run_comparison` | Agent 自驱回测的工作运行、最终/已替代结论、输入摘要、策略哈希、工作器/SDK、指标、缺口、适用边界与对比关系；不保存代码正文 |
+| 本地研究脚本 | 回测执行完全迁出系统；数据库不保存回测运行、输入冻结、事件、净值或源码 |
 | `agent_memory_artifact` | 已验证可复用产物及其来源、证据、状态、最后验证时间和替代关系；不保存当前业务事实副本 |
-| `strategy_state` / `strategy_document` / `strategy_evolution_log` / `strategy_publish_proposal` | 第三阶段新增：当前策略一致性状态与当前正文、简要演进与真人审核提案；系统不保存历史正文，发布提案永远要求真实用户 |
+| `strategy_state` / `strategy_document` | 当前策略一致性状态、组合总策略、任务级策略和指引；策略演进与审核提案表已退役 |
 
-回测只保留结构化结果、最终结论、比较关系和固化源码，不保留已失效的文件地址登记。其余一期遗留 `task_*`、`strategy_*` 与 `script_*` 只保留迁移历史或已由后续迁移退役，不注册生产写入口；当前迁移版本仍由 `schema_migrations` 管理。
+回测只通过仓库内本地脚本执行。旧内容库、一期任务表、旧策略/脚本版本库、账户与持仓快照、系统跟踪、Agent 评测和 CLI 占位表均已物理删除；迁移历史只由 `schema_migrations` 保留。
 
 ## 九、安全与边界
 

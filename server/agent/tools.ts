@@ -19,21 +19,6 @@ import { wakeScheduler } from "../scheduler/service.js";
 import { executeAnalysis } from "../analysis/service.js";
 import { queryStrategyScreen } from "../modules/plans/strategy-screen.js";
 import { initializePoolOnboarding } from "../modules/pools/onboarding.js";
-import { runAgentBacktest } from "../backtest/agent-workspace.js";
-import { AGENT_BACKTEST_SDK_VERSION } from "../backtest/agent-contract.js";
-import {
-  PreflightBacktestSchema, StartStandardBacktestSchema, GetBacktestStatusSchema, CancelBacktestSchema,
-  validateRuntimeInput,
-} from "../backtest/runtime-contract.js";
-import type { Static } from "@earendil-works/pi-ai";
-import { preflightStandardBacktest } from "../modules/backtests/service.js";
-import {
-  startStandardBacktest, getStandardBacktestStatus, cancelStandardBacktest, isStandardBacktestEnabled,
-} from "../modules/backtests/runtime.js";
-import type { AgentBacktestRunSummary } from "../backtest/agent-contract.js";
-import { getVersionedBacktestSource } from "../modules/backtests/repo.js";
-import { apiErrors } from "../http/router.js";
-import { createStrategyProposal } from "../modules/strategy/repo.js";
 import { queryMemories } from "../modules/memory/repo.js";
 import {
   discoverDatabaseSchema,
@@ -54,6 +39,9 @@ import {
   buildDailyPlanContextTool,
   buildLimitUpSignalTool,
   buildMarketDomainTools,
+  buildValueRankTool,
+  buildValueAnchorSignalTool,
+  buildTwoYearReversalSignalTool,
   buildSwingSignalTool,
 } from "./market-domain-tools.js";
 import { buildBusinessContextTools } from "./business-context-tools.js";
@@ -78,40 +66,32 @@ import {
 import {
   AnalysisRunSchema,
   JobWriteSchema,
-  RunBacktestSchema,
-  StrategyPublishRequestSchema,
   DatabaseQuerySchema,
   DatabaseSchemaSchema,
   FetchMarketDataSchema,
   FetchHithinkDataSchema,
-  FinalizeBacktestSchema,
   MemoryQuerySchema,
   MemoryWriteSchema,
   PoolWriteSchema,
   PoolOnboardSchema,
   PortfolioWriteSchema,
   PositionEntrySignalWriteSchema,
-  ReadBacktestSourceSchema,
   StrategyScreenSchema,
   TriggerJobSchema,
   WebFetchSchema,
   WebSearchSchema,
   validateAnalysisRunInput,
   validateJobWriteInput,
-  validateRunBacktestInput,
-  validateStrategyPublishRequestInput,
   validateDatabaseQueryInput,
   validateDatabaseSchemaInput,
   validateFetchMarketDataInput,
   validateFetchHithinkDataInput,
-  validateFinalizeBacktestInput,
   validateMemoryQueryInput,
   validateMemoryWriteInput,
   validatePoolWriteInput,
   validatePoolOnboardInput,
   validatePortfolioWriteInput,
   validatePositionEntrySignalWriteInput,
-  validateReadBacktestSourceInput,
   validateStrategyScreenInput,
   validateTriggerJobInput,
   validateWebFetchInput,
@@ -121,9 +101,6 @@ import {
   type MemoryQueryInput,
   type PoolOnboardInput,
   type AnalysisRunInput,
-  type RunBacktestInput,
-  type ReadBacktestSourceInput,
-  type StrategyPublishRequestInput,
   type StrategyScreenInput,
   type TriggerJobInput,
   type WebFetchInput,
@@ -145,11 +122,6 @@ export interface ChatToolDeps {
   /** 永久测试注入；生产缺省走扶摇临时查询，不写业务数据。 */
   queryHithink?: HithinkTransientQuery;
   /** 永久测试注入；生产缺省走 Docker 隔离工作器。 */
-  runAgentBacktest?: (
-    sessionId: string,
-    request: RunBacktestInput,
-    signal?: AbortSignal,
-  ) => Promise<AgentBacktestRunSummary>;
   /** 永久测试或后续供应商切换注入；生产缺省复用 DeepSeek 数据库凭据。 */
   webResearch?: WebResearchProvider;
   /** 永久测试注入；生产缺省走带 SSRF、跳转、响应大小和内容类型限制的安全抓取。 */
@@ -163,12 +135,6 @@ function textResult(data: unknown, details?: unknown): AgentToolResult<unknown> 
   };
 }
 
-function sourceResult(data: Record<string, unknown>): AgentToolResult<unknown> {
-  return {
-    content: [{ type: "text", text: JSON.stringify(data, null, 1) }],
-    details: { ...data, ephemeral_code_result: true },
-  };
-}
 
 async function publishRefresh(deps: ChatToolDeps, targets: string[], reason: string): Promise<void> {
   if (!deps.sessionId) return;
@@ -260,19 +226,19 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "pool_attention_write",
     "daily_plan_write",
   ],
-  midweek_check: [
+  copper_inventory_signal_review: [
     "strategy_document_query",
-    "pool_context_query",
-    "job_context_query",
-    "daily_plan_context_query",
+    "copper_inventory_signal_query",
   ],
-  weekly_review: [
+  lithium_warehouse_signal_review: [
     "strategy_document_query",
-    "pool_context_query",
-    "portfolio_context_query",
-    "daily_plan_context_query",
-    "swing_signal_query",
-    "analysis_run",
+    "lithium_warehouse_signal_query",
+  ],
+  two_year_reversal_scan: ["strategy_document_query", "two_year_reversal_signal_query"],
+  value_anchor_opportunity_scan: [
+    "strategy_document_query",
+    "value_anchor_signal_query",
+    "pool_attention_write",
   ],
   nightly_sector_opportunity_scan: [
     "strategy_document_query",
@@ -283,6 +249,7 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "strategy_screen_query",
     "stock_research_query",
     "market_event_query",
+    "pool_attention_write",
   ],
 };
 
@@ -294,16 +261,12 @@ const JOB_FLOW_ONLY_TOOLS = new Set([
   "auction_assessment_write",
 ]);
 
-const STANDARD_BACKTEST_TOOLS = new Set([
-  "preflight_backtest", "start_standard_backtest", "get_backtest_status", "cancel_backtest",
-]);
-
 function toolsForScope(tools: AgentTool[], scope: ToolScope): AgentTool[] {
   if (scope.kind === "job") {
     const bundle = Object.hasOwn(JOB_FLOW_TOOL_BUNDLES, scope.jobCode) ? JOB_FLOW_TOOL_BUNDLES[scope.jobCode] : undefined;
     if (!bundle) {
       console.warn(`agent_flow 任务 ${scope.jobCode} 未定义工具子集，回退交互工具目录`);
-      return tools.filter((tool) => !JOB_FLOW_ONLY_TOOLS.has(tool.name) && !STANDARD_BACKTEST_TOOLS.has(tool.name));
+      return tools.filter((tool) => !JOB_FLOW_ONLY_TOOLS.has(tool.name));
     }
     const allowed = new Set([...bundle, "web_search", "web_fetch"]);
     const filtered = tools.filter((tool) => allowed.has(tool.name));
@@ -319,9 +282,6 @@ function toolsForScope(tools: AgentTool[], scope: ToolScope): AgentTool[] {
 /** 构建绑定到会话的工具集：渐进式只读 + 领域写入 + 受控系统动作；按会话范围裁剪任务流程工具。 */
 export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "chat" }): AgentTool[] {
   const { pool } = deps;
-  const standardAvailability = isStandardBacktestEnabled()
-    ? "标准回测当前已启用（STANDARD_BACKTEST_ENABLED=true）"
-    : "标准回测当前未启用（STANDARD_BACKTEST_ENABLED 默认 false），start 服务会拒绝发起";
   const fetchMarket =
     deps.fetchMarket ??
     ((request, name) => fetchAndStore(pool, request, { instrumentName: name }));
@@ -341,7 +301,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     {
       name: "portfolio_write",
       label: "批量维护持仓",
-      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。买入事件必须声明 entry_signal_type（right_side/left_reversal/trial_start/swing/limit_up/discretionary），每日计划按该类型选择评估口径。持仓与近期关注独立，买入不会创建关注，只会消费同标的已有的每日计划自动关注并保留人工关注。服务端统一经过持仓 service；不能直接指定表或字段。",
+      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。买入事件必须声明 entry_signal_type（right_side/left_reversal/two_year_reversal/trial_start/swing/limit_up/discretionary），每日计划按该类型选择评估口径。持仓与近期关注独立，买入不会创建关注，只会消费同标的已有的每日计划自动关注并保留人工关注。服务端统一经过持仓 service；不能直接指定表或字段。",
       parameters: PortfolioWriteSchema,
       validate: validatePortfolioWriteInput,
     },
@@ -362,16 +322,9 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     {
       name: "job_write",
       label: "维护作业",
-      description: "创建或修改受控定时作业，并创建、编辑、归档或回滚 agent_flow 提示词。作业运行历史不可修改，trigger_job 仍只负责执行。",
+      description: "创建或修改受控定时作业，并创建、编辑、归档或回滚 agent_flow 提示词。新建作业时应给出 purpose（职责与产出）、phase（盘前/盘中/盘后/夜间/周末）与 priority（重要性排序权重，越小越靠前），使任务页能直接体现任务特征。作业运行历史不可修改，trigger_job 仍只负责执行。",
       parameters: JobWriteSchema,
       validate: validateJobWriteInput,
-    },
-    {
-      name: "finalize_backtest",
-      label: "固化回测结论",
-      description: "把当前研究会话中的一条已完成工作运行晋升为最终结论，并记录结论摘要与适用边界；同会话旧最终结论会保留并标记为已替代。",
-      parameters: FinalizeBacktestSchema,
-      validate: validateFinalizeBacktestInput,
     },
     {
       name: "memory_write",
@@ -385,7 +338,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
   const domainWriteTools: AgentTool[] = domainWriteSpecs.map((spec) => ({
     name: spec.name,
     label: spec.label,
-    description: `${spec.description} ${spec.name === "finalize_backtest" ? "验证完成后由 Agent 直接事务执行，不要求真人批准。" : "确认制生成待确认提案；YOLO 模式直接事务执行。"}执行前重验目标状态，所有领域写工具共享数据库级写锁并写审计。`,
+    description: `${spec.description} 确认制生成待确认提案；YOLO 模式直接事务执行。执行前重验目标状态，所有领域写工具共享数据库级写锁并写审计。`,
     parameters: spec.parameters,
     executionMode: "sequential",
     execute: guard(deps, spec.name, spec.validate, async (params) => {
@@ -393,7 +346,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
         const preview = await previewDomainWrite(client, spec.name, params, { sessionId: deps.sessionId });
         const publicPreview = publicDomainWritePreview(preview);
         const settings = await getAgentSettings(client);
-        if (settings.yolo_mode || spec.name === "finalize_backtest") {
+        if (settings.yolo_mode) {
           const result = await executeDomainWriteInTransaction(client, spec.name, params, {
             expectedStateHash: preview._state_hash,
             sessionId: deps.sessionId,
@@ -407,14 +360,12 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
           });
           return textResult(
             {
-              message: spec.name === "finalize_backtest"
-                ? "回测结论与源码已固化"
-                : `YOLO 模式已开启，${spec.label}已通过领域 service 执行`,
-              mode: spec.name === "finalize_backtest" ? "direct" : "yolo",
+              message: `YOLO 模式已开启，${spec.label}已通过领域 service 执行`,
+              mode: "yolo",
               preview: publicPreview,
               result,
             },
-            { auto_approved: settings.yolo_mode, direct: spec.name === "finalize_backtest", yolo_mode: settings.yolo_mode, payload: params, result },
+            { auto_approved: settings.yolo_mode, yolo_mode: settings.yolo_mode, payload: params, result },
           );
         }
 
@@ -445,15 +396,14 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
           proposal,
         );
       });
-      const details = response.details as { auto_approved?: boolean; direct?: boolean } | undefined;
-      if (deps.sessionId && (details?.auto_approved || details?.direct)) {
+      const details = response.details as { auto_approved?: boolean } | undefined;
+      if (deps.sessionId && details?.auto_approved) {
         const targets: Record<DomainWriteToolName, string[]> = {
           portfolio_write: ["positions", "dashboard", "status"],
           position_entry_signal_write: ["positions", "dashboard", "status"],
           pool_onboard: ["pools", "dashboard"],
           pool_write: ["pools", "dashboard"],
           job_write: ["jobs", "dashboard", "status"],
-          finalize_backtest: ["backtests"],
           memory_write: ["memories"],
         };
         await publishRefresh(deps, targets[spec.name], `${spec.name} 已执行`);
@@ -466,7 +416,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     name: "pool_onboard",
     label: "标的入池初始化",
     description:
-      "输入A股或ETF的名称、简称或代码及可选池别/角色；服务端一次完成标的消歧、约420日行情与A股财务估值同步、正式指标重算、版本化五维股性/阶段/评分、官方行业校验和入池预览。当前买入信号不参与入池。成功后确认制直接生成一张入池确认卡，YOLO直接写入；不要再调用行情、分析或pool_write拼装入池流程。",
+      "输入A股或ETF的名称、简称或代码；服务端一次完成标的消歧、约420日行情与A股财务估值同步、正式指标重算、版本化五维股性画像与阶段、官方行业校验和入池预览，统一入关注池。当前买入信号不参与入池。成功后确认制直接生成一张入池确认卡，YOLO直接写入；不要再调用行情、分析或pool_write拼装入池流程。",
     parameters: PoolOnboardSchema,
     executionMode: "sequential",
     execute: guard<PoolOnboardInput>(deps, "pool_onboard", validatePoolOnboardInput, async (params, context) => {
@@ -537,6 +487,9 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     ...buildHithinkTools({ pool, sessionId: deps.sessionId, query: deps.queryHithink }),
     ...buildMarketDomainTools({ pool, sessionId: deps.sessionId }),
     buildDailyPlanContextTool({ pool, sessionId: deps.sessionId }),
+    buildValueRankTool({ pool, sessionId: deps.sessionId }),
+    buildValueAnchorSignalTool({ pool, sessionId: deps.sessionId }),
+    buildTwoYearReversalSignalTool({ pool, sessionId: deps.sessionId }),
     buildSwingSignalTool({ pool, sessionId: deps.sessionId }),
     buildLimitUpSignalTool({ pool, sessionId: deps.sessionId }),
     {
@@ -605,65 +558,9 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     buildJobDailyPlanTool({ pool, sessionId: deps.sessionId }),
     buildJobAuctionAssessmentTool({ pool, sessionId: deps.sessionId }),
     {
-      name: "strategy_publish_request",
-      label: "提交策略发布提案",
-      description:
-        "提交策略演进摘要、完整拟议正文与关联回测，创建只能由真人在“当前策略”页面审核的 pending 提案。该工具永远不直接发布，不进入普通 confirmation，YOLO 也不能绕过真人审核。提交前必须读取当前 strategy_state 与 strategy_document 基线。",
-      parameters: StrategyPublishRequestSchema,
-      executionMode: "sequential",
-      execute: guard<StrategyPublishRequestInput>(
-        deps,
-        "strategy_publish_request",
-        validateStrategyPublishRequestInput,
-        async (params) => {
-          if (!deps.sessionId) throw new Error("策略发布提案只能由有持久化 session 的 Agent 发起");
-          const summary = await withAgentMutationLock(pool, async (client) => {
-            const proposal = await createStrategyProposal(client, {
-              ...params,
-              session_id: deps.sessionId,
-              backtest_run_ids: params.backtest_run_ids ?? [],
-            });
-            const created = {
-              message: "策略发布提案已创建，必须在“当前策略”页面由真人审核；YOLO 不会自动发布",
-              proposal_id: proposal.id,
-              evolution_id: proposal.evolution_id,
-              status: proposal.status,
-              requires_human: proposal.requires_human,
-            };
-            await insertToolAudit(client, {
-              session_id: deps.sessionId,
-              tool_name: "strategy_publish_request",
-              args: {
-                ...params,
-                changes: params.changes.map((change) => ({
-                  document_id: change.document_id,
-                  base_sha256: change.base_sha256,
-                  content_sha256: sha256Json(change.content),
-                })),
-              },
-              result_sha256: sha256Json(created),
-              status: "pending",
-            });
-            return created;
-          });
-          await persistAndPublishSessionEvent(pool, {
-            session_id: deps.sessionId,
-            event_type: "strategy_publish_pending",
-            data: summary,
-          });
-          await persistAndPublishSessionEvent(pool, {
-            session_id: deps.sessionId,
-            event_type: "ui_refresh",
-            data: { targets: ["strategies", "status"], reason: "策略发布提案待真人审核" },
-          });
-          return textResult(summary, summary);
-        },
-      ),
-    },
-    {
       name: "analysis_run",
       label: "运行复合分析",
-      description: "批量运行板块温度、关键位或长线估值分析。全部能力由服务读取数据库执行，结果和缺口写入 analysis_run；不调用外部 Python。板块温度的正式口径仅覆盖 881/884 本地日更的行业板块；概念/地域/特色板块走势用 hithink index_history 原始 K 线解读，不包装为温度结论。",
+      description: "批量运行板块温度、关键位、长线估值或月度价值排名分析。全部能力由服务读取数据库执行，结果和缺口写入 analysis_run；不调用外部 Python。板块温度的正式口径仅覆盖 881/884 本地日更的行业板块；概念/地域/特色板块走势用 hithink index_history 原始 K 线解读，不包装为温度结论。",
       parameters: AnalysisRunSchema,
       executionMode: "sequential",
       execute: guard<AnalysisRunInput>(deps, "analysis_run", validateAnalysisRunInput, async (params, context) => {
@@ -684,136 +581,12 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
       name: "strategy_screen_query",
       label: "策略条件参考筛选",
       description:
-        "对任意 1–50 只 A 股个股按当前策略确定性规则做参考口径筛选：short_right 右侧六条件、short_left 左侧反转、trial 试盘启动、swing 波段四条件，逐只返回条件布尔、必要数值证据和数据缺口。评估前会对指标过期标的同步重算正式指标；缺日线返回缺口并应先用 fetch_market_data 批量补拉后重跑。不产生 signal_grade、不做“右侧>左侧>试盘”唯一信号合并，也不评估大盘环境门禁；候选转正式口径走 pool_onboard 入池，由每日计划产出。",
+        "对任意 1–50 只 A 股个股按当前策略确定性规则做参考口径筛选：short_right 右侧六条件（持有评估参考）、trial 试盘形态（上涨概率评估）、swing 波段四条件（唯一开仓信号），逐只返回条件布尔、必要数值证据和数据缺口。评估前会对指标过期标的同步重算正式指标；缺日线返回缺口并应先用 fetch_market_data 批量补拉后重跑。不产生 signal_grade、不做唯一信号合并；候选转正式口径走 pool_onboard 入池，由每日计划产出。",
       parameters: StrategyScreenSchema,
       executionMode: "sequential",
       execute: guard<StrategyScreenInput>(deps, "strategy_screen_query", validateStrategyScreenInput, async (params) => {
         const result = textResult(await queryStrategyScreen(pool, params));
         return withAudit(deps, "strategy_screen_query", params, "ok", result);
-      }),
-    },
-    {
-      name: "read_backtest_source",
-      label: "读取回测源码版本",
-      description:
-        "按 run_id 读取已经最终化并固化的回测 TypeScript 源码。优先选择与当前策略哈希和 SDK 相同、研究目标最接近的版本；源码只用于当前轮修改参考，不进入聊天或审计。读取后如需验证，向 run_backtest 提交完整修改后源码并填写 base_source_run_id，系统仍会重新编译并在隔离容器执行。",
-      parameters: ReadBacktestSourceSchema,
-      executionMode: "sequential",
-      execute: guard<ReadBacktestSourceInput>(deps, "read_backtest_source", validateReadBacktestSourceInput, async (params) => {
-        const source = await getVersionedBacktestSource(pool, params.run_id);
-        if (!source) throw apiErrors.notFound(`回测 #${params.run_id} 没有可复用的固化源码`);
-        const result = sourceResult({
-          ...source,
-          sdk_compatible: source.sdk_version === AGENT_BACKTEST_SDK_VERSION,
-          current_sdk_version: AGENT_BACKTEST_SDK_VERSION,
-        });
-        return withAudit(deps, "read_backtest_source", params, "ok", result);
-      }),
-    },
-    {
-      name: "preflight_backtest",
-      label: `标准回测预检${isStandardBacktestEnabled() ? "" : "（未启用）"}`,
-      description: `${standardAvailability}。只读检查注册规则计划和 PostgreSQL 输入覆盖，不抓取或补造数据；返回计划、哈希、覆盖摘要和缺口，不返回逐块清单。executable 仅表示数据与计划可执行，不代表开关已开启。证据始终 research_only，不能冒充 qualified；用户未明确要求运行时不得自动发起回测。`,
-      parameters: PreflightBacktestSchema,
-      execute: guard<Static<typeof PreflightBacktestSchema>>(deps, "preflight_backtest",
-        input => validateRuntimeInput("preflight_backtest", PreflightBacktestSchema, input), async (params, context) => {
-          const report = await preflightStandardBacktest(pool, params.plan, context.signal);
-          const { seed_start, start, end, row_count, day_count } = report.manifest;
-          return withAudit(deps, "preflight_backtest", params, "ok", textResult({
-            enabled: isStandardBacktestEnabled(),
-            executable: report.executable,
-            plan: report.plan,
-            plan_hash: report.plan_hash,
-            input_hash: report.input_hash,
-            evidence_status: report.evidence_status,
-            coverage: { seed_start, start, end, row_count, day_count },
-            data_gaps: report.manifest.gaps,
-          }));
-        }),
-    },
-    {
-      name: "start_standard_backtest",
-      label: `发起标准回测${isStandardBacktestEnabled() ? "" : "（未启用）"}`,
-      description: `${standardAvailability}。仅在用户明确要求运行后，提交 preflight_backtest 返回的原计划、plan_hash、input_hash 和幂等键；预检过期必须重新预检。受控系统动作经领域 service 排队后立即返回，不等待长任务；使用返回 id 查询状态，不重复发起。只支持注册规则，不接受源码；研究证据仍为 research_only，完成不代表 qualified 或正式验证。独立于旧 AGENT_BACKTEST_WORKER_ENABLED。`,
-      parameters: StartStandardBacktestSchema,
-      executionMode: "sequential",
-      execute: guard<Static<typeof StartStandardBacktestSchema>>(deps, "start_standard_backtest",
-        input => validateRuntimeInput("start_standard_backtest", StartStandardBacktestSchema, input), async (params) => {
-          if (!deps.sessionId) throw new Error("标准回测只能由有持久化 session 的 Agent 发起");
-          const sessionId = deps.sessionId;
-          const run = await withAgentMutationLock(pool, () => startStandardBacktest(pool, sessionId, params));
-          const result = await withAudit(deps, "start_standard_backtest", params, "ok", textResult(run));
-          await publishRefresh(deps, ["backtests"], `标准回测 #${run.id} 状态已更新`);
-          return result;
-        }),
-    },
-    {
-      name: "get_backtest_status",
-      label: "查询标准回测状态",
-      description: `${standardAvailability}。按 run_id 只读查询本机标准回测的进度、阶段、终态、研究指标与缺口；不推进或重新运行任务。发起后无需在同一 Agent 循环频繁轮询，按用户需要查询；evidence_status=research_only 不得解释为 qualified。`,
-      parameters: GetBacktestStatusSchema,
-      execute: guard<Static<typeof GetBacktestStatusSchema>>(deps, "get_backtest_status",
-        input => validateRuntimeInput("get_backtest_status", GetBacktestStatusSchema, input), async (params) => {
-          const run = await getStandardBacktestStatus(pool, params.run_id);
-          if (!run) throw apiErrors.notFound(`标准回测 #${params.run_id} 不存在`);
-          return withAudit(deps, "get_backtest_status", params, "ok", textResult(run));
-        }),
-    },
-    {
-      name: "cancel_backtest",
-      label: "取消标准回测",
-      description: `${standardAvailability}。仅按用户明确要求取消本机标准回测，须提供 run_id 与原因；允许从另一交互会话取消，服务审计记录来源会话。不删除历史、输入或账本，实际取消进度与终态以返回状态为准，不频繁轮询。`,
-      parameters: CancelBacktestSchema,
-      executionMode: "sequential",
-      execute: guard<Static<typeof CancelBacktestSchema>>(deps, "cancel_backtest",
-        input => validateRuntimeInput("cancel_backtest", CancelBacktestSchema, input), async (params) => {
-          if (!deps.sessionId) throw new Error("取消标准回测需要有持久化 session 的 Agent");
-          const sessionId = deps.sessionId;
-          const run = await withAgentMutationLock(pool, () => cancelStandardBacktest(pool, params.run_id, params.reason, sessionId));
-          const result = await withAudit(deps, "cancel_backtest", params, "ok", textResult(run));
-          await publishRefresh(deps, ["backtests"], `标准回测 #${run.id} 取消状态已更新`);
-          return result;
-        }),
-    },
-    {
-      name: "run_backtest",
-      label: "编写并运行回测",
-      description:
-        "仅在用户明确要求时，在隔离的临时 TypeScript 工作区研究一个策略思路；源码执行成功或最终化不代表自动正式验证，不能冒充 qualified 证据。最多读取500000行日线和500000行涨停/跌停/炸板事件。codes 可显式指定；limit_up_universe=mainboard/all 时可留空并由区间涨停事件自动解析候选，market_event_types 选择额外注入的事件类型，自动候选模式始终注入 up。日线只读 PostgreSQL market_bar，不在回测中远程拉取；缺日线时运行标为 partial，应先用 fetch_market_data 批量补齐。source_code 必须 default export async function run(sdk)，只能使用注入 sdk：sdk.codes、start、end、initialCash、parameters、bars(code)、events(type?)、eventsOn(date,type?)、stats.mean/stdev。返回 {daily_returns, metrics, conclusion, data_gaps}：daily_returns 必须有 1–50000 个唯一日期项 {date:'YYYY-MM-DD',return}；metrics 必须是最多100项的扁平对象，键匹配 ^[a-z][a-z0-9_]{0,62}$，值只能是有限数值或 null，结构化详情写入 conclusion；conclusion 为1–16000字符非空文本；data_gaps 为最多200项的数组。系统在无网络、无数据库凭据、只读根文件系统和资源限制的独立 Node 容器运行；临时目录结束后立即删除，成功源码只暂存到最终化或超期，最终化后固化为可复用版本。失败会返回安全错误码、执行阶段和可用源码位置：STRATEGY_* 或回测结果契约错误应修正源码后最多自动重试一次，同一错误重复时停止；只有 WORKER_*、CONTAINER_* 或 INPUT_LIMIT 才表示容量或环境问题。可用 comparison_run_ids 关联历史证据，基于固化源码改造时必须填写 base_source_run_id。",
-      parameters: RunBacktestSchema,
-      executionMode: "sequential",
-      execute: guard<RunBacktestInput>(deps, "run_backtest", validateRunBacktestInput, async (params, context) => {
-        if (!deps.sessionId) throw new Error("Agent 回测只能由有持久化 session 的 Agent 发起");
-        context.onUpdate?.(textResult({ status: "preparing", message: "正在构建脱敏行情快照并启动隔离工作器" }));
-        const run = await (deps.runAgentBacktest
-          ? deps.runAgentBacktest(deps.sessionId, params, context.signal)
-          : runAgentBacktest(pool, deps.sessionId, params, { signal: context.signal }));
-        const safeArgs = { ...params } as Record<string, unknown>;
-        delete safeArgs.source_code;
-        await insertToolAudit(pool, {
-          session_id: deps.sessionId,
-          tool_name: "run_backtest",
-          args: {
-            ...safeArgs,
-            source_code_sha256: run.source_sha256,
-            source_size_bytes: run.source_size_bytes,
-            source_code_persisted_in_chat: false,
-            source_retention_status: run.source_retention_status,
-          },
-          result_sha256: sha256Json(run),
-          status: run.execution_status === "failed" ? "error" : "ok",
-        });
-        await persistAndPublishSessionEvent(pool, {
-          session_id: deps.sessionId,
-          event_type: "ui_refresh",
-          data: { targets: ["backtests"], reason: `Agent 回测 #${run.id} 已结束` },
-        });
-        return textResult({
-          message: run.execution_status === "failed" ? "隔离回测失败；代码已删除" : "隔离回测已完成；源码等待最终化",
-          run,
-          source_code_persisted_in_chat: false,
-          source_retention_status: run.source_retention_status,
-        });
       }),
     },
     {

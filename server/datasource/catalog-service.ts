@@ -1,7 +1,7 @@
 // 完整标的目录、板块目录/成分和交易日历的数据库同步服务。
 import type pg from "pg";
 import { inServiceTransaction, type TransactionDb } from "../db/transaction.js";
-import { fetchBoardCatalog, fetchBoardConstituents, BOARD_TYPES, type BoardType } from "./hithink-boards.js";
+import { fetchBoardCatalog, fetchBoardConstituents, BOARD_TYPES, type BoardConstituent, type BoardType } from "./hithink-boards.js";
 import {
   fetchAllTickers,
   fetchTradingDays,
@@ -202,16 +202,16 @@ export async function syncBoardMembership(
   db: TransactionDb,
   boardCode: string,
   effectiveDate: string,
-  deps: HithinkDeps & { jobRunId?: string } = {},
+  deps: HithinkDeps & { jobRunId?: string; members?: BoardConstituent[] } = {},
 ): Promise<BoardMembershipSyncResult> {
   deps = { ...deps, db: deps.db ?? db };
-  const members = await fetchBoardConstituents(boardCode, deps);
+  const members = deps.members ?? await fetchBoardConstituents(boardCode, deps);
   return inServiceTransaction(db, async (client) => {
     const board = await client.query<{ id: string }>(
       `SELECT instrument.id::text
        FROM market_instrument instrument JOIN market_board board ON board.instrument_id = instrument.id
         WHERE instrument.code = $1 AND board.active = true
-          AND board.source = 'hithink' AND board.board_type = 'industry' FOR UPDATE`,
+          AND board.source = 'hithink' AND board.board_type IN ('industry','special') FOR UPDATE`,
       [boardCode],
     );
     if (!board.rows[0]) throw new Error(`未知或未激活板块：${boardCode}`);

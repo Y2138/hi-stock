@@ -69,24 +69,53 @@ it("任务完成门禁只接受本次正确日期的工具结果，并按真实�
   expect(createJobCompletionGate("daily_plan_flow", "2026-08-17").missing()).toContain("pool_attention_write");
   expect(createJobCompletionGate("constructor", "2026-08-17").missing()).toEqual([]);
 
+  const copper = createJobCompletionGate("copper_inventory_signal_review", "2026-08-17");
+  // 防守评估任务必须读取本任务策略文档，再解释固定公式结果。
+  expect(copper.missing()).toEqual(["strategy_document_query", "copper_inventory_signal_query"]);
+  copper.observe({ type: "tool_start", data: { toolCallId: "copper-wrong", name: "copper_inventory_signal_query", args: { date: "2026-08-16" } } });
+  copper.observe({ type: "tool_end", data: { toolCallId: "copper-wrong", name: "copper_inventory_signal_query", isError: false, result: { details: { status: "ready" } } } });
+  expect(copper.missing()).toEqual(["strategy_document_query", "copper_inventory_signal_query"]);
+  copper.observe({ type: "tool_start", data: { toolCallId: "copper-strategy", name: "strategy_document_query", args: {} } });
+  copper.observe({ type: "tool_end", data: { toolCallId: "copper-strategy", name: "strategy_document_query", isError: false, result: { details: { documents: [] } } } });
+  copper.observe({ type: "tool_start", data: { toolCallId: "copper-right", name: "copper_inventory_signal_query", args: { date: "2026-08-17" } } });
+  copper.observe({ type: "tool_end", data: { toolCallId: "copper-right", name: "copper_inventory_signal_query", isError: false, result: { details: { status: "ready" } } } });
+  expect(copper.missing()).toEqual([]);
+
+
+  const valueAnchor = createJobCompletionGate("value_anchor_opportunity_scan", "2026-08-17");
+  // 价值错杀任务也要读取任务策略文档并写入关注池。
+  expect([...valueAnchor.missing()].sort()).toEqual(["strategy_document_query", "pool_attention_write", "value_anchor_signal_query"].sort());
+  valueAnchor.observe({ type: "tool_start", data: { toolCallId: "value-strategy", name: "strategy_document_query", args: {} } });
+  valueAnchor.observe({ type: "tool_end", data: { toolCallId: "value-strategy", name: "strategy_document_query", isError: false, result: { details: { documents: [] } } } });
+  valueAnchor.observe({ type: "tool_start", data: { toolCallId: "value-attention", name: "pool_attention_write", args: {} } });
+  valueAnchor.observe({ type: "tool_end", data: { toolCallId: "value-attention", name: "pool_attention_write", isError: false, result: { details: { items: [] } } } });
+  valueAnchor.observe({ type: "tool_start", data: { toolCallId: "value", name: "value_anchor_signal_query", args: { date: "2026-08-17" } } });
+  valueAnchor.observe({ type: "tool_end", data: { toolCallId: "value", name: "value_anchor_signal_query", isError: false, result: { details: { status: "success" } } } });
+  expect(valueAnchor.missing()).toEqual([]);
+
+  const twoYear = createJobCompletionGate("two_year_reversal_scan", "2026-08-17");
+  twoYear.observe({ type: "tool_start", data: { toolCallId: "two-year-strategy", name: "strategy_document_query", args: { codes: ["two_year_reversal_strategy"] } } });
+  twoYear.observe({ type: "tool_end", data: { toolCallId: "two-year-strategy", name: "strategy_document_query", isError: false,
+    result: { details: { documents: [{ code: "two_year_reversal_strategy", role: "task" }] } } } });
+  twoYear.observe({ type: "tool_start", data: { toolCallId: "two-year-scan", name: "two_year_reversal_signal_query", args: { date: "2026-08-17" } } });
+  twoYear.observe({ type: "tool_end", data: { toolCallId: "two-year-scan", name: "two_year_reversal_signal_query", isError: false,
+    result: { details: { status: "success", qualified: [] } } } });
+  expect(twoYear.missing()[0]).toContain("必须读取本任务策略和投资总策略");
+  twoYear.observe({ type: "tool_start", data: { toolCallId: "two-year-strategy", name: "strategy_document_query", args: { codes: ["two_year_reversal_strategy", "portfolio"] } } });
+  twoYear.observe({ type: "tool_end", data: { toolCallId: "two-year-strategy", name: "strategy_document_query", isError: false,
+    result: { details: { documents: [{ code: "two_year_reversal_strategy", role: "task" }, { code: "portfolio", role: "portfolio" }] } } } });
+  expect(twoYear.missing()).toEqual([]);
+  expect(twoYear.unavailableGaps()).toEqual([]);
+  twoYear.observe({ type: "tool_start", data: { toolCallId: "two-year-stale", name: "two_year_reversal_signal_query", args: { date: "2026-08-17" } } });
+  twoYear.observe({ type: "tool_end", data: { toolCallId: "two-year-stale", name: "two_year_reversal_signal_query", isError: false,
+    result: { details: { status: "success", data_date: "2026-08-14", gaps: ["滞后数据"] } } } });
+  expect(twoYear.unavailableGaps()).toEqual(["滞后数据"]);
+
   const closed = createJobCompletionGate("auction_opportunity_assessment", "2026-08-16");
   closed.observe({ type: "tool_start", data: { toolCallId: "closed", name: "auction_context_query", args: { date: "2026-08-16" } } });
   closed.observe({ type: "tool_end", data: { toolCallId: "closed", name: "auction_context_query", isError: false,
     result: { details: { market_day: { should_run: false } } } } });
   expect(closed.missing()).toEqual([]);
-
-  const weekly = createJobCompletionGate("weekly_review", "2026-08-17");
-  function poolResult(args: Record<string, unknown>, pools: unknown[]) {
-    weekly.observe({ type: "tool_start", data: { toolCallId: "pool", name: "pool_context_query", args } });
-    weekly.observe({ type: "tool_end", data: { toolCallId: "pool", name: "pool_context_query", isError: false,
-      result: { details: { pools } } } });
-  }
-  poolResult({ codes: ["600000.SH"] }, [{ pool: "short", member_count: 1 }]);
-  expect(weekly.missing().some((name) => name.includes("完整摘要"))).toBe(true);
-  poolResult({}, [{ pool: "short", member_count: 1 }, { pool: "long", member_count: 1 }]);
-  poolResult({ codes: ["600000.SH"] }, [{ pool: "short", member_count: 1 }]);
-  expect(weekly.missing().some((name) => name.includes("完整摘要"))).toBe(false);
-  expect(weekly.missing()).toContain("analysis_run");
 
   const nightly = createJobCompletionGate("nightly_sector_opportunity_scan", "2026-08-17");
   let nightlyCall = 0;
@@ -110,6 +139,9 @@ it("任务完成门禁只接受本次正确日期的工具结果，并按真实�
   nightlyObserved("analysis_run", {
     requests: [{ analysis_type: "sector_temperature", as_of: "2026-08-17" }],
   }, { items: [{ analysis_type: "sector_temperature", status: "partial" }] });
+  expect(nightly.missing()).toEqual(["pool_attention_write"]);
+  // 夜间筛选同样必须把入选标的写入关注池完成对账。
+  nightlyObserved("pool_attention_write", { items: [] }, { items: [] });
   expect(nightly.missing()).toEqual([]);
 });
 
@@ -358,41 +390,41 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       expect((await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => markdown }, run.id))?.status).toBe("success");
       return run;
     };
-    await finish("midweek_check", "# 检查报告\n## 结论摘要\n等待条件，不追高。");
-    await finish("weekly_review", "# 周复盘\n## 结论摘要\n本周无调整，数据不足仍需复核。");
+    await finish("nightly_sector_opportunity_scan", "# 板块扫描\n## 结论摘要\n等待条件，不追高。");
+    await finish("value_anchor_opportunity_scan", "# 价值错杀\n## 结论摘要\n本周无正式候选，数据不足仍需复核。");
     const notifications = await listNotifications(pool);
-    expect(notifications.map((item) => item.job_code).sort()).toEqual(["midweek_check", "weekly_review"]);
+    expect(notifications.map((item) => item.job_code).sort()).toEqual(["nightly_sector_opportunity_scan", "value_anchor_opportunity_scan"]);
     expect(notifications.every((item) => item.kind === "agent_result")).toBe(true);
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({ code: 0 }));
-    await updateNotificationSettings(pool, { job_codes: ["weekly_review"] });
+    await updateNotificationSettings(pool, { job_codes: ["nightly_sector_opportunity_scan"] });
     await deliverNextNotification(pool, fetcher);
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect((await listNotifications(pool)).find((n) => n.job_code === 'midweek_check')?.status).toBe("pending");
-    expect((await listNotifications(pool)).find((n) => n.job_code === 'weekly_review')?.status).toBe("sent");
+    expect((await listNotifications(pool)).find((n) => n.job_code === 'value_anchor_opportunity_scan')?.status).toBe("pending");
+    expect((await listNotifications(pool)).find((n) => n.job_code === 'nightly_sector_opportunity_scan')?.status).toBe("sent");
     await updateNotificationSettings(pool, { job_codes: null });
     await deliverNextNotification(pool, fetcher);
     expect(fetcher).toHaveBeenCalledTimes(2);
-    await finish("weekly_review", "# 复盘\n## 结论摘要\n暂无结论");
+    await finish("value_anchor_opportunity_scan", "# 复盘\n## 结论摘要\n暂无结论");
     await finish("daily_plan_flow", "# 正文但没有结论");
     expect(await listNotifications(pool)).toHaveLength(2);
-    const failed = await queueManualJob(pool, "weekly_review", "2026-08-17");
+    const failed = await queueManualJob(pool, "value_anchor_opportunity_scan", "2026-08-17");
     await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => { throw new Error("模型失败"); } }, failed.id);
     expect(await listNotifications(pool)).toHaveLength(2);
     await expect(updateNotificationSettings(pool, { job_codes: ["daily_data_update"] })).rejects.toThrow("只能订阅");
     await expect(updateNotificationSettings(pool, { job_codes: ["missing_job"] })).rejects.toThrow("只能订阅");
     await updateNotificationSettings(pool, { job_codes: [] });
-    await finish("weekly_review", "## 结论摘要\n满足条件才操作。");
+    await finish("value_anchor_opportunity_scan", "## 结论摘要\n满足条件才操作。");
     expect(await listNotifications(pool)).toHaveLength(2);
-    const query = await api(server.baseUrl, "GET", "/api/notifications?job_code=midweek_check&status=sent");
+    const query = await api(server.baseUrl, "GET", "/api/notifications?job_code=nightly_sector_opportunity_scan&status=sent");
     expect((query.json.items as unknown[]).length).toBe(1);
-    const preview = await api(server.baseUrl, "GET", "/api/notifications/preview?job_code=midweek_check");
-    expect(preview.json).toMatchObject({ job_code: "midweek_check" });
+    const preview = await api(server.baseUrl, "GET", "/api/notifications/preview?job_code=nightly_sector_opportunity_scan");
+    expect(preview.json).toMatchObject({ job_code: "nightly_sector_opportunity_scan" });
     expect((await pool.query("SELECT content::text FROM chat_message WHERE role='user' ORDER BY id LIMIT 1")).rows[0].content).toContain("结论摘要");
   });
 
   it("新增Agent任务自动纳入全部订阅，非Agent结果不能借用输出类型触发推送", async () => {
     await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret });
-    const template = (await listJobDefinitions(pool)).find((job) => job.code === 'weekly_review')!;
+    const template = (await listJobDefinitions(pool)).find((job) => job.code === 'nightly_sector_opportunity_scan')!;
     const custom = await createJobDefinition(pool, { code: "custom_conclusion", name: "自定义结论任务", cron: "0 16 * * 1-5", job_type: "agent_flow", config: {}, prompt_id: template.prompt_id });
     const run = await queueManualJob(pool, custom.code, "2026-08-17");
     await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => "## 结论摘要\n仅在条件满足后调整。" }, run.id);
@@ -429,26 +461,54 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect((await api(server.baseUrl, "GET", "/api/notifications/999999")).status).toBe(404);
   });
 
-  it("迁移初始化十个受控作业，板块目录与成分同步默认启用，cron 固定按上海时区解析", async () => {
+  it("迁移初始化受控作业清单，板块目录与成分同步默认启用，cron 固定按上海时区解析", async () => {
     const jobs = await listJobDefinitions(pool);
+    // 清单按 priority 升序：数据链路 → 收盘/夜间研判 → 盘中复核 → 低频研究。
     expect(jobs.map((job) => job.code)).toEqual([
-      "auction_opportunity_assessment",
+      "market_catalog_sync",
       "board_membership_sync",
+      "weekly_full_market_indicators",
       "daily_data_update",
       "daily_market_structure",
+      "value_candidate_sync",
+      "value_monthly_rank",
+      "commodity_copper_sync",
+      "commodity_copper_inventory_sync",
+      "commodity_lithium_warehouse_sync",
       "daily_plan_flow",
-      "market_catalog_sync",
-      "midweek_check",
       "nightly_sector_opportunity_scan",
-      "weekly_full_market_indicators",
-      "weekly_review",
+      "value_anchor_opportunity_scan",
+      "two_year_reversal_scan",
+      "auction_opportunity_assessment",
+      "copper_inventory_signal_review",
+      "lithium_warehouse_signal_review",
     ]);
-    expect(jobs.find((job) => job.code === "midweek_check")?.cron).toBe("30 17 * * 2");
-    expect(jobs.find((job) => job.code === "weekly_review")?.cron).toBe("0 20 * * 0");
+    // 已退役任务（每周评分、周中检查、左侧结构反转）不再保留定义行。
+    for (const retired of ["weekly_review", "midweek_check", "left_reversal_opportunity_scan"]) {
+      expect(jobs.find((job) => job.code === retired)).toBeUndefined();
+      expect((await pool.query("SELECT 1 FROM job_prompt WHERE code = $1", [retired])).rows).toHaveLength(0);
+    }
+    // 每个任务都有职责特征与排序权重，时段取值受约束。
+    expect(jobs.every((job) => job.purpose && job.purpose.length > 0)).toBe(true);
+    expect(jobs.every((job) => job.priority !== null)).toBe(true);
+    expect(jobs.every((job) => ["盘前", "盘中", "盘后", "夜间", "周末"].includes(job.phase ?? ""))).toBe(true);
+    expect(jobs.filter((job) => job.job_type === "agent_flow").map((job) => job.code).sort()).toEqual([
+      "auction_opportunity_assessment",
+      "copper_inventory_signal_review",
+      "daily_plan_flow",
+      "lithium_warehouse_signal_review",
+      "nightly_sector_opportunity_scan",
+      "two_year_reversal_scan",
+      "value_anchor_opportunity_scan",
+    ]);
     expect(jobs.find((job) => job.code === "auction_opportunity_assessment")?.cron).toBe("30 9 * * 1-5");
     const nightly = jobs.find((job) => job.code === "nightly_sector_opportunity_scan")!;
     expect(nightly.cron).toBe("0 23 * * 1-5");
     expect(nightly.enabled).toBe(true);
+    expect(jobs.find((job) => job.code === "value_candidate_sync")?.cron).toBe("40 6 * * 6");
+    expect(jobs.find((job) => job.code === "value_monthly_rank")?.cron).toBe("45 17 * * 1-5");
+    expect(jobs.find((job) => job.code === "value_anchor_opportunity_scan")?.cron).toBe("30 19 * * 1-5");
+    expect(jobs.find((job) => job.code === "two_year_reversal_scan")?.cron).toBe("0 19 * * 1-5");
     const nightlyModel = (await pool.query<{ provider_key: string; model_key: string }>(
       `SELECT provider.provider_key, model.model_key
          FROM llm_model model JOIN llm_provider provider ON provider.id = model.provider_id
@@ -467,33 +527,55 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         .every((job) => job.enabled === true),
     ).toBe(true);
     expect(jobs.find((job) => job.code === "daily_market_structure")?.enabled).toBe(false);
+    expect(jobs.find((job) => job.code === "commodity_copper_sync")).toMatchObject({
+      cron: "20 16 * * 1-5", enabled: true, config: { pipeline: "commodity_copper_sync", export_volume: false },
+    });
+    expect(jobs.find((job) => job.code === "commodity_copper_inventory_sync")).toMatchObject({
+      cron: "10 17 * * 5", enabled: true, config: { pipeline: "commodity_copper_inventory_sync", export_volume: false },
+    });
+    expect(jobs.find((job) => job.code === "copper_inventory_signal_review")).toMatchObject({
+      cron: "30 17 * * 5", enabled: true, job_type: "agent_flow", config: {},
+    });
+    expect(jobs.find((job) => job.code === "commodity_lithium_warehouse_sync")).toMatchObject({
+      cron: "10 17 * * 1-5", enabled: true, config: { pipeline: "commodity_lithium_warehouse_sync", export_volume: false },
+    });
+    expect(jobs.find((job) => job.code === "lithium_warehouse_signal_review")).toMatchObject({
+      cron: "30 17 * * 5", enabled: true, job_type: "agent_flow", config: {},
+    });
     const prompts = await pool.query<{ code: string; content: string }>(
       `SELECT p.code, r.content FROM job_prompt p JOIN job_prompt_revision r ON r.id = p.current_revision_id ORDER BY p.code`,
     );
-    expect(prompts.rows).toHaveLength(5);
-    expect(prompts.rows.filter((row) => row.code !== "auction_opportunity_assessment")
+    // 三个已退役任务（每周评分、周中检查、左侧结构反转）的提示词已删除，新两年结构任务有独立提示词。
+    expect(prompts.rows).toHaveLength(7);
+    const valuePrompt = prompts.rows.find((row) => row.code === "value_anchor_opportunity_scan")!.content;
+    expect(valuePrompt).toContain("Top10覆盖");
+    expect(valuePrompt).not.toContain("Top50");
+    expect(prompts.rows.filter((row) => !["auction_opportunity_assessment", "copper_inventory_signal_review", "lithium_warehouse_signal_review", "value_anchor_opportunity_scan"].includes(row.code))
       .every((row) => row.content.includes("当前最终策略"))).toBe(true);
-    expect(prompts.rows.filter((row) => row.code !== "auction_opportunity_assessment")
+    expect(prompts.rows.filter((row) => !["auction_opportunity_assessment", "copper_inventory_signal_review", "lithium_warehouse_signal_review", "value_anchor_opportunity_scan"].includes(row.code))
       .every((row) => row.content.includes("job_run_output"))).toBe(true);
     expect(prompts.rows.every((row) => !row.content.includes(".md"))).toBe(true);
     expect(prompts.rows.every((row) => !row.content.includes("## 策略模拟账户信号"))).toBe(true);
     const dailyPrompt = prompts.rows.find((row) => row.code === "daily_plan_flow")!.content;
-    const midweekPrompt = prompts.rows.find((row) => row.code === "midweek_check")!.content;
-    const weeklyPrompt = prompts.rows.find((row) => row.code === "weekly_review")!.content;
     const nightlyPrompt = prompts.rows.find((row) => row.code === "nightly_sector_opportunity_scan")!.content;
+    const copperPrompt = prompts.rows.find((row) => row.code === "copper_inventory_signal_review")!.content;
+    const lithiumPrompt = prompts.rows.find((row) => row.code === "lithium_warehouse_signal_review")!.content;
     expect(dailyPrompt).toContain("pool_attention_write");
     expect(dailyPrompt).toContain("daily_plan_context_query");
     expect(dailyPrompt.length).toBeLessThan(4_000);
-    expect(midweekPrompt).toContain("pool_context_query");
-    expect(midweekPrompt.length).toBeLessThan(1_200);
-    expect(weeklyPrompt).toContain("analysis_run(long_valuation)");
-    expect(weeklyPrompt.length).toBeLessThan(1_200);
     expect(nightlyPrompt).toContain('"analysis_type":"sector_temperature"');
     expect(nightlyPrompt).toContain("不得传 `codes`");
     expect(nightlyPrompt).toContain("每个板块最多保留 2 只标的");
     expect(nightlyPrompt).toContain("不超过 600 个中文字符");
     expect(nightlyPrompt.length).toBeLessThan(4_000);
-    expect([dailyPrompt, midweekPrompt, weeklyPrompt, nightlyPrompt]
+    expect(copperPrompt).toContain("copper_inventory_signal_query");
+    expect(copperPrompt).toContain("20个百分点缓冲");
+    expect(copperPrompt).toContain("不交易");
+    expect(copperPrompt.length).toBeLessThan(3_000);
+    expect(lithiumPrompt).toContain("lithium_warehouse_signal_query");
+    expect(lithiumPrompt).toContain("10个百分点缓冲");
+    expect(lithiumPrompt.length).toBeLessThan(3_000);
+    expect([dailyPrompt, nightlyPrompt, copperPrompt, lithiumPrompt]
       .every((content) => !content.includes("本节替代前文"))).toBe(true);
     const auctionPrompt = prompts.rows.find((row) => row.code === "auction_opportunity_assessment")!.content;
     expect(auctionPrompt).toContain("tool_catalog");
@@ -792,18 +874,18 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     );
     await pool.query(
       `INSERT INTO pool_membership (instrument_id,pool,role,effective_from)
-       SELECT id,'short','观察','2026-08-01' FROM market_instrument WHERE code IN ('990086.SZ','990087.SZ','990088.SZ','990089.SZ')`,
+       SELECT id,'watch','关注','2026-08-01' FROM market_instrument WHERE code IN ('990086.SZ','990087.SZ','990088.SZ','990089.SZ')`,
+    );
+    // 人工来源条目与上一轮每日计划遗留的自动来源条目并存。
+    await pool.query(
+      `INSERT INTO pool_attention_entry (instrument_id,source_job,status,reason,missing_signals,valid_from,valid_until)
+       SELECT instrument.id,'manual','manual','人工持续跟踪','[]'::jsonb,'2026-08-17','2026-08-25'
+         FROM market_instrument instrument WHERE code='990086.SZ'`,
     );
     await pool.query(
-      `UPDATE pool_membership membership
-          SET attention_reason = CASE instrument.code
-                WHEN '990086.SZ' THEN '人工持续跟踪'
-                ELSE '每日计划·即将符合：上一计划遗留'
-              END,
-              attention_from = '2026-08-17', attention_until = '2026-08-25'
-         FROM market_instrument instrument
-        WHERE instrument.id = membership.instrument_id
-          AND instrument.code IN ('990086.SZ','990087.SZ')`,
+      `INSERT INTO pool_attention_entry (instrument_id,source_job,status,reason,missing_signals,valid_from,valid_until)
+       SELECT instrument.id,'daily_plan_flow','approaching','上一计划遗留','["右侧：放量站稳关键位"]'::jsonb,'2026-08-17','2026-08-25'
+         FROM market_instrument instrument WHERE code='990087.SZ'`,
     );
     await pool.query(
       `INSERT INTO portfolio_position (instrument_id,quantity,cost_price)
@@ -817,38 +899,39 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       items: [{
         action: "mark",
         code: "990088.SZ",
-        pool: "short",
         attention_status: "approaching",
-        attention_reason: "每日计划·即将符合：仍缺放量站稳关键位",
+        attention_reason: "仍缺放量站稳关键位",
         missing_signals: ["右侧信号：放量站稳关键位"],
         attention_from: "2026-08-18",
         attention_until: "2026-08-25",
       }],
     });
+    // 本来源条目写入；上一轮遗留的每日计划条目因不在保留集合被对账清除；人工来源不受影响。
     expect((await pool.query(
-      `SELECT attention_signal,attention_reason,attention_from::text,attention_until::text
-         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id=membership.instrument_id
-        WHERE membership.effective_to IS NULL AND instrument.code='990088.SZ'`,
+      `SELECT entry.source_job, entry.status, entry.reason, entry.missing_signals, entry.valid_from::text, entry.valid_until::text
+         FROM pool_attention_entry entry JOIN market_instrument instrument ON instrument.id=entry.instrument_id
+        WHERE instrument.code='990088.SZ'`,
     )).rows[0]).toEqual({
-      attention_signal: { status: "approaching", missing_signals: ["右侧信号：放量站稳关键位"] },
-      attention_reason: "每日计划·即将符合：仍缺放量站稳关键位",
-      attention_from: "2026-08-18",
-      attention_until: "2026-08-25",
+      source_job: "daily_plan_flow",
+      status: "approaching",
+      reason: "仍缺放量站稳关键位",
+      missing_signals: ["右侧信号：放量站稳关键位"],
+      valid_from: "2026-08-18",
+      valid_until: "2026-08-25",
     });
     expect((await pool.query(
-      `SELECT instrument.code, membership.attention_reason
-         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id=membership.instrument_id
+      `SELECT instrument.code, entry.source_job, entry.reason
+         FROM pool_attention_entry entry JOIN market_instrument instrument ON instrument.id=entry.instrument_id
         WHERE instrument.code IN ('990086.SZ','990087.SZ') ORDER BY instrument.code`,
     )).rows).toEqual([
-      { code: "990086.SZ", attention_reason: "人工持续跟踪" },
-      { code: "990087.SZ", attention_reason: null },
+      { code: "990086.SZ", source_job: "manual", reason: "人工持续跟踪" },
     ]);
+
     const heldResult = await tool.execute("tc-attention-held", {
-      reason: "已持仓标的不进入近期关注",
+      reason: "已持仓标的不进入自动关注",
       items: [{
         action: "mark",
         code: "990089.SZ",
-        pool: "short",
         attention_status: "qualified",
         attention_reason: "满足信号但已经持仓",
         attention_from: "2026-08-18",
@@ -856,40 +939,41 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       }],
     });
     expect(heldResult.details).toMatchObject({
+      source_job: "daily_plan_flow",
       items: [
         { code: "990089.SZ", action: "skip", suppressed_by: "existing_position" },
         { code: "990088.SZ", action: "clear", reconciled: true },
       ],
     });
     expect((await pool.query(
-      `SELECT attention_reason FROM pool_membership membership
-        JOIN market_instrument instrument ON instrument.id=membership.instrument_id
+      `SELECT count(*)::int AS count FROM pool_attention_entry entry
+        JOIN market_instrument instrument ON instrument.id=entry.instrument_id
        WHERE instrument.code='990089.SZ'`,
-    )).rows[0]!.attention_reason).toBeNull();
+    )).rows[0]!.count).toBe(0);
     await tool.execute("tc-attention-empty", {
       reason: "本轮没有符合或即将符合条件的标的",
       items: [],
     });
     expect((await pool.query(
-      `SELECT attention_reason FROM pool_membership membership
-        JOIN market_instrument instrument ON instrument.id=membership.instrument_id
-       WHERE instrument.code='990088.SZ'`,
-    )).rows[0]!.attention_reason).toBeNull();
+      `SELECT entry.reason FROM pool_attention_entry entry
+        JOIN market_instrument instrument ON instrument.id=entry.instrument_id
+       WHERE instrument.code='990088.SZ' AND entry.source_job='daily_plan_flow'`,
+    )).rows[0]?.reason).toBeUndefined();
+    // 人工条目不能被自动作业清除：clear 只作用于本任务来源。
     await pool.query(
-      `UPDATE pool_membership membership SET attention_reason='人工持续跟踪'
-         FROM market_instrument instrument
-        WHERE instrument.id=membership.instrument_id AND instrument.code='990088.SZ'`,
+      `INSERT INTO pool_attention_entry (instrument_id,source_job,status,reason,missing_signals,valid_from)
+       SELECT instrument.id,'manual','manual','人工持续跟踪','[]'::jsonb,'2026-08-18'
+         FROM market_instrument instrument WHERE code='990088.SZ'`,
     );
-    await expect(tool.execute("tc-attention-clear", {
+    await tool.execute("tc-attention-clear-manual-safe", {
       reason: "本轮已不接近条件",
-      items: [{ action: "clear", code: "990088.SZ", pool: "short" }],
-    })).rejects.toThrow("不得清除");
+      items: [{ action: "clear", code: "990088.SZ" }],
+    });
     expect((await pool.query(
-      `SELECT attention_reason FROM pool_membership membership
-        JOIN market_instrument instrument ON instrument.id=membership.instrument_id
-       WHERE instrument.code='990088.SZ'`,
-    )).rows[0]!.attention_reason)
-      .toBe("人工持续跟踪");
+      `SELECT entry.reason FROM pool_attention_entry entry
+        JOIN market_instrument instrument ON instrument.id=entry.instrument_id
+       WHERE instrument.code='990088.SZ' AND entry.source_job='manual'`,
+    )).rows[0]!.reason).toBe("人工持续跟踪");
 
     await tools.find((item) => item.name === "daily_plan_write")!.execute("tc-plan-write", {
       items: [{
@@ -1179,6 +1263,46 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         }),
       }, boardRun.id);
       expect(board).toMatchObject({ status: "partial", data_gaps: [{ code: "885001.TI" }] });
+
+      const commodityJob = await createJobDefinition(pool, {
+        code: "commodity_probe",
+        name: "商品探针",
+        cron: "0 0 * * *",
+        job_type: "datasource",
+        config: { pipeline: "commodity_copper_sync", export_volume: false },
+      });
+      const commodityRun = await queueManualJob(pool, commodityJob.code, "2026-08-17");
+      const commodity = await executeJobRun({
+        pool,
+        databaseUrl: prepared!.url,
+        commodityCopperSync: async (targetDate) => ({
+          tradeDate: targetDate, productCode: "CU", contractCount: 12, mainContractCode: "CU2610",
+          rowsWritten: 25, fetchRunId: "31", gaps: [],
+        }),
+      }, commodityRun.id);
+      expect(commodity).toMatchObject({
+        status: "success", artifacts: [{ kind: "market_fetch_run", id: "31" }],
+      });
+
+      const inventoryJob = await createJobDefinition(pool, {
+        code: "inventory_probe",
+        name: "库存探针",
+        cron: "0 0 * * *",
+        job_type: "datasource",
+        config: { pipeline: "commodity_copper_inventory_sync", export_volume: false },
+      });
+      const inventoryRun = await queueManualJob(pool, inventoryJob.code, "2026-08-14");
+      const inventory = await executeJobRun({
+        pool,
+        databaseUrl: prepared!.url,
+        commodityCopperInventorySync: async (targetDate) => ({
+          reportDate: targetDate, inventory: 50000, previousInventory: 55000,
+          publishedAt: `${targetDate}T23:59:59+08:00`, rowsWritten: 1, fetchRunId: "32", gaps: [],
+        }),
+      }, inventoryRun.id);
+      expect(inventory).toMatchObject({
+        status: "success", artifacts: [{ kind: "market_fetch_run", id: "32" }],
+      });
 
       const structureJob = await createJobDefinition(pool, {
         code: "structure_probe",
@@ -1677,7 +1801,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       },
       run.id,
     );
-    expect(finished).toMatchObject({ status: "success", task_run_id: null });
+    expect(finished).toMatchObject({ status: "success" });
     expect(finished?.result_md).toBeNull();
     const output = await pool.query(
       "SELECT output_type, markdown, strategy_change_seq::text, strategy_snapshot_hash FROM job_run_output WHERE run_id = $1",
@@ -1686,7 +1810,6 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(output.rows[0]).toMatchObject({ output_type: "daily_plan", strategy_change_seq: "0" });
     expect(output.rows[0]!.markdown).toContain("# 测试结果");
     expect(output.rows[0]!.strategy_snapshot_hash).toMatch(/^[a-f0-9]{64}$/);
-    expect(Number((await pool.query("SELECT count(*) FROM task_run")).rows[0]!.count)).toBe(0);
   });
 
   it("结果已事务入账后，对话链接同步失败不会把成功任务反写为重试", async () => {

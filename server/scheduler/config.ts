@@ -24,6 +24,10 @@ const DATASOURCE_PIPELINES = new Set<DatasourcePipeline>([
   "board_membership_sync",
   "daily_market_structure",
   "full_market_indicator_refresh",
+  "commodity_copper_sync",
+  "commodity_copper_inventory_sync",
+  "commodity_lithium_warehouse_sync",
+  "value_candidate_sync",
 ]);
 
 export function assertJobType(value: unknown): JobType {
@@ -52,7 +56,7 @@ export function validateJobConfig(jobType: JobType, input: unknown): ValidatedJo
     }
     case "analysis": {
       noUnknownKeys(config, ["analysis_type", "request"]);
-      if (config.analysis_type !== "sector_temperature" && config.analysis_type !== "key_levels" && config.analysis_type !== "long_valuation") {
+      if (config.analysis_type !== "sector_temperature" && config.analysis_type !== "key_levels" && config.analysis_type !== "long_valuation" && config.analysis_type !== "value_monthly_rank") {
         throw new Error("analysis config.analysis_type 非法");
       }
       if (config.request !== undefined && (!config.request || typeof config.request !== "object" || Array.isArray(config.request))) {

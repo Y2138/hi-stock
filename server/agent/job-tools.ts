@@ -1,7 +1,7 @@
 // 结构化计划工具属于所有持久化 Agent 会话的共享目录；关联任务运行由会话自动解析。
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
-import { setPoolAttention } from "../modules/pools/repo.js";
+import { WATCH_POOL, setPoolAttentionEntry } from "../modules/pools/repo.js";
 import { replaceDraftAuctionAssessments, replaceDraftPlaybook } from "../modules/plans/repo.js";
 import { withAgentMutationLock } from "./mutation-lock.js";
 import { insertToolAudit } from "./repo.js";
@@ -14,8 +14,6 @@ import {
   validateAuctionAssessmentWriteInput,
   validateDailyPlanWriteInput,
 } from "./tool-validation.js";
-
-const DAILY_PREFIX = "每日计划·";
 
 function result(value: unknown): AgentToolResult<unknown> {
   return { content: [{ type: "text", text: JSON.stringify(value, null, 1) }], details: value };
@@ -42,148 +40,129 @@ async function auditError(pool: pg.Pool, sessionId: string | null, toolName: str
 async function associatedRunningJob(
   pool: pg.Pool,
   sessionId: string | null,
-  code: "daily_plan_flow" | "auction_opportunity_assessment",
-): Promise<string> {
-  if (!sessionId) throw new Error(`${code} 结构化写入需要持久化 Agent 会话`);
-  const result = await pool.query<{ id: string }>(
-    `SELECT run.id::text
+  codes: readonly string[],
+): Promise<{ id: string; code: string }> {
+  if (!sessionId) throw new Error(`${codes.join("/")} 结构化写入需要持久化 Agent 会话`);
+  const result = await pool.query<{ id: string; code: string }>(
+    `SELECT run.id::text, definition.code
        FROM job_run run
        JOIN job_definition definition ON definition.id = run.job_id
       WHERE run.session_id = $1
-        AND definition.code = $2
+        AND definition.code = ANY($2::text[])
         AND run.status IN ('queued', 'running')
       ORDER BY CASE run.status WHEN 'running' THEN 0 ELSE 1 END, run.id DESC
       LIMIT 1`,
-    [sessionId, code],
+    [sessionId, codes],
   );
-  if (!result.rows[0]) throw new Error(`当前会话没有可写入的 ${code} 运行`);
-  return result.rows[0].id;
+  if (!result.rows[0]) throw new Error(`当前会话没有可写入的 ${codes.join("/")} 运行`);
+  return result.rows[0];
 }
+
+/** 允许向关注池写入自动关注的定时评估任务；来源隔离，各自对账，互不清除。 */
+const POOL_ATTENTION_JOBS = [
+  "daily_plan_flow",
+  "nightly_sector_opportunity_scan",
+  "value_anchor_opportunity_scan",
+] as const;
 
 export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
   return {
     name: "pool_attention_write",
-    label: "批量维护每日计划近期关注",
+    label: "批量维护关注池自动关注",
     description:
-      "一次提交本轮应保留的全部近期关注并在同一事务对账。items 中的 mark 是完整保留集合，遗漏的历史自动关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧自动关注；人工关注永不清除或覆盖。只维护已在短线池或长线池中的标的，不得新增标的、改变池角色或研究属性。qualified 表示信号已成立，不得有缺失条件；approaching 必须在 missing_signals 中逐项列出尚未成立的信号和次日确认标准（包含策略名称与实际阈值，只使用查询证据，不得臆造）。不同策略不可合成统一质量分，页面按已成立、待补信号分档展示。",
+      "一次提交本轮应保留的全部自动关注并在同一事务按任务来源对账。items 中的 mark 是本任务来源的完整保留集合，遗漏的本来源历史关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧本来源关注；其他任务来源与人工关注互不影响、不得覆盖。只维护已在关注池中的标的，不得新增标的、改变角色或研究属性。qualified 表示信号已成立，不得有缺失条件；approaching 必须在 missing_signals 中逐项列出尚未成立的信号和次日确认标准（包含策略名称与实际阈值，只使用查询证据，不得臆造）。不同任务来源的关注在页面并列展示，不合成统一质量分。",
     parameters: ScheduledPoolAttentionSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {
       try {
-        if (signal?.aborted) throw new Error("每日计划关注维护已中断");
+        if (signal?.aborted) throw new Error("关注池维护已中断");
         const input = validateScheduledPoolAttentionInput(rawInput);
-        await associatedRunningJob(deps.pool, deps.sessionId, "daily_plan_flow");
+        const { code: jobCode } = await associatedRunningJob(deps.pool, deps.sessionId, POOL_ATTENTION_JOBS);
         const outcome = await withAgentMutationLock(deps.pool, async (client) => {
           const items = [];
           const kept = new Set<string>();
           for (const item of input.items) {
-            const current = await client.query<{ attention_reason: string | null; quantity: number }>(
-              `SELECT membership.attention_reason, COALESCE(position.quantity, 0)::float8 AS quantity
-                 FROM pool_membership membership
-                 JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-                 LEFT JOIN portfolio_position position ON position.instrument_id = membership.instrument_id
-                WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL
-                FOR UPDATE OF membership`,
-              [item.code, item.pool],
+            const current = await client.query<{ quantity: number }>(
+              `SELECT COALESCE(position.quantity, 0)::float8 AS quantity
+                 FROM market_instrument instrument
+                 LEFT JOIN portfolio_position position ON position.instrument_id = instrument.id
+                WHERE instrument.code = $1`,
+              [item.code],
             );
-            const existingReason = current.rows[0]?.attention_reason ?? null;
-            if (!current.rows[0]) throw new Error(`标的 ${item.code} 不在当前策略池中，自动作业不得绕过完整入池评估`);
-            if (item.action === "mark" && current.rows[0].quantity > 0) {
-              if (existingReason?.startsWith(DAILY_PREFIX)) {
-                const write = await setPoolAttention(client, {
-                  code: item.code,
-                  pool: item.pool,
-                  attention_reason: null,
-                  attention_from: null,
-                  attention_until: null,
+            const held = (current.rows[0]?.quantity ?? 0) > 0;
+            const existing = held
+              ? await client.query<{ source_job: string }>(
+                  `SELECT entry.source_job FROM pool_attention_entry entry
+                    JOIN market_instrument instrument ON instrument.id = entry.instrument_id
+                   WHERE instrument.code = $1 AND entry.source_job = $2`,
+                  [item.code, jobCode],
+                )
+              : { rows: [] as Array<{ source_job: string }> };
+            if (!current.rows[0]) throw new Error(`未知标的代码：${item.code}`);
+            const membership = await client.query<{ id: string }>(
+              `SELECT membership.id::text FROM pool_membership membership
+                 JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+                WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL`,
+              [item.code, WATCH_POOL],
+            );
+            if (!membership.rows[0]) {
+              throw new Error(`标的 ${item.code} 不在关注池中，自动作业不得绕过完整入池评估`);
+            }
+            if (item.action === "mark" && held) {
+              if (existing.rows[0]) {
+                const write = await setPoolAttentionEntry(client, {
+                  code: item.code, source_job: jobCode, status: item.attention_status!,
+                  reason: null,
                 });
                 items.push({
-                  code: item.code,
-                  pool: item.pool,
-                  action: "clear",
-                  previous_attention_reason: write.before.attention_reason,
-                  attention_reason: null,
-                  attention_from: null,
-                  attention_until: null,
+                  code: item.code, action: "clear",
+                  previous_reason: write.before?.reason ?? null,
                   suppressed_by: "existing_position",
                 });
               } else {
-                items.push({
-                  code: item.code,
-                  pool: item.pool,
-                  action: "skip",
-                  previous_attention_reason: existingReason,
-                  attention_reason: existingReason,
-                  suppressed_by: "existing_position",
-                });
+                items.push({ code: item.code, action: "skip", suppressed_by: "existing_position" });
               }
               continue;
             }
-            if (item.action === "clear" && !existingReason?.startsWith(DAILY_PREFIX)) {
-              throw new Error(`标的 ${item.code} 的关注不是每日计划自动创建，自动作业不得清除`);
-            }
-            if (item.action === "mark" && existingReason && !existingReason.startsWith(DAILY_PREFIX)) {
-              throw new Error(`标的 ${item.code} 已有人工关注原因，自动作业不得覆盖`);
-            }
-            if (item.action === "mark") kept.add(`${item.pool}:${item.code}`);
-            const write = item.action === "mark"
-              ? await setPoolAttention(client, {
-                  code: item.code,
-                  pool: item.pool,
-                  attention_reason: `${DAILY_PREFIX}${item.attention_status === "qualified" ? "已符合" : "即将符合"}：${item.attention_reason!.replace(/^每日计划·(?:已符合|即将符合)：/, "")}`,
-                  attention_signal: { status: item.attention_status!, missing_signals: item.missing_signals ?? [] },
-                  attention_from: item.attention_from!,
-                  attention_until: item.attention_until!,
-                })
-              : await setPoolAttention(client, {
-                  code: item.code,
-                  pool: item.pool,
-                  attention_reason: null,
-                  attention_from: null,
-                  attention_until: null,
-                });
+            if (item.action === "mark") kept.add(item.code);
+            const write = await setPoolAttentionEntry(client, {
+              code: item.code,
+              source_job: jobCode,
+              status: item.action === "mark" ? item.attention_status! : "qualified",
+              reason: item.action === "mark" ? item.attention_reason! : null,
+              missing_signals: item.action === "mark" ? item.missing_signals ?? [] : [],
+              valid_from: item.attention_from ?? undefined,
+              valid_until: item.action === "mark" ? item.attention_until ?? null : null,
+            });
             items.push({
               code: item.code,
-              pool: item.pool,
               action: item.action,
-              previous_attention_reason: write.before.attention_reason,
-              attention_signal: write.after.attention_signal,
-              attention_reason: write.after.attention_reason,
-              attention_from: write.after.attention_from,
-              attention_until: write.after.attention_until,
+              previous_reason: write.before?.reason ?? null,
+              reason: write.after?.reason ?? null,
+              attention_from: write.after?.valid_from ?? null,
+              attention_until: write.after?.valid_until ?? null,
             });
           }
-          const stale = await client.query<{ code: string; pool: "short" | "long" }>(
-            `SELECT instrument.code, membership.pool
-               FROM pool_membership membership
-               JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-              WHERE membership.effective_to IS NULL
-                AND membership.attention_reason LIKE $1
-                AND NOT ((membership.pool || ':' || instrument.code) = ANY($2::text[]))
-              ORDER BY membership.pool, instrument.code
-              FOR UPDATE OF membership`,
-            [`${DAILY_PREFIX}%`, [...kept]],
+          const stale = await client.query<{ code: string }>(
+            `SELECT instrument.code
+               FROM pool_attention_entry entry
+               JOIN market_instrument instrument ON instrument.id = entry.instrument_id
+              WHERE entry.source_job = $1
+                AND NOT (instrument.code = ANY($2::text[]))
+              ORDER BY instrument.code`,
+            [jobCode, [...kept]],
           );
           for (const item of stale.rows) {
-            const write = await setPoolAttention(client, {
-              code: item.code,
-              pool: item.pool,
-              attention_reason: null,
-              attention_from: null,
-              attention_until: null,
+            const write = await setPoolAttentionEntry(client, {
+              code: item.code, source_job: jobCode, status: "qualified", reason: null,
             });
             items.push({
-              code: item.code,
-              pool: item.pool,
-              action: "clear",
-              previous_attention_reason: write.before.attention_reason,
-              attention_reason: null,
-              attention_from: null,
-              attention_until: null,
+              code: item.code, action: "clear",
+              previous_reason: write.before?.reason ?? null,
               reconciled: true,
             });
           }
-          const summary = { total: items.length, items };
+          const summary = { source_job: jobCode, total: items.length, items };
           await insertToolAudit(client, {
             session_id: deps.sessionId,
             tool_name: "pool_attention_write",
@@ -217,7 +196,7 @@ export function buildJobDailyPlanTool(deps: {
       try {
         if (signal?.aborted) throw new Error("每日计划预案写入已中断");
         const input = validateDailyPlanWriteInput(rawInput);
-        const runId = await associatedRunningJob(deps.pool, deps.sessionId, "daily_plan_flow");
+        const { id: runId } = await associatedRunningJob(deps.pool, deps.sessionId, ["daily_plan_flow"]);
         const outcome = await withAgentMutationLock(deps.pool, async (client) => {
           const write = await replaceDraftPlaybook(client, {
             source_job_run_id: runId,
@@ -256,7 +235,7 @@ export function buildJobAuctionAssessmentTool(deps: {
       try {
         if (signal?.aborted) throw new Error("集合竞价研判写入已中断");
         const input = validateAuctionAssessmentWriteInput(rawInput);
-        const runId = await associatedRunningJob(deps.pool, deps.sessionId, "auction_opportunity_assessment");
+        const { id: runId } = await associatedRunningJob(deps.pool, deps.sessionId, ["auction_opportunity_assessment"]);
         const outcome = await withAgentMutationLock(deps.pool, async (client) => {
           const write = await replaceDraftAuctionAssessments(client, {
             source_job_run_id: runId,

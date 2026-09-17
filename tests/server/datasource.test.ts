@@ -12,6 +12,7 @@ import {
   HithinkEnvelopeError,
   fetchKline,
   fetchSnapshot,
+  fetchCorporateActions,
 } from "../../server/datasource/hithink.js";
 import { fetchAllTickers, fetchTickerPage, fetchTradingDays } from "../../server/datasource/hithink-meta.js";
 import { fetchBoardCatalog, fetchBoardConstituents } from "../../server/datasource/hithink-boards.js";
@@ -51,6 +52,20 @@ import {
   storeBars,
 } from "../../server/datasource/service.js";
 import type { Bar, Channel, FetchRequest } from "../../server/datasource/types.js";
+import {
+  recordCommodityFetchRun,
+  storeCompanyCommodityMetric,
+  storeCompanyCommodityProfile,
+  storeFuturesDailyDetail,
+  storeFuturesRoll,
+  storeMarketFactorObservation,
+  upsertFuturesContract,
+  upsertMarketFactorSeries,
+} from "../../server/datasource/commodity-service.js";
+import { fetchShfeCopperWeeklyInventory, fetchShfeDailyContracts } from "../../server/datasource/shfe.js";
+import { fetchCoastalPowerCoalHistory } from "../../server/datasource/jin10.js";
+import { fetchGfexLithiumWarehouseReceipt } from "../../server/datasource/gfex.js";
+import { syncShfeCopperWeeklyInventory, syncShfeFuturesDaily } from "../../server/datasource/shfe-service.js";
 
 const noopSleep = async () => {};
 const noWait = { limiter: new RateLimiter(0, noopSleep), sleep: noopSleep, apiKey: "test-placeholder" };
@@ -244,7 +259,7 @@ describe("datasource 限流与重试", () => {
     expect(flat[14]!.rsi14).toBe(50);
   });
 
-  it("五维股性、阶段和评分对相同输入稳定且只输出有限数", () => {
+  it("五维股性画像与阶段对相同输入稳定且只输出有限数", () => {
     const closes = Array.from({ length: 160 }, (_, index) => 10 + index * 0.02 + Math.sin(index / 6) * 0.4);
     const indicators = calculateIndicators(closes);
     const bars = closes.map((close, index) => ({
@@ -262,9 +277,9 @@ describe("datasource 限流与重试", () => {
     expect(STOCK_CHARACTER_CALCULATION_VERSION).toBe("标的入池五维画像一版");
     expect(Object.keys(first.dimensions)).toEqual(["washout", "markup", "false_breakout", "defense", "volatility"]);
     expect(first.stage).toBeTypeOf("string");
-    expect(first.grade).toMatch(/^[A-D]$/);
-    expect(first.score).not.toBeNull();
-    expect(Number.isFinite(first.score)).toBe(true);
+    // 标的评分机制已退役：画像只保留股性、阶段、标签与关键位。
+    expect(first).not.toHaveProperty("score");
+    expect(first).not.toHaveProperty("grade");
     for (const dimension of Object.values(first.dimensions)) {
       expect(Number.isFinite(dimension.score)).toBe(true);
       expect(Object.values(dimension.evidence).every((value) => value === null || Number.isFinite(value))).toBe(true);
@@ -339,6 +354,21 @@ describe("datasource 限流与重试", () => {
     await fetchStarted;
     requestController.abort();
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    vi.unstubAllGlobals();
+  });
+
+  it("公司行动按除权日解析现金分红、送股和配股字段", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({
+      code: 0, message: "success", data: { item: [{
+        ex_date_ms: Date.parse("2026-07-10T00:00:00Z"), dividend_per_share: 0.5,
+        per_share_bonus: 0.1, rights_ratio: 0.2, rights_price: 6.8,
+      }] },
+    })));
+    const rows = await fetchCorporateActions("600000.SH", "2026-01-01", "2026-09-16", noWait);
+    expect(rows).toEqual([expect.objectContaining({
+      code: "600000.SH", exDate: "2026-07-10", dividendPerShare: 0.5,
+      bonusPerShare: 0.1, rightsRatio: 0.2, rightsPrice: 6.8,
+    })]);
     vi.unstubAllGlobals();
   });
 
@@ -614,6 +644,37 @@ describe("datasource 限流与重试", () => {
     vi.unstubAllGlobals();
   });
 
+  it("广期所碳酸锂仓单日报只提取小计并校验数值", async () => {
+    const fetcher = vi.fn(async () => Response.json({ code: "0", data: [
+      { varietyOrder: "lc", variety: "碳酸锂", lastWbillQty: 10, wbillQty: 12, diff: 2 },
+      { varietyOrder: "lc", variety: "碳酸锂小计", lastWbillQty: 100, wbillQty: 90, diff: -10 },
+    ] }));
+    expect(await fetchGfexLithiumWarehouseReceipt("2026-09-15", { fetch: fetcher })).toEqual({
+      date: "2026-09-15", previousQuantity: 100, quantity: 90, change: -10,
+      sourceUrl: "http://www.gfex.com.cn/u/interfacesWebTdWbillWeeklyQuotes/loadList",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("沿海六大电厂公开归档严格解析库存、日耗和存煤可用天数", async () => {
+    const list = Array.from({ length: 120 }, (_, index) => {
+      const date = new Date(Date.UTC(2016, 0, 1 + index)).toISOString().slice(0, 10).replaceAll("-", "");
+      return { date, datas: { "沿海六大电厂库存动态报告": [String(1100 + index), "60", "18.5"] } };
+    });
+    const fetcher = vi.fn(async () => ({
+      ok: true, status: 200, text: async () => `var dataCenter_data = ${JSON.stringify({
+        kinds: ["沿海六大电库存", "日耗", "存煤可用天数"], list,
+      })};`,
+    } as Response));
+    const rows = await fetchCoastalPowerCoalHistory({ fetch: fetcher });
+    expect(rows).toHaveLength(120);
+    expect(rows[0]).toEqual({
+      date: "2016-01-01", inventoryTenThousandTonnes: 1100,
+      dailyConsumptionTenThousandTonnes: 60, availableDays: 18.5,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it("扶摇标的目录识别公募 REITs", async () => {
     const timestamp = Date.parse("2026-08-20T07:00:00+08:00");
     vi.stubGlobal("fetch", vi.fn(async (url: unknown) => {
@@ -796,6 +857,171 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       report_period: "2025-12-31",
     }]);
     expect(mock).toHaveBeenCalledTimes(8);
+  });
+
+  it("商品期货点时数据通过领域服务幂等保存且历史修订不被覆盖", async () => {
+    await upsertFuturesContract(pool, {
+      code: "CU0", name: "沪铜主力", exchange: "SHFE", commodityCode: "CU",
+      contractKind: "main_continuous", multiplier: 5, priceUnit: "人民币/吨", currency: "CNY", source: "test",
+    });
+    await upsertFuturesContract(pool, {
+      code: "CU2610", name: "沪铜2610", exchange: "SHFE", commodityCode: "CU",
+      contractKind: "listed", contractMonth: "202610", multiplier: 5, priceUnit: "人民币/吨",
+      currency: "CNY", lastTradeDate: "2026-10-15", source: "test",
+    });
+    await storeFuturesDailyDetail(pool, {
+      code: "CU2610", tradeDate: "2026-09-14", settlement: 80120, prevSettlement: 79800,
+      openInterest: 123456, upperLimit: 86000, lowerLimit: 74000, source: "test",
+    });
+    await storeFuturesRoll(pool, {
+      continuousCode: "CU0", underlyingCode: "CU2610", tradeDate: "2026-09-14",
+      methodCode: "open_interest_v1", adjustmentFactor: 1, source: "test",
+    });
+
+    await upsertMarketFactorSeries(pool, {
+      seriesCode: "test.cu.inventory.total", commodityCode: "CU", market: "SHFE", metricCode: "inventory",
+      frequency: "weekly", unit: "吨", source: "SHFE", revisionPolicy: "revisable",
+    });
+    const firstObservation = await storeMarketFactorObservation(pool, {
+      seriesCode: "test.cu.inventory.total", periodStart: "2026-09-07", periodEnd: "2026-09-11",
+      publishedAt: "2026-09-11T15:30:00+08:00", value: 98765, sourceRef: "test://shfe/2026-09-11",
+    });
+    expect(await storeMarketFactorObservation(pool, {
+      seriesCode: "test.cu.inventory.total", periodStart: "2026-09-07", periodEnd: "2026-09-11",
+      publishedAt: "2026-09-11T15:30:00+08:00", value: 98765, sourceRef: "test://shfe/2026-09-11",
+    })).toBe(firstObservation);
+    await expect(storeMarketFactorObservation(pool, {
+      seriesCode: "test.cu.inventory.total", periodStart: "2026-09-07", periodEnd: "2026-09-11",
+      publishedAt: "2026-09-11T15:30:00+08:00", value: 1, sourceRef: "test://shfe/2026-09-11",
+    })).rejects.toThrow("已存在不同值");
+    await storeMarketFactorObservation(pool, {
+      seriesCode: "test.cu.inventory.total", periodStart: "2026-09-07", periodEnd: "2026-09-11",
+      publishedAt: "2026-09-12T09:00:00+08:00", revisionNo: 1, value: 98760, sourceRef: "test://shfe/revision",
+    });
+
+    await ensureInstrument(pool, "600362.SH", "江西铜业", "day");
+    const profileId = await storeCompanyCommodityProfile(pool, {
+      code: "600362.SH", commodityCode: "CU", role: "integrated", effectiveFrom: "2025-01-01",
+      publishedAt: "2026-03-30T18:00:00+08:00", sourceRef: "test://filing/profile",
+    });
+    expect(await storeCompanyCommodityProfile(pool, {
+      code: "600362.SH", commodityCode: "CU", role: "integrated", effectiveFrom: "2025-01-01",
+      publishedAt: "2026-03-30T18:00:00+08:00", sourceRef: "test://filing/profile",
+    })).toBe(profileId);
+    const metricId = await storeCompanyCommodityMetric(pool, {
+      code: "600362.SH", commodityCode: "CU", reportPeriod: "2025-12-31",
+      publishedAt: "2026-03-30T18:00:00+08:00", metricCode: "equity_production",
+      value: 20.5, unit: "万吨", sourceRef: "test://filing/metric",
+    });
+    expect(await storeCompanyCommodityMetric(pool, {
+      code: "600362.SH", commodityCode: "CU", reportPeriod: "2025-12-31",
+      publishedAt: "2026-03-30T18:00:00+08:00", metricCode: "equity_production",
+      value: 20.5, unit: "万吨", sourceRef: "test://filing/metric",
+    })).toBe(metricId);
+    await expect(storeCompanyCommodityMetric(pool, {
+      code: "600362.SH", commodityCode: "CU", reportPeriod: "2025-12-31",
+      publishedAt: "2026-03-30T18:00:00+08:00", metricCode: "equity_production",
+      value: 99, unit: "万吨", sourceRef: "test://filing/metric",
+    })).rejects.toThrow("已存在不同值");
+
+    const fetchRunId = await recordCommodityFetchRun(pool, {
+      channel: "test", scope: { commodity: "CU", date: "2026-09-14" }, rowsWritten: 7,
+    });
+    const stored = await pool.query<{ contracts: number; observations: number; profiles: number; metrics: number; pipeline: string }>(
+      `SELECT
+         (SELECT count(*)::int FROM market_futures_contract) AS contracts,
+         (SELECT count(*)::int FROM market_factor_observation) AS observations,
+         (SELECT count(*)::int FROM company_commodity_profile) AS profiles,
+         (SELECT count(*)::int FROM company_commodity_metric) AS metrics,
+         (SELECT scope->>'pipeline' FROM market_fetch_run WHERE id=$1) AS pipeline`,
+      [fetchRunId],
+    );
+    expect(stored.rows[0]).toEqual({ contracts: 2, observations: 2, profiles: 1, metrics: 1, pipeline: "commodity_research" });
+  });
+
+  it("上期所官方日行情过滤小计并保存真实合约、结算持仓和主力映射", async () => {
+    const payload = {
+      report_date: "20260915",
+      o_curinstrument: [
+        { PRODUCTID: "cu_f    ", PRODUCTNAME: "铜", DELIVERYMONTH: "2609", OPENPRICE: 80000,
+          HIGHESTPRICE: 81000, LOWESTPRICE: 79500, CLOSEPRICE: 80500, SETTLEMENTPRICE: 80300,
+          PRESETTLEMENTPRICE: 79800, VOLUME: 2000, OPENINTEREST: 3000, OPENINTERESTCHG: -100, TURNOVER: 123 },
+        { PRODUCTGROUPID: "cu", PRODUCTNAME: "铜", DELIVERYMONTH: "2610", OPENPRICE: 80100,
+          HIGHESTPRICE: 81200, LOWESTPRICE: 80000, CLOSEPRICE: 81000, SETTLEMENTPRICE: 80800,
+          PRESETTLEMENTPRICE: 79900, VOLUME: 5000, OPENINTEREST: 9000, OPENINTERESTCHG: 200, TURNOVER: 456 },
+        { PRODUCTGROUPID: "cu", PRODUCTNAME: "铜", DELIVERYMONTH: "小计", OPENPRICE: "",
+          HIGHESTPRICE: "", LOWESTPRICE: "", CLOSEPRICE: "", SETTLEMENTPRICE: "",
+          PRESETTLEMENTPRICE: "", VOLUME: 7000, OPENINTEREST: 12000 },
+        { PRODUCTGROUPID: "al", PRODUCTNAME: "铝", DELIVERYMONTH: "2610", OPENPRICE: 20000,
+          HIGHESTPRICE: 20100, LOWESTPRICE: 19900, CLOSEPRICE: 20050, SETTLEMENTPRICE: 20020,
+          PRESETTLEMENTPRICE: 19980, VOLUME: 100, OPENINTEREST: 200 },
+      ],
+    };
+    const mockedFetch = vi.fn(async () => jsonResponse(payload));
+    expect(await fetchShfeDailyContracts("2026-09-15", "CU", { fetch: mockedFetch, sleep: noopSleep })).toHaveLength(2);
+    const result = await syncShfeFuturesDaily(pool, "2026-09-15", "CU", { fetch: mockedFetch, sleep: noopSleep });
+    expect(result).toMatchObject({ contractCount: 2, mainContractCode: "CU2610", gaps: [] });
+    const stored = await pool.query<{ code: string; close: number; settlement: number; open_interest: number }>(
+      `SELECT instrument.code,bar.close::float8,detail.settlement::float8,detail.open_interest::float8
+         FROM market_futures_daily_detail detail
+         JOIN market_instrument instrument ON instrument.id=detail.instrument_id
+         JOIN market_bar bar ON bar.instrument_id=detail.instrument_id AND bar.freq='futures_day'
+          AND bar.bar_date=detail.trade_date
+        WHERE detail.trade_date='2026-09-15' ORDER BY instrument.code`,
+    );
+    expect(stored.rows).toEqual([
+      { code: "CU2609", close: 80500, settlement: 80300, open_interest: 3000 },
+      { code: "CU2610", close: 81000, settlement: 80800, open_interest: 9000 },
+    ]);
+    expect((await pool.query(
+      `SELECT continuous.code AS continuous_code,underlying.code AS underlying_code,roll.method_code
+         FROM market_futures_roll roll
+         JOIN market_instrument continuous ON continuous.id=roll.continuous_instrument_id
+         JOIN market_instrument underlying ON underlying.id=roll.underlying_instrument_id
+        WHERE roll.trade_date='2026-09-15'`,
+    )).rows).toEqual([{ continuous_code: "CU0", underlying_code: "CU2610", method_code: "open_interest_v1" }]);
+    vi.unstubAllGlobals();
+  });
+
+  it("上期所铜库存周报兼容历史JSON和当前HTML并按发布时间落库", async () => {
+    const legacy = {
+      o_tradingday: "20260911", o_issueno: "35", update_date: "20260911 16:20:00",
+      o_cursor: [{
+        VARID: "cu", VARNAME: "铜$$COPPER", WHABBRNAME: "总计$$Total",
+        PRESPOTWGHTS: 63000, PREWRTWGHTS: 25781, SPOTWGHTS: 54780, WRTWGHTS: 20854,
+      }],
+    };
+    const legacyFetch = vi.fn(async () => jsonResponse(legacy));
+    const parsed = await fetchShfeCopperWeeklyInventory("2026-09-11", { fetch: legacyFetch });
+    expect(parsed).toMatchObject({
+      inventory: 54780, previousInventory: 63000, warehouseWarrant: 20854,
+      publishedAt: "2026-09-11T16:20:00+08:00",
+    });
+    const synced = await syncShfeCopperWeeklyInventory(pool, "2026-09-11", { fetch: legacyFetch });
+    expect(synced).toMatchObject({ inventory: 54780, previousInventory: 63000, rowsWritten: 1, gaps: [] });
+    const stored = await pool.query<{ value: number; published_at: string; source_ref: string }>(
+      `SELECT observation.value::float8,observation.published_at::text,observation.source_ref
+         FROM market_factor_observation observation
+         JOIN market_factor_series series ON series.id=observation.series_id
+        WHERE series.series_code='shfe.cu.inventory.total'`,
+    );
+    expect(stored.rows).toHaveLength(1);
+    expect(stored.rows[0]!.value).toBe(54780);
+    expect(stored.rows[0]!.source_ref).toContain("20260911weeklystock.dat");
+
+    const html = `<html><body>2026-09-12<table><tr class="special_row_type"><td><div class="cell">铜</div></td><td>单位：吨</td></tr>
+      <tr class="isTotal"><td colspan="2">总计</td><td>54,780</td><td>20,854</td><td>60,000</td><td>25,000</td><td>5,220</td><td>4,146</td></tr>
+      <tr class="special_row_type"><td><div class="cell">铝</div></td></tr></table></body></html>`;
+    let calls = 0;
+    const htmlFetch = vi.fn(async () => {
+      calls += 1;
+      return calls === 1
+        ? ({ status: 404, text: async () => "not found" } as Response)
+        : ({ status: 200, text: async () => html } as Response);
+    });
+    expect(await fetchShfeCopperWeeklyInventory("2026-09-12", { fetch: htmlFetch })).toMatchObject({
+      previousInventory: 54780, previousWarehouseWarrant: 20854, inventory: 60000, warehouseWarrant: 25000,
+    });
   });
 
   it("MA5/10/20/60 补算：构造 61 根等差收盘价验证数值，窗口不足留空", async () => {
@@ -1555,7 +1781,7 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     )).rows[0]!.rsi14)).toBeGreaterThanOrEqual(0);
     expect((await pool.query(
       `SELECT calculation_version, input_row_count, defense_break_count, defense_recovered_count,
-              stock_character_profile, stage, research_score::float8, grade, stock_character, tags
+              stock_character_profile, stage, stock_character, tags
          FROM market_stock_character_metric WHERE instrument_id = $1`,
       [instrumentId],
     )).rows[0]).toMatchObject({
@@ -1573,14 +1799,21 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
         },
       },
       stage: expect.any(String),
-      research_score: expect.any(Number),
-      grade: expect.stringMatching(/^[A-D]$/),
       stock_character: expect.any(String),
       tags: expect.arrayContaining(["画像版本：标的入池五维画像一版"]),
     });
     expect(Number((await pool.query(
       "SELECT count(*) FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
       [instrumentId],
+    )).rows[0]!.count)).toBe(0);
+
+    const wideInstrumentId = await ensureInstrument(pool, "601998.SH", "宽域快照股票", "day");
+    await expect(storeBars(pool, wideInstrumentId, "day", [{
+      date: "2026-09-17", open: 10, high: 10.5, low: 9.8, close: 10.2, volume: 1000, adjustment: "forward",
+    }], "hithink", { markIndicator: false })).resolves.toBe(1);
+    expect(Number((await pool.query(
+      "SELECT count(*) FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
+      [wideInstrumentId],
     )).rows[0]!.count)).toBe(0);
   });
 

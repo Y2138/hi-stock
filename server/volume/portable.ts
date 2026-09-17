@@ -14,7 +14,7 @@ import { ensureDatabase } from "./restore.js";
 import { redactEphemeralCode } from "../agent/redaction.js";
 
 export const DEFAULT_PORTABLE_DIR = path.join(PROJECT_ROOT, "bootstrap");
-export const PORTABLE_FORMAT_VERSION = 5 as const;
+export const PORTABLE_FORMAT_VERSION = 6 as const;
 export const PORTABLE_FORBIDDEN = [
   "system_setting.hithink_api_key",
   "notification_*",
@@ -41,19 +41,19 @@ interface PortableTableSpec {
 }
 
 /**
- * 可提交固定资产包的唯一白名单：当前策略正文/演进摘要 + 定时任务定义/提示词。
+ * 可提交固定资产包的唯一白名单：当前策略正文（组合总策略 + 任务级策略文档 + 指引）
+ * + 定时任务定义/提示词。
  * 未列出的运行数据和本机设置绝不进入 payload；尤其不读取任何 api_key。
- * 策略只携带当前最终正文，不携带历史版本。
+ * 策略只携带当前最终正文，不携带历史版本；演进摘要与提案审核流程已退役。
  * 表顺序同时是恢复插入顺序，必须满足外键依赖。
  */
 export const PORTABLE_TABLES: readonly PortableTableSpec[] = [
   { table: "job_prompt", columns: ["id", "code", "name", "status", "current_revision_id", "created_at", "updated_at"], orderBy: ["id"], identity: true },
   { table: "job_prompt_revision", columns: ["id", "prompt_id", "revision_no", "content", "sha256", "source", "base_revision_id", "change_summary", "created_at"], orderBy: ["id"], identity: true },
   { table: "job_definition", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
-  { table: "strategy_evolution_log", columns: ["id", "outline", "conclusion", "adjustments", "adoption_status", "strategy_hash_before", "strategy_hash_after", "created_at", "decided_at"], orderBy: ["id"], identity: true, jsonColumns: ["adjustments"] },
-  { table: "strategy_document", columns: ["id", "code", "title", "role", "injection_order", "content", "sha256", "created_at", "updated_at"], orderBy: ["id"], identity: true },
+  { table: "strategy_document", columns: ["id", "code", "title", "role", "injection_order", "job_code", "content", "sha256", "created_at", "updated_at"], orderBy: ["id"], identity: true },
   { table: "strategy_score_benchmark", columns: ["id", "document_id", "benchmark_code", "training_start", "training_end", "methodology", "distributions", "sample_counts", "source_summary", "sha256", "created_at"], orderBy: ["id"], identity: true, jsonColumns: ["distributions", "sample_counts", "source_summary"], dateColumns: ["training_start", "training_end"] },
-  { table: "strategy_state", columns: ["singleton", "change_seq", "current_hash", "last_evolution_id", "updated_at"], orderBy: ["singleton"] },
+  { table: "strategy_state", columns: ["singleton", "change_seq", "current_hash", "updated_at"], orderBy: ["singleton"] },
 ] as const;
 
 export interface PortableHashRow {
@@ -64,7 +64,7 @@ export interface PortableHashRow {
 }
 
 export interface PortableManifest {
-  version: 5;
+  version: typeof PORTABLE_FORMAT_VERSION;
   kind: "portable_fixed_assets";
   exported_at: string;
   migration_max: number;
@@ -239,7 +239,6 @@ const RESET_STATEMENTS = [
   "DELETE FROM agent_memory_artifact",
   "DELETE FROM agent_tool_metric",
   "DELETE FROM agent_run_metric",
-  "DELETE FROM agent_evaluation_run",
   "DELETE FROM market_dragon_tiger_entry",
   "DELETE FROM market_limit_ladder_snapshot",
   "DELETE FROM market_limit_event",
@@ -249,36 +248,25 @@ const RESET_STATEMENTS = [
   "DELETE FROM market_indicator_run",
   "DELETE FROM market_indicator_dirty",
   "DELETE FROM job_run_output",
-  "DELETE FROM strategy_evolution_backtest",
   "DELETE FROM strategy_score_benchmark",
   "DELETE FROM strategy_state",
-  "DELETE FROM strategy_publish_proposal",
-  "DELETE FROM strategy_evolution_log",
   "DELETE FROM strategy_document",
   "DELETE FROM analysis_run",
   "DELETE FROM fundamental_snapshot",
   "DELETE FROM valuation_snapshot",
-  "DELETE FROM backtest_run",
-  "DELETE FROM backtest_input_set",
-  "DELETE FROM portfolio_position_snapshot_daily",
   "DELETE FROM portfolio_position_change",
   "DELETE FROM portfolio_position",
   "DELETE FROM portfolio_account_state",
-  "DELETE FROM portfolio_account_snapshot",
   "DELETE FROM job_run",
   "DELETE FROM job_definition",
   "UPDATE job_prompt SET current_revision_id = NULL",
   "DELETE FROM job_prompt_revision",
   "DELETE FROM job_prompt",
-  "UPDATE content_document SET current_revision_id = NULL",
-  "DELETE FROM content_legacy_import",
-  "DELETE FROM content_revision",
-  "DELETE FROM content_document",
+  "DELETE FROM pool_attention_entry",
   "DELETE FROM pool_board_preference",
   "DELETE FROM pool_membership",
   "DELETE FROM market_bar",
   "DELETE FROM market_board_membership",
-  "DELETE FROM market_system_tracking",
   "DELETE FROM market_trading_day",
   "DELETE FROM market_board",
   "DELETE FROM market_instrument_alias",

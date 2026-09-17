@@ -1,20 +1,31 @@
-// 短线池/长线池领域：当前角色、研究属性、板块投影与展示偏好。
+// 关注池领域：当前成员、股性画像、板块投影、多来源近期关注与展示偏好。
 import type pg from "pg";
 import { inServiceTransaction, type TransactionDb } from "../../db/transaction.js";
 
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
-export type PoolKind = "short" | "long";
+export type PoolKind = "watch";
+export const WATCH_POOL: PoolKind = "watch";
+export const WATCH_POOL_ROLE = "关注";
+export const MANUAL_ATTENTION_SOURCE = "manual";
+
 export interface PoolAttentionSignal {
   status: "qualified" | "approaching";
   missing_signals: string[];
+}
+
+export interface PoolAttentionEntry {
+  source_job: string;
+  status: "qualified" | "approaching" | "manual";
+  reason: string;
+  missing_signals: string[];
+  valid_from: string;
+  valid_until: string | null;
 }
 
 export interface PoolMemberRow {
   id: string;
   pool: PoolKind;
   role: string;
-  grade: string | null;
-  score: number | null;
   tags: string[];
   stock_character: string | null;
   stock_character_profile: Record<string, unknown>;
@@ -26,10 +37,7 @@ export interface PoolMemberRow {
   effective_from: string;
   effective_to: string | null;
   note: string | null;
-  attention_signal: PoolAttentionSignal | null;
-  attention_reason: string | null;
-  attention_from: string | null;
-  attention_until: string | null;
+  attention_entries: PoolAttentionEntry[];
   code: string;
   name: string;
   kind: string;
@@ -64,11 +72,11 @@ export interface PoolViewData {
 }
 
 const MEMBER_SELECT = `SELECT membership.id::text, membership.pool, membership.role,
-  membership.grade, membership.score::float8, membership.tags,
+  membership.tags,
   membership.stock_character, membership.stock_character_profile, membership.stage, membership.evaluation_summary,
   membership.profile_as_of::text, membership.profile_calculation_version, membership.profile_input_sha256,
   membership.effective_from::text, membership.effective_to::text, membership.note,
-  membership.attention_signal, membership.attention_reason, membership.attention_from::text, membership.attention_until::text,
+  COALESCE(attention_list.entries, '[]'::jsonb) AS attention_entries,
   instrument.code, instrument.name, instrument.kind,
   latest_close.close::float8 AS last,
   latest_close.prev_close::float8,
@@ -90,6 +98,17 @@ LEFT JOIN LATERAL (
 ) latest_close ON true
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(jsonb_build_object(
+           'source_job', entry.source_job, 'status', entry.status, 'reason', entry.reason,
+           'missing_signals', entry.missing_signals,
+           'valid_from', entry.valid_from::text, 'valid_until', entry.valid_until::text
+         ) ORDER BY entry.source_job) AS entries
+    FROM pool_attention_entry entry
+   WHERE entry.instrument_id = membership.instrument_id
+     AND entry.valid_from <= $2::date
+     AND (entry.valid_until IS NULL OR entry.valid_until >= $2::date)
+) attention_list ON true
+LEFT JOIN LATERAL (
+  SELECT jsonb_agg(jsonb_build_object(
            'code', board_instrument.code, 'name', board_instrument.name, 'board_type', board.board_type,
            'level', CASE WHEN board_instrument.code LIKE '881%.TI' THEN 'primary' ELSE 'secondary' END
          ) ORDER BY CASE WHEN board_instrument.code LIKE '881%.TI' THEN 0 ELSE 1 END, board_instrument.name) AS boards
@@ -102,12 +121,13 @@ LEFT JOIN LATERAL (
      AND (board_instrument.code LIKE '881%.TI' OR board_instrument.code LIKE '884%.TI')
 ) board_list ON true`;
 
-export async function listPoolView(db: Db, pool: PoolKind): Promise<PoolViewData> {
+export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData> {
+  const asOfDate = asOf ?? new Date().toISOString().slice(0, 10);
   const members = await db.query<PoolMemberRow>(
     `${MEMBER_SELECT}
       WHERE membership.pool = $1 AND membership.effective_to IS NULL
-      ORDER BY membership.score DESC NULLS LAST, instrument.code`,
-    [pool],
+      ORDER BY instrument.code`,
+    [WATCH_POOL, asOfDate],
   );
   const boards = await db.query<PoolBoardRow>(
     `SELECT board_instrument.code, board_instrument.name, board.board_type, 'primary'::text AS level,
@@ -140,16 +160,13 @@ export async function listPoolView(db: Db, pool: PoolKind): Promise<PoolViewData
       GROUP BY board_instrument.id, board.instrument_id, preference.sort,
                latest_close.close, latest_close.prev_close, latest_close.bar_date
       ORDER BY preference.sort NULLS LAST, count(DISTINCT membership.id) DESC, board_instrument.name`,
-    [pool],
+    [WATCH_POOL],
   );
-  const today = new Date().toISOString().slice(0, 10);
   return {
-    pool,
+    pool: WATCH_POOL,
     members: members.rows,
     boards: boards.rows,
-    attention_count: members.rows.filter((row) =>
-      row.attention_reason && (!row.attention_from || row.attention_from <= today) && (!row.attention_until || row.attention_until >= today),
-    ).length,
+    attention_count: members.rows.filter((row) => row.attention_entries.length > 0).length,
     unclassified_count: members.rows.filter((row) => row.kind === "stock" && row.boards.length === 0).length,
   };
 }
@@ -159,8 +176,6 @@ export interface PoolChangeInput {
   code: string;
   pool: PoolKind;
   role?: string;
-  grade?: string;
-  score?: number;
   tags?: string[];
   stock_character?: string;
   stock_character_profile?: Record<string, unknown>;
@@ -169,21 +184,19 @@ export interface PoolChangeInput {
   profile_as_of?: string;
   profile_calculation_version?: string;
   profile_input_sha256?: string;
-  attention_reason?: string | null;
-  attention_from?: string | null;
-  attention_until?: string | null;
   effective_from: string;
   note?: string;
   evaluation_session_id?: string | null;
 }
 
-export interface PoolAttentionInput {
-  attention_signal?: PoolAttentionSignal | null;
+export interface PoolAttentionEntryInput {
   code: string;
-  pool: PoolKind;
-  attention_reason: string | null;
-  attention_from: string | null;
-  attention_until: string | null;
+  source_job: string;
+  status: "qualified" | "approaching" | "manual";
+  reason: string | null;
+  missing_signals?: string[];
+  valid_from?: string;
+  valid_until?: string | null;
 }
 
 function validDate(value: string): boolean {
@@ -197,78 +210,118 @@ function requiredText(value: string | undefined | null, label: string): string {
   return normalized;
 }
 
-/** 近期关注是当前角色上的短期状态，不生成新的角色历史行。 */
-export async function setPoolAttention(
+function validateEntryInput(input: PoolAttentionEntryInput): { reason: string; missing: string[]; from: string; until: string | null } {
+  const reason = input.reason?.trim() ?? "";
+  const missing = input.missing_signals ?? [];
+  if (!reason) {
+    if (missing.length) throw new Error("清除关注条目时不得携带缺失条件");
+    return { reason: "", missing: [], from: "", until: null };
+  }
+  if (reason.length > 500) throw new Error("关注原因不得超过 500 字");
+  if (!["qualified", "approaching", "manual"].includes(input.status)) throw new Error("关注状态无效");
+  if (input.status !== "approaching" && missing.length) {
+    throw new Error("只有待补信号状态可以携带缺失条件");
+  }
+  if (input.status === "approaching" && !missing.length) {
+    throw new Error("待补信号状态必须逐项列出缺失条件");
+  }
+  if (missing.length > 20 || missing.some((item) => typeof item !== "string" || !item.trim() || item.length > 200)) {
+    throw new Error("缺失条件列表无效");
+  }
+  const from = input.valid_from ?? new Date().toISOString().slice(0, 10);
+  if (!validDate(from)) throw new Error("valid_from 必须是有效日期");
+  const until = input.valid_until ?? null;
+  if (until && !validDate(until)) throw new Error("valid_until 必须是有效日期");
+  if (until && until < from) throw new Error("valid_until 不得早于 valid_from");
+  return { reason, missing, from, until };
+}
+
+/** 关注条目按来源独立维护：写入或更新同来源条目，reason 为空时删除该来源条目。 */
+export async function setPoolAttentionEntry(
   db: TransactionDb,
-  input: PoolAttentionInput,
-): Promise<{ before: PoolMemberRow; after: PoolMemberRow }> {
+  input: PoolAttentionEntryInput,
+): Promise<{ before: PoolAttentionEntry | null; after: PoolAttentionEntry | null }> {
   return inServiceTransaction(db, async (client) => {
-    const current = await client.query<PoolMemberRow>(
-      `${MEMBER_SELECT}
-        WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL
-        ORDER BY membership.id DESC LIMIT 1 FOR UPDATE OF membership`,
-      [input.code, input.pool],
+    const instrument = await client.query<{ id: string }>(
+      "SELECT id::text FROM market_instrument WHERE code = $1",
+      [input.code],
     );
-    const before = current.rows[0];
-    if (!before) throw new Error(`标的 ${input.code} 不在当前${input.pool === "short" ? "短线" : "长线"}池中`);
-    const reason = input.attention_reason?.trim() || null;
-    const signal = reason ? input.attention_signal ?? null : null;
-    if (signal) {
-      if (!["qualified", "approaching"].includes(signal.status) ||
-          !Array.isArray(signal.missing_signals) || signal.missing_signals.length > 20 ||
-          signal.missing_signals.some((item) => typeof item !== "string" || !item.trim() || item.length > 200)) {
-        throw new Error("关注信号状态或缺失条件无效");
-      }
-      if (signal.status === "qualified" && signal.missing_signals.length) throw new Error("已成立信号不得包含缺失条件");
+    if (!instrument.rows[0]) throw new Error(`未知标的代码：${input.code}`);
+    const membership = await client.query<{ id: string }>(
+      `SELECT id::text FROM pool_membership
+        WHERE instrument_id = $1 AND pool = $2 AND effective_to IS NULL FOR UPDATE`,
+      [instrument.rows[0].id, WATCH_POOL],
+    );
+    if (!membership.rows[0]) throw new Error(`标的 ${input.code} 不在关注池中`);
+    const current = await client.query<PoolAttentionEntry>(
+      `SELECT source_job, status, reason, missing_signals, valid_from::text, valid_until::text
+         FROM pool_attention_entry
+        WHERE instrument_id = $1 AND source_job = $2`,
+      [instrument.rows[0].id, input.source_job],
+    );
+    const before = current.rows[0] ?? null;
+    const parsed = validateEntryInput(input);
+    if (!parsed.reason) {
+      await client.query(
+        "DELETE FROM pool_attention_entry WHERE instrument_id = $1 AND source_job = $2",
+        [instrument.rows[0].id, input.source_job],
+      );
+      return { before, after: null };
     }
-    if (input.attention_from && !validDate(input.attention_from)) throw new Error("attention_from 必须是有效日期");
-    if (input.attention_until && !validDate(input.attention_until)) throw new Error("attention_until 必须是有效日期");
-    if (input.attention_from && input.attention_until && input.attention_until < input.attention_from) {
-      throw new Error("attention_until 不得早于 attention_from");
-    }
-    if (!reason && (input.attention_from || input.attention_until)) throw new Error("清除近期关注时必须同时清除起止日期");
     await client.query(
-      `UPDATE pool_membership
-          SET attention_reason = $2, attention_from = $3, attention_until = $4, attention_signal = $5
-        WHERE id = $1`,
-      [before.id, reason, input.attention_from, input.attention_until, signal ? JSON.stringify(signal) : null],
+      `INSERT INTO pool_attention_entry
+         (instrument_id, source_job, status, reason, missing_signals, valid_from, valid_until, updated_at)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7, now())
+       ON CONFLICT (instrument_id, source_job) DO UPDATE SET
+         status = EXCLUDED.status, reason = EXCLUDED.reason, missing_signals = EXCLUDED.missing_signals,
+         valid_from = EXCLUDED.valid_from, valid_until = EXCLUDED.valid_until, updated_at = now()`,
+      [
+        instrument.rows[0].id, input.source_job, input.status, parsed.reason,
+        JSON.stringify(parsed.missing), parsed.from, parsed.until,
+      ],
     );
-    const after = await client.query<PoolMemberRow>(`${MEMBER_SELECT} WHERE membership.id = $1`, [before.id]);
-    return { before, after: after.rows[0]! };
+    const afterRows = await client.query<PoolAttentionEntry>(
+      `SELECT source_job, status, reason, missing_signals, valid_from::text, valid_until::text
+         FROM pool_attention_entry WHERE instrument_id = $1 AND source_job = $2`,
+      [instrument.rows[0].id, input.source_job],
+    );
+    return { before, after: afterRows.rows[0] ?? null };
   });
 }
 
-/** 用户从池页面手动移除近期关注；只清空当前角色的短期关注状态。 */
+/** 用户从池页面手动移除某个来源的近期关注；人工页面移除只清人工条目。 */
 export async function clearPoolAttention(
   db: TransactionDb,
-  input: { code: string; pool: PoolKind },
-): Promise<{ before: PoolMemberRow; after: PoolMemberRow } | null> {
+  input: { code: string; source_job?: string },
+): Promise<{ before: PoolAttentionEntry | null; after: PoolAttentionEntry | null } | null> {
   return inServiceTransaction(db, async (client) => {
-    const current = await client.query<PoolMemberRow>(
-      `${MEMBER_SELECT}
-        WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL
-        ORDER BY membership.id DESC LIMIT 1 FOR UPDATE OF membership`,
-      [input.code, input.pool],
+    const source = input.source_job ?? MANUAL_ATTENTION_SOURCE;
+    const instrument = await client.query<{ id: string }>(
+      "SELECT id::text FROM market_instrument WHERE code = $1",
+      [input.code],
     );
-    const before = current.rows[0];
-    if (!before) return null;
+    if (!instrument.rows[0]) return null;
+    const current = await client.query<PoolAttentionEntry>(
+      `SELECT source_job, status, reason, missing_signals, valid_from::text, valid_until::text
+         FROM pool_attention_entry WHERE instrument_id = $1 AND source_job = $2`,
+      [instrument.rows[0].id, source],
+    );
+    if (!current.rows[0]) return null;
     await client.query(
-      `UPDATE pool_membership
-          SET attention_reason = NULL, attention_from = NULL, attention_until = NULL, attention_signal = NULL
-        WHERE id = $1`,
-      [before.id],
+      "DELETE FROM pool_attention_entry WHERE instrument_id = $1 AND source_job = $2",
+      [instrument.rows[0].id, source],
     );
-    const after = await client.query<PoolMemberRow>(`${MEMBER_SELECT} WHERE membership.id = $1`, [before.id]);
-    return { before, after: after.rows[0]! };
+    return { before: current.rows[0], after: null };
   });
 }
 
-/** 跨日角色变化保留历史；同日重新初始化原地刷新当前行。 */
+/** 跨日入池变化保留历史；同日重新初始化原地刷新当前行。 */
 export async function applyPoolChange(
   db: TransactionDb,
   input: PoolChangeInput,
 ): Promise<{ before: PoolMemberRow | null; after: PoolMemberRow | null }> {
   if (!validDate(input.effective_from)) throw new Error("effective_from 必须是有效的 YYYY-MM-DD 日期");
+  if (input.pool !== WATCH_POOL) throw new Error("系统当前只有单一关注池（watch）");
   return inServiceTransaction(db, async (client) => {
     const instrument = await client.query<{ id: string; kind: string }>(
       "SELECT id::text, kind FROM market_instrument WHERE code = $1 FOR UPDATE",
@@ -280,34 +333,19 @@ export async function applyPoolChange(
       `${MEMBER_SELECT}
         WHERE membership.instrument_id = $1 AND membership.effective_to IS NULL
         ORDER BY membership.id DESC LIMIT 1 FOR UPDATE OF membership`,
-      [instrumentId],
+      [instrumentId, input.effective_from],
     );
     const before = current.rows[0] ?? null;
 
-    if (input.action === "add" && before) throw new Error(`标的 ${input.code} 已有当前角色 ${before.pool}/${before.role}，请用 update`);
+    if (input.action === "add" && before) throw new Error(`标的 ${input.code} 已在关注池中（角色 ${before.role}），请用 update`);
     if ((input.action === "update" || input.action === "remove") && !before) throw new Error(`标的 ${input.code} 没有当前策略角色`);
     if (input.action === "remove") {
       await client.query("UPDATE pool_membership SET effective_to = $2 WHERE id = $1", [before!.id, input.effective_from]);
       return { before, after: null };
     }
 
-    const attentionOnly = input.action === "update" && before?.pool === input.pool &&
-      [input.role, input.grade, input.score, input.tags, input.stock_character, input.stock_character_profile, input.stage,
-       input.evaluation_summary, input.note].every((value) => value === undefined) &&
-      [input.attention_reason, input.attention_from, input.attention_until].some((value) => value !== undefined);
-    if (attentionOnly) {
-      return setPoolAttention(client, {
-        code: input.code,
-        pool: input.pool,
-        attention_signal: input.attention_reason === undefined ? before.attention_signal : null,
-        attention_reason: input.attention_reason === undefined ? before.attention_reason : input.attention_reason,
-        attention_from: input.attention_from === undefined ? before.attention_from : input.attention_from,
-        attention_until: input.attention_until === undefined ? before.attention_until : input.attention_until,
-      });
-    }
-
-    const role = requiredText(input.role ?? before?.role, "role");
-    const grade = requiredText(input.grade ?? before?.grade, "grade");
+    const role = requiredText(input.role ?? before?.role ?? WATCH_POOL_ROLE, "role");
+    if (role !== WATCH_POOL_ROLE) throw new Error(`池统一后入池角色固定为“${WATCH_POOL_ROLE}”`);
     const stockCharacter = requiredText(input.stock_character ?? before?.stock_character, "stock_character");
     const stage = requiredText(input.stage ?? before?.stage, "stage");
     const evaluationSummary = requiredText(input.evaluation_summary ?? before?.evaluation_summary, "evaluation_summary");
@@ -317,12 +355,13 @@ export async function applyPoolChange(
     const profileInputSha256 = input.profile_input_sha256 ?? before?.profile_input_sha256 ?? null;
     if (profileAsOf && !validDate(profileAsOf)) throw new Error("profile_as_of 必须是有效日期");
     if (profileInputSha256 && !/^[a-f0-9]{64}$/.test(profileInputSha256)) throw new Error("profile_input_sha256 非法");
-    const score = input.score ?? before?.score;
-    if (score === null || score === undefined || !Number.isFinite(score)) throw new Error("score 必须是有限数值");
     const tags = (input.tags ?? before?.tags)?.map((tag) => String(tag).trim());
     if (!tags || tags.length === 0 || tags.some((tag) => !tag)) throw new Error("tags 至少包含一个非空标签");
     if (tags.some((tag) => tag.startsWith("板块："))) {
       throw new Error("tags 不再接受“板块：”本地标签；所属行业只读取同花顺官方关系");
+    }
+    if (tags.some((tag) => tag.startsWith("评分：") || tag.startsWith("分级："))) {
+      throw new Error("标的评分机制已退役，tags 不再接受评分或分级标签");
     }
     if (instrument.rows[0].kind === "stock") {
       const industry = await client.query(
@@ -337,49 +376,42 @@ export async function applyPoolChange(
       if (!industry.rows[0]) throw new Error("同花顺官方行业关系尚未同步；当前标的不允许入池");
     }
 
-    const attentionFrom = input.attention_from === undefined ? before?.attention_from ?? null : input.attention_from;
-    const attentionUntil = input.attention_until === undefined ? before?.attention_until ?? null : input.attention_until;
-    if (attentionFrom && !validDate(attentionFrom)) throw new Error("attention_from 必须是有效日期");
-    if (attentionUntil && !validDate(attentionUntil)) throw new Error("attention_until 必须是有效日期");
-    if (attentionFrom && attentionUntil && attentionUntil < attentionFrom) throw new Error("attention_until 不得早于 attention_from");
-
-    const attentionSignal = input.attention_reason === undefined ? before?.attention_signal ?? null : null;
     const values = [
-      input.pool, role, grade, score, JSON.stringify(tags), stockCharacter,
+      input.pool, role, JSON.stringify(tags), stockCharacter,
       JSON.stringify(stockCharacterProfile), stage, evaluationSummary,
       profileAsOf, profileCalculationVersion, profileInputSha256,
-      input.attention_reason === undefined ? before?.attention_reason ?? null : input.attention_reason,
-      attentionFrom, attentionUntil, input.evaluation_session_id ?? null,
+      input.evaluation_session_id ?? null,
       input.effective_from, input.note ?? before?.note ?? null,
     ];
     // 同一生效日再次初始化属于当日档案刷新，原行更新可避免唯一键冲突和零时长历史。
     if (before?.effective_from === input.effective_from) {
       await client.query(
         `UPDATE pool_membership SET
-           pool=$2, role=$3, grade=$4, score=$5, tags=$6, stock_character=$7,
-           stock_character_profile=$8, stage=$9, evaluation_summary=$10, profile_as_of=$11,
-           profile_calculation_version=$12, profile_input_sha256=$13, attention_reason=$14,
-           attention_from=$15, attention_until=$16, evaluation_session_id=$17, note=$18, attention_signal=$19
+           pool=$2, role=$3, tags=$4, stock_character=$5,
+           stock_character_profile=$6, stage=$7, evaluation_summary=$8, profile_as_of=$9,
+           profile_calculation_version=$10, profile_input_sha256=$11, evaluation_session_id=$12,
+           note=$13
          WHERE id=$1`,
-        [before.id, ...values.slice(0, 16), values[17], attentionSignal ? JSON.stringify(attentionSignal) : null],
+        // values 中的 effective_from 只用于新建历史行，同日刷新时不在 UPDATE 列中。
+        [before.id, ...values.slice(0, 11), values[12]],
       );
-      const afterRows = await client.query<PoolMemberRow>(`${MEMBER_SELECT} WHERE membership.id = $1`, [before.id]);
+      const afterRows = await client.query<PoolMemberRow>(`${MEMBER_SELECT} WHERE membership.id = $1`, [before.id, input.effective_from]);
       return { before, after: afterRows.rows[0]! };
     }
 
     if (before) await client.query("UPDATE pool_membership SET effective_to = $2 WHERE id = $1", [before.id, input.effective_from]);
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO pool_membership
-         (instrument_id, pool, role, grade, score, tags, stock_character, stock_character_profile, stage,
-          evaluation_summary, profile_as_of, profile_calculation_version, profile_input_sha256, attention_reason,
-          attention_from, attention_until, evaluation_session_id, effective_from, note, attention_signal)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         (instrument_id, pool, role, tags, stock_character, stock_character_profile, stage,
+          evaluation_summary, profile_as_of, profile_calculation_version, profile_input_sha256,
+          evaluation_session_id, effective_from, note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING id::text`,
-      [instrumentId, ...values, attentionSignal ? JSON.stringify(attentionSignal) : null],
+      [instrumentId, ...values],
     );
     const afterRows = await client.query<PoolMemberRow>(
       `${MEMBER_SELECT} WHERE membership.id = $1`,
-      [inserted.rows[0]!.id],
+      [inserted.rows[0]!.id, input.effective_from],
     );
     return { before, after: afterRows.rows[0]! };
   });
@@ -387,7 +419,6 @@ export async function applyPoolChange(
 
 export async function setPoolBoardOrder(
   db: TransactionDb,
-  pool: PoolKind,
   boardCodes: string[],
 ): Promise<{ pool: PoolKind; board_codes: string[] }> {
   return inServiceTransaction(db, async (client) => {
@@ -405,13 +436,13 @@ export async function setPoolBoardOrder(
       : { rows: [] as Array<{ id: string; code: string }> };
     if (boards.rows.length !== unique.length) throw new Error("board_codes 只能包含已同步的同花顺官方大行业");
     const byCode = new Map(boards.rows.map((row) => [row.code, row.id]));
-    await client.query("DELETE FROM pool_board_preference WHERE pool = $1", [pool]);
+    await client.query("DELETE FROM pool_board_preference WHERE pool = $1", [WATCH_POOL]);
     for (let index = 0; index < unique.length; index += 1) {
       await client.query(
         "INSERT INTO pool_board_preference (pool, board_instrument_id, sort) VALUES ($1,$2,$3)",
-        [pool, byCode.get(unique[index]!)!, index],
+        [WATCH_POOL, byCode.get(unique[index]!)!, index],
       );
     }
-    return { pool, board_codes: unique };
+    return { pool: WATCH_POOL, board_codes: unique };
   });
 }

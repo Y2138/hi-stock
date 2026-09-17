@@ -1,16 +1,36 @@
-import type { PoolMember } from "../api/types";
+import type { PoolAttentionEntry, PoolMember } from "../api/types";
 
-type AttentionMember = Pick<PoolMember, "attention_signal" | "code">;
+type AttentionEntryLike = Pick<PoolAttentionEntry, "status" | "reason" | "missing_signals" | "valid_from" | "valid_until" | "source_job">;
+type AttentionMember = Pick<PoolMember, "attention_entries" | "code">;
 
-/** 信号完整度分档；不混用研究评分，也不按不同策略的条件条数推断质量。 */
+const STATUS_RANK: Record<AttentionEntryLike["status"], number> = {
+  qualified: 0,
+  approaching: 1,
+  manual: 2,
+};
+
+/** 信号完整度分档：已成立 → 待补信号 → 人工关注；不混用不同来源的质量评估。 */
 export function compareAttentionQuality(left: AttentionMember, right: AttentionMember): number {
-  const rank = (member: AttentionMember) => member.attention_signal?.status === "qualified" ? 0
-    : member.attention_signal?.status === "approaching" ? 1 : 2;
+  const rank = (member: AttentionMember) =>
+    Math.min(...(member.attention_entries.length ? member.attention_entries.map((entry) => STATUS_RANK[entry.status]) : [3]));
   return rank(left) - rank(right) || left.code.localeCompare(right.code);
 }
 
-export function attentionSignalLabel(member: AttentionMember): string {
-  if (member.attention_signal?.status === "qualified") return "信号已成立";
-  if (member.attention_signal?.status === "approaching") return "待补信号 · 次日观察";
-  return "信号状态未明确";
+export function attentionStatusLabel(entry: AttentionEntryLike): string {
+  if (entry.status === "qualified") return "信号已成立";
+  if (entry.status === "approaching") return "待补信号 · 次日观察";
+  return "人工关注";
+}
+
+export function attentionSourceLabel(entry: AttentionEntryLike): string {
+  if (entry.source_job === "manual") return "人工";
+  if (entry.source_job === "daily_plan_flow") return "每日计划";
+  if (entry.source_job === "nightly_sector_opportunity_scan") return "夜间板块";
+  if (entry.source_job === "value_anchor_opportunity_scan") return "价值错杀";
+  return entry.source_job;
+}
+
+export function memberAttentionLabel(member: AttentionMember): string {
+  if (!member.attention_entries.length) return "信号状态未明确";
+  return member.attention_entries.map((entry) => attentionStatusLabel(entry)).join("；");
 }

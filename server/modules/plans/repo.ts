@@ -530,18 +530,25 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
     db.query<{
       code: string;
       name: string;
-      pool: "short" | "long";
+      pool: "watch";
       role: string;
-      attention_reason: string | null;
-      attention_from: string | null;
-      attention_until: string | null;
+      attention: Array<{ source_job: string; reason: string }>;
     }>(
       `SELECT instrument.code, instrument.name, membership.pool, membership.role,
-              membership.attention_reason, membership.attention_from::text, membership.attention_until::text
+              COALESCE(attention.entries, '[]'::jsonb) AS attention
          FROM pool_membership membership
          JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+         LEFT JOIN LATERAL (
+           SELECT jsonb_agg(jsonb_build_object('source_job', entry.source_job, 'reason', entry.reason)
+                            ORDER BY entry.source_job) AS entries
+             FROM pool_attention_entry entry
+            WHERE entry.instrument_id = membership.instrument_id
+              AND entry.valid_from <= $1::date
+              AND (entry.valid_until IS NULL OR entry.valid_until >= $1::date)
+         ) attention ON true
         WHERE membership.effective_to IS NULL
         ORDER BY membership.pool, instrument.code`,
+      [targetDate],
     ),
   ]);
 
@@ -600,19 +607,16 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
     if (conflict) gaps.push({ scope: "opportunity", code: item.code, reason: `打板候选冲突：${conflict}` });
     return { ...compactPlaybookItem(item), conflict };
   });
+  // 关注池多来源条目：同一标的多来源并列，不合成统一原因；已持仓标的不进入自动关注。
   const attentions = poolResult.rows
-    .filter((member) => member.attention_reason !== null)
-    .filter((member) => !member.attention_from || member.attention_from <= targetDate)
-    .filter((member) => !member.attention_until || member.attention_until >= targetDate)
+    .filter((member) => member.attention.length > 0)
     .filter((member) => !positionCodes.has(member.code))
     .map((member) => ({
       code: member.code,
       name: member.name,
       pool: member.pool,
       role: member.role,
-      attention_reason: member.attention_reason,
-      attention_from: member.attention_from,
-      attention_until: member.attention_until,
+      attention: member.attention,
     }));
   const positionItems = positions.map((position) => ({
     code: position.code,

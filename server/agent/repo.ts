@@ -6,7 +6,7 @@ import { redactAgentMessage, redactEphemeralCode } from "./redaction.js";
 
 export type Db = Pick<pg.Pool, "query">;
 
-export type ChatSessionType = "interactive" | "job" | "backtest" | "strategy_evolution";
+export type ChatSessionType = "interactive" | "job";
 export type ChatSessionStatus =
   | "idle"
   | "queued"
@@ -347,17 +347,6 @@ export async function listToolAudits(db: Db, limit: number): Promise<ToolAuditRo
   const r = await db.query<ToolAuditRow>(
     `SELECT id::text, session_id::text, tool_name, args, result_sha256, status, created_at
        FROM agent_tool_audit ORDER BY id DESC LIMIT $1`,
-    [limit],
-  );
-  return r.rows;
-}
-
-/** M4 占位：agent_external_cli_run 只建表不接逻辑，此处仅提供空表读取供审计端点使用 */
-export async function listCliRuns(db: Db, limit: number): Promise<unknown[]> {
-  const r = await db.query(
-    `SELECT id::text, session_id::text, agent, prompt, exit_code, output_sha256,
-            timed_out, started_at, finished_at
-       FROM agent_external_cli_run ORDER BY id DESC LIMIT $1`,
     [limit],
   );
   return r.rows;

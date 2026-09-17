@@ -215,7 +215,6 @@ export async function approveConfirmation(pool: pg.Pool, id: string): Promise<Co
       pool_onboard: ["pools", "dashboard", "market", "datasync"],
       pool_write: ["pools", "dashboard"],
       job_write: ["jobs", "dashboard", "status"],
-      finalize_backtest: ["backtests"],
       memory_write: ["memories"],
     };
     const refreshTargets = targets[row.tool_name];

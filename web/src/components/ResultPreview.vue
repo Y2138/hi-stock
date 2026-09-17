@@ -2,7 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { apiClient, type ApiFail } from "../api/client";
-import type { AgentMemory, BacktestDetail, JobRunOutput } from "../api/types";
+import type { AgentMemory, JobRunOutput } from "../api/types";
 import { openAgentSession } from "../utils/askAi";
 import { fmtTime } from "../utils/format";
 import type { ResultRef } from "../utils/results";
@@ -13,21 +13,20 @@ const emit = defineEmits<{ close: [] }>();
 const router = useRouter();
 const loading = ref(false);
 const error = ref<ApiFail | null>(null);
-const data = ref<JobRunOutput | BacktestDetail | AgentMemory | null>(null);
+const data = ref<JobRunOutput | AgentMemory | null>(null);
 let loadVersion = 0;
 
 const jobOutput = computed(() => props.result.type === "job-output" ? data.value as JobRunOutput | null : null);
-const backtest = computed(() => props.result.type === "backtest-result" ? data.value as BacktestDetail | null : null);
 const memory = computed(() => props.result.type === "memory" ? data.value as AgentMemory | null : null);
 const title = computed(() => jobOutput.value
   ? `${jobOutput.value.output_type} · ${jobOutput.value.target_date}`
-  : backtest.value?.name ?? memory.value?.title ?? "结果预览");
+  : memory.value?.title ?? "结果预览");
 const eyebrow = computed(() => jobOutput.value
   ? `任务结果 #${jobOutput.value.id}`
-  : backtest.value ? `回测结论 #${backtest.value.id}` : memory.value ? `Agent 记忆 #${memory.value.id}` : "结果预览");
-const markdown = computed(() => jobOutput.value?.markdown ?? backtest.value?.conclusion_md ?? memory.value?.content ?? "");
-const sessionId = computed(() => jobOutput.value?.session_id ?? backtest.value?.session_id ?? memory.value?.source_session_id ?? null);
-const pageLabel = computed(() => jobOutput.value ? "前往任务中心" : backtest.value ? "前往回测历史" : "前往记忆库");
+  : memory.value ? `Agent 记忆 #${memory.value.id}` : "结果预览");
+const markdown = computed(() => jobOutput.value?.markdown ?? memory.value?.content ?? "");
+const sessionId = computed(() => jobOutput.value?.session_id ?? memory.value?.source_session_id ?? null);
+const pageLabel = computed(() => jobOutput.value ? "前往任务中心" : "前往记忆库");
 
 async function load(): Promise<void> {
   const version = ++loadVersion;
@@ -36,10 +35,8 @@ async function load(): Promise<void> {
   data.value = null;
   const path = props.result.type === "job-output"
     ? `/api/job-outputs/${props.result.id}`
-    : props.result.type === "backtest-result"
-      ? `/api/backtests/${props.result.id}`
-      : `/api/memories/${props.result.id}`;
-  const result = await apiClient.get<JobRunOutput | BacktestDetail | AgentMemory>(path);
+    : `/api/memories/${props.result.id}`;
+  const result = await apiClient.get<JobRunOutput | AgentMemory>(path);
   if (version !== loadVersion) return;
   loading.value = false;
   if (result.ok) data.value = result.data;
@@ -52,8 +49,6 @@ function goToPage(): void {
       job: jobOutput.value.job_id,
       ...(jobOutput.value.run_id ? { run: jobOutput.value.run_id } : {}),
     } });
-  } else if (backtest.value) {
-    void router.push({ path: "/backtests", query: { run: backtest.value.id } });
   } else if (memory.value) {
     void router.push({ path: "/memories", query: { memory: memory.value.id } });
   }
@@ -87,15 +82,10 @@ watch(() => `${props.result.type}:${props.result.id}`, () => void load(), { imme
           <template v-if="jobOutput">
             <span class="badge accent">{{ jobOutput.status }}</span><span>目标日 {{ jobOutput.target_date }}</span><span>{{ fmtTime(jobOutput.created_at) }}</span>
           </template>
-          <template v-else-if="backtest">
-            <span class="badge ok">最终结论</span><span>{{ backtest.execution_origin }}</span><span>{{ fmtTime(backtest.finalized_at ?? backtest.created_at) }}</span>
-          </template>
           <template v-else-if="memory">
             <span class="badge accent">{{ memory.category }}</span><span>{{ memory.status }}</span><span>最后验证 {{ fmtTime(memory.last_verified_at) }}</span>
           </template>
         </div>
-        <p v-if="backtest?.conclusion_summary" class="result-summary">{{ backtest.conclusion_summary }}</p>
-        <p v-if="backtest?.applicability_boundary" class="result-boundary"><strong>适用边界：</strong>{{ backtest.applicability_boundary }}</p>
         <p v-if="memory?.summary" class="result-summary">{{ memory.summary }}</p>
         <MarkdownView v-if="markdown" :source="markdown" />
         <p v-else class="result-state">该记录没有可预览的 Markdown 正文。</p>

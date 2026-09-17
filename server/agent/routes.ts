@@ -33,7 +33,6 @@ import {
   getSession,
   insertAttachment,
   listAttachments,
-  listCliRuns,
   listMessages,
   listSessions,
   listToolAudits,
@@ -128,8 +127,8 @@ export const chatRoutes = {
       throw apiErrors.badRequest("title 必须是字符串");
     }
     const sessionType = b.session_type ?? "interactive";
-    if (!["interactive", "backtest", "strategy_evolution"].includes(String(sessionType))) {
-      throw apiErrors.badRequest("页面只能新建普通、回测或策略演进会话");
+    if (String(sessionType) !== "interactive") {
+      throw apiErrors.badRequest("页面只能新建普通对话会话");
     }
     if (
       b.parent_session_id !== undefined &&
@@ -145,7 +144,7 @@ export const chatRoutes = {
       status: 201,
       data: await createSession(pool, {
         title: b.title as string | undefined,
-        session_type: sessionType as "interactive" | "backtest" | "strategy_evolution",
+        session_type: "interactive",
         parent_session_id: b.parent_session_id as string | null | undefined,
       }),
     };
@@ -483,8 +482,4 @@ export const chatRoutes = {
     return { data: await listToolAudits(pool, parseLimit(query, 100, 1000)) };
   },
 
-  /** GET /api/audit/cli-runs?limit=（M4 占位：表已建，暂无逻辑写入） */
-  async listCliRuns({ pool, query }: Ctx) {
-    return { data: await listCliRuns(pool, parseLimit(query, 100, 1000)) };
-  },
 };

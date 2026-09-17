@@ -54,22 +54,15 @@ export function redactEphemeralCode(value: unknown, depth = 0): unknown {
 }
 
 /**
- * pi 会把工具调用参数放进 assistant message。若本条包含 run_backtest，连同同条说明文本
- * 一并收敛为固定提示，避免模型把源码同时复制进自然语言消息。
+ * pi 会把工具调用参数放进 assistant message。临时结果连同说明文本一并收敛为固定提示，
+ * 避免模型把临时数据明细复制进自然语言消息。
  */
 export function redactAgentMessage(message: AgentMessage): AgentMessage {
-  const ephemeralCodeResult = message.role === "toolResult"
-    && Boolean((message as AgentMessage & { details?: { ephemeral_code_result?: boolean } }).details?.ephemeral_code_result);
   const ephemeralDataResult = message.role === "toolResult"
     && Boolean((message as AgentMessage & { details?: { ephemeral_data_result?: boolean } }).details?.ephemeral_data_result);
   const copy = redactEphemeralCode(message) as AgentMessage;
-  if ((ephemeralCodeResult || ephemeralDataResult) && copy.role === "toolResult" && Array.isArray(copy.content)) {
-    copy.content = [{
-      type: "text",
-      text: ephemeralCodeResult
-        ? "已向 Agent 提供固化回测源码；源码不会保存到会话。"
-        : "已向 Agent 提供扶摇临时查询结果；数据明细不会保存到会话。",
-    }];
+  if (ephemeralDataResult && copy.role === "toolResult" && Array.isArray(copy.content)) {
+    copy.content = [{ type: "text", text: "已向 Agent 提供扶摇临时查询结果；数据明细不会保存到会话。" }];
     return copy;
   }
   if (copy.role !== "assistant") return copy;
@@ -83,18 +76,6 @@ export function redactAgentMessage(message: AgentMessage): AgentMessage {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     };
   }
-  if (!Array.isArray(copy.content)) return copy;
-  const hasBacktestCall = copy.content.some(
-    (part) => part.type === "toolCall" && part.name === "run_backtest",
-  );
-  if (!hasBacktestCall) return copy;
-  let noticeAdded = false;
-  copy.content = copy.content.map((part) => {
-    if (part.type !== "text") return part;
-    if (noticeAdded) return { ...part, text: "" };
-    noticeAdded = true;
-    return { ...part, text: "已提交临时代码至隔离回测工作区；代码不会保存到会话。" };
-  });
   return copy;
 }
 
@@ -105,17 +86,12 @@ export function redactAgentMessages(messages: AgentMessage[]): AgentMessage[] {
 /** SSE 和低频事件只保留临时工具结果元数据，当前模型仍使用工具返回的原始内容。 */
 export function redactEphemeralToolResult(value: unknown): unknown {
   const details = value && typeof value === "object"
-    ? (value as { details?: { ephemeral_code_result?: boolean; ephemeral_data_result?: boolean } }).details
+    ? (value as { details?: { ephemeral_data_result?: boolean } }).details
     : null;
-  if (!details?.ephemeral_code_result && !details?.ephemeral_data_result) return redactEphemeralCode(value);
+  if (!details?.ephemeral_data_result) return redactEphemeralCode(value);
   const redacted = redactEphemeralCode(value) as Record<string, unknown>;
   return {
     ...redacted,
-    content: [{
-      type: "text",
-      text: details.ephemeral_code_result
-        ? "已向 Agent 提供固化回测源码；源码不会保存到会话。"
-        : "已向 Agent 提供扶摇临时查询结果；数据明细不会保存到会话。",
-    }],
+    content: [{ type: "text", text: "已向 Agent 提供扶摇临时查询结果；数据明细不会保存到会话。" }],
   };
 }

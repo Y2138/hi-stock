@@ -24,11 +24,12 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
       "board_query",
       "market_event_query",
       "indicator_query",
+      "value_rank_query",
     ],
   },
   {
     title: "策略计算读取",
-    tools: ["daily_plan_context_query", "swing_signal_query", "limit_up_signal_query", "analysis_run", "strategy_screen_query"],
+    tools: ["daily_plan_context_query", "swing_signal_query", "limit_up_signal_query", "copper_inventory_signal_query", "lithium_warehouse_signal_query", "value_anchor_signal_query", "two_year_reversal_signal_query", "analysis_run", "strategy_screen_query"],
   },
   {
     title: "持久同步",
@@ -43,8 +44,6 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
       "pool_write",
       "job_write",
       "memory_write",
-      "strategy_publish_request",
-      "finalize_backtest",
     ],
   },
   {
@@ -52,8 +51,8 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
     tools: ["auction_context_query", "auction_assessment_write", "pool_attention_write", "daily_plan_write"],
   },
   {
-    title: "研究与回测",
-    tools: ["memory_query", "web_search", "web_fetch", "read_backtest_source", "run_backtest"],
+    title: "研究与资料",
+    tools: ["memory_query", "web_search", "web_fetch"],
   },
   {
     title: "系统与排障",

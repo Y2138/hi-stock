@@ -1,6 +1,5 @@
 // 服务入口：建池、迁移检查、起 HTTP
 // 本机默认只绑定 127.0.0.1；容器内可绑定 0.0.0.0，但宿主端口仍只映射到 127.0.0.1。
-import { StandardBacktestRunner } from "./backtest/runner.js";
 import { loadConfig } from "./config.js";
 import { closePool, getPool } from "./db/client.js";
 import { MigrationConflictError, runMigrations } from "./db/migrate.js";
@@ -9,12 +8,6 @@ import { NotificationWorker } from "./modules/notifications/service.js";
 import { JobScheduler } from "./scheduler/service.js";
 import { IndicatorWorker } from "./indicators/worker.js";
 import { recoverInterruptedAgentSessions } from "./agent/session-runner.js";
-import {
-  cleanupAgentBacktestWorkspaces,
-  failInterruptedAgentBacktests,
-  isAgentBacktestWorkerEnabled,
-} from "./backtest/agent-workspace.js";
-import { cleanupStaleBacktestSourceCandidates } from "./modules/backtests/repo.js";
 import { importLegacyHithinkApiKey } from "./system-settings.js";
 
 async function main(): Promise<void> {
@@ -52,18 +45,12 @@ async function main(): Promise<void> {
   }
 
   try {
-    const cleaned = await cleanupAgentBacktestWorkspaces();
-    if (cleaned > 0) console.log(`已清理 ${cleaned} 个遗留 Agent 回测临时工作区。`);
-    const interrupted = await failInterruptedAgentBacktests(pool);
-    if (interrupted > 0) console.log(`已将 ${interrupted} 个重启中断的 Agent 回测标记为失败。`);
-    const staleSources = await cleanupStaleBacktestSourceCandidates(pool);
-    if (staleSources > 0) console.log(`已清理 ${staleSources} 份超期候选回测源码。`);
     const interruptedSessions = await recoverInterruptedAgentSessions(pool);
     if (interruptedSessions > 0) {
       console.log(`已将 ${interruptedSessions} 个重启中断的 Agent 会话标记为失败。`);
     }
   } catch (error) {
-    console.error(`Agent 回测临时工作区启动清理失败：${(error as Error).message}`);
+    console.error(`Agent 会话启动恢复失败：${(error as Error).message}`);
     process.exitCode = 1;
     await closePool();
     return;
@@ -75,7 +62,6 @@ async function main(): Promise<void> {
     dailyFullMarket: config.dailyFullMarket,
   });
   const indicatorWorker = new IndicatorWorker(pool, config.indicatorIntervalMs);
-  const standardBacktests = new StandardBacktestRunner(pool);
   const notificationWorker = new NotificationWorker(pool);
   const server = createApiServer({ pool });
   let shuttingDown = false;
@@ -91,7 +77,6 @@ async function main(): Promise<void> {
       console.error(`调度器停止失败：${(error as Error).message}`);
       process.exitCode = 1;
     });
-    await standardBacktests.stop();
     await notificationWorker.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await closePool();
@@ -113,11 +98,9 @@ async function main(): Promise<void> {
     await scheduler.start();
     indicatorWorker.start();
     notificationWorker.start();
-    standardBacktests.start();
     console.log("作业调度器已启动：30 秒 tick，时区 Asia/Shanghai。");
     console.log("指标工作器已启动。");
     console.log("统一 Agent session 执行器已启用。");
-    console.log(`Agent 临时代码回测工作器：${isAgentBacktestWorkerEnabled() ? "已启用" : "已关闭"}。`);
   } catch (error) {
     console.error(`作业调度器启动失败：${(error as Error).message}`);
     process.exitCode = 1;

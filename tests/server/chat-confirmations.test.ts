@@ -216,19 +216,17 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
     }).find((tool) => tool.name === "pool_onboard")!;
     const poolProposal = await poolOnboard.execute("tc-pool", {
       instrument: "确认测试股份",
-      requested_role: "短线",
-      reason: "初始化完整档案并登记标的池角色",
+      reason: "初始化完整档案并加入关注池",
     });
     expect(poolProposal.details).toMatchObject({ tool_name: "pool_onboard" });
     await approveConfirmation(pool, (poolProposal.details as { confirmation_id: string }).confirmation_id);
     expect((await pool.query(
-      `SELECT role, grade, score::float8, stock_character_profile, profile_as_of::text,
+      `SELECT pool, role, stock_character_profile, profile_as_of::text,
               profile_calculation_version, profile_input_sha256
          FROM pool_membership WHERE effective_to IS NULL`,
     )).rows[0]).toMatchObject({
-      role: "短线",
-      grade: expect.stringMatching(/^[A-D]$/),
-      score: expect.any(Number),
+      pool: "watch",
+      role: "关注",
       stock_character_profile: { dimensions: { washout: {}, markup: {}, false_breakout: {}, defense: {}, volatility: {} } },
       profile_as_of: bars.at(-1)!.date,
       profile_calculation_version: "标的入池五维画像一版",
@@ -255,8 +253,8 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
     expect(Number((await pool.query("SELECT count(*) FROM agent_confirmation")).rows[0]!.count)).toBe(confirmationCount);
 
     const orderProposal = await findTool("pool_write").execute("tc-pool-order", {
-      reason: "维护短线池板块顺序",
-      operations: [{ action: "set_board_order", pool: "short", board_codes: ["881999.TI"] }],
+      reason: "维护关注池板块顺序",
+      operations: [{ action: "set_board_order", pool: "watch", board_codes: ["881999.TI"] }],
     });
     await approveConfirmation(pool, (orderProposal.details as { confirmation_id: string }).confirmation_id);
 

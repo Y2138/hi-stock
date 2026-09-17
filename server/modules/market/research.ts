@@ -26,7 +26,7 @@ export async function queryStockResearch(db: Db, codes: string[]) {
          LEFT JOIN LATERAL (
            SELECT metric.as_of_date::text, metric.calculation_version, run.input_sha256,
                   run.adjustment, metric.input_row_count, metric.stock_character_profile,
-                  metric.stock_character, metric.stage, metric.research_score, metric.grade,
+                  metric.stock_character, metric.stage,
                   metric.defense_recovery_ma10, metric.tags
              FROM market_stock_character_metric metric
              JOIN market_indicator_run run ON run.id = metric.indicator_run_id

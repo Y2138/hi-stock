@@ -47,8 +47,6 @@ export interface StockCharacterProfile extends Record<string, unknown> {
     volatility: StockCharacterDimension;
   };
   stage: string | null;
-  score: number | null;
-  grade: string | null;
   stock_character: string;
   tags: string[];
   key_levels: {
@@ -226,14 +224,6 @@ export function calculateStockCharacterProfile(input: StockCharacterBar[]): Stoc
     : 0;
   const annualizedVolatility = Math.sqrt(variance * 252);
   const volatilityScore = clampScore((annualizedVolatility - 0.1) / 0.4 * 100);
-  const stabilityScore = 100 - Math.abs(volatilityScore - 45);
-  const score = rows.length >= 60
-    ? clampScore(
-      washoutScore * 0.2 + markupScore * 0.25 + (100 - falseBreakoutScore) * 0.2 +
-      defenseScore * 0.2 + stabilityScore * 0.15,
-    )
-    : null;
-  const grade = score === null ? null : score >= 80 ? "A" : score >= 65 ? "B" : score >= 50 ? "C" : "D";
   const ma20 = latest?.ma20 ?? null;
   const ma60 = latest?.ma60 ?? null;
   const high60 = rows.length ? Math.max(...rows.slice(-60).map((row) => row.high)) : null;
@@ -280,8 +270,6 @@ export function calculateStockCharacterProfile(input: StockCharacterBar[]): Stoc
       },
     },
     stage,
-    score,
-    grade,
     stock_character: stockCharacter,
     tags: [
       `画像版本：${STOCK_CHARACTER_CALCULATION_VERSION}`,

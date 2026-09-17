@@ -45,8 +45,33 @@ const DATASOURCE_INFO: Record<string, { label: string; responsibility: string; r
     responsibility: "同步涨停、跌停、炸板、连板天梯和龙虎榜。",
     result: "每日市场结构事件及各数据集同步记录。",
   },
+  commodity_copper_sync: {
+    label: "铜期货真实合约同步",
+    responsibility: "同步上期所铜真实合约日行情、结算持仓和主力连续映射。",
+    result: "真实合约K线、期货专属日线字段、换月映射和抓取记录。",
+  },
+  commodity_copper_inventory_sync: {
+    label: "铜库存周报同步",
+    responsibility: "同步上期所铜总库存周报并保留官方发布时间。",
+    result: "铜总库存点时观测和抓取记录。",
+  },
+  commodity_lithium_warehouse_sync: {
+    label: "碳酸锂仓单同步",
+    responsibility: "同步广期所碳酸锂仓单日报小计。",
+    result: "碳酸锂仓单点时观测和抓取记录。",
+  },
+  full_market_indicator_refresh: {
+    label: "全市场指标重算",
+    responsibility: "每周把全市场股票行情标记为待重算指标。",
+    result: "指标脏标记，由后台工作器分批计算。",
+  },
 };
-const DATASOURCE_ORDER = ["market_catalog_sync", "board_membership_sync", "daily_market_update", "daily_market_structure"];
+const DATASOURCE_ORDER = [
+  "market_catalog_sync", "board_membership_sync", "daily_market_update",
+  "commodity_copper_sync", "commodity_copper_inventory_sync",
+  "commodity_lithium_warehouse_sync",
+  "daily_market_structure", "full_market_indicator_refresh",
+];
 const GROUP_INFO: Record<string, { title: string; description: string }> = {
   datasource: { title: "数据链路", description: "调度器直接执行固定服务端代码，结果写入行情与市场数据表，不调用 Agent。" },
   agent_flow: { title: "Agent 任务", description: "按版本化提示词启动任务对话，生成可查看、可继续追问的 Markdown 结果。" },
@@ -82,9 +107,7 @@ const jobGroups = computed(() => (["agent_flow", "datasource", "analysis"] as co
     ...GROUP_INFO[type]!,
     jobs: visibleJobs.value
       .filter((job) => job.job_type === type)
-      .sort((left, right) => type === "datasource"
-        ? DATASOURCE_ORDER.indexOf(pipelineOf(left)) - DATASOURCE_ORDER.indexOf(pipelineOf(right))
-        : 0),
+      .sort((left, right) => compareJobs(left, right, type)),
   }))
   .filter((group) => group.jobs.length > 0));
 const detachedOutputs = computed(() => outputs.value.filter((output) =>
@@ -95,6 +118,20 @@ const counts = computed(() => {
   const rows = jobs.data.value ?? [];
   return { all: rows.length, enabled: rows.filter((row) => row.enabled).length, paused: rows.filter((row) => !row.enabled).length };
 });
+
+/** 组内排序：优先级权重优先（数值越小越靠前），缺失时数据链路退回固定顺序、其余按名称。 */
+function compareJobs(left: JobDefinition, right: JobDefinition, type: string): number {
+  if (left.priority !== null && right.priority !== null && left.priority !== right.priority) {
+    return left.priority - right.priority;
+  }
+  if (left.priority !== null && right.priority === null) return -1;
+  if (left.priority === null && right.priority !== null) return 1;
+  if (type === "datasource") {
+    const order = DATASOURCE_ORDER.indexOf(pipelineOf(left)) - DATASOURCE_ORDER.indexOf(pipelineOf(right));
+    if (order !== 0) return order;
+  }
+  return left.name.localeCompare(right.name, "zh-CN");
+}
 
 function pipelineOf(job: JobDefinition): string {
   return typeof job.config.pipeline === "string" ? job.config.pipeline : "unknown";
@@ -121,6 +158,7 @@ function modelLabel(job: JobDefinition): string {
 }
 
 function responsibility(job: JobDefinition): string {
+  if (job.purpose) return job.purpose;
   if (job.job_type === "datasource") return DATASOURCE_INFO[pipelineOf(job)]?.responsibility ?? "执行受控服务端数据同步。";
   if (job.job_type === "agent_flow") return "按绑定提示词读取数据库事实并生成任务结论。";
   return "运行固定服务内分析并登记数据缺口。";
@@ -130,6 +168,18 @@ function expectedResult(job: JobDefinition): string {
   if (job.job_type === "datasource") return DATASOURCE_INFO[pipelineOf(job)]?.result ?? "数据同步记录。";
   if (job.job_type === "agent_flow") return "任务结果与来源对话；完整结果在“历史与结果”中查看。";
   return "分析记录、指标结果和数据缺口。";
+}
+
+/** 调度节奏：由 cron 推导出人类可读的频率标签，不参与调度。 */
+function cadenceLabel(job: JobDefinition): string {
+  const [minute, hour, dom, , dow] = job.cron.split(/\s+/);
+  const at = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  if (dow === "*") return `每天 ${at}`;
+  if (dow === "1-5") return `工作日 ${at}`;
+  const names = ["日", "一", "二", "三", "四", "五", "六"];
+  if (/^\d$/.test(dow ?? "")) return `每周${names[Number(dow)]} ${at}`;
+  if (dom === "*") return `每次 ${at}`;
+  return `每月 ${dom} 日 ${at}`;
 }
 
 function createWithAgent(): void {
@@ -297,10 +347,16 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
                 <div><strong>{{ job.name }}</strong><span class="code">{{ job.code }}</span></div>
                 <span class="badge" :class="job.enabled ? 'ok' : ''">{{ job.enabled ? "已启用" : "已暂停" }}</span>
               </div>
-              <div class="meta-row"><span class="badge accent">{{ TYPE_LABELS[job.job_type] }}</span><span class="num">{{ job.cron }}</span></div>
-              <p class="context">{{ executionLabel(job) }}</p>
+              <div class="meta-row">
+                <span class="badge accent">{{ TYPE_LABELS[job.job_type] }}</span>
+                <span v-if="job.phase" class="badge">{{ job.phase }}</span>
+                <span v-if="job.priority !== null" class="badge num" title="重要性排序权重，越小越靠前">P{{ job.priority }}</span>
+                <span class="num">{{ cadenceLabel(job) }}</span>
+                <span class="code num">{{ job.cron }}</span>
+              </div>
+              <p class="job-purpose-text">{{ responsibility(job) }}</p>
               <dl class="job-kv job-purpose">
-                <dt>职责</dt><dd>{{ responsibility(job) }}</dd>
+                <dt>执行</dt><dd>{{ executionLabel(job) }}</dd>
                 <dt>产出</dt><dd>{{ expectedResult(job) }}</dd>
                 <template v-if="job.job_type === 'agent_flow'"><dt>模型</dt><dd>{{ modelLabel(job) }}</dd></template>
                 <dt>下次运行</dt><dd>{{ job.next_run ? fmtTime(job.next_run) : "已暂停" }}</dd>
@@ -390,5 +446,5 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
 </template>
 
 <style scoped>
-.page-head-actions,.job-title,.actions,.history-head,.detail-head,.meta-row,.group-head,.section-title{display:flex;align-items:center;gap:8px}.page-head-actions,.job-title,.history-head,.detail-head,.group-head,.section-title{justify-content:space-between}.filter-row{display:flex;gap:7px;margin-bottom:14px}.job-groups,.job-group{display:grid;gap:14px}.job-group+.job-group{margin-top:8px}.group-head{align-items:flex-start}.group-head h2{margin:0;font-size:var(--fs-lg)}.group-head p{margin:3px 0 0;color:var(--ink-soft);font-size:var(--fs-sm)}.job-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}.job-card{display:grid;gap:10px}.job-title>div,.history-head>div,.detail-head>div{display:grid;gap:2px}.code{font:11px var(--font-mono);color:var(--ink-faint)}.context{margin:0;color:var(--ink-soft);font:11px var(--font-mono);overflow-wrap:anywhere}.job-kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 12px;margin:0}.job-kv dt{color:var(--ink-faint)}.job-kv dd{margin:0;min-width:0}.job-purpose dd{line-height:1.45}.actions{flex-wrap:wrap;border-top:1px solid var(--line);padding-top:10px}.history-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}.history-panel,.prompt-panel{display:grid;height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.history-panel{width:min(1040px,96vw)}.prompt-panel{width:min(820px,96vw)}.history-head{padding:15px 18px;background:var(--paper);border-bottom:1px solid var(--line)}.icon-btn{display:grid;width:32px;height:32px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:20px;line-height:1;cursor:pointer}.icon-btn:hover{border-color:var(--accent);color:var(--accent-ink)}.history-panel>:deep(.state-block),.prompt-panel>:deep(.state-block){min-height:0}.prompt-body{height:100%;overflow:auto;padding:18px 22px 48px}.prompt-meta{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:18px;color:var(--ink-faint);font-size:var(--fs-sm)}.history-body{display:grid;height:100%;min-height:0;grid-template-columns:minmax(240px,290px) minmax(0,1fr)}.history-list-pane,.run-detail-pane{min-height:0;overflow:auto}.history-list-pane{padding:14px;border-right:1px solid var(--line);background:var(--paper-deep)}.run-detail-pane{padding:18px 20px 48px}.pane-title{display:flex;align-items:center;justify-content:space-between;margin:0 2px 8px;color:var(--ink-soft);font-size:var(--fs-sm)}.pane-title span{font:11px var(--font-mono)}.detached-title{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}.history-list{display:grid;gap:6px}.history-item{position:relative;display:grid;gap:5px;width:100%;padding:10px 11px;text-align:left;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm);cursor:pointer}.history-item:hover{border-color:var(--accent)}.history-item.active{border-color:var(--accent);background:var(--accent-soft)}.history-item-main{display:flex;align-items:center;justify-content:space-between;gap:8px}.history-item small{padding-right:48px;color:var(--ink-faint);font-size:10.5px}.result-mark{position:absolute;right:10px;bottom:9px;color:var(--accent-ink);font-size:10.5px;font-weight:600}.output-item{grid-template-columns:minmax(0,1fr) auto}.output-item small{grid-column:1/-1}.detail-head{padding-bottom:14px;border-bottom:1px solid var(--line)}.run-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:14px 0}.run-summary>div{display:grid;gap:5px;padding:10px;background:var(--paper-deep);border-radius:var(--radius-sm)}.run-summary span{color:var(--ink-faint);font-size:11px}.run-summary strong{font-size:12px}.run-section{margin-top:18px}.section-title{margin-bottom:8px}.section-title>div{display:grid;gap:2px}.section-title span{color:var(--ink-faint);font-size:11px}.inline-output{padding:16px 18px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm)}.output-meta{display:flex;align-items:center;gap:8px;margin-bottom:14px;color:var(--ink-faint);font-size:11px}.empty-output,.detail-state{display:grid;place-items:center;min-height:120px;margin:0;color:var(--ink-faint);text-align:center;background:var(--paper-deep);border:1px dashed var(--line);border-radius:var(--radius-sm)}.detail-json,.run-log{margin:0;padding:11px 12px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);background:var(--paper-deep);border-radius:var(--radius-sm);font:11.5px/1.55 var(--font-mono)}.mobile-back{display:none}@media(max-width:800px){.run-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.page-head-actions,.group-head{align-items:flex-start;flex-direction:column}.job-grid{grid-template-columns:1fr}.history-panel,.prompt-panel{width:100vw}.prompt-body{padding:16px 16px 40px}.history-body{grid-template-columns:1fr}.history-body.detail-open .history-list-pane{display:none}.history-body:not(.detail-open) .run-detail-pane{display:none}.history-list-pane,.run-detail-pane{border-right:0}.mobile-back{display:inline-flex;margin-bottom:12px;border:0;background:transparent;color:var(--accent-ink);padding:0;cursor:pointer}.run-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.section-title{align-items:flex-start}.inline-output{padding:13px}}
+.page-head-actions,.job-title,.actions,.history-head,.detail-head,.meta-row,.group-head,.section-title{display:flex;align-items:center;gap:8px}.page-head-actions,.job-title,.history-head,.detail-head,.group-head,.section-title{justify-content:space-between}.filter-row{display:flex;gap:7px;margin-bottom:14px}.job-groups,.job-group{display:grid;gap:14px}.job-group+.job-group{margin-top:8px}.group-head{align-items:flex-start}.group-head h2{margin:0;font-size:var(--fs-lg)}.group-head p{margin:3px 0 0;color:var(--ink-soft);font-size:var(--fs-sm)}.job-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}.job-card{display:grid;gap:10px}.job-title>div,.history-head>div,.detail-head>div{display:grid;gap:2px}.code{font:11px var(--font-mono);color:var(--ink-faint)}.context{margin:0;color:var(--ink-soft);font:11px var(--font-mono);overflow-wrap:anywhere}.job-purpose-text{margin:0;color:var(--ink);line-height:1.5;font-size:12.5px}.job-kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 12px;margin:0}.job-kv dt{color:var(--ink-faint)}.job-kv dd{margin:0;min-width:0}.job-purpose dd{line-height:1.45}.actions{flex-wrap:wrap;border-top:1px solid var(--line);padding-top:10px}.history-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}.history-panel,.prompt-panel{display:grid;height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.history-panel{width:min(1040px,96vw)}.prompt-panel{width:min(820px,96vw)}.history-head{padding:15px 18px;background:var(--paper);border-bottom:1px solid var(--line)}.icon-btn{display:grid;width:32px;height:32px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:20px;line-height:1;cursor:pointer}.icon-btn:hover{border-color:var(--accent);color:var(--accent-ink)}.history-panel>:deep(.state-block),.prompt-panel>:deep(.state-block){min-height:0}.prompt-body{height:100%;overflow:auto;padding:18px 22px 48px}.prompt-meta{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:18px;color:var(--ink-faint);font-size:var(--fs-sm)}.history-body{display:grid;height:100%;min-height:0;grid-template-columns:minmax(240px,290px) minmax(0,1fr)}.history-list-pane,.run-detail-pane{min-height:0;overflow:auto}.history-list-pane{padding:14px;border-right:1px solid var(--line);background:var(--paper-deep)}.run-detail-pane{padding:18px 20px 48px}.pane-title{display:flex;align-items:center;justify-content:space-between;margin:0 2px 8px;color:var(--ink-soft);font-size:var(--fs-sm)}.pane-title span{font:11px var(--font-mono)}.detached-title{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}.history-list{display:grid;gap:6px}.history-item{position:relative;display:grid;gap:5px;width:100%;padding:10px 11px;text-align:left;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm);cursor:pointer}.history-item:hover{border-color:var(--accent)}.history-item.active{border-color:var(--accent);background:var(--accent-soft)}.history-item-main{display:flex;align-items:center;justify-content:space-between;gap:8px}.history-item small{padding-right:48px;color:var(--ink-faint);font-size:10.5px}.result-mark{position:absolute;right:10px;bottom:9px;color:var(--accent-ink);font-size:10.5px;font-weight:600}.output-item{grid-template-columns:minmax(0,1fr) auto}.output-item small{grid-column:1/-1}.detail-head{padding-bottom:14px;border-bottom:1px solid var(--line)}.run-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:14px 0}.run-summary>div{display:grid;gap:5px;padding:10px;background:var(--paper-deep);border-radius:var(--radius-sm)}.run-summary span{color:var(--ink-faint);font-size:11px}.run-summary strong{font-size:12px}.run-section{margin-top:18px}.section-title{margin-bottom:8px}.section-title>div{display:grid;gap:2px}.section-title span{color:var(--ink-faint);font-size:11px}.inline-output{padding:16px 18px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm)}.output-meta{display:flex;align-items:center;gap:8px;margin-bottom:14px;color:var(--ink-faint);font-size:11px}.empty-output,.detail-state{display:grid;place-items:center;min-height:120px;margin:0;color:var(--ink-faint);text-align:center;background:var(--paper-deep);border:1px dashed var(--line);border-radius:var(--radius-sm)}.detail-json,.run-log{margin:0;padding:11px 12px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);background:var(--paper-deep);border-radius:var(--radius-sm);font:11.5px/1.55 var(--font-mono)}.mobile-back{display:none}@media(max-width:800px){.run-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.page-head-actions,.group-head{align-items:flex-start;flex-direction:column}.job-grid{grid-template-columns:1fr}.history-panel,.prompt-panel{width:100vw}.prompt-body{padding:16px 16px 40px}.history-body{grid-template-columns:1fr}.history-body.detail-open .history-list-pane{display:none}.history-body:not(.detail-open) .run-detail-pane{display:none}.history-list-pane,.run-detail-pane{border-right:0}.mobile-back{display:inline-flex;margin-bottom:12px;border:0;background:transparent;color:var(--accent-ink);padding:0;cursor:pointer}.run-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.section-title{align-items:flex-start}.inline-output{padding:13px}}
 </style>

@@ -24,12 +24,10 @@ import {
 const NAV_ITEMS = [
   { to: "/", icon: "📊", label: "仪表盘" },
   { to: "/positions", icon: "💼", label: "持仓" },
-  { to: "/short-pool", icon: "⚡", label: "短线池" },
-  { to: "/long-pool", icon: "🌱", label: "长线池" },
+  { to: "/pools", icon: "🌱", label: "关注池" },
   { to: "/market-structure", icon: "▦", label: "市场结构" },
   { to: "/jobs", icon: "⏱", label: "任务中心" },
   { to: "/strategies", icon: "📜", label: "当前策略" },
-  { to: "/backtests", icon: "🧪", label: "回测" },
   { to: "/memories", icon: "🧠", label: "Agent 记忆" },
   { to: "/datasync", icon: "💾", label: "数据与备份" },
   { to: "/settings", icon: "⚙️", label: "设置" },

@@ -3,27 +3,32 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { runMigrations } from "../../server/db/migrate.js";
 import { createPool } from "../../server/db/client.js";
-import { applyPoolChange, setPoolAttention, setPoolBoardOrder } from "../../server/modules/pools/repo.js";
-import { attentionSignalLabel, compareAttentionQuality } from "../../web/src/utils/poolAttention.js";
+import { applyPoolChange, setPoolAttentionEntry, setPoolBoardOrder } from "../../server/modules/pools/repo.js";
+import { attentionSourceLabel, attentionStatusLabel, compareAttentionQuality } from "../../web/src/utils/poolAttention.js";
 import { recordPositionChange, updatePositionEntrySignalType } from "../../server/modules/positions/repo.js";
 import { marketRoutes } from "../../server/modules/market/routes.js";
 import { api, prepareTestDb, resetSchema, seedTestStrategy, startTestServer, type TestServer } from "./helpers.js";
 
 const prepared = await prepareTestDb();
 
-it("近期关注按信号完整度分档，同档不使用研究评分或缺口条数", () => {
+it("近期关注按信号完整度分档：已成立 → 待补信号 → 人工关注", () => {
+  const entry = (status: "qualified" | "approaching" | "manual", source_job = "manual") => ({
+    source_job, status, reason: "测试", missing_signals: [] as string[], valid_from: "2026-08-18", valid_until: null,
+  });
   const members = [
-    { code: "000003.SZ", attention_signal: { status: "approaching" as const, missing_signals: ["放量"] } },
-    { code: "000001.SZ", attention_signal: null },
-    { code: "000004.SZ", attention_signal: { status: "qualified" as const, missing_signals: [] } },
-    { code: "000002.SZ", attention_signal: { status: "approaching" as const, missing_signals: ["放量", "突破"] } },
-    { code: "000005.SZ", attention_signal: { status: "approaching" as const, missing_signals: [] } },
+    { code: "000003.SZ", attention_entries: [entry("approaching")] },
+    { code: "000001.SZ", attention_entries: [] },
+    { code: "000004.SZ", attention_entries: [entry("qualified")] },
+    { code: "000002.SZ", attention_entries: [entry("manual")] },
+    { code: "000005.SZ", attention_entries: [entry("approaching", "daily_plan_flow")] },
   ];
   expect([...members].sort(compareAttentionQuality).map((member) => member.code))
-    .toEqual(["000004.SZ", "000002.SZ", "000003.SZ", "000005.SZ", "000001.SZ"]);
-  expect(attentionSignalLabel(members[0]!)).toBe("待补信号 · 次日观察");
-  expect(attentionSignalLabel(members[1]!)).toBe("信号状态未明确");
-  expect(attentionSignalLabel(members[2]!)).toBe("信号已成立");
+    .toEqual(["000004.SZ", "000003.SZ", "000005.SZ", "000002.SZ", "000001.SZ"]);
+  expect(attentionStatusLabel(entry("approaching"))).toBe("待补信号 · 次日观察");
+  expect(attentionStatusLabel(entry("manual"))).toBe("人工关注");
+  expect(attentionStatusLabel(entry("qualified"))).toBe("信号已成立");
+  expect(attentionSourceLabel(entry("qualified", "daily_plan_flow"))).toBe("每日计划");
+  expect(attentionSourceLabel(entry("qualified"))).toBe("人工");
 });
 
 describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真实库）", () => {
@@ -280,7 +285,7 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     expect(note.rows[0]!.attribution_note).toContain("swing");
   });
 
-  it("短线池/长线池只按官方行业投影完整研究属性", async () => {
+  it("关注池只按官方行业投影完整研究属性", async () => {
     const boardId = (await pool.query<{ id: string }>(
       `INSERT INTO market_instrument (code, name, kind) VALUES ('885001.TI', '测试概念', 'board') RETURNING id::text`,
     )).rows[0]!.id;
@@ -310,36 +315,37 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     );
     await pool.query(
       `INSERT INTO pool_membership
-         (instrument_id, pool, role, grade, score, tags, stock_character, stage, evaluation_summary, effective_from)
-       SELECT id, 'short', '短线', 'A', 5.5, '["CPO"]', '高波动', '右侧确认', '完整短线评估', '2026-08-18'
+         (instrument_id, pool, role, tags, stock_character, stage, evaluation_summary, effective_from)
+       SELECT id, 'watch', '关注', '["CPO"]', '高波动', '右侧确认', '完整评估：600487', '2026-08-18'
          FROM market_instrument WHERE code = '600487.SH'`,
     );
     await pool.query(
       `INSERT INTO pool_membership
-         (instrument_id, pool, role, grade, score, tags, stock_character, stage, evaluation_summary, effective_from)
-       SELECT id, 'long', '波段', 'B', 4.2, '["ETF"]', '中波动', '观察', '完整长线评估', '2026-08-18'
+         (instrument_id, pool, role, tags, stock_character, stage, evaluation_summary, effective_from)
+       SELECT id, 'watch', '关注', '["ETF"]', '中波动', '观察', '完整评估：510500', '2026-08-18'
          FROM market_instrument WHERE code = '510500.SH'`,
     );
     await expect(applyPoolChange(pool, {
-      action: "update", code: "600487.SH", pool: "short", tags: ["板块：测试"], effective_from: "2026-08-18",
+      action: "update", code: "600487.SH", pool: "watch", tags: ["板块：测试"], effective_from: "2026-08-18",
     })).rejects.toThrow("所属行业只读取同花顺官方关系");
-    const short = await api(server!.baseUrl, "GET", "/api/pools/short");
-    expect(short.json).toMatchObject({
-      pool: "short",
-      members: [{ code: "600487.SH", stock_character: "高波动" }],
-    });
-    const shortView = short.json as unknown as {
-      members: Array<{ boards: Array<{ code: string; name: string; board_type: string; level: string }> }>;
+    const watch = await api(server!.baseUrl, "GET", "/api/pools?date=2026-08-18");
+    expect(watch.json).toMatchObject({ pool: "watch" });
+    expect((watch.json as unknown as { members: Array<{ code: string; stock_character: string | null }> }).members)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "600487.SH", stock_character: "高波动" }),
+        expect.objectContaining({ code: "510500.SH" }),
+      ]));
+    const watchView = watch.json as unknown as {
+      members: Array<{ code: string; boards: Array<{ code: string; name: string; board_type: string; level: string }> }>;
       boards: Array<{ code: string; member_count: number; level: string }>;
     };
-    expect(shortView.boards).toEqual([expect.objectContaining({ code: "881001.TI", member_count: 1, level: "primary" })]);
-    expect(shortView.members[0]!.boards).toEqual([
+    // 大行业投影只统计有官方行业关系的成员（ETF 无行业内关系）。
+    expect(watchView.boards).toEqual([expect.objectContaining({ code: "881001.TI", member_count: 1, level: "primary" })]);
+    expect(watchView.members.find((member) => member.code === "600487.SH")!.boards).toEqual([
       { name: "通信网络设备", board_type: "industry", code: "881001.TI", level: "primary" },
       { name: "光通信设备", board_type: "industry", code: "884001.TI", level: "secondary" },
     ]);
-    await expect(setPoolBoardOrder(pool, "short", ["884001.TI"])).rejects.toThrow("大行业");
-    const long = await api(server!.baseUrl, "GET", "/api/pools/long");
-    expect(long.json).toMatchObject({ pool: "long", members: [{ code: "510500.SH" }] });
+    await expect(setPoolBoardOrder(pool, ["884001.TI"])).rejects.toThrow("大行业");
     const boards = await api(server!.baseUrl, "GET", "/api/boards?type=concept");
     expect(boards.json).toMatchObject([{ code: "885001.TI", pool_intersection: 2 }]);
   });
@@ -353,10 +359,8 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await applyPoolChange(pool, {
       action: "update",
       code: "510500.SH",
-      pool: "long",
-      role: "波段",
-      grade: "B",
-      score: 60,
+      pool: "watch",
+      role: "关注",
       tags: ["画像版本：标的入池五维画像一版"],
       stock_character: "洗盘恢复中·拉升中·假突破风险低·护盘中·波动中",
       stock_character_profile: { dimensions: {} },
@@ -375,96 +379,75 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     expect(after).toEqual({ id: before, profile_calculation_version: "标的入池五维画像一版" });
   });
 
-  it("近期关注只更新当前角色状态并由标的池查询返回", async () => {
-    const before = Number((await pool.query("SELECT count(*) FROM pool_membership WHERE effective_to IS NULL")).rows[0]!.count);
-    await applyPoolChange(pool, {
-      action: "update",
-      code: "600487.SH",
-      pool: "short",
-      effective_from: "2026-08-18",
-      attention_reason: "等待右侧量价确认",
-      attention_from: "2026-08-18",
-      attention_until: "2026-08-25",
+  it("关注条目按来源独立维护，池接口返回多来源近期关注", async () => {
+    await setPoolAttentionEntry(pool, {
+      code: "600487.SH", source_job: "daily_plan_flow", status: "approaching",
+      reason: "等待右侧量价确认", missing_signals: ["右侧：放量站稳关键位"],
+      valid_from: "2026-08-18", valid_until: "2026-08-25",
     });
-    const after = Number((await pool.query("SELECT count(*) FROM pool_membership WHERE effective_to IS NULL")).rows[0]!.count);
-    expect(after).toBe(before);
-    const short = await api(server!.baseUrl, "GET", "/api/pools/short");
-    expect(short.json).toMatchObject({ members: [{
-      code: "600487.SH", attention_reason: "等待右侧量价确认",
-      attention_from: "2026-08-18", attention_until: "2026-08-25",
-    }] });
-    const removed = await api(server!.baseUrl, "DELETE", "/api/pools/short/600487.SH/attention");
-    expect(removed).toMatchObject({ status: 200, json: {
-      code: "600487.SH", pool: "short", role: "短线", grade: "A",
-      stock_character: "高波动", stage: "右侧确认", evaluation_summary: "完整短线评估",
-      attention_signal: null, attention_reason: null, attention_from: null, attention_until: null,
-    } });
-    expect(Number((await pool.query("SELECT count(*) FROM pool_membership WHERE effective_to IS NULL")).rows[0]!.count)).toBe(before);
-    expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{
-      code: "600487.SH", attention_signal: null,
-      attention_reason: null, attention_from: null, attention_until: null,
-    }] });
-    expect(await api(server!.baseUrl, "DELETE", "/api/pools/short/999999.SH/attention"))
+    await setPoolAttentionEntry(pool, {
+      code: "600487.SH", source_job: "manual", status: "manual",
+      reason: "人工持续跟踪", valid_from: "2026-08-18",
+    });
+    const view = await api(server!.baseUrl, "GET", "/api/pools?date=2026-08-18");
+    const viewMembers = (view.json as unknown as { members: Array<{ code: string; attention_entries: Array<{ source_job: string; status: string; reason: string; missing_signals: string[] }> }> }).members;
+    expect(viewMembers.find((member) => member.code === "600487.SH")!.attention_entries).toEqual([
+      { source_job: "daily_plan_flow", status: "approaching", reason: "等待右侧量价确认", missing_signals: ["右侧：放量站稳关键位"], valid_from: "2026-08-18", valid_until: "2026-08-25" },
+      { source_job: "manual", status: "manual", reason: "人工持续跟踪", missing_signals: [], valid_from: "2026-08-18", valid_until: null },
+    ]);
+    // 按来源移除：只清指定来源，另一来源保留。
+    const removed = await api(server!.baseUrl, "DELETE", "/api/pools/600487.SH/attention?source=daily_plan_flow");
+    expect(removed).toMatchObject({ status: 200, json: { code: "600487.SH", removed: { source_job: "daily_plan_flow" } } });
+    const afterRemove = await api(server!.baseUrl, "GET", "/api/pools?date=2026-08-18");
+    expect((afterRemove.json as unknown as { members: Array<{ code: string; attention_entries: Array<{ source_job: string }> }> })
+      .members.find((member) => member.code === "600487.SH")!.attention_entries.map((entry) => entry.source_job))
+      .toEqual(["manual"]);
+    expect(await api(server!.baseUrl, "DELETE", "/api/pools/999999.SH/attention"))
       .toMatchObject({ status: 404, json: { error: { code: "NOT_FOUND" } } });
   });
 
-  it("信号缺口落库后由池接口返回，人工改写原因会清除旧信号状态", async () => {
-    await setPoolAttention(pool, {
-      code: "600487.SH", pool: "short", attention_reason: "每日计划·即将符合：等待确认",
-      attention_from: "2026-08-18", attention_until: "2026-08-25",
-      attention_signal: { status: "approaching", missing_signals: ["右侧：放量站稳关键位"] },
+  it("approaching 条目必须携带缺失条件，qualified 不得携带；清除时日期一并清除", async () => {
+    await expect(setPoolAttentionEntry(pool, {
+      code: "510500.SH", source_job: "daily_plan_flow", status: "approaching",
+      reason: "等待确认", missing_signals: [], valid_from: "2026-08-18",
+    })).rejects.toThrow("缺失条件");
+    await expect(setPoolAttentionEntry(pool, {
+      code: "510500.SH", source_job: "daily_plan_flow", status: "qualified",
+      reason: "波段信号成立", missing_signals: ["多余缺口"], valid_from: "2026-08-18",
+    })).rejects.toThrow("缺失条件");
+    const write = await setPoolAttentionEntry(pool, {
+      code: "510500.SH", source_job: "daily_plan_flow", status: "qualified",
+      reason: "波段信号成立", valid_from: "2026-08-18", valid_until: "2026-08-25",
     });
-    expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{
-      code: "600487.SH", attention_signal: { status: "approaching", missing_signals: ["右侧：放量站稳关键位"] },
-    }] });
-    await applyPoolChange(pool, {
-      action: "update", code: "600487.SH", pool: "short", effective_from: "2026-08-18", attention_until: "2026-08-26",
+    expect(write.after).toMatchObject({ status: "qualified", reason: "波段信号成立", valid_until: "2026-08-25" });
+    const cleared = await setPoolAttentionEntry(pool, {
+      code: "510500.SH", source_job: "daily_plan_flow", status: "qualified", reason: null,
     });
-    expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{
-      attention_signal: { status: "approaching", missing_signals: ["右侧：放量站稳关键位"] },
-    }] });
-    await applyPoolChange(pool, {
-      action: "update", code: "600487.SH", pool: "short", effective_from: "2026-08-18", attention_reason: "人工持续跟踪",
-    });
-    expect((await api(server!.baseUrl, "GET", "/api/pools/short")).json).toMatchObject({ members: [{ attention_signal: null }] });
+    expect(cleared.before).not.toBeNull();
+    expect(cleared.after).toBeNull();
   });
 
-  it("买入成交只清除每日计划自动关注并保留人工关注", async () => {
-    await pool.query(
-      `UPDATE pool_membership membership
-          SET attention_reason = '每日计划·已符合：等待买入',
-              attention_signal = '{"status":"qualified","missing_signals":[]}',
-              attention_from = '2026-08-18', attention_until = '2026-08-19'
-         FROM market_instrument instrument
-        WHERE instrument.id = membership.instrument_id
-          AND instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
-    );
+  it("买入成交清除全部任务来源关注并保留人工关注", async () => {
+    await setPoolAttentionEntry(pool, {
+      code: "600487.SH", source_job: "daily_plan_flow", status: "qualified",
+      reason: "已符合：等待买入", valid_from: "2026-08-18", valid_until: "2026-08-19",
+    });
+    await setPoolAttentionEntry(pool, {
+      code: "600487.SH", source_job: "manual", status: "manual",
+      reason: "人工持续跟踪", valid_from: "2026-08-18",
+    });
     await recordPositionChange(pool, {
       code: "600487.SH", kind: "buy", quantity: 100, price: 60, change_date: "2026-08-18",
       source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
       execution_compliance: "matched", entry_signal_type: "right_side",
     });
-    expect((await pool.query(
-      `SELECT attention_signal, attention_reason, attention_from::text, attention_until::text
-         FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-        WHERE instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
-    )).rows[0]).toEqual({ attention_signal: null, attention_reason: null, attention_from: null, attention_until: null });
-
-    await pool.query(
-      `UPDATE pool_membership membership SET attention_reason = '人工持续跟踪'
-         FROM market_instrument instrument
-        WHERE instrument.id = membership.instrument_id
-          AND instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
-    );
-    await recordPositionChange(pool, {
-      code: "600487.SH", kind: "buy", quantity: 100, price: 61, change_date: "2026-08-19",
-      source: "chat", source_session_id: sessionId, decision_origin: "planned_discretionary",
-      execution_compliance: "matched", entry_signal_type: "right_side",
-    });
-    expect((await pool.query(
-      `SELECT attention_reason FROM pool_membership membership JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-        WHERE instrument.code = '600487.SH' AND membership.effective_to IS NULL`,
-    )).rows[0]!.attention_reason).toBe("人工持续跟踪");
+    const entries = (await pool.query<{ source_job: string }>(
+      `SELECT entry.source_job
+         FROM pool_attention_entry entry
+         JOIN market_instrument instrument ON instrument.id = entry.instrument_id
+        WHERE instrument.code = '600487.SH'`,
+    )).rows.map((row) => row.source_job);
+    expect(entries).toEqual(["manual"]);
   });
 
   it("旧账户快照和资金摘要 API 已退役", async () => {

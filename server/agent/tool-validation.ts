@@ -6,7 +6,6 @@ import type {
   DatabaseQueryInput,
   DatabaseSchemaInput,
 } from "./database-tools.js";
-import type { AgentBacktestRequest, JsonValue } from "../backtest/agent-contract.js";
 import {
   HITHINK_DATASET_CAPABILITIES,
   normalizeHithinkDatasetRequest,
@@ -204,7 +203,7 @@ const ExecutionComplianceSchema = Type.Union([
   Type.Literal("not_applicable"), Type.Literal("unknown"),
 ]);
 export const EntrySignalTypeSchema = Type.Union([
-  Type.Literal("right_side"), Type.Literal("left_reversal"), Type.Literal("trial_start"),
+  Type.Literal("right_side"), Type.Literal("left_reversal"), Type.Literal("two_year_reversal"), Type.Literal("trial_start"),
   Type.Literal("swing"), Type.Literal("limit_up"), Type.Literal("discretionary"),
 ]);
 
@@ -216,11 +215,8 @@ export const PortfolioContextQuerySchema = strictObject({
 export type PortfolioContextQueryInput = Static<typeof PortfolioContextQuerySchema>;
 
 export const PoolContextQuerySchema = strictObject({
-  pools: Type.Optional(Type.Array(Type.Union([Type.Literal("short"), Type.Literal("long")]), {
-    minItems: 1,
-    maxItems: 2,
-  })),
   codes: Type.Optional(Type.Array(CodeSchema, { minItems: 1, maxItems: 200 })),
+  date: Type.Optional(DateSchema),
   include_boards: Type.Optional(Type.Boolean()),
 });
 export type PoolContextQueryInput = Static<typeof PoolContextQuerySchema>;
@@ -290,26 +286,20 @@ export type PortfolioWriteInput = {
   changes: PositionChangePortfolioWriteInput[];
 };
 
-const PoolKindSchema = Type.Union([Type.Literal("short"), Type.Literal("long")]);
-const PoolOnboardRoleSchema = Type.Union([
-  Type.Literal("短线"), Type.Literal("波段"), Type.Literal("长线"),
-]);
+const PoolKindSchema = Type.Literal("watch");
 export const PoolOnboardSchema = strictObject({
   instrument: Type.String({ minLength: 1, maxLength: 80 }),
   requested_pool: Type.Optional(PoolKindSchema),
-  requested_role: Type.Optional(PoolOnboardRoleSchema),
   reason: Type.Optional(ReasonSchema),
 });
 export type PoolOnboardInput = {
   instrument: string;
-  requested_pool?: "short" | "long";
-  requested_role?: "短线" | "波段" | "长线";
+  requested_pool?: "watch";
   reason: string;
 };
 export const PoolOnboardCommitSchema = strictObject({
   code: Type.String({ pattern: "^\\d{6}\\.(?:SH|SZ|BJ)$" }),
   requested_pool: Type.Optional(PoolKindSchema),
-  requested_role: Type.Optional(PoolOnboardRoleSchema),
   reason: ReasonSchema,
   effective_from: DateSchema,
   profile_as_of: DateSchema,
@@ -349,7 +339,6 @@ export type PoolWriteInput = { reason: string; operations: PoolWriteOperation[] 
 const ScheduledPoolAttentionItemSchema = strictObject({
   action: Type.Union([Type.Literal("mark"), Type.Literal("clear")]),
   code: CodeSchema,
-  pool: PoolKindSchema,
   missing_signals: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 20 })),
   attention_status: Type.Optional(Type.Union([Type.Literal("qualified"), Type.Literal("approaching")])),
   attention_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 420 })),
@@ -360,20 +349,6 @@ export const ScheduledPoolAttentionSchema = strictObject({
   reason: ReasonSchema,
   items: Type.Array(ScheduledPoolAttentionItemSchema, { maxItems: 100 }),
 });
-const LegacyScheduledPoolAttentionSchema = objectRoot(Type.Union([
-  strictObject({
-    reason: ReasonSchema,
-    action: Type.Literal("mark"),
-    code: CodeSchema,
-    pool: PoolKindSchema,
-    missing_signals: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 20 })),
-    attention_status: Type.Union([Type.Literal("qualified"), Type.Literal("approaching")]),
-    attention_reason: Type.String({ minLength: 1, maxLength: 420 }),
-    attention_from: DateSchema,
-    attention_until: DateSchema,
-  }),
-  strictObject({ reason: ReasonSchema, action: Type.Literal("clear"), code: CodeSchema, pool: PoolKindSchema }),
-]));
 export type ScheduledPoolAttentionItem = Static<typeof ScheduledPoolAttentionItemSchema>;
 export type ScheduledPoolAttentionInput = { reason: string; items: ScheduledPoolAttentionItem[] };
 
@@ -445,40 +420,18 @@ export const AuctionAssessmentWriteSchema = strictObject({
 export type AuctionAssessmentWriteInput = Static<typeof AuctionAssessmentWriteSchema>;
 
 const RevisionIdSchema = Type.String({ pattern: "^[0-9]+$" });
-const ContentTextSchema = Type.String({ minLength: 1, maxLength: 200_000 });
 const ChangeSummarySchema = Type.Optional(Type.String({ maxLength: 500 }));
-
-const StrategyDocumentChangeSchema = strictObject({
-  document_id: RevisionIdSchema,
-  base_sha256: HashSchema,
-  content: ContentTextSchema,
-});
-
-/**
- * 策略发布是独立于普通确认制/YOLO 的真人门禁。
- * session_id 由服务端会话上下文绑定，绝不接受模型自行指定。
- */
-export const StrategyPublishRequestSchema = strictObject({
-  base_change_seq: RevisionIdSchema,
-  base_strategy_hash: HashSchema,
-  outline: Type.String({ minLength: 1, maxLength: 4_000 }),
-  conclusion: Type.String({ minLength: 1, maxLength: 8_000 }),
-  adjustments: Type.Array(Type.String({ minLength: 1, maxLength: 1_000 }), {
-    minItems: 1,
-    maxItems: 30,
-  }),
-  summary: Type.String({ minLength: 1, maxLength: 2_000 }),
-  changes: Type.Array(StrategyDocumentChangeSchema, { minItems: 1, maxItems: 20 }),
-  backtest_run_ids: Type.Optional(Type.Array(RevisionIdSchema, { maxItems: 50 })),
-});
-export type StrategyPublishRequestInput = Static<typeof StrategyPublishRequestSchema>;
-
 const DatasourceJobConfigSchema = strictObject({
   pipeline: Type.Union([
     Type.Literal("daily_market_update"),
     Type.Literal("market_catalog_sync"),
     Type.Literal("board_membership_sync"),
     Type.Literal("daily_market_structure"),
+    Type.Literal("full_market_indicator_refresh"),
+    Type.Literal("commodity_copper_sync"),
+    Type.Literal("commodity_copper_inventory_sync"),
+    Type.Literal("commodity_lithium_warehouse_sync"),
+    Type.Literal("value_candidate_sync"),
   ]),
   export_volume: Type.Optional(Type.Boolean()),
 });
@@ -488,11 +441,13 @@ const AnalysisJobConfigSchema = strictObject({
     Type.Literal("sector_temperature"),
     Type.Literal("key_levels"),
     Type.Literal("long_valuation"),
+    Type.Literal("value_monthly_rank"),
   ]),
   request: Type.Optional(strictObject({
     codes: Type.Optional(Type.Array(CodeSchema, { minItems: 1, maxItems: 200 })),
     as_of: Type.Optional(DateSchema),
     lookback: Type.Optional(Type.Integer({ minimum: 20, maximum: 500 })),
+    force: Type.Optional(Type.Boolean()),
   })),
 });
 const JobConfigSchema = Type.Union([DatasourceJobConfigSchema, AgentFlowJobConfigSchema, AnalysisJobConfigSchema]);
@@ -514,14 +469,6 @@ const MemoryContentFields = {
   evidence: Type.String({ minLength: 1, maxLength: 4_000 }),
   last_verified_at: TimestampSchema,
 };
-
-export const FinalizeBacktestSchema = strictObject({
-  reason: ReasonSchema,
-  run_id: RevisionIdSchema,
-  conclusion_summary: Type.String({ minLength: 1, maxLength: 4_000 }),
-  applicability_boundary: Type.String({ minLength: 1, maxLength: 4_000 }),
-});
-export type FinalizeBacktestInput = Static<typeof FinalizeBacktestSchema>;
 
 export const MemoryWriteSchema = objectRoot(Type.Union([
   strictObject({ reason: ReasonSchema, action: Type.Literal("create"), ...MemoryContentFields }),
@@ -553,6 +500,11 @@ export const MemoryQuerySchema = strictObject({
 });
 export type MemoryQueryInput = Static<typeof MemoryQuerySchema>;
 const PromptContentSchema = Type.String({ minLength: 1, maxLength: 200_000 });
+const JobPhaseSchema = Type.Union([
+  Type.Literal("盘前"), Type.Literal("盘中"), Type.Literal("盘后"), Type.Literal("夜间"), Type.Literal("周末"),
+]);
+const JobPurposeSchema = Type.String({ minLength: 1, maxLength: 500 });
+const JobPrioritySchema = Type.Integer({ minimum: 1, maximum: 999 });
 
 export const JobWriteSchema = objectRoot(Type.Union([
   strictObject({
@@ -565,6 +517,9 @@ export const JobWriteSchema = objectRoot(Type.Union([
     config: JobConfigSchema,
     prompt_id: Type.Optional(RevisionIdSchema),
     model_id: Type.Optional(Type.Union([RevisionIdSchema, Type.Null()])),
+    purpose: Type.Optional(JobPurposeSchema),
+    phase: Type.Optional(JobPhaseSchema),
+    priority: Type.Optional(JobPrioritySchema),
     enabled: Type.Optional(Type.Boolean()),
   }),
   strictObject({
@@ -577,6 +532,9 @@ export const JobWriteSchema = objectRoot(Type.Union([
     config: Type.Optional(JobConfigSchema),
     prompt_id: Type.Optional(RevisionIdSchema),
     model_id: Type.Optional(Type.Union([RevisionIdSchema, Type.Null()])),
+    purpose: Type.Optional(Type.Union([JobPurposeSchema, Type.Null()])),
+    phase: Type.Optional(Type.Union([JobPhaseSchema, Type.Null()])),
+    priority: Type.Optional(Type.Union([JobPrioritySchema, Type.Null()])),
     enabled: Type.Optional(Type.Boolean()),
   }),
   strictObject({
@@ -617,6 +575,7 @@ const AnalysisTypeSchema = Type.Union([
   Type.Literal("sector_temperature"),
   Type.Literal("key_levels"),
   Type.Literal("long_valuation"),
+  Type.Literal("value_monthly_rank"),
 ]);
 export const AnalysisRunSchema = strictObject({
   requests: Type.Array(strictObject({
@@ -624,6 +583,7 @@ export const AnalysisRunSchema = strictObject({
     codes: Type.Optional(Type.Array(CodeSchema, { minItems: 1, maxItems: 200 })),
     as_of: Type.Optional(DateSchema),
     lookback: Type.Optional(Type.Integer({ minimum: 20, maximum: 500 })),
+    force: Type.Optional(Type.Boolean()),
   }), { minItems: 1, maxItems: 20 }),
 });
 export type AnalysisRunInput = Static<typeof AnalysisRunSchema>;
@@ -637,38 +597,6 @@ export const StrategyScreenSchema = strictObject({
   date: DateSchema,
 });
 export type StrategyScreenInput = Static<typeof StrategyScreenSchema>;
-
-export const RunBacktestSchema = strictObject({
-  name: Type.String({ minLength: 1, maxLength: 300 }),
-  kind: Type.Optional(Type.Union([Type.Literal("formal"), Type.Literal("research")])),
-  research_outline: Type.String({ minLength: 1, maxLength: 4_000 }),
-  hypothesis: Type.String({ minLength: 1, maxLength: 4_000 }),
-  codes: Type.Array(CodeSchema, { maxItems: 100 }),
-  market_event_types: Type.Optional(Type.Array(Type.Union([
-    Type.Literal("up"), Type.Literal("down"), Type.Literal("break"),
-  ]), { maxItems: 3 })),
-  limit_up_universe: Type.Optional(Type.Union([
-    Type.Literal("none"), Type.Literal("mainboard"), Type.Literal("all"),
-  ])),
-  start: DateSchema,
-  end: DateSchema,
-  initial_cash: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000_000_000 })),
-  parameters: Type.Optional(Type.Record(IdentifierSchema, Type.Unknown())),
-  comparison_run_ids: Type.Optional(Type.Array(RevisionIdSchema, { maxItems: 20 })),
-  base_source_run_id: Type.Optional(RevisionIdSchema),
-  source_code: Type.String({
-    minLength: 1,
-    maxLength: 65_536,
-    description:
-      "default export async function run(sdk)。必须返回非空 daily_returns；metrics 最多100项且只能是扁平的有限数值/null；结构化明细写入 conclusion。",
-  }),
-});
-export type RunBacktestInput = AgentBacktestRequest;
-
-export const ReadBacktestSourceSchema = strictObject({
-  run_id: RevisionIdSchema,
-});
-export type ReadBacktestSourceInput = Static<typeof ReadBacktestSourceSchema>;
 
 export const FetchMarketDataSchema = strictObject({
   requests: Type.Optional(Type.Array(
@@ -828,7 +756,6 @@ export function validatePoolContextQueryInput(input: unknown): PoolContextQueryI
   const parsed = validateToolInput<PoolContextQueryInput>("pool_context_query", PoolContextQuerySchema, input);
   return {
     ...parsed,
-    pools: uniqueValues(parsed.pools, "pool_context_query pools") as Array<"short" | "long"> | undefined,
     codes: uniqueValues(parsed.codes, "pool_context_query codes", true),
   };
 }
@@ -891,7 +818,7 @@ export function validatePortfolioWriteInput(input: unknown): PortfolioWriteInput
         throw new Error(`${change.code} 计划外例外或执行偏离必须提供 deviation_reason`);
       }
       if (change.kind === "buy" && !change.entry_signal_type) {
-        throw new Error(`${change.code} buy 必须提供 entry_signal_type（right_side/left_reversal/trial_start/swing/limit_up/discretionary）`);
+        throw new Error(`${change.code} buy 必须提供 entry_signal_type（right_side/left_reversal/two_year_reversal/trial_start/swing/limit_up/discretionary）`);
       }
       if (change.kind !== "buy" && change.entry_signal_type !== undefined) {
         throw new Error(`${change.code} entry_signal_type 仅 buy 事件可以填写`);
@@ -920,16 +847,8 @@ export function validatePortfolioWriteInput(input: unknown): PortfolioWriteInput
   };
 }
 
-function validatePoolSelection(input: { requested_pool?: "short" | "long"; requested_role?: "短线" | "波段" | "长线" }): void {
-  const rolePool = input.requested_role === undefined ? undefined : input.requested_role === "短线" ? "short" : "long";
-  if (input.requested_pool && rolePool && input.requested_pool !== rolePool) {
-    throw new Error("pool_onboard requested_pool 与 requested_role 冲突");
-  }
-}
-
 export function validatePoolOnboardInput(input: unknown): PoolOnboardInput {
   const parsed = validateToolInput<Static<typeof PoolOnboardSchema>>("pool_onboard", PoolOnboardSchema, input);
-  validatePoolSelection(parsed);
   return {
     ...parsed,
     instrument: parsed.instrument.trim(),
@@ -939,7 +858,6 @@ export function validatePoolOnboardInput(input: unknown): PoolOnboardInput {
 
 export function validatePoolOnboardCommitInput(input: unknown): PoolOnboardCommitInput {
   const parsed = validateToolInput<PoolOnboardCommitInput>("pool_onboard", PoolOnboardCommitSchema, input);
-  validatePoolSelection(parsed);
   if (!isRealDate(parsed.effective_from) || !isRealDate(parsed.profile_as_of)) {
     throw new Error("pool_onboard 日期不是有效日历日期");
   }
@@ -998,25 +916,14 @@ export function validatePoolWriteInput(input: unknown): PoolWriteInput {
 }
 
 export function validateScheduledPoolAttentionInput(input: unknown): ScheduledPoolAttentionInput {
-  let reason: string;
-  let items: ScheduledPoolAttentionItem[];
-  if (input && typeof input === "object" && Array.isArray((input as { items?: unknown }).items)) {
-    const parsed = validateToolInput<Static<typeof ScheduledPoolAttentionSchema>>(
-      "pool_attention_write", ScheduledPoolAttentionSchema, input,
-    );
-    reason = parsed.reason;
-    items = parsed.items;
-  } else {
-    const legacy = validateToolInput<Static<typeof LegacyScheduledPoolAttentionSchema>>(
-      "pool_attention_write", LegacyScheduledPoolAttentionSchema, input,
-    );
-    const { reason: legacyReason, ...item } = legacy;
-    reason = legacyReason;
-    items = [item];
-  }
+  const parsed = validateToolInput<Static<typeof ScheduledPoolAttentionSchema>>(
+    "pool_attention_write", ScheduledPoolAttentionSchema, input,
+  );
+  const reason = parsed.reason;
+  const items = parsed.items;
   const seen = new Set<string>();
   const normalized = items.map((item) => {
-    const key = `${item.pool}:${item.code.toUpperCase()}`;
+    const key = item.code.toUpperCase();
     if (seen.has(key)) throw new Error(`pool_attention_write items 存在重复标的：${key}`);
     seen.add(key);
     if (item.action === "mark") {
@@ -1058,11 +965,6 @@ function assertMemoryPayloadSafe(value: MemoryWriteInput): void {
   }
 }
 
-export function validateFinalizeBacktestInput(input: unknown): FinalizeBacktestInput {
-  const parsed = validateToolInput<FinalizeBacktestInput>("finalize_backtest", FinalizeBacktestSchema, input);
-  return { ...parsed, reason: parsed.reason.trim(), conclusion_summary: parsed.conclusion_summary.trim(), applicability_boundary: parsed.applicability_boundary.trim() };
-}
-
 export function validateMemoryWriteInput(input: unknown): MemoryWriteInput {
   const parsed = validateToolInput<MemoryWriteInput>("memory_write", MemoryWriteSchema, input);
   if ("base_updated_at" in parsed && !validTimestamp(parsed.base_updated_at)) throw new Error("base_updated_at 不是有效时间");
@@ -1085,29 +987,6 @@ export function validateMemoryQueryInput(input: unknown): MemoryQueryInput {
   return { ...parsed, keyword: parsed.keyword?.trim(), tags: parsed.tags?.map((tag) => tag.trim()) };
 }
 
-export function validateStrategyPublishRequestInput(input: unknown): StrategyPublishRequestInput {
-  const parsed = validateToolInput<StrategyPublishRequestInput>(
-    "strategy_publish_request",
-    StrategyPublishRequestSchema,
-    input,
-  );
-  const documentIds = parsed.changes.map((change) => change.document_id);
-  if (new Set(documentIds).size !== documentIds.length) {
-    throw new Error("strategy_publish_request changes 存在重复 document_id");
-  }
-  const backtestIds = parsed.backtest_run_ids ?? [];
-  if (new Set(backtestIds).size !== backtestIds.length) {
-    throw new Error("strategy_publish_request backtest_run_ids 存在重复项");
-  }
-  return {
-    ...parsed,
-    outline: parsed.outline.trim(),
-    conclusion: parsed.conclusion.trim(),
-    summary: parsed.summary.trim(),
-    adjustments: parsed.adjustments.map((item) => item.trim()),
-  };
-}
-
 export function validateJobWriteInput(input: unknown): JobWriteInput {
   const parsed = validateToolInput<JobWriteInput>("job_write", JobWriteSchema, input);
   if (parsed.action === "create_job") {
@@ -1119,7 +998,8 @@ export function validateJobWriteInput(input: unknown): JobWriteInput {
     if (parsed.job_type === "analysis" && !("analysis_type" in parsed.config)) throw new Error("analysis 作业 config 类型不匹配");
   }
   if (parsed.action === "update_job") {
-    const changed = [parsed.name, parsed.cron, parsed.config, parsed.prompt_id, parsed.model_id, parsed.enabled]
+    const changed = [parsed.name, parsed.cron, parsed.config, parsed.prompt_id, parsed.model_id, parsed.enabled,
+      parsed.purpose, parsed.phase, parsed.priority]
       .some((value) => value !== undefined);
     if (!changed) throw new Error("job_write update_job 至少需要一个更新字段");
     if (Number.isNaN(new Date(parsed.base_updated_at).getTime())) throw new Error("base_updated_at 不是有效时间");
@@ -1212,45 +1092,6 @@ export function validateAuctionAssessmentWriteInput(input: unknown): AuctionAsse
     }
   }
   return parsed;
-}
-
-export function validateRunBacktestInput(input: unknown): RunBacktestInput {
-  const parsed = validateToolInput<Static<typeof RunBacktestSchema>>("run_backtest", RunBacktestSchema, input);
-  if (!isRealDate(parsed.start) || !isRealDate(parsed.end) || parsed.start > parsed.end) {
-    throw new Error(`回测日期范围非法：${parsed.start} 至 ${parsed.end}`);
-  }
-  if (new Set(parsed.codes).size !== parsed.codes.length) throw new Error(`回测 ${parsed.name} 的 codes 存在重复项`);
-  if (parsed.codes.length === 0 && (parsed.limit_up_universe ?? "none") === "none") {
-    throw new Error("回测必须提供 codes，或把 limit_up_universe 设为 mainboard/all");
-  }
-  if (new Set(parsed.market_event_types ?? []).size !== (parsed.market_event_types ?? []).length) {
-    throw new Error("market_event_types 存在重复项");
-  }
-  const comparisonIds = parsed.comparison_run_ids ?? [];
-  if (new Set(comparisonIds).size !== comparisonIds.length) throw new Error("comparison_run_ids 存在重复项");
-  const parameters = (parsed.parameters ?? {}) as Record<string, JsonValue>;
-  const parameterBytes = Buffer.byteLength(JSON.stringify(parameters), "utf8");
-  if (parameterBytes > 32 * 1024) throw new Error("parameters 超过 32 KiB 上限");
-  return {
-    name: parsed.name.trim(),
-    kind: parsed.kind ?? "research",
-    research_outline: parsed.research_outline.trim(),
-    hypothesis: parsed.hypothesis.trim(),
-    codes: parsed.codes,
-    market_event_types: parsed.market_event_types ?? [],
-    limit_up_universe: parsed.limit_up_universe ?? "none",
-    start: parsed.start,
-    end: parsed.end,
-    initial_cash: parsed.initial_cash ?? 1_000_000,
-    parameters,
-    comparison_run_ids: comparisonIds,
-    base_source_run_id: parsed.base_source_run_id ?? null,
-    source_code: parsed.source_code,
-  };
-}
-
-export function validateReadBacktestSourceInput(input: unknown): ReadBacktestSourceInput {
-  return validateToolInput<ReadBacktestSourceInput>("read_backtest_source", ReadBacktestSourceSchema, input);
 }
 
 /** 行情请求除 schema 外再校验真实日历、区间方向与重复项。 */

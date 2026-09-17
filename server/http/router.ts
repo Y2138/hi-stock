@@ -5,7 +5,6 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
-import { backtestRoutes } from "../modules/backtests/routes.js";
 import { marketRoutes } from "../modules/market/routes.js";
 import { positionRoutes } from "../modules/positions/routes.js";
 import { plansRoutes } from "../modules/plans/routes.js";
@@ -261,11 +260,6 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/job-runs/:id", jobRoutes.runDetail),
     route("GET", "/api/job-outputs/:id", jobRoutes.outputDetail),
     route("GET", "/api/strategy/current", strategyRoutes.current),
-    route("GET", "/api/strategy/evolutions", strategyRoutes.evolutions),
-    route("GET", "/api/strategy/proposals", strategyRoutes.proposals),
-    route("GET", "/api/strategy/proposals/:id/review", strategyRoutes.review),
-    route("POST", "/api/strategy/proposals/:id/approve", strategyRoutes.approve),
-    route("POST", "/api/strategy/proposals/:id/reject", strategyRoutes.reject),
     route("GET", "/api/job-prompts", jobPromptRoutes.list),
     route("GET", "/api/job-prompts/:id", jobPromptRoutes.get),
     route("GET", "/api/job-prompts/:id/revisions", jobPromptRoutes.revisions),
@@ -273,9 +267,6 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/analysis/runs", analysisRoutes.list),
     route("POST", "/api/analysis/run", analysisRoutes.run),
     route("GET", "/api/analysis/runs/:id", analysisRoutes.get),
-    route("GET", "/api/backtests", backtestRoutes.listRuns),
-    route("GET", "/api/backtests/:id/source", backtestRoutes.getSource),
-    route("GET", "/api/backtests/:id", backtestRoutes.getRun),
     route("GET", "/api/memories", memoryRoutes.list),
     route("GET", "/api/memories/:id", memoryRoutes.get),
     // 二期 M1 任务六：行情/标的检索（技术设计 v2.0 §十，只追加不改既有端点）
@@ -286,22 +277,24 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/market/bars", marketRoutes.bars),
     route("GET", "/api/market/structure", marketRoutes.structure),
     route("GET", "/api/market/coverage", marketRoutes.coverage),
-    // 持仓与短线/长线池。
+    // 持仓与关注池。
     route("GET", "/api/positions", positionRoutes.list),
     route("GET", "/api/positions/changes", positionRoutes.changes),
     route("GET", "/api/positions/realized-pnl", positionRoutes.realizedPnl),
     route("GET", "/api/plans/latest", plansRoutes.latest),
-    route("GET", "/api/pools/:pool", async ({ params }) => {
-      if (params.pool !== "short" && params.pool !== "long") throw apiErrors.notFound("标的池不存在");
-      return { data: await listPoolView(pool, params.pool) };
+    route("GET", "/api/pools", async ({ query }) => {
+      const asOf = query.get("date") ?? undefined;
+      if (asOf && !/^\d{4}-\d{2}-\d{2}$/u.test(asOf)) throw apiErrors.badRequest("date 必须是 YYYY-MM-DD");
+      return { data: await listPoolView(pool, asOf) };
     }),
-    route("DELETE", "/api/pools/:pool/:code/attention", async ({ params }) => {
-      if (params.pool !== "short" && params.pool !== "long") throw apiErrors.notFound("标的池不存在");
+    route("DELETE", "/api/pools/:code/attention", async ({ params, query }) => {
       const code = params.code?.trim().toUpperCase() ?? "";
       if (!/^[A-Z0-9._-]{1,32}$/u.test(code)) throw apiErrors.badRequest("标的代码无效");
-      const result = await clearPoolAttention(pool, { pool: params.pool, code });
-      if (!result) throw apiErrors.notFound(`标的 ${code} 不在当前${params.pool === "short" ? "短线" : "长线"}池中`);
-      return { data: result.after };
+      const source = query.get("source") ?? undefined;
+      const result = await clearPoolAttention(pool, { code, source_job: source });
+      if (!result) throw apiErrors.notFound(`标的 ${code} 在关注池中没有可移除的关注`);
+      // 返回被移除的条目快照；移除后该来源已不存在。
+      return { data: { code, removed: result.before } };
     }),
     // 二期 M1 收尾：数据卷 HTTP 路由（技术设计 v2.0 §九，只追加；恢复的前端二次确认在 web 侧）
     route("GET", "/api/volume/snapshots", volumeRoutes.listSnapshots),
@@ -347,7 +340,6 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("POST", "/api/confirmations/:id/approve", chatRoutes.approve),
     route("POST", "/api/confirmations/:id/reject", chatRoutes.reject),
     route("GET", "/api/audit/tools", chatRoutes.listToolAudits),
-    route("GET", "/api/audit/cli-runs", chatRoutes.listCliRuns),
   ];
 
   return http.createServer(async (req, res) => {

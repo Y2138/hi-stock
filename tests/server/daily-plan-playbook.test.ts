@@ -76,7 +76,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     );
     await pool.query(
       `INSERT INTO pool_membership (instrument_id, pool, role, effective_from)
-       SELECT id, 'short', '观察', '2026-08-01' FROM market_instrument WHERE code = '600519.SH'`,
+       SELECT id, 'watch', '关注', '2026-08-01' FROM market_instrument WHERE code = '600519.SH'`,
     );
   });
 

@@ -223,8 +223,8 @@ export async function recomputeIndicatorSeries(
           `INSERT INTO market_stock_character_metric
              (instrument_id, as_of_date, calculation_version, indicator_run_id,
               input_row_count, defense_break_count, defense_recovered_count, defense_recovery_ma10,
-              stock_character_profile, stage, research_score, grade, stock_character, tags)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+              stock_character_profile, stage, stock_character, tags)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
            ON CONFLICT (instrument_id, as_of_date, calculation_version) DO UPDATE SET
              indicator_run_id = EXCLUDED.indicator_run_id,
              input_row_count = EXCLUDED.input_row_count,
@@ -233,8 +233,6 @@ export async function recomputeIndicatorSeries(
              defense_recovery_ma10 = EXCLUDED.defense_recovery_ma10,
              stock_character_profile = EXCLUDED.stock_character_profile,
              stage = EXCLUDED.stage,
-             research_score = EXCLUDED.research_score,
-             grade = EXCLUDED.grade,
              stock_character = EXCLUDED.stock_character,
              tags = EXCLUDED.tags,
              computed_at = now()`,
@@ -249,8 +247,6 @@ export async function recomputeIndicatorSeries(
             metric.recoveryRate,
             JSON.stringify(profile),
             profile.stage,
-            profile.score,
-            profile.grade,
             profile.stock_character,
             JSON.stringify(profile.tags),
           ],
