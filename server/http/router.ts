@@ -18,6 +18,7 @@ import { jobRoutes } from "../scheduler/routes.js";
 import { jobPromptRoutes } from "../modules/job-prompts/routes.js";
 import { analysisRoutes } from "../analysis/routes.js";
 import { strategyRoutes } from "../modules/strategy/routes.js";
+import { strategyRuntimeRoutes } from "../modules/strategy-runtime/routes.js";
 import { boardRoutes } from "../modules/boards/routes.js";
 import { memoryRoutes } from "../modules/memory/routes.js";
 import { notificationRoutes } from "../modules/notifications/routes.js";
@@ -260,6 +261,9 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/job-runs/:id", jobRoutes.runDetail),
     route("GET", "/api/job-outputs/:id", jobRoutes.outputDetail),
     route("GET", "/api/strategy/current", strategyRoutes.current),
+    route("GET", "/api/strategies/runtime", strategyRuntimeRoutes.list),
+    route("GET", "/api/strategies/runtime/:code", strategyRuntimeRoutes.get),
+    route("GET", "/api/strategies/runtime/:code/evaluations", strategyRuntimeRoutes.evaluations),
     route("GET", "/api/job-prompts", jobPromptRoutes.list),
     route("GET", "/api/job-prompts/:id", jobPromptRoutes.get),
     route("GET", "/api/job-prompts/:id/revisions", jobPromptRoutes.revisions),

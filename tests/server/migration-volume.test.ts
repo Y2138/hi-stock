@@ -137,10 +137,11 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
   it("固定资产包只含策略与定时任务，恢复后运行数据为空且逐表哈希一致", async () => {
     const exported = await exportPortableInitialization(pool, { outDir, now: new Date("2026-08-18T10:00:00+08:00") });
     const manifest = await readPortableManifest(exported.payloadPath);
-    expect(manifest.version).toBe(6);
+    expect(manifest.version).toBe(7);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(115);
+    expect(manifest.migration_max).toBe(116);
     expect(manifest.tables.strategy_document).toBeGreaterThan(0);
+    expect(manifest.tables.strategy_definition).toBeGreaterThan(0);
     expect(manifest.tables.strategy_score_benchmark).toBe(1);
     expect(manifest.tables.job_definition).toBeGreaterThan(0);
     expect(manifest.tables.market_bar).toBeUndefined();
@@ -190,6 +191,9 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       "agent_memory_artifact",
       "pool_attention_entry",
       "job_run",
+      "strategy_evaluation_run",
+      "strategy_entry_signal",
+      "strategy_position_evaluation",
     ]) {
       expect(payload).not.toContain(`\"table\":\"${forbidden}\"`);
     }
@@ -199,6 +203,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const target = createPool(targetUrl);
     try {
       expect((await target.query("SELECT count(*)::int AS count FROM strategy_document")).rows[0]!.count).toBe(manifest.tables.strategy_document);
+      expect((await target.query("SELECT count(*)::int AS count FROM strategy_definition")).rows[0]!.count).toBe(manifest.tables.strategy_definition);
       expect((await target.query("SELECT count(*)::int AS count FROM strategy_score_benchmark")).rows[0]!.count).toBe(1);
       expect((await target.query(
         "SELECT sha256 FROM strategy_score_benchmark WHERE benchmark_code = 'daban_v1_4_fixed_20250901_20260122'",
@@ -213,6 +218,19 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       )).rows[0]!;
       expect(restoredNightly).toMatchObject({ provider_key: "deepseek", model_key: "deepseek-v4-pro" });
       expect(restoredNightly.model_id).not.toBe(sourceNightlyModelId);
+      expect((await target.query<{ strategy_code: string; agent_role: string; purpose: string }>(
+        "SELECT strategy_code, agent_role, purpose FROM job_definition WHERE code = 'nightly_sector_opportunity_scan'",
+      )).rows[0]).toMatchObject({
+        strategy_code: "nightly_sector",
+        agent_role: "strategy_entry_report",
+        purpose: expect.stringContaining("板块"),
+      });
+      expect((await target.query<{ fallback_strategy_code: string; exit_policy_mode: string }>(
+        "SELECT fallback_strategy_code, exit_policy_mode FROM strategy_definition WHERE code = 'legacy_right_side'",
+      )).rows[0]).toEqual({
+        fallback_strategy_code: "portfolio_fallback_exit",
+        exit_policy_mode: "dedicated_plus_fallback",
+      });
       expect((await target.query("SELECT count(*)::int AS count FROM market_bar")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM portfolio_position")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM daily_plan_auction_assessment")).rows[0]!.count).toBe(0);

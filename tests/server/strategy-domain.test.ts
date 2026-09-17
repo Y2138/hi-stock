@@ -206,4 +206,41 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
       "SELECT sha256 FROM strategy_document ORDER BY injection_order, id",
     )).rows.map((row) => row.sha256)).toEqual(before);
   });
+
+  it("策略运行时定义通过只读接口展示评估器、兜底和单策略任务关系", async () => {
+    const listed = await api(server.baseUrl, "GET", "/api/strategies/runtime");
+    expect(listed.status).toBe(200);
+    const definitions = listed.json as unknown as Array<{
+      code: string;
+      status: string;
+      daily_plan_scope: string[];
+      tasks: Array<{ code: string; agent_role: string }>;
+    }>;
+    expect(definitions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "swing", status: "active", daily_plan_scope: ["entry", "exit", "attention"] }),
+      expect.objectContaining({ code: "legacy_left_reversal", status: "exit_only" }),
+      expect.objectContaining({ code: "portfolio_fallback_exit", status: "active" }),
+    ]));
+
+    const right = await api(server.baseUrl, "GET", "/api/strategies/runtime/legacy_right_side");
+    expect(right.status).toBe(200);
+    expect(right.json).toMatchObject({
+      code: "legacy_right_side",
+      exit_evaluator_code: "legacy_right_side_exit_v1",
+      fallback_strategy_code: "portfolio_fallback_exit",
+      exit_policy_mode: "dedicated_plus_fallback",
+    });
+
+    const reversal = await api(server.baseUrl, "GET", "/api/strategies/runtime/two_year_reversal");
+    expect(reversal.status).toBe(200);
+    expect(reversal.json.tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "two_year_reversal_scan", agent_role: "strategy_entry_report" }),
+    ]));
+
+    const evaluations = await api(server.baseUrl, "GET", "/api/strategies/runtime/swing/evaluations?limit=10");
+    expect(evaluations).toEqual({ status: 200, json: [] });
+    expect((await api(server.baseUrl, "GET", "/api/strategies/runtime/swing/evaluations?limit=0")).status).toBe(400);
+    expect((await api(server.baseUrl, "GET", "/api/strategies/runtime/not_exists")).status).toBe(404);
+  });
+
 });

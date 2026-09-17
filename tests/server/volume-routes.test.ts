@@ -106,16 +106,17 @@ describe.skipIf(!prepared)("数据卷 HTTP 路由（stock_test 真实库）", ()
   it("固定资产包路由可导出并列出策略与任务摘要", async () => {
     const exported = await api(server.baseUrl, "POST", "/api/volume/portable/export", {});
     expect(exported.status).toBe(201);
-    const data = exported.json as { path: string; manifest_path: string; migration_max: number; strategy_revision_count: number; job_definition_count: number };
+    const data = exported.json as { path: string; manifest_path: string; migration_max: number; strategy_revision_count: number; strategy_definition_count: number; job_definition_count: number };
     expect(data.path).toMatch(/\.ndjson\.gz$/);
-    expect(data.migration_max).toBe(115);
+    expect(data.migration_max).toBe(116);
     expect(data.strategy_revision_count).toBeGreaterThan(0);
+    expect(data.strategy_definition_count).toBeGreaterThan(0);
     expect(data.job_definition_count).toBeGreaterThan(0);
     portableFiles.push(path.join(PROJECT_ROOT, data.path), path.join(PROJECT_ROOT, data.manifest_path));
     const listed = await api(server.baseUrl, "GET", "/api/volume/portable");
     expect(listed.status).toBe(200);
     expect(listed.json).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: data.path, migration_max: 115, strategy_revision_count: data.strategy_revision_count }),
+      expect.objectContaining({ path: data.path, migration_max: 116, strategy_revision_count: data.strategy_revision_count, strategy_definition_count: data.strategy_definition_count }),
     ]));
   });
 

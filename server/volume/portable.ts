@@ -14,7 +14,7 @@ import { ensureDatabase } from "./restore.js";
 import { redactEphemeralCode } from "../agent/redaction.js";
 
 export const DEFAULT_PORTABLE_DIR = path.join(PROJECT_ROOT, "bootstrap");
-export const PORTABLE_FORMAT_VERSION = 6 as const;
+export const PORTABLE_FORMAT_VERSION = 7 as const;
 export const PORTABLE_FORBIDDEN = [
   "system_setting.hithink_api_key",
   "notification_*",
@@ -29,6 +29,9 @@ export const PORTABLE_FORBIDDEN = [
   "backtest_*",
   "content_*",
   "job_run*",
+  "strategy_evaluation_run",
+  "strategy_entry_signal",
+  "strategy_position_evaluation",
 ] as const;
 
 interface PortableTableSpec {
@@ -42,7 +45,7 @@ interface PortableTableSpec {
 
 /**
  * 可提交固定资产包的唯一白名单：当前策略正文（组合总策略 + 任务级策略文档 + 指引）
- * + 定时任务定义/提示词。
+ * + 策略运行时定义 + 定时任务定义/提示词。
  * 未列出的运行数据和本机设置绝不进入 payload；尤其不读取任何 api_key。
  * 策略只携带当前最终正文，不携带历史版本；演进摘要与提案审核流程已退役。
  * 表顺序同时是恢复插入顺序，必须满足外键依赖。
@@ -50,8 +53,9 @@ interface PortableTableSpec {
 export const PORTABLE_TABLES: readonly PortableTableSpec[] = [
   { table: "job_prompt", columns: ["id", "code", "name", "status", "current_revision_id", "created_at", "updated_at"], orderBy: ["id"], identity: true },
   { table: "job_prompt_revision", columns: ["id", "prompt_id", "revision_no", "content", "sha256", "source", "base_revision_id", "change_summary", "created_at"], orderBy: ["id"], identity: true },
-  { table: "job_definition", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
   { table: "strategy_document", columns: ["id", "code", "title", "role", "injection_order", "job_code", "content", "sha256", "created_at", "updated_at"], orderBy: ["id"], identity: true },
+  { table: "strategy_definition", columns: ["code", "name", "strategy_type", "strategy_document_code", "status", "allow_new_entry", "entry_evaluator_code", "exit_evaluator_code", "context_evaluator_code", "fallback_strategy_code", "exit_policy_mode", "daily_plan_scope", "attention_policy", "runtime_version", "created_at", "updated_at"], orderBy: ["code"] },
+  { table: "job_definition", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "purpose", "phase", "priority", "strategy_code", "agent_role"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
   { table: "strategy_score_benchmark", columns: ["id", "document_id", "benchmark_code", "training_start", "training_end", "methodology", "distributions", "sample_counts", "source_summary", "sha256", "created_at"], orderBy: ["id"], identity: true, jsonColumns: ["distributions", "sample_counts", "source_summary"], dateColumns: ["training_start", "training_end"] },
   { table: "strategy_state", columns: ["singleton", "change_seq", "current_hash", "updated_at"], orderBy: ["singleton"] },
 ] as const;
@@ -247,10 +251,10 @@ const RESET_STATEMENTS = [
   "DELETE FROM market_indicator_value",
   "DELETE FROM market_indicator_run",
   "DELETE FROM market_indicator_dirty",
+  "DELETE FROM strategy_entry_signal",
+  "DELETE FROM strategy_position_evaluation",
+  "DELETE FROM strategy_evaluation_run",
   "DELETE FROM job_run_output",
-  "DELETE FROM strategy_score_benchmark",
-  "DELETE FROM strategy_state",
-  "DELETE FROM strategy_document",
   "DELETE FROM analysis_run",
   "DELETE FROM fundamental_snapshot",
   "DELETE FROM valuation_snapshot",
@@ -259,6 +263,10 @@ const RESET_STATEMENTS = [
   "DELETE FROM portfolio_account_state",
   "DELETE FROM job_run",
   "DELETE FROM job_definition",
+  "DELETE FROM strategy_definition",
+  "DELETE FROM strategy_score_benchmark",
+  "DELETE FROM strategy_state",
+  "DELETE FROM strategy_document",
   "UPDATE job_prompt SET current_revision_id = NULL",
   "DELETE FROM job_prompt_revision",
   "DELETE FROM job_prompt",

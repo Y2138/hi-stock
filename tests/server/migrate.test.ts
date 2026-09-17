@@ -91,7 +91,11 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "portfolio_position_change",
       "portfolio_realized_pnl_baseline",
       "schema_migrations",
+      "strategy_definition",
       "strategy_document",
+      "strategy_entry_signal",
+      "strategy_evaluation_run",
+      "strategy_position_evaluation",
       "strategy_score_benchmark",
       "strategy_state",
       "system_setting",
@@ -279,6 +283,45 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     );
     expect(retiredTables.rows.every((row) => row.name === null)).toBe(true);
   }, 15_000);
+
+  it("策略运行时约束固定策略、任务角色和评估结果归属", async () => {
+    const definitions = await pool.query<{ code: string }>("SELECT code FROM strategy_definition ORDER BY code");
+    expect(definitions.rows.map((row) => row.code)).toEqual(expect.arrayContaining([
+      "swing", "two_year_reversal", "legacy_right_side", "portfolio_fallback_exit",
+    ]));
+    await pool.query("BEGIN");
+    try {
+      await expect(pool.query(
+        "UPDATE strategy_definition SET fallback_strategy_code = code WHERE code = 'legacy_right_side'",
+      )).rejects.toThrow();
+      await pool.query("ROLLBACK");
+      await pool.query("BEGIN");
+      await expect(pool.query(
+        "UPDATE job_definition SET strategy_code = 'swing' WHERE code = 'daily_plan_flow'",
+      )).rejects.toThrow();
+      await pool.query("ROLLBACK");
+      await pool.query("BEGIN");
+      const instrument = await pool.query<{ id: string }>(
+        "INSERT INTO market_instrument (code, name, kind) VALUES ('999116.SZ', '运行时约束样本', 'stock') RETURNING id::text",
+      );
+      const run = await pool.query<{ id: string }>(
+        `INSERT INTO strategy_evaluation_run
+           (strategy_code, phase, target_date, evaluator_code, evaluator_version,
+            strategy_runtime_version, strategy_snapshot_hash, input_fingerprint, status)
+         VALUES ('swing', 'entry', '2026-09-17', 'swing_entry_v1', 1, 1, $1, $2, 'success')
+         RETURNING id::text`,
+        ["0".repeat(64), "1".repeat(64)],
+      );
+      await expect(pool.query(
+        `INSERT INTO strategy_entry_signal
+           (run_id, strategy_code, instrument_id, signal_status, reason, valid_from)
+         VALUES ($1, 'two_year_reversal', $2, 'qualified', '策略归属不一致', '2026-09-17')`,
+        [run.rows[0]!.id, instrument.rows[0]!.id],
+      )).rejects.toThrow();
+    } finally {
+      await pool.query("ROLLBACK");
+    }
+  });
 
   it("关注条目表结构约束：approaching 必须携带缺口，来源联合主键", async () => {
     await pool.query("INSERT INTO market_instrument (code, name, kind) VALUES ('990081.SZ', '条目测试标的', 'stock')");
