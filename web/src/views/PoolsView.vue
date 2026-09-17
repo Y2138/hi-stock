@@ -315,6 +315,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                         <div class="attention-entry-head">
                           <span class="badge signal-status" :class="entry.status">{{ attentionStatusLabel(entry) }}</span>
                           <span class="muted source-tag">{{ attentionSourceLabel(entry) }}</span>
+                        <span v-if="entry.stale_reason" class="badge warn">待复核</span>
                         </div>
                         <ul v-if="entry.status === 'approaching'" class="signal-gaps">
                           <li v-for="gap in entry.missing_signals" :key="gap">待确认：{{ gap }}</li>
@@ -371,7 +372,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                   <li v-if="!entry.missing_signals.length">缺口待补充，请结合关注原因核实</li>
                 </ul>
                 <p>{{ entry.reason }}</p>
-                <div class="muted">{{ fmtDate(entry.valid_from) ?? "现在" }}–{{ fmtDate(entry.valid_until) ?? "持续" }}</div>
+                <div class="muted">{{ fmtDate(entry.valid_from) ?? "现在" }}–{{ fmtDate(entry.valid_until) ?? "持续" }}<template v-if="entry.data_date"> · 数据 {{ fmtDate(entry.data_date) }}</template></div>
+                <p v-if="entry.stale_reason" class="missing">{{ entry.stale_reason }}</p>
                 <div class="detail-attention-actions">
                   <button class="btn compact remove-attention" type="button" :disabled="removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}`" @click="removeAttention(detailMember, entry)">{{ removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}` ? "移除中" : "移除关注" }}</button>
                 </div>

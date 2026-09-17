@@ -45,6 +45,10 @@ const planEmpty = computed(() => {
   return board !== null && board.opportunities.length === 0;
 });
 const opportunities = computed(() => dailyPlan.data.value?.opportunities ?? []);
+const planPositionActions = computed(() => dailyPlan.data.value?.position_actions ?? []);
+const planStrategyCovered = computed(() => planPositionActions.value.filter((item) => item.primary_evaluation_run_id).length);
+const planFallbackCovered = computed(() => planPositionActions.value.filter((item) => item.fallback_evaluation_run_id).length);
+const planIncomplete = computed(() => planPositionActions.value.filter((item) => item.evaluation_status && item.evaluation_status !== "success").length);
 const planTargetDate = computed(() => dailyPlan.data.value?.plan.target_date ?? null);
 const planPendingReview = computed(() =>
   opportunities.value.filter((item) => item.auction_assessment === null).length,
@@ -171,6 +175,24 @@ const attentionItems = computed<AttentionItem[]>(() => {
       to: "/datasync",
     });
   }
+
+  const unassigned = activePositions.value.filter((position) => !position.strategy_code).length;
+  if (unassigned > 0) items.push({
+    key: "unassigned-positions", title: `${unassigned} 只持仓待策略归因`,
+    detail: "每日计划无法为待归因持仓选择主出场策略", tone: "bad", to: "/positions",
+  });
+  const incompleteActions = (dailyPlan.data.value?.position_actions ?? []).filter((item) =>
+    item.evaluation_status && item.evaluation_status !== "success").length;
+  if (incompleteActions > 0) items.push({
+    key: "incomplete-plan-evaluation", title: `${incompleteActions} 笔持仓预案评估不完整`,
+    detail: "查看主策略、兜底策略和数据缺口", tone: "warn", to: "/positions",
+  });
+  const staleAttention = (watchPool.data.value?.members ?? []).flatMap((member) => member.attention_entries)
+    .filter((entry) => entry.stale_reason).length;
+  if (staleAttention > 0) items.push({
+    key: "stale-strategy-attention", title: `${staleAttention} 条策略关注待复核`,
+    detail: "部分评估未覆盖或数据日滞后", tone: "warn", to: "/pools",
+  });
 
   if (positionSummary.value.missingQuote > 0) {
     items.push({
@@ -389,12 +411,12 @@ onMounted(reloadAll);
       <div class="card-heading">
         <div>
           <span class="section-label">每日计划 · {{ planTargetDate ?? "—" }}</span>
-          <h2>打板机会</h2>
+          <h2>计划覆盖与打板机会</h2>
         </div>
         <RouterLink to="/market-structure">查看市场结构</RouterLink>
       </div>
       <p class="strategy-scope-note">
-        此处只汇总数量；逐只信号、评分依据与 T+1 竞价复核详情在市场结构页的“打板机会”查看。
+        汇总持仓主策略、兜底覆盖与打板数量；逐只动作在持仓页查看，竞价复核在市场结构页查看。
       </p>
       <StateBlock
         :loading="planLoading"
@@ -406,6 +428,16 @@ onMounted(reloadAll);
       >
         <p v-if="planMissing" class="no-runs">每日计划尚未生成结构化预案，生成后此处显示打板机会数量。</p>
         <div v-else class="overview-grid">
+          <div class="overview-item">
+            <span class="overview-label">持仓预案</span>
+            <strong class="num">{{ planPositionActions.length }}</strong>
+            <small>主策略 {{ planStrategyCovered }} · 兜底 {{ planFallbackCovered }}</small>
+          </div>
+          <div class="overview-item">
+            <span class="overview-label">评估缺口</span>
+            <strong class="num" :class="{ down: planIncomplete > 0 }">{{ planIncomplete }}</strong>
+            <small>partial / failed / waiting</small>
+          </div>
           <div class="overview-item">
             <span class="overview-label">打板信号</span>
             <strong class="num">{{ opportunities.length }}</strong>

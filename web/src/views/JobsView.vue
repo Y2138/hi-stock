@@ -157,6 +157,15 @@ function modelLabel(job: JobDefinition): string {
   return `模型 #${job.model_id}（当前不可用）`;
 }
 
+const AGENT_ROLE_LABELS: Record<string, string> = {
+  strategy_entry_report: "入场专项", strategy_exit_report: "出场专项", strategy_confirmation: "盘中确认",
+  portfolio_aggregator: "组合统筹", data_pipeline: "数据链路", research_report: "研究报告",
+};
+function runtimeRole(job: JobDefinition): string {
+  const role = job.agent_role ? AGENT_ROLE_LABELS[job.agent_role] ?? job.agent_role : "未纳入策略运行时";
+  return job.strategy_code ? `${role} · ${job.strategy_code}` : role;
+}
+
 function responsibility(job: JobDefinition): string {
   if (job.purpose) return job.purpose;
   if (job.job_type === "datasource") return DATASOURCE_INFO[pipelineOf(job)]?.responsibility ?? "执行受控服务端数据同步。";
@@ -351,12 +360,14 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
                 <span class="badge accent">{{ TYPE_LABELS[job.job_type] }}</span>
                 <span v-if="job.phase" class="badge">{{ job.phase }}</span>
                 <span v-if="job.priority !== null" class="badge num" title="重要性排序权重，越小越靠前">P{{ job.priority }}</span>
+                <span v-if="job.agent_role" class="badge">{{ runtimeRole(job) }}</span>
                 <span class="num">{{ cadenceLabel(job) }}</span>
                 <span class="code num">{{ job.cron }}</span>
               </div>
               <p class="job-purpose-text">{{ responsibility(job) }}</p>
               <dl class="job-kv job-purpose">
                 <dt>执行</dt><dd>{{ executionLabel(job) }}</dd>
+                <dt>运行时角色</dt><dd>{{ runtimeRole(job) }}</dd>
                 <dt>产出</dt><dd>{{ expectedResult(job) }}</dd>
                 <template v-if="job.job_type === 'agent_flow'"><dt>模型</dt><dd>{{ modelLabel(job) }}</dd></template>
                 <dt>下次运行</dt><dd>{{ job.next_run ? fmtTime(job.next_run) : "已暂停" }}</dd>

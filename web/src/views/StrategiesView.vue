@@ -1,42 +1,47 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { apiClient, type ApiFail } from "../api/client";
-import type { CurrentStrategy, StrategyDocument } from "../api/types";
+import type { CurrentStrategy, StrategyDocument, StrategyRuntimeDefinition } from "../api/types";
 import MarkdownView from "../components/MarkdownView.vue";
 import StateBlock from "../components/StateBlock.vue";
 import { useUiRefresh } from "../composables/useUiRefresh";
-import { shortHash, fmtTime } from "../utils/format";
+import { shortHash, fmtDate, fmtTime } from "../utils/format";
 
 const strategy = ref<CurrentStrategy | null>(null);
+const runtimes = ref<StrategyRuntimeDefinition[]>([]);
+const selectedCode = ref<string | null>(null);
 const selectedDocumentId = ref<string | null>(null);
 const loading = ref(false);
 const error = ref<ApiFail | null>(null);
 
-const selectedDocument = computed<StrategyDocument | null>(() =>
-  strategy.value?.documents.find((document) => document.id === selectedDocumentId.value)
-  ?? strategy.value?.documents[0]
-  ?? null,
-);
+const selectedRuntime = computed(() => runtimes.value.find((item) => item.code === selectedCode.value) ?? null);
+const selectedDocument = computed<StrategyDocument | null>(() => {
+  const code = selectedRuntime.value?.strategy_document_code;
+  return strategy.value?.documents.find((document) => document.code === code)
+    ?? strategy.value?.documents.find((document) => document.id === selectedDocumentId.value)
+    ?? strategy.value?.documents[0] ?? null;
+});
+const publicDocuments = computed(() => strategy.value?.documents.filter((document) =>
+  !runtimes.value.some((runtime) => runtime.strategy_document_code === document.code)) ?? []);
 
-const ROLE_LABELS: Record<StrategyDocument["role"], string> = {
-  portfolio: "组合总策略",
-  task: "任务策略",
-  guidance: "核心指引",
-};
+const TYPE_LABELS: Record<string, string> = { position: "持仓策略", attention: "关注策略", observation: "观察策略", fallback_exit: "兜底出场", portfolio_overlay: "组合叠加" };
+const STATUS_LABELS: Record<string, string> = { active: "运行中", exit_only: "仅退出", paused: "已暂停", retired: "已退役" };
+const SCOPE_LABELS: Record<string, string> = { entry: "入场", exit: "出场", attention: "关注", observe: "观察", context: "组合上下文" };
+const EXIT_LABELS: Record<string, string> = { none: "不适用", dedicated: "专属出场", fallback_only: "仅兜底", dedicated_plus_fallback: "专属 + 兜底" };
 
-async function loadAll(keepDocument = selectedDocumentId.value): Promise<void> {
-  loading.value = true;
-  error.value = null;
-  const result = await apiClient.get<CurrentStrategy>("/api/strategy/current");
+async function loadAll(keep = selectedCode.value): Promise<void> {
+  loading.value = true; error.value = null;
+  const [current, runtime] = await Promise.all([
+    apiClient.get<CurrentStrategy>("/api/strategy/current"),
+    apiClient.get<StrategyRuntimeDefinition[]>("/api/strategies/runtime"),
+  ]);
   loading.value = false;
-  if (!result.ok) {
-    error.value = result;
-    return;
-  }
-  strategy.value = result.data;
-  const kept = strategy.value?.documents.find((document) => document.id === keepDocument);
-  selectedDocumentId.value = kept?.id ?? strategy.value?.documents[0]?.id ?? null;
+  if (!current.ok) { error.value = current; return; }
+  if (!runtime.ok) { error.value = runtime; return; }
+  strategy.value = current.data; runtimes.value = runtime.data;
+  selectedCode.value = runtime.data.some((item) => item.code === keep) ? keep : runtime.data[0]?.code ?? null;
 }
+function selectDocument(document: StrategyDocument): void { selectedCode.value = null; selectedDocumentId.value = document.id; }
 
 useUiRefresh("strategies", () => loadAll());
 onMounted(() => void loadAll());
@@ -45,43 +50,45 @@ onMounted(() => void loadAll());
 <template>
   <section>
     <div class="page-head strategy-head">
-      <div>
-        <h1>当前策略</h1>
-        <div class="sub">组合总策略统筹 · 每个定时任务对应一份任务策略 · 正文随本地回测结论经迁移维护</div>
-      </div>
-      <div class="head-actions">
-        <span v-if="strategy" class="badge ok num">序号 {{ strategy.state.change_seq }} · {{ shortHash(strategy.state.current_hash) }}</span>
-      </div>
+      <div><h1>策略中心</h1><div class="sub">当前策略正文 · 入场/出场评估器 · 关注、持仓、兜底与任务关系</div></div>
+      <span v-if="strategy" class="badge ok num">序号 {{ strategy.state.change_seq }} · {{ shortHash(strategy.state.current_hash) }}</span>
     </div>
-
-    <StateBlock :loading="loading" :error="error" :empty="!strategy" empty-text="当前策略尚未初始化" @retry="loadAll">
+    <StateBlock :loading="loading" :error="error" :empty="!strategy" empty-text="策略运行时尚未初始化" @retry="loadAll">
       <div class="strategy-layout">
-        <aside class="card document-list">
-          <div class="card-title">策略文档（{{ strategy?.documents.length ?? 0 }}）</div>
-          <button
-            v-for="document in strategy?.documents"
-            :key="document.id"
-            class="document-item"
-            :class="{ active: selectedDocument?.id === document.id }"
-            type="button"
-            @click="selectedDocumentId = document.id"
-          >
-            <strong>{{ document.title }}</strong>
-            <span>{{ ROLE_LABELS[document.role] }}</span>
+        <aside class="card runtime-list">
+          <div class="card-title">运行时策略（{{ runtimes.length }}）</div>
+          <button v-for="item in runtimes" :key="item.code" class="runtime-item" :class="{ active: selectedCode === item.code }" type="button" @click="selectedCode=item.code">
+            <span><strong>{{ item.name }}</strong><small>{{ TYPE_LABELS[item.strategy_type] }}</small></span>
+            <span class="badge" :class="{ ok:item.status==='active', warn:item.status==='exit_only' }">{{ STATUS_LABELS[item.status] }}</span>
           </button>
+          <div v-if="publicDocuments.length" class="list-divider">公共文档</div>
+          <button v-for="document in publicDocuments" :key="document.id" class="runtime-item" :class="{ active: !selectedCode && selectedDocument?.id === document.id }" type="button" @click="selectDocument(document)"><span><strong>{{ document.title }}</strong><small>{{ document.role }}</small></span></button>
         </aside>
 
-        <main class="card strategy-reader">
-          <template v-if="selectedDocument">
-            <div class="reader-head">
-              <div>
-                <div class="card-title">{{ selectedDocument.title }}</div>
-                <p class="card-desc num">{{ selectedDocument.code }}<template v-if="selectedDocument.job_code"> · 任务 {{ selectedDocument.job_code }}</template> · {{ shortHash(selectedDocument.sha256) }} · {{ fmtTime(selectedDocument.updated_at) }}</p>
-              </div>
-              <span class="badge">{{ ROLE_LABELS[selectedDocument.role] }}</span>
+        <main class="strategy-main">
+          <article v-if="selectedRuntime" class="card runtime-overview">
+            <div class="reader-head"><div><h2>{{ selectedRuntime.name }}</h2><p class="num">{{ selectedRuntime.code }} · 运行版本 v{{ selectedRuntime.runtime_version }}</p></div><span class="badge" :class="{ ok:selectedRuntime.status==='active', warn:selectedRuntime.status==='exit_only' }">{{ STATUS_LABELS[selectedRuntime.status] }}</span></div>
+            <div class="metric-grid">
+              <div><span>当前持仓</span><strong class="num">{{ selectedRuntime.position_count }}</strong></div>
+              <div><span>关注标的</span><strong class="num">{{ selectedRuntime.attention_count }}</strong></div>
+              <div><span>出场模式</span><strong>{{ EXIT_LABELS[selectedRuntime.exit_policy_mode] }}</strong></div>
+              <div><span>最近评估</span><strong>{{ selectedRuntime.latest_evaluation ? `${fmtDate(selectedRuntime.latest_evaluation.target_date)} · ${selectedRuntime.latest_evaluation.status}` : "尚无" }}</strong></div>
             </div>
-            <MarkdownView :source="selectedDocument.content" />
-          </template>
+            <dl class="runtime-kv">
+              <dt>入场评估器</dt><dd class="num">{{ selectedRuntime.entry_evaluator_code ?? "—" }}</dd>
+              <dt>出场评估器</dt><dd class="num">{{ selectedRuntime.exit_evaluator_code ?? "—" }}</dd>
+              <dt>组合评估器</dt><dd class="num">{{ selectedRuntime.context_evaluator_code ?? "—" }}</dd>
+              <dt>兜底策略</dt><dd>{{ selectedRuntime.fallback_strategy_name ?? selectedRuntime.fallback_strategy_code ?? "不使用" }}</dd>
+              <dt>每日计划</dt><dd><span v-for="scope in selectedRuntime.daily_plan_scope" :key="scope" class="badge">{{ SCOPE_LABELS[scope] }}</span><span v-if="!selectedRuntime.daily_plan_scope.length">不参与</span></dd>
+              <dt>关联任务</dt><dd><span v-for="task in selectedRuntime.tasks" :key="task.code" class="badge" :class="{ ok:task.enabled }">{{ task.name }} · {{ task.agent_role }}</span><span v-if="!selectedRuntime.tasks.length">无专项任务</span></dd>
+            </dl>
+          </article>
+          <article class="card strategy-reader">
+            <template v-if="selectedDocument">
+              <div class="reader-head"><div><div class="card-title">{{ selectedDocument.title }}</div><p class="card-desc num">{{ selectedDocument.code }} · {{ shortHash(selectedDocument.sha256) }} · {{ fmtTime(selectedDocument.updated_at) }}</p></div><span class="badge">当前正文</span></div>
+              <MarkdownView :source="selectedDocument.content" />
+            </template>
+          </article>
         </main>
       </div>
     </StateBlock>
@@ -89,6 +96,6 @@ onMounted(() => void loadAll());
 </template>
 
 <style scoped>
-.strategy-head,.head-actions,.reader-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.head-actions{justify-content:flex-end}.reader-head{align-items:flex-start;padding-bottom:12px;border-bottom:1px solid var(--line)}.card-desc{margin:5px 0 0}
-.strategy-layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:14px}.document-list{align-self:start;padding:10px}.document-list>.card-title{padding:6px 8px 10px}.document-item{display:grid;gap:4px;width:100%;padding:9px;border:0;border-radius:var(--radius-sm);background:transparent;color:inherit;text-align:left;cursor:pointer}.document-item:hover,.document-item.active{background:var(--accent-soft)}.document-item span{color:var(--ink-faint);font-size:11px}.strategy-reader{min-width:0}.muted{color:var(--ink-faint);font-size:12px}@container business (max-width:760px){.strategy-head,.head-actions{align-items:flex-start;flex-direction:column}.strategy-layout{grid-template-columns:1fr}.document-list{display:flex;gap:6px;overflow:auto}.document-list>.card-title{display:none}.document-item{min-width:170px}}
+.strategy-head,.reader-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.strategy-layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:14px}.runtime-list{align-self:start;padding:10px}.runtime-list>.card-title{padding:6px 8px 10px}.runtime-item{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;padding:9px;border:0;border-radius:var(--radius-sm);background:transparent;color:inherit;text-align:left;cursor:pointer}.runtime-item:hover,.runtime-item.active{background:var(--accent-soft)}.runtime-item>span:first-child{display:grid;gap:3px}.runtime-item small,.reader-head p{color:var(--ink-faint);font-size:11px}.list-divider{margin:10px 8px 4px;padding-top:10px;border-top:1px solid var(--line);color:var(--ink-faint);font-size:11px}.strategy-main{display:grid;gap:14px;min-width:0}.runtime-overview h2{margin:0}.runtime-overview p,.card-desc{margin:4px 0 0}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:14px 0}.metric-grid>div{display:grid;gap:4px;padding:10px;background:var(--paper-deep);border-radius:var(--radius-sm)}.metric-grid span,.runtime-kv dt{color:var(--ink-faint);font-size:11px}.runtime-kv{display:grid;grid-template-columns:90px minmax(0,1fr);gap:8px 12px;margin:0}.runtime-kv dd{margin:0;overflow-wrap:anywhere}.runtime-kv .badge{margin:0 5px 4px 0}.strategy-reader{min-width:0}.strategy-reader .reader-head{padding-bottom:12px;border-bottom:1px solid var(--line)}
+@container business (max-width:800px){.strategy-layout{grid-template-columns:1fr}.runtime-list{display:flex;gap:6px;overflow:auto}.runtime-list>.card-title,.list-divider{display:none}.runtime-item{min-width:200px}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>

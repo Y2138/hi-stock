@@ -273,7 +273,7 @@ onMounted(reloadPositionsData);
             <thead>
               <tr>
                 <th scope="col">标的</th>
-                <th scope="col">动作</th>
+                <th scope="col">策略 / 动作</th>
                 <th scope="col">触发方式</th>
                 <th scope="col">预案要点</th>
                 <th scope="col">集合竞价预案</th>
@@ -284,12 +284,17 @@ onMounted(reloadPositionsData);
             <tbody>
               <tr v-for="item in positionActions" :key="item.id">
                 <td><strong>{{ item.name }}</strong><br /><small class="num">{{ item.code }}</small></td>
-                <td><span class="num" :class="triggerClass(item)">{{ ACTION_LABELS[item.action] }}</span></td>
+                <td>
+                  <span v-if="item.strategy_code" class="badge accent">{{ item.strategy_code }}</span>
+                  <span class="num" :class="triggerClass(item)">{{ ACTION_LABELS[item.effective_action ?? item.action] }}</span>
+                  <div class="code-sub">主 {{ item.primary_action ? ACTION_LABELS[item.primary_action] : "—" }} · 兜底 {{ item.fallback_action ? ACTION_LABELS[item.fallback_action] : "—" }}</div>
+                  <span v-if="item.evaluation_status" class="badge" :class="{ warn:item.evaluation_status !== 'success' }">{{ item.evaluation_status }}</span>
+                </td>
                 <td><small>{{ triggerLabel(item) }}</small></td>
                 <td>{{ item.headline }}</td>
                 <td><small>{{ item.auction_md ?? "—" }}</small></td>
                 <td><small>{{ item.intraday_md ?? "—" }}</small></td>
-                <td><small>{{ item.invalidation_md ?? "—" }}</small></td>
+                <td><small>{{ item.invalidation_md ?? "—" }}</small><div v-if="item.evaluation_missing.length" class="missing">{{ item.evaluation_missing.join("；") }}</div></td>
               </tr>
             </tbody>
           </table>

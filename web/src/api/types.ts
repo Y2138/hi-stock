@@ -27,6 +27,71 @@ export interface CurrentStrategy {
   documents: StrategyDocument[];
 }
 
+export type StrategyRuntimeType = "position" | "attention" | "observation" | "fallback_exit" | "portfolio_overlay";
+export type StrategyRuntimeStatus = "active" | "exit_only" | "paused" | "retired";
+export type StrategyEvaluationPhase = "entry" | "exit" | "context";
+export type StrategyEvaluationStatus = "queued" | "running" | "success" | "partial" | "failed";
+
+export interface StrategyEvaluationRun {
+  id: string;
+  strategy_code: string;
+  phase: StrategyEvaluationPhase;
+  target_date: string;
+  data_date: string | null;
+  evaluator_code: string;
+  evaluator_version: number;
+  strategy_runtime_version: number;
+  strategy_snapshot_hash: string;
+  input_fingerprint: string;
+  status: StrategyEvaluationStatus;
+  requested_by_job_run_id: string | null;
+  reused_from_run_id: string | null;
+  coverage: Record<string, unknown>;
+  gaps: unknown[];
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  result: unknown | null;
+  attempt_count: number;
+  last_requested_at: string;
+}
+
+export interface StrategyRuntimeTask {
+  code: string;
+  name: string;
+  enabled: boolean;
+  agent_role: string | null;
+  purpose: string | null;
+  phase: string | null;
+  priority: number | null;
+}
+
+export interface StrategyRuntimeDefinition {
+  code: string;
+  name: string;
+  strategy_type: StrategyRuntimeType;
+  strategy_document_code: string;
+  strategy_document_title: string;
+  strategy_document_sha256: string;
+  status: StrategyRuntimeStatus;
+  allow_new_entry: boolean;
+  entry_evaluator_code: string | null;
+  exit_evaluator_code: string | null;
+  context_evaluator_code: string | null;
+  fallback_strategy_code: string | null;
+  fallback_strategy_name: string | null;
+  exit_policy_mode: "none" | "dedicated" | "fallback_only" | "dedicated_plus_fallback";
+  daily_plan_scope: Array<"entry" | "exit" | "attention" | "observe" | "context">;
+  attention_policy: "none" | "qualified_only" | "qualified_and_approaching" | "manual_review";
+  runtime_version: number;
+  created_at: string;
+  updated_at: string;
+  position_count: number;
+  attention_count: number;
+  latest_evaluation: StrategyEvaluationRun | null;
+  tasks: StrategyRuntimeTask[];
+}
+
 // ---- 二期 M3：系统调度作业 ----
 
 export type JobType = "datasource" | "analysis" | "agent_flow";
@@ -62,6 +127,8 @@ export interface JobDefinition {
   phase: JobPhase | null;
   /** 重要性排序权重：数值越小越靠前。 */
   priority: number | null;
+  strategy_code: string | null;
+  agent_role: string | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -314,6 +381,16 @@ export interface DailyPlanPlaybookItem {
   missing_md: string | null;
   invalidation_md: string | null;
   risk_md: string | null;
+  strategy_code: string | null;
+  strategy_runtime_version: number | null;
+  primary_evaluation_run_id: string | null;
+  fallback_evaluation_run_id: string | null;
+  primary_action: "hold" | "observe" | "reduce" | "exit" | null;
+  fallback_action: "hold" | "observe" | "reduce" | "exit" | null;
+  effective_action: "hold" | "observe" | "reduce" | "exit" | null;
+  evaluation_status: "success" | "partial" | "failed" | "waiting" | null;
+  evaluation_data_date: string | null;
+  evaluation_missing: string[];
   target_date: string;
   auction_assessment: {
     id: string;

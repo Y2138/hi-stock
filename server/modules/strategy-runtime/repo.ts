@@ -15,10 +15,32 @@ const DEFINITION_SELECT = `
          definition.exit_policy_mode, definition.daily_plan_scope,
          definition.attention_policy, definition.runtime_version,
          definition.created_at::text, definition.updated_at::text,
+         COALESCE(position_count.count,0)::int AS position_count,
+         COALESCE(attention_count.count,0)::int AS attention_count,
+         latest_evaluation.item AS latest_evaluation,
          COALESCE(tasks.items, '[]'::jsonb) AS tasks
     FROM strategy_definition definition
     JOIN strategy_document document ON document.code = definition.strategy_document_code
     LEFT JOIN strategy_definition fallback ON fallback.code = definition.fallback_strategy_code
+    LEFT JOIN LATERAL (
+      SELECT count(*)::int AS count FROM portfolio_position position
+       WHERE position.strategy_code=definition.code AND position.quantity>0
+    ) position_count ON true
+    LEFT JOIN LATERAL (
+      SELECT count(*)::int AS count FROM pool_attention_entry attention
+       WHERE attention.source_type='strategy' AND attention.strategy_code=definition.code
+         AND attention.valid_from<=CURRENT_DATE AND (attention.valid_until IS NULL OR attention.valid_until>=CURRENT_DATE)
+    ) attention_count ON true
+    LEFT JOIN LATERAL (
+      SELECT to_jsonb(run) || jsonb_build_object(
+        'id',run.id::text,'target_date',run.target_date::text,'data_date',run.data_date::text,
+        'requested_by_job_run_id',run.requested_by_job_run_id::text,'reused_from_run_id',run.reused_from_run_id::text,
+        'started_at',run.started_at::text,'finished_at',run.finished_at::text,'created_at',run.created_at::text,
+        'last_requested_at',run.last_requested_at::text
+      ) AS item
+      FROM strategy_evaluation_run run WHERE run.strategy_code=definition.code
+      ORDER BY run.target_date DESC,run.created_at DESC LIMIT 1
+    ) latest_evaluation ON true
     LEFT JOIN LATERAL (
       SELECT jsonb_agg(jsonb_build_object(
                'code', job.code,

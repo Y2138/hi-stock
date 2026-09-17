@@ -28,6 +28,10 @@ export interface JobDefinitionRow {
   phase: JobPhase | null;
   /** 重要性排序权重：数值越小越靠前。 */
   priority: number | null;
+  /** 单策略任务关联的运行时策略；组合聚合和数据任务为空。 */
+  strategy_code: string | null;
+  /** 任务在策略运行时中的受控角色。 */
+  agent_role: string | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;

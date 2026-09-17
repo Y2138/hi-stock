@@ -64,7 +64,7 @@ function assertPriority(value: unknown): number | null {
 export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLatest[]> {
   const result = await db.query<JobDefinitionRow & { latest_run: Partial<JobRunRow> | null }>(
     `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text, to_jsonb(d)->>'model_id' AS model_id,
-            d.purpose, d.phase, d.priority, d.enabled,
+            d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
             (SELECT json_build_object(
@@ -89,7 +89,7 @@ export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLates
 export async function findJobByCode(db: Db, code: string): Promise<JobDefinitionRow | null> {
   const result = await db.query<JobDefinitionRow>(
     `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text,
-            to_jsonb(d)->>'model_id' AS model_id, d.purpose, d.phase, d.priority, d.enabled,
+            to_jsonb(d)->>'model_id' AS model_id, d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
        FROM job_definition d WHERE d.code = $1`,
@@ -129,7 +129,7 @@ export async function createJobDefinition(
   const result = await db.query<JobDefinitionRow>(
     `INSERT INTO job_definition (code, name, cron, job_type, config, prompt_id, model_id, purpose, phase, priority, enabled)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority, enabled,
+     RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority, strategy_code, agent_role, enabled,
                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
     [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, purpose, phase, priority, input.enabled ?? true],
@@ -192,7 +192,7 @@ export async function updateJobDefinition(
             purpose = $9, phase = $10, priority = $11, updated_at = now()
       WHERE code = $1
         AND ($12::timestamptz IS NULL OR updated_at = $12::timestamptz)
-      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority, enabled,
+      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority, strategy_code, agent_role, enabled,
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
     [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, patch.enabled ?? current.enabled, purpose, phase, priority, baseUpdatedAt],

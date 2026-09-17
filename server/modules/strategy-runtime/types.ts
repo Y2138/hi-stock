@@ -49,6 +49,9 @@ export interface StrategyRuntimeDefinition {
   runtime_version: number;
   created_at: string;
   updated_at: string;
+  position_count: number;
+  attention_count: number;
+  latest_evaluation: StrategyEvaluationRunSummary | null;
   tasks: StrategyTaskLink[];
 }
 
