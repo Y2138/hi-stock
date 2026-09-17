@@ -17,15 +17,11 @@ import {
   queryMarketStructure,
   type MarketStructureDataset,
 } from "../modules/market/structure.js";
-import { queryLimitUpSignals } from "../modules/market/limit-up-signals.js";
+import type { LimitUpSignalResult } from "../modules/market/limit-up-signals.js";
 import { queryDailyPlanContext } from "../modules/plans/daily-context.js";
-import { querySwingSignals } from "../modules/plans/swing-signals.js";
 import { queryStockResearch } from "../modules/market/research.js";
-import { queryCopperInventorySignal } from "../modules/market/copper-inventory-signal.js";
-import { queryLithiumWarehouseSignal } from "../modules/market/lithium-warehouse-signal.js";
 import { queryValueRank } from "../modules/value-ranking/service.js";
-import { queryValueAnchorSignals } from "../modules/plans/value-anchor-signal.js";
-import { queryTwoYearReversalSignals } from "../modules/plans/two-year-reversal-signal.js";
+import { executeStrategyEvaluator } from "../modules/strategy-runtime/registry.js";
 import { strategyForSession } from "./business-context-tools.js";
 import { insertToolAudit } from "./repo.js";
 import { sha256Json } from "./hash.js";
@@ -124,7 +120,9 @@ export function buildLimitUpSignalTool(deps: { pool: pg.Pool; sessionId: string 
       return audited(deps, "limit_up_signal_query", input, async () => {
         const strategy = await strategyForSession(deps);
         const documentId = strategy.documents.find((document) => document.code === "limit_up_board")?.id ?? null;
-        const value = await queryLimitUpSignals(deps.pool, input.date, documentId);
+        const value = await executeStrategyEvaluator<LimitUpSignalResult>("limit_up_observation_v1", {
+          pool: deps.pool, targetDate: input.date, strategyDocumentId: documentId,
+        });
         return {
           ...value,
           candidates: value.candidates.map((candidate) => ({
@@ -170,7 +168,9 @@ export function buildSwingSignalTool(deps: { pool: pg.Pool; sessionId: string | 
     parameters: SwingSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof SwingSignalSchema>>("swing_signal_query", SwingSignalSchema, raw);
-      return audited(deps, "swing_signal_query", input, () => querySwingSignals(deps.pool, input.date));
+      return audited(deps, "swing_signal_query", input, () => executeStrategyEvaluator("swing_entry_v1", {
+        pool: deps.pool, targetDate: input.date,
+      }));
     },
   };
 }
@@ -194,7 +194,9 @@ export function buildValueAnchorSignalTool(deps: { pool: pg.Pool; sessionId: str
     parameters: ValueAnchorSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof ValueAnchorSignalSchema>>("value_anchor_signal_query", ValueAnchorSignalSchema, raw);
-      return audited(deps, "value_anchor_signal_query", input, () => queryValueAnchorSignals(deps.pool, input.date));
+      return audited(deps, "value_anchor_signal_query", input, () => executeStrategyEvaluator("value_anchor_entry_v1", {
+        pool: deps.pool, targetDate: input.date,
+      }));
     },
   };
 }
@@ -206,7 +208,9 @@ export function buildTwoYearReversalSignalTool(deps: { pool: pg.Pool; sessionId:
     parameters: TwoYearReversalSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof TwoYearReversalSignalSchema>>("two_year_reversal_signal_query", TwoYearReversalSignalSchema, raw);
-      return audited(deps, "two_year_reversal_signal_query", input, () => queryTwoYearReversalSignals(deps.pool, input.date));
+      return audited(deps, "two_year_reversal_signal_query", input, () => executeStrategyEvaluator("two_year_reversal_entry_v1", {
+        pool: deps.pool, targetDate: input.date,
+      }));
     },
   };
 }
@@ -247,7 +251,9 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
         const input = validateToolInput<Static<typeof CopperInventorySignalSchema>>(
           "copper_inventory_signal_query", CopperInventorySignalSchema, raw,
         );
-        return audited(deps, "copper_inventory_signal_query", input, () => queryCopperInventorySignal(deps.pool, input.date));
+        return audited(deps, "copper_inventory_signal_query", input, () => executeStrategyEvaluator("copper_inventory_context_v1", {
+          pool: deps.pool, targetDate: input.date,
+        }));
       },
     },
     {
@@ -259,7 +265,9 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
         const input = validateToolInput<Static<typeof LithiumWarehouseSignalSchema>>(
           "lithium_warehouse_signal_query", LithiumWarehouseSignalSchema, raw,
         );
-        return audited(deps, "lithium_warehouse_signal_query", input, () => queryLithiumWarehouseSignal(deps.pool, input.date));
+        return audited(deps, "lithium_warehouse_signal_query", input, () => executeStrategyEvaluator("lithium_warehouse_context_v1", {
+          pool: deps.pool, targetDate: input.date,
+        }));
       },
     },
     {

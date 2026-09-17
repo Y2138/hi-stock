@@ -8,6 +8,12 @@ import { buildSystemPrompt } from "../../server/agent/prompt.js";
 import { createSession } from "../../server/agent/repo.js";
 import { buildChatTools } from "../../server/agent/tools.js";
 import { runMigrations } from "../../server/db/migrate.js";
+import {
+  executeStrategyEvaluator,
+  findStrategyEvaluatorBindingGaps,
+  getStrategyEvaluatorDefinition,
+  listStrategyEvaluatorDefinitions,
+} from "../../server/modules/strategy-runtime/registry.js";
 import { api, prepareTestDb, resetSchema, startTestServer, type TestServer } from "./helpers.js";
 
 const prepared = await prepareTestDb();
@@ -205,6 +211,31 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     expect((await pool.query<{ sha256: string }>(
       "SELECT sha256 FROM strategy_document ORDER BY injection_order, id",
     )).rows.map((row) => row.sha256)).toEqual(before);
+  });
+
+  it("评估器注册表覆盖全部策略绑定并拒绝未接入执行链路的评估器", async () => {
+    const evaluators = listStrategyEvaluatorDefinitions();
+    expect(new Set(evaluators.map((item) => item.code)).size).toBe(evaluators.length);
+    expect(getStrategyEvaluatorDefinition("swing_entry_v1")).toMatchObject({ phase: "entry", status: "ready", version: 1 });
+    expect(getStrategyEvaluatorDefinition("fallback_exit_v1")).toMatchObject({ phase: "exit", status: "pending", version: 1 });
+    expect(await findStrategyEvaluatorBindingGaps(pool)).toEqual([]);
+    await expect(executeStrategyEvaluator("fallback_exit_v1", { pool, targetDate: "2026-09-17" }))
+      .rejects.toThrow("尚未接入统一执行链路");
+
+    await pool.query("BEGIN");
+    try {
+      await pool.query("UPDATE strategy_definition SET entry_evaluator_code = 'missing_entry_v1' WHERE code = 'swing'");
+      expect(await findStrategyEvaluatorBindingGaps(pool)).toEqual([
+        expect.objectContaining({
+          strategy_code: "swing",
+          field: "entry_evaluator_code",
+          evaluator_code: "missing_entry_v1",
+          reason: "unregistered",
+        }),
+      ]);
+    } finally {
+      await pool.query("ROLLBACK");
+    }
   });
 
   it("策略运行时定义通过只读接口展示评估器、兜底和单策略任务关系", async () => {
