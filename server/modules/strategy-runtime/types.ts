@@ -71,6 +71,9 @@ export interface StrategyEvaluationRunSummary {
   started_at: string | null;
   finished_at: string | null;
   created_at: string;
+  result: unknown | null;
+  attempt_count: number;
+  last_requested_at: string;
 }
 
 export interface StrategyPositionEvaluation {

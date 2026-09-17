@@ -37,6 +37,7 @@ import { persistAndPublishSessionEvent } from "./events.js";
 import { sha256Json } from "./hash.js";
 import {
   buildDailyPlanContextTool,
+  buildStrategyEvaluationTool,
   buildLimitUpSignalTool,
   buildMarketDomainTools,
   buildValueRankTool,
@@ -228,15 +229,18 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
   ],
   copper_inventory_signal_review: [
     "strategy_document_query",
+    "strategy_evaluation_query",
     "copper_inventory_signal_query",
   ],
   lithium_warehouse_signal_review: [
     "strategy_document_query",
+    "strategy_evaluation_query",
     "lithium_warehouse_signal_query",
   ],
-  two_year_reversal_scan: ["strategy_document_query", "two_year_reversal_signal_query"],
+  two_year_reversal_scan: ["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query"],
   value_anchor_opportunity_scan: [
     "strategy_document_query",
+    "strategy_evaluation_query",
     "value_anchor_signal_query",
     "pool_attention_write",
   ],
@@ -487,6 +491,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     ...buildHithinkTools({ pool, sessionId: deps.sessionId, query: deps.queryHithink }),
     ...buildMarketDomainTools({ pool, sessionId: deps.sessionId }),
     buildDailyPlanContextTool({ pool, sessionId: deps.sessionId }),
+    buildStrategyEvaluationTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined }),
     buildValueRankTool({ pool, sessionId: deps.sessionId }),
     buildValueAnchorSignalTool({ pool, sessionId: deps.sessionId }),
     buildTwoYearReversalSignalTool({ pool, sessionId: deps.sessionId }),

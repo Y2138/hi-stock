@@ -59,7 +59,8 @@ export async function listStrategyEvaluationRuns(
             evaluator_code, evaluator_version, strategy_runtime_version,
             strategy_snapshot_hash, input_fingerprint, status,
             requested_by_job_run_id::text, reused_from_run_id::text,
-            coverage, gaps, started_at::text, finished_at::text, created_at::text
+            coverage, gaps, started_at::text, finished_at::text, created_at::text,
+            result, attempt_count, last_requested_at::text
        FROM strategy_evaluation_run
       WHERE strategy_code = $1
       ORDER BY target_date DESC, created_at DESC

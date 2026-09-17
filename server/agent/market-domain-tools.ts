@@ -22,6 +22,7 @@ import { queryDailyPlanContext } from "../modules/plans/daily-context.js";
 import { queryStockResearch } from "../modules/market/research.js";
 import { queryValueRank } from "../modules/value-ranking/service.js";
 import { executeStrategyEvaluator } from "../modules/strategy-runtime/registry.js";
+import { ensureStrategyEvaluation } from "../modules/strategy-runtime/service.js";
 import { strategyForSession } from "./business-context-tools.js";
 import { insertToolAudit } from "./repo.js";
 import { sha256Json } from "./hash.js";
@@ -67,6 +68,11 @@ const LithiumWarehouseSignalSchema = strict({ date: DateString });
 const ValueRankSchema = strict({ as_of: Type.Optional(DateString), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })), codes: Type.Optional(Type.Array(Code, { maxItems: 50, uniqueItems: true })) });
 const ValueAnchorSignalSchema = strict({ date: DateString });
 const TwoYearReversalSignalSchema = strict({ date: DateString });
+const StrategyEvaluationSchema = strict({
+  date: DateString,
+  phase: Type.Union([Type.Literal("entry"), Type.Literal("exit"), Type.Literal("context")]),
+  strategy_code: Type.Optional(Type.String({ minLength: 1, maxLength: 96, pattern: "^[a-z][a-z0-9_]*$" })),
+});
 const IndicatorSchema = strict({
   codes: Type.Array(Code, { minItems: 1, maxItems: 20 }),
   freq: Type.Optional(Type.Union([Type.Literal("day"), Type.Literal("30m"), Type.Literal("futures_day")])),
@@ -141,6 +147,58 @@ export function buildLimitUpSignalTool(deps: { pool: pg.Pool; sessionId: string 
           })),
         };
       });
+    },
+  };
+}
+
+export function buildStrategyEvaluationTool(deps: {
+  pool: pg.Pool;
+  sessionId: string | null;
+  jobCode?: string;
+}): AgentTool {
+  return {
+    name: "strategy_evaluation_query",
+    label: "查询策略结构化评估",
+    description: "按策略、阶段和目标日确保一次结构化评估运行；相同输入成功结果直接复用，运行中请求返回 waiting，失败或部分结果可重试。任务会话只能执行任务绑定的策略与阶段，不得借此查询其他策略。",
+    parameters: StrategyEvaluationSchema,
+    execute: async (_id, raw) => {
+      const input = validateToolInput<Static<typeof StrategyEvaluationSchema>>(
+        "strategy_evaluation_query", StrategyEvaluationSchema, raw,
+      );
+      let strategyCode = input.strategy_code ?? null;
+      let requestedByJobRunId: string | null = null;
+      if (deps.jobCode) {
+        const binding = await deps.pool.query<{
+          strategy_code: string | null;
+          agent_role: string | null;
+          strategy_type: string | null;
+        }>(`SELECT definition.strategy_code,definition.agent_role,strategy.strategy_type
+              FROM job_definition definition
+              LEFT JOIN strategy_definition strategy ON strategy.code=definition.strategy_code
+             WHERE definition.code=$1`, [deps.jobCode]);
+        const row = binding.rows[0];
+        if (!row) throw new Error(`未知任务：${deps.jobCode}`);
+        if (row.strategy_code) {
+          if (strategyCode && strategyCode !== row.strategy_code) throw new Error(`任务 ${deps.jobCode} 只能评估策略 ${row.strategy_code}`);
+          strategyCode = row.strategy_code;
+          const expectedPhase = row.strategy_type === "portfolio_overlay" ? "context"
+            : row.agent_role === "strategy_exit_report" ? "exit" : "entry";
+          if (input.phase !== expectedPhase) throw new Error(`任务 ${deps.jobCode} 只能执行 ${expectedPhase} 评估`);
+        }
+        if (deps.sessionId) {
+          requestedByJobRunId = (await deps.pool.query<{ id: string }>(
+            `SELECT run.id::text FROM job_run run JOIN job_definition definition ON definition.id=run.job_id
+              WHERE run.session_id=$1 AND definition.code=$2 AND run.status IN ('queued','running')
+              ORDER BY run.id DESC LIMIT 1`, [deps.sessionId, deps.jobCode],
+          )).rows[0]?.id ?? null;
+        }
+      }
+      if (!strategyCode) throw new Error("strategy_evaluation_query 必须提供 strategy_code");
+      return audited(deps, "strategy_evaluation_query", { ...input, strategy_code: strategyCode }, () =>
+        ensureStrategyEvaluation(deps.pool, {
+          strategy_code: strategyCode!, phase: input.phase, target_date: input.date,
+          requested_by_job_run_id: requestedByJobRunId,
+        }));
     },
   };
 }

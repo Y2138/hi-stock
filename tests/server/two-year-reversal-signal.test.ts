@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { prepareTestDb } from "./helpers.js";
 import { queryTwoYearReversalSignals } from "../../server/modules/plans/two-year-reversal-signal.js";
 import { evaluateStrategyExit } from "../../server/modules/strategy-runtime/exit-evaluators.js";
+import { ensureStrategyEvaluation } from "../../server/modules/strategy-runtime/service.js";
 
 const prepared = await prepareTestDb();
 describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
@@ -60,6 +61,18 @@ describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
     expect(result.eligible_industries?.map((item) => item.code)).toEqual(["881001.TI"]);
     expect(result.qualified.map((item) => item.code)).toEqual(["000001.SZ"]);
     expect(result.qualified[0]).toMatchObject({ reference_fraction: 0.20, already_held: false, signal_low_raw: 84 });
+    const runtime = await ensureStrategyEvaluation(pool, {
+      strategy_code: "two_year_reversal", phase: "entry", target_date: date,
+    });
+    expect(runtime).toMatchObject({ execution: "executed", run: { status: "success" } });
+    expect((await pool.query(
+      `SELECT signal.signal_status,instrument.code FROM strategy_entry_signal signal
+        JOIN market_instrument instrument ON instrument.id=signal.instrument_id WHERE signal.run_id=$1`,
+      [runtime.run.id],
+    )).rows).toEqual([{ signal_status: "qualified", code: "000001.SZ" }]);
+    expect((await ensureStrategyEvaluation(pool, {
+      strategy_code: "two_year_reversal", phase: "entry", target_date: date,
+    })).execution).toBe("reused");
     const stale = await queryTwoYearReversalSignals(pool, "2026-09-18");
     expect(stale.qualified).toEqual([]);
     expect((stale.historical ?? []).map((item) => item.code)).toEqual(["000001.SZ"]);

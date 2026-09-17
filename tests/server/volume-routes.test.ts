@@ -108,7 +108,7 @@ describe.skipIf(!prepared)("数据卷 HTTP 路由（stock_test 真实库）", ()
     expect(exported.status).toBe(201);
     const data = exported.json as { path: string; manifest_path: string; migration_max: number; strategy_revision_count: number; strategy_definition_count: number; job_definition_count: number };
     expect(data.path).toMatch(/\.ndjson\.gz$/);
-    expect(data.migration_max).toBe(118);
+    expect(data.migration_max).toBe(119);
     expect(data.strategy_revision_count).toBeGreaterThan(0);
     expect(data.strategy_definition_count).toBeGreaterThan(0);
     expect(data.job_definition_count).toBeGreaterThan(0);
@@ -116,7 +116,7 @@ describe.skipIf(!prepared)("数据卷 HTTP 路由（stock_test 真实库）", ()
     const listed = await api(server.baseUrl, "GET", "/api/volume/portable");
     expect(listed.status).toBe(200);
     expect(listed.json).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: data.path, migration_max: 118, strategy_revision_count: data.strategy_revision_count, strategy_definition_count: data.strategy_definition_count }),
+      expect.objectContaining({ path: data.path, migration_max: 119, strategy_revision_count: data.strategy_revision_count, strategy_definition_count: data.strategy_definition_count }),
     ]));
   });
 

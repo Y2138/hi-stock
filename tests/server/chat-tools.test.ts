@@ -355,6 +355,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "market_event_query",
       "indicator_query",
       "daily_plan_context_query",
+      "strategy_evaluation_query",
       "value_rank_query",
       "value_anchor_signal_query",
       "two_year_reversal_signal_query",
@@ -434,7 +435,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(tools.at(-1)?.name).toBe("database_query");
   });
 
-  it("任务会话按提示词声明集裁剪并保留 Web，未知任务不获得专属写入", () => {
+  it("任务会话按提示词声明集裁剪并保留 Web，未知任务不获得专属写入", async () => {
     const full = buildChatTools({ pool, sessionId });
     const auction = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "auction_opportunity_assessment" });
     expect(auction.map((tool) => tool.name)).toEqual([
@@ -466,16 +467,25 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     // 防守评估任务接入任务级策略文档，必须能读取本任务策略正文。
     const copper = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "copper_inventory_signal_review" });
     expect(copper.map((tool) => tool.name)).toEqual([
-      "strategy_document_query", "copper_inventory_signal_query", "web_search", "web_fetch",
+      "strategy_document_query", "copper_inventory_signal_query", "strategy_evaluation_query", "web_search", "web_fetch",
     ]);
     // 左侧任务已停用：即使会话仍指定该 jobCode，也只回退到通用目录，不再获得专属工具。
     const leftReversal = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "left_reversal_opportunity_scan" });
     expect(leftReversal.map((tool) => tool.name)).not.toContain("left_reversal_opportunity_query");
     expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "two_year_reversal_scan" }).map((tool) => tool.name).sort())
-      .toEqual(["strategy_document_query", "two_year_reversal_signal_query", "web_search", "web_fetch"].sort());
+      .toEqual(["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query", "web_search", "web_fetch"].sort());
+    const scopedEvaluation = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "two_year_reversal_scan" })
+      .find((tool) => tool.name === "strategy_evaluation_query")!;
+    expect(scopedEvaluation).toBeDefined();
+    await expect(scopedEvaluation.execute("wrong-strategy", {
+      date: "2026-09-17", phase: "entry", strategy_code: "swing",
+    })).rejects.toThrow("只能评估策略 two_year_reversal");
+    await expect(scopedEvaluation.execute("wrong-phase", {
+      date: "2026-09-17", phase: "exit", strategy_code: "two_year_reversal",
+    })).rejects.toThrow("只能执行 entry 评估");
     const valueAnchor = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "value_anchor_opportunity_scan" });
     expect(valueAnchor.map((tool) => tool.name).sort()).toEqual([
-      "pool_attention_write", "strategy_document_query", "value_anchor_signal_query", "web_fetch", "web_search",
+      "pool_attention_write", "strategy_document_query", "strategy_evaluation_query", "value_anchor_signal_query", "web_fetch", "web_search",
     ].sort());
     const nightly = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "nightly_sector_opportunity_scan" });
     const nightlyNames = nightly.map((tool) => tool.name);

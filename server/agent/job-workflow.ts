@@ -19,7 +19,7 @@ const REQUIRED_READS: Record<string, readonly string[]> = {
 };
 const TARGET_DATE_TOOLS = new Set([
   "daily_plan_context_query", "swing_signal_query", "auction_context_query", "copper_inventory_signal_query", "lithium_warehouse_signal_query",
-  "value_anchor_signal_query", "two_year_reversal_signal_query",
+  "value_anchor_signal_query", "two_year_reversal_signal_query", "strategy_evaluation_query",
 ]);
 
 function object(value: unknown): Record<string, unknown> {

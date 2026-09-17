@@ -29,7 +29,7 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
   },
   {
     title: "策略计算读取",
-    tools: ["daily_plan_context_query", "swing_signal_query", "limit_up_signal_query", "copper_inventory_signal_query", "lithium_warehouse_signal_query", "value_anchor_signal_query", "two_year_reversal_signal_query", "analysis_run", "strategy_screen_query"],
+    tools: ["strategy_evaluation_query", "daily_plan_context_query", "swing_signal_query", "limit_up_signal_query", "copper_inventory_signal_query", "lithium_warehouse_signal_query", "value_anchor_signal_query", "two_year_reversal_signal_query", "analysis_run", "strategy_screen_query"],
   },
   {
     title: "持久同步",
