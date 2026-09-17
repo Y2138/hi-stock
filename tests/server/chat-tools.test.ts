@@ -24,6 +24,7 @@ import {
   inferStopLossMode,
 } from "../../server/modules/plans/daily-context.js";
 import { evaluateSwingSignal } from "../../server/modules/plans/swing-signals.js";
+import { mergeExitEvaluations, queryPositionExitEvaluationBundle } from "../../server/modules/strategy-runtime/exit-evaluators.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
 
 const prepared = await prepareTestDb();
@@ -1149,9 +1150,14 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       [instrumentId],
     );
     await pool.query(
-      `INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at)
-       VALUES ($1, 10, 20, '2026-08-01')
-       ON CONFLICT (instrument_id) DO UPDATE SET quantity = 10, cost_price = 20, opened_at = '2026-08-01'`,
+      `INSERT INTO portfolio_position
+         (instrument_id, quantity, cost_price, opened_at, entry_signal_type, strategy_code,
+          strategy_runtime_version, fallback_strategy_code, exit_policy_mode)
+       VALUES ($1, 10, 20, '2026-08-01', 'discretionary', 'discretionary', 1,
+               'portfolio_fallback_exit', 'fallback_only')
+       ON CONFLICT (instrument_id) DO UPDATE SET quantity = 10, cost_price = 20, opened_at = '2026-08-01',
+         entry_signal_type='discretionary', strategy_code='discretionary', strategy_runtime_version=1,
+         fallback_strategy_code='portfolio_fallback_exit', exit_policy_mode='fallback_only'`,
       [instrumentId],
     );
     const dailyContextResult = textOf(await dailyContext.execute("tc-daily-context", { date: "2026-08-18" })) as {
@@ -1190,6 +1196,12 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(dailyContextResult.market_structure_sync.datasets).toContainEqual(expect.objectContaining({
       dataset: "limit_down",
       valid_empty: true,
+    }));
+    const fallbackBundle = await queryPositionExitEvaluationBundle(pool, "2026-08-18");
+    expect(fallbackBundle.items).toContainEqual(expect.objectContaining({
+      code: "990002.SZ", strategy_code: "discretionary", exit_policy_mode: "fallback_only",
+      primary: null, fallback: expect.objectContaining({ strategy_code: "portfolio_fallback_exit", action: "reduce" }),
+      effective_action: "reduce", effective_source: "fallback",
     }));
     await expect(dailyContext.execute("tc-daily-context-strict", { date: "2026-08-18", sql: "select 1" } as never))
       .rejects.toThrow("参数校验失败");
@@ -1326,6 +1338,21 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       left_reversal_position_count: 1,
       left_reversal_stop_resolved_count: 1,
     });
+    const exits = await queryPositionExitEvaluationBundle(pool, "2026-08-18");
+    expect(exits.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "990020.SZ", strategy_code: "swing", effective_action: "exit", effective_source: "primary",
+        primary: expect.objectContaining({ action: "exit", reason: expect.stringContaining("disaster_stop") }),
+      }),
+      expect.objectContaining({
+        code: "990021.SZ", strategy_code: "legacy_left_reversal", effective_action: "exit", effective_source: "primary",
+        primary: expect.objectContaining({ action: "exit", reason: expect.stringContaining("stop_breach") }),
+      }),
+    ]));
+    expect(mergeExitEvaluations("legacy_right_side", "dedicated_plus_fallback",
+      { code: "X", name: "X", strategy_code: "legacy_right_side", evaluation_role: "primary", action: "hold", trigger_kind: "condition", trigger_price_lower: null, trigger_price_upper: null, protection_price: null, reason: "主策略持有", evidence: {}, missing_items: [] },
+      { code: "X", name: "X", strategy_code: "portfolio_fallback_exit", evaluation_role: "fallback", action: "exit", trigger_kind: "open", trigger_price_lower: 9, trigger_price_upper: 9, protection_price: 9, reason: "兜底退出", evidence: {}, missing_items: [] },
+    )).toMatchObject({ effective_action: "exit", effective_source: "fallback", effective_reason: "兜底退出" });
 
     // 清理本用例新增的持仓与池角色，避免影响后续用例的持仓数量断言。
     await pool.query("DELETE FROM portfolio_position WHERE instrument_id = ANY($1::bigint[])", [[swingId, leftId]]);

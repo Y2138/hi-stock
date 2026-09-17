@@ -72,3 +72,18 @@ export interface StrategyEvaluationRunSummary {
   finished_at: string | null;
   created_at: string;
 }
+
+export interface StrategyPositionEvaluation {
+  code: string;
+  name: string;
+  strategy_code: string;
+  evaluation_role: "primary" | "fallback";
+  action: "hold" | "observe" | "reduce" | "exit";
+  trigger_kind: string;
+  trigger_price_lower: number | null;
+  trigger_price_upper: number | null;
+  protection_price: number | null;
+  reason: string;
+  evidence: Record<string, unknown>;
+  missing_items: unknown[];
+}

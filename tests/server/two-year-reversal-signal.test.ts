@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { prepareTestDb } from "./helpers.js";
 import { queryTwoYearReversalSignals } from "../../server/modules/plans/two-year-reversal-signal.js";
+import { evaluateStrategyExit } from "../../server/modules/strategy-runtime/exit-evaluators.js";
 
 const prepared = await prepareTestDb();
 describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
@@ -62,12 +63,27 @@ describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
     const stale = await queryTwoYearReversalSignals(pool, "2026-09-18");
     expect(stale.qualified).toEqual([]);
     expect((stale.historical ?? []).map((item) => item.code)).toEqual(["000001.SZ"]);
+    await pool.query("INSERT INTO market_trading_day (trade_date,is_open,source) VALUES ('2026-09-18',true,'test')");
     await pool.query(
-      `INSERT INTO portfolio_position (instrument_id,quantity,cost_price,opened_at,entry_signal_type)
-       SELECT id,100,85,$1::date,'two_year_reversal' FROM market_instrument WHERE code='000001.SZ'`, [date],
+      `INSERT INTO market_bar (instrument_id,freq,bar_date,bar_time,open,high,low,close,open_raw,high_raw,low_raw,close_raw,volume,channel)
+       SELECT id,'day','2026-09-18','2026-09-18'::timestamp AT TIME ZONE 'UTC',85,95,84,90,85,95,84,90,1000,'test'
+         FROM market_instrument WHERE code='000001.SZ'`,
+    );
+    await pool.query(
+      `INSERT INTO portfolio_position
+         (instrument_id,quantity,cost_price,opened_at,entry_signal_type,strategy_code,strategy_runtime_version,exit_policy_mode)
+       SELECT id,100,85,'2026-09-18','two_year_reversal','two_year_reversal',1,'dedicated'
+         FROM market_instrument WHERE code='000001.SZ'`,
     );
     const held = await queryTwoYearReversalSignals(pool, date);
     expect(held.qualified).toEqual([]);
     expect((held.held ?? []).map((item) => item.code)).toEqual(["000001.SZ"]);
+    const exit = await evaluateStrategyExit({ pool, targetDate: "2026-09-18", strategyCode: "two_year_reversal" });
+    expect(exit.items).toEqual([
+      expect.objectContaining({
+        code: "000001.SZ", strategy_code: "two_year_reversal", evaluation_role: "primary",
+        evidence: expect.objectContaining({ signal_low_raw: 84, current_close_raw: 90, ma20_reached: false }),
+      }),
+    ]);
   });
 });

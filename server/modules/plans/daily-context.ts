@@ -100,6 +100,10 @@ interface PositionContextRow {
   highest_high: number | null;
   highest_close: number | null;
   entry_signal_type: "right_side" | "left_reversal" | "two_year_reversal" | "trial_start" | "swing" | "limit_up" | "discretionary" | null;
+  strategy_code: string | null;
+  strategy_runtime_version: number | null;
+  fallback_strategy_code: string | null;
+  exit_policy_mode: "dedicated" | "fallback_only" | "dedicated_plus_fallback" | null;
   entry_buy_date: string | null;
   current_close: number | null;
   entry_metric_date: string | null;
@@ -645,6 +649,18 @@ async function queryPositionContext(
     `SELECT instrument.code, instrument.name, instrument.kind,
             position.quantity::float8, position.cost_price::float8, position.opened_at::text,
             position.entry_signal_type,
+            COALESCE(position.strategy_code, CASE position.entry_signal_type
+              WHEN 'right_side' THEN 'legacy_right_side' WHEN 'left_reversal' THEN 'legacy_left_reversal'
+              WHEN 'two_year_reversal' THEN 'two_year_reversal' WHEN 'trial_start' THEN 'legacy_trial_start'
+              WHEN 'swing' THEN 'swing' WHEN 'limit_up' THEN 'limit_up' WHEN 'discretionary' THEN 'discretionary' END) AS strategy_code,
+            position.strategy_runtime_version,
+            COALESCE(position.fallback_strategy_code, CASE WHEN position.entry_signal_type IN ('right_side','trial_start','limit_up','discretionary')
+              THEN 'portfolio_fallback_exit' END) AS fallback_strategy_code,
+            COALESCE(position.exit_policy_mode, CASE position.entry_signal_type
+              WHEN 'right_side' THEN 'dedicated_plus_fallback' WHEN 'trial_start' THEN 'fallback_only'
+              WHEN 'limit_up' THEN 'fallback_only' WHEN 'discretionary' THEN 'fallback_only'
+              WHEN 'swing' THEN 'dedicated' WHEN 'left_reversal' THEN 'dedicated'
+              WHEN 'two_year_reversal' THEN 'dedicated' END) AS exit_policy_mode,
             membership.pool, membership.role, COALESCE(membership.tags, '[]'::jsonb) AS tags, membership.stock_character,
             indicator.bar_date::text AS indicator_date,
             indicator.ma5::float8, indicator.ma10::float8, indicator.status AS indicator_status,
@@ -714,7 +730,8 @@ async function queryPositionContext(
     [date],
   );
   const entryWindows = await loadEntryWindows(db, rows.rows
-    .filter((row) => row.entry_signal_type === "swing" || row.entry_signal_type === "left_reversal")
+    .filter((row) => row.strategy_code === "swing" || row.strategy_code === "legacy_left_reversal"
+      || row.strategy_code === "two_year_reversal")
     .map((row) => ({ code: row.code, buy_date: row.entry_buy_date }))
     .filter((target): target is { code: string; buy_date: string } => target.buy_date !== null));
   const gaps: Array<{ code: string; reason: string }> = [];
@@ -723,11 +740,11 @@ async function queryPositionContext(
   const items = rows.rows.map((row) => {
     if (row.pool === null) gaps.push({ code: row.code, reason: "持仓缺少当前策略角色" });
     // 评估口径由买入信号类型决定：波段与左侧（存量）独立评估；其余回退短线口径做持有评估。
-    const evaluationBasis: PositionEvaluationBasis = row.entry_signal_type === "swing"
+    const evaluationBasis: PositionEvaluationBasis = row.strategy_code === "swing"
       ? "swing"
-      : row.entry_signal_type === "left_reversal"
+      : row.strategy_code === "legacy_left_reversal"
         ? "left_reversal"
-        : row.entry_signal_type === "two_year_reversal" ? "two_year_reversal" : "short_term";
+        : row.strategy_code === "two_year_reversal" ? "two_year_reversal" : "short_term";
     if (evaluationBasis === "two_year_reversal") gaps.push({ code: row.code, reason: "两年结构反转新策略持仓按独立策略A方案人工核对风险线、MA20分批与ATR移动止损；旧左侧和短线退出位不适用" });
     const stopRequired = evaluationBasis === "short_term";
     const stopLossMode = inferStopLossMode(row.stock_character, row.tags);
@@ -789,11 +806,11 @@ async function queryPositionContext(
         ? `护盘收回率数据日为${row.metric_date}，市场数据日为${expectedDataDate}`
         : "护盘收回率尚未完成可信重算",
     });
-    const swing = row.entry_signal_type === "swing"
+    const swing = row.strategy_code === "swing"
       ? buildSwingTriggers(row, entryWindows.get(row.code) ?? [], (reason) => gaps.push({ code: row.code, reason }))
       : null;
     if (swing) swingItems.push({ code: row.code, resolved: swing.resolved });
-    const leftReversal = row.entry_signal_type === "left_reversal"
+    const leftReversal = row.strategy_code === "legacy_left_reversal"
       ? buildLeftReversalTriggers(row, entryWindows.get(row.code) ?? [], (reason) => gaps.push({ code: row.code, reason }))
       : null;
     if (leftReversal) leftReversalItems.push({ code: row.code, resolved: leftReversal.resolved });
@@ -805,6 +822,10 @@ async function queryPositionContext(
       cost_price: row.cost_price,
       opened_at: row.opened_at,
       entry_signal_type: row.entry_signal_type,
+      strategy_code: row.strategy_code,
+      strategy_runtime_version: row.strategy_runtime_version,
+      fallback_strategy_code: row.fallback_strategy_code,
+      exit_policy_mode: row.exit_policy_mode,
       entry_buy_date: row.entry_buy_date,
       evaluation_basis: evaluationBasis,
       pool: row.pool,
@@ -822,6 +843,7 @@ async function queryPositionContext(
         first_take_profit: firstTakeProfit,
         second_take_profit: secondTakeProfit,
         first_take_profit_price_reached: firstTakeProfitPriceReached,
+        second_take_profit_price_reached: row.highest_high !== null && row.highest_high >= secondTakeProfit,
         post_first_take_profit_stop_candidate: postFirstTakeProfitStop,
         right_side_survival_count: rightSide?.passed_count ?? null,
         macd_weakness_exit_candidate: macdWeaknessExit,
@@ -839,12 +861,16 @@ async function queryPositionContext(
       defense_metric_date: metricReady ? row.metric_date : null,
       defense_metric_input_rows: metricReady ? row.input_row_count : null,
       defense_metric_version: metricReady ? row.calculation_version : null,
+      current_close: row.current_close,
+      highest_high: row.highest_high,
+      highest_close: row.highest_close,
+      holding_trade_days: row.holding_trade_days,
     };
   });
   const positionBasis = (row: PositionContextRow): PositionEvaluationBasis =>
-    row.entry_signal_type === "swing" ? "swing"
-      : row.entry_signal_type === "left_reversal" ? "left_reversal"
-        : row.entry_signal_type === "two_year_reversal" ? "two_year_reversal" : "short_term";
+    row.strategy_code === "swing" ? "swing"
+      : row.strategy_code === "legacy_left_reversal" ? "left_reversal"
+        : row.strategy_code === "two_year_reversal" ? "two_year_reversal" : "short_term";
   const requiredStops = rows.rows.filter((row) => positionBasis(row) === "short_term");
   const requiredMetrics = rows.rows.filter((row) => row.kind === "stock");
   return {
@@ -868,6 +894,24 @@ async function queryPositionContext(
     items,
     gaps,
   };
+}
+
+export async function queryPositionCompatibilityContext(db: Db, date: string) {
+  const latest = await db.query<{ data_date: string | null }>(
+    `SELECT max(bar.bar_date)::text AS data_date FROM market_bar bar
+      JOIN market_instrument instrument ON instrument.id=bar.instrument_id
+     WHERE bar.freq='day' AND bar.bar_date <= $1::date AND instrument.kind IN ('stock','etf')`,
+    [date],
+  );
+  const dataDate = latest.rows[0]?.data_date ?? null;
+  const rightSide = await scanRightSideSignals(db, date, dataDate);
+  const positions = await queryPositionContext(
+    db,
+    date,
+    dataDate,
+    new Map(rightSide.items.map((item) => [item.code, item])),
+  );
+  return { requested_date: date, data_date: dataDate, right_side: rightSide, positions };
 }
 
 export async function queryDailyPlanContext(db: Db, date: string) {

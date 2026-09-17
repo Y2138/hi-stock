@@ -9,7 +9,6 @@ import { createSession } from "../../server/agent/repo.js";
 import { buildChatTools } from "../../server/agent/tools.js";
 import { runMigrations } from "../../server/db/migrate.js";
 import {
-  executeStrategyEvaluator,
   findStrategyEvaluatorBindingGaps,
   getStrategyEvaluatorDefinition,
   listStrategyEvaluatorDefinitions,
@@ -217,11 +216,8 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     const evaluators = listStrategyEvaluatorDefinitions();
     expect(new Set(evaluators.map((item) => item.code)).size).toBe(evaluators.length);
     expect(getStrategyEvaluatorDefinition("swing_entry_v1")).toMatchObject({ phase: "entry", status: "ready", version: 1 });
-    expect(getStrategyEvaluatorDefinition("fallback_exit_v1")).toMatchObject({ phase: "exit", status: "pending", version: 1 });
+    expect(getStrategyEvaluatorDefinition("fallback_exit_v1")).toMatchObject({ phase: "exit", status: "ready", version: 1 });
     expect(await findStrategyEvaluatorBindingGaps(pool)).toEqual([]);
-    await expect(executeStrategyEvaluator("fallback_exit_v1", { pool, targetDate: "2026-09-17" }))
-      .rejects.toThrow("尚未接入统一执行链路");
-
     await pool.query("BEGIN");
     try {
       await pool.query("UPDATE strategy_definition SET entry_evaluator_code = 'missing_entry_v1' WHERE code = 'swing'");

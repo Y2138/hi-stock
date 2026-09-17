@@ -5,6 +5,7 @@ import { queryLithiumWarehouseSignal } from "../market/lithium-warehouse-signal.
 import { querySwingSignals } from "../plans/swing-signals.js";
 import { queryTwoYearReversalSignals } from "../plans/two-year-reversal-signal.js";
 import { queryValueAnchorSignals } from "../plans/value-anchor-signal.js";
+import { evaluateStrategyExit } from "./exit-evaluators.js";
 import type { StrategyEvaluationPhase } from "./types.js";
 
 export interface StrategyEvaluatorContext {
@@ -36,7 +37,7 @@ const pending = (code: string, phase: StrategyEvaluationPhase): StrategyEvaluato
 
 /**
  * 策略评估器唯一代码白名单。数据库只能引用这里登记的稳定编码，不能保存模块路径或脚本。
- * 出场评估器在阶段五完成专属与兜底拆分前先登记为 pending，现有每日计划继续走兼容链路。
+ * 入场、出场和组合评估均通过稳定编码复用领域服务；尚未接入的能力显式标记 pending。
  */
 const DEFINITIONS: readonly StrategyEvaluatorDefinition[] = [
   ready("swing_entry_v1", "entry", ({ pool, targetDate }) => querySwingSignals(pool, targetDate)),
@@ -48,11 +49,11 @@ const DEFINITIONS: readonly StrategyEvaluatorDefinition[] = [
   ready("lithium_warehouse_context_v1", "context", ({ pool, targetDate }) => queryLithiumWarehouseSignal(pool, targetDate)),
   pending("nightly_sector_attention_v1", "entry"),
   pending("manual_entry_v1", "entry"),
-  pending("swing_exit_v1", "exit"),
-  pending("two_year_reversal_exit_v1", "exit"),
-  pending("legacy_right_side_exit_v1", "exit"),
-  pending("legacy_left_reversal_exit_v1", "exit"),
-  pending("fallback_exit_v1", "exit"),
+  ready("swing_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "swing" })),
+  ready("two_year_reversal_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "two_year_reversal" })),
+  ready("legacy_right_side_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "legacy_right_side" })),
+  ready("legacy_left_reversal_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "legacy_left_reversal" })),
+  ready("fallback_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "portfolio_fallback_exit" })),
 ];
 
 const REGISTRY = new Map(DEFINITIONS.map((definition) => [definition.code, definition]));
