@@ -159,7 +159,7 @@ function modelLabel(job: JobDefinition): string {
 
 const AGENT_ROLE_LABELS: Record<string, string> = {
   strategy_entry_report: "入场专项", strategy_exit_report: "出场专项", strategy_confirmation: "盘中确认",
-  portfolio_aggregator: "组合统筹", data_pipeline: "数据链路", research_report: "研究报告",
+  portfolio_aggregator: "组合统筹", auction_cross_scope: "竞价跨域研判", data_pipeline: "数据链路", research_report: "研究报告",
 };
 function runtimeRole(job: JobDefinition): string {
   const role = job.agent_role ? AGENT_ROLE_LABELS[job.agent_role] ?? job.agent_role : "未纳入策略运行时";

@@ -239,9 +239,9 @@ export function buildJobAuctionAssessmentTool(deps: {
 }): AgentTool {
   return {
     name: "auction_assessment_write",
-    label: "更新打板机会竞价复核",
+    label: "写入跨域集合竞价研判",
     description:
-      "一次性提交当前每日计划全部打板机会的 T+1 集合竞价复核。必须完整覆盖并写明一字延续、换手晋级、分歧、放弃或数据不足分类；小额实盘验证期只允许信号通过、放弃或数据不足，任务成功后才在仪表盘“打板机会”中激活。",
+      "一次提交三类竞价结果：items 完整覆盖每日计划打板机会；scope_items 按 target_key 完整覆盖全部真实持仓与每条有效关注来源。持仓只作原计划匹配/风险升级/数据不足判断，关注按来源策略补齐条件，打板按打板策略门禁分类。服务端对账后由任务成功统一激活；不成交、不改持仓或关注。",
     parameters: AuctionAssessmentWriteSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {
@@ -253,6 +253,7 @@ export function buildJobAuctionAssessmentTool(deps: {
           const write = await replaceDraftAuctionAssessments(client, {
             source_job_run_id: runId,
             items: input.items,
+            scope_items: input.scope_items,
           });
           await insertToolAudit(client, {
             session_id: deps.sessionId,

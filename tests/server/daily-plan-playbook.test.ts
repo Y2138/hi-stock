@@ -10,6 +10,7 @@ import {
   activatePlaybookForRun,
   getLatestDailyPlanBoard,
   queryAuctionAssessmentContext,
+  getLatestAuctionScopeAssessments,
   queryHistoricalPlanItems,
   replaceDraftAuctionAssessments,
   replaceDraftPlaybook,
@@ -233,7 +234,19 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
        VALUES ('2026-08-27', true, 'test'), ('2026-08-28', true, 'test')
        ON CONFLICT (trade_date) DO UPDATE SET is_open = EXCLUDED.is_open`,
     );
+    await pool.query(
+      `INSERT INTO pool_attention_entry
+         (instrument_id,source_type,strategy_code,source_job,status,reason,missing_signals,valid_from)
+       SELECT instrument.id,'strategy',strategy.code,'daily_plan_flow','qualified',
+              strategy.name||'等待竞价复核','[]'::jsonb,'2026-08-28'
+         FROM market_instrument instrument CROSS JOIN strategy_definition strategy
+        WHERE instrument.code='600519.SH' AND strategy.code IN ('swing','two_year_reversal')`,
+    );
     const context = await queryAuctionAssessmentContext(pool, "2026-08-28");
+    expect(context.coverage).toMatchObject({ position_count: 1, attention_count: 2, opportunity_count: 1, candidate_count: 3 });
+    expect(context.attentions.map((item) => item.strategy_code).sort()).toEqual(['swing', 'two_year_reversal']);
+    expect(context.attentions.map((item) => item.target_key)).toHaveLength(2);
+    expect(context.required_strategy_documents).toEqual(expect.arrayContaining(['daily_plan_strategy','two_year_reversal_strategy','limit_up_board']));
     expect(context.market_day).toMatchObject({ should_run: true, previous_open_date: "2026-08-27" });
     expect(context.plan).toMatchObject({ target_date: "2026-08-27", validity: "valid" });
     expect(context.coverage.opportunity_count).toBe(1);
@@ -247,8 +260,25 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
        RETURNING id::text`,
     );
     const runId = auctionRun.rows[0]!.id;
+    await expect(replaceDraftAuctionAssessments(pool, {
+      source_job_run_id: runId, scope_items: context.positions.map((item) => ({
+        target_key: item.target_key, conclusion: "plan_aligned", metrics_summary: "竞价状态可用",
+        assessment_summary: "按原持仓预案复核", data_status: "ready",
+      })), items: [{ code: "300750.SZ", conclusion: "unavailable", review_type: "data_insufficient",
+        metrics_summary: "测试缺数", assessment_summary: "不能确认", data_status: "missing" }],
+    })).rejects.toThrow('必须完整覆盖持仓和关注来源');
     await replaceDraftAuctionAssessments(pool, {
       source_job_run_id: runId,
+      scope_items: [
+        ...context.positions.map((item) => ({
+          target_key: item.target_key, conclusion: "plan_aligned" as const, metrics_summary: "竞价状态可用",
+          assessment_summary: "按原持仓预案复核", data_status: "ready" as const,
+        })),
+        ...context.attentions.map((item) => ({
+          target_key: item.target_key, conclusion: "wait" as const, metrics_summary: "竞价量能待核实",
+          assessment_summary: `${item.strategy_name} 尚缺确认`, data_status: "ready" as const,
+        })),
+      ],
       items: [{
         code: "300750.SZ",
         conclusion: "signal_passed",
@@ -272,6 +302,14 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
       [runId, markdown, crypto.createHash("sha256").update(markdown).digest("hex")],
     );
     await activateAuctionAssessmentsForRun(pool, runId, output.rows[0]!.id);
+    expect((await getLatestAuctionScopeAssessments(pool)).items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ scope_kind: "position", code: "600000.SH", conclusion: "plan_aligned" }),
+      expect.objectContaining({ scope_kind: "attention", code: "600519.SH", strategy_code: "swing", conclusion: "wait" }),
+      expect.objectContaining({ scope_kind: "attention", code: "600519.SH", strategy_code: "two_year_reversal", conclusion: "wait" }),
+    ]));
+    const auctionResponse = await api(server.baseUrl, "GET", "/api/auction/latest");
+    expect(auctionResponse.status).toBe(200);
+    expect((auctionResponse.json as { items: unknown[] }).items).toHaveLength(3);
 
     expect((await getLatestDailyPlanBoard(pool)).opportunities[0]!.auction_assessment).toMatchObject({
       output_id: output.rows[0]!.id,
@@ -314,6 +352,39 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
       { kind: "sell", plan_output_id: exitPlan.outputId, entry_signal_date: "2026-08-27", entry_assessment_date: "2026-08-28", entry_signal_review_type: "turnover_advance" },
       { kind: "buy", entry_signal_date: "2026-08-27", entry_assessment_date: "2026-08-28", entry_signal_review_type: "turnover_advance" },
     ]);
+  });
+
+  it("无打板机会时仍完整回写持仓与策略关注来源", async () => {
+    const plan = await seedDailyPlanRun(pool, "daily_plan");
+    await replaceDraftPlaybook(pool, { source_job_run_id: plan.jobRunId, items: [{
+      item_kind: "position_action", code: "600000.SH", action: "hold", trigger_kind: "condition", headline: "按原持仓计划继续核对",
+    }] });
+    await activatePlaybookForRun(pool, plan.jobRunId, plan.outputId);
+    await pool.query("INSERT INTO market_trading_day(trade_date,is_open,source) VALUES ('2026-08-29',true,'test') ON CONFLICT(trade_date) DO UPDATE SET is_open=true");
+    const context = await queryAuctionAssessmentContext(pool, "2026-08-29");
+    expect(context.opportunities).toEqual([]);
+    expect(context.coverage).toMatchObject({ position_count: 1, attention_count: 2, opportunity_count: 0 });
+    const run = (await pool.query<{ id: string }>(
+      `INSERT INTO job_run(job_id,target_date,trigger_kind,status)
+       SELECT id,'2026-08-29','manual','running' FROM job_definition WHERE code='auction_opportunity_assessment'
+       RETURNING id::text`,
+    )).rows[0]!.id;
+    const items = [
+      ...context.positions.map((item) => ({ target_key: item.target_key, conclusion: "unavailable" as const,
+        metrics_summary: "竞价数据缺失", assessment_summary: "不改变原持仓计划", data_status: "missing" as const })),
+      ...context.attentions.map((item) => ({ target_key: item.target_key, conclusion: "unavailable" as const,
+        metrics_summary: "竞价数据缺失", assessment_summary: `${item.strategy_name} 待核验`, data_status: "missing" as const })),
+    ];
+    expect(await replaceDraftAuctionAssessments(pool, { source_job_run_id: run, items: [], scope_items: items }))
+      .toEqual({ replaced: 0, scope_replaced: 3 });
+    const output = (await pool.query<{ id: string }>(
+      `INSERT INTO job_run_output(job_id,run_id,output_type,target_date,markdown,sha256,status,source)
+       SELECT job_id,id,'auction_opportunity_assessment',target_date,'无打板机会，其他范围数据缺失',$2,'generated','agent_flow'
+         FROM job_run WHERE id=$1 RETURNING id::text`,
+      [run, crypto.createHash('sha256').update('无打板机会，其他范围数据缺失').digest('hex')],
+    )).rows[0]!.id;
+    expect(await activateAuctionAssessmentsForRun(pool, run, output)).toBe(3);
+    expect((await getLatestAuctionScopeAssessments(pool)).items).toHaveLength(3);
   });
 
   it("输入校验：评级缺失、priority 规则与触发区间倒挂被拒绝", () => {
@@ -383,6 +454,15 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     })).toThrow(/下限高于上限/);
 
     expect(() => validateAuctionAssessmentWriteInput({
+      items: [], scope_items: [{ target_key: "position:600000.SH", conclusion: "confirmed",
+        metrics_summary: "字段完整", assessment_summary: "错误位置结论", data_status: "ready" }],
+    })).toThrow(/持仓竞价结论类型不匹配/);
+    expect(() => validateAuctionAssessmentWriteInput({
+      items: [], scope_items: [{ target_key: "attention:1", conclusion: "confirmed",
+        metrics_summary: "竞价缺失", assessment_summary: "不得确认", data_status: "missing" }],
+    })).toThrow(/只能标记 unavailable/);
+    expect(() => validateAuctionAssessmentWriteInput({
+      scope_items: [],
       items: [{
         code: "300750.SZ",
         conclusion: "signal_passed",

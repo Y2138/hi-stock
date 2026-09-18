@@ -6,6 +6,7 @@ import { useRoute } from "vue-router";
 import { apiClient } from "../api/client";
 import type {
   BarsResponse,
+  AuctionScopeBoard,
   DailyPlanBoard,
   DailyPlanPlaybookItem,
   Position,
@@ -29,6 +30,8 @@ const realizedPnl = useResource<RealizedPnlSummary>(() =>
 );
 // 次日执行预案：来自最新每日计划的结构化盯防数据；404 = 尚无预案，不算错误。
 const dailyPlan = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>("/api/plans/latest"));
+const auctionScope = useResource<AuctionScopeBoard>(() => apiClient.get<AuctionScopeBoard>("/api/auction/latest"));
+const positionAuctionRows = computed(() => (auctionScope.data.value?.items ?? []).filter((item) => item.scope_kind === "position"));
 const planMissing = computed(() => !dailyPlan.data.value && dailyPlan.error.value?.status === 404);
 const planError = computed(() => (planMissing.value ? null : dailyPlan.error.value));
 const positionActions = computed(() => dailyPlan.data.value?.position_actions ?? []);
@@ -186,7 +189,7 @@ function recordWithAgent(): void {
 }
 
 async function reloadPositionsData(): Promise<void> {
-  await Promise.all([positions.reload(), changes.reload(), realizedPnl.reload(), dailyPlan.reload()]);
+  await Promise.all([positions.reload(), changes.reload(), realizedPnl.reload(), dailyPlan.reload(), auctionScope.reload()]);
   await loadDayChanges(positions.data.value ?? []);
 }
 
@@ -300,6 +303,15 @@ onMounted(reloadPositionsData);
           </table>
         </div>
       </StateBlock>
+    </div>
+
+    <div v-if="positionAuctionRows.length" class="card" style="margin-top:16px">
+      <div class="card-title">竞价持仓复核 · {{ fmtDate(auctionScope.data.value?.target_date) }}</div>
+      <div v-for="item in positionAuctionRows" :key="item.id" class="auction-position-row">
+        <strong>{{ item.name }} · {{ item.strategy_name ?? item.strategy_code ?? "待归因" }}</strong>
+        <span class="badge" :class="{ warn:item.conclusion !== 'plan_aligned' }">{{ item.conclusion === 'plan_aligned' ? '原预案匹配' : item.conclusion === 'risk_alert' ? '竞价风险升级' : '数据不足' }}</span>
+        <small>{{ item.assessment_summary }} · {{ item.metrics_summary }}</small>
+      </div>
     </div>
 
     <!-- 持仓表 -->
@@ -587,4 +599,7 @@ onMounted(reloadPositionsData);
 .plan-source { margin-left: var(--space-sm); color: var(--ink-faint); font-weight: 400; }
 .playbook-table td:nth-child(n + 4) small,
 .playbook-table td:nth-child(3) small { line-height: 1.5; }
+
+.auction-position-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:8px 0;border-top:1px solid var(--line)}
+.auction-position-row small{flex-basis:100%;color:var(--ink-soft)}
 </style>

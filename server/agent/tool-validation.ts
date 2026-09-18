@@ -433,8 +433,20 @@ const AuctionAssessmentItemSchema = strictObject({
   ]),
   data_time: Type.Optional(Type.String({ minLength: 20, maxLength: 40 })),
 });
+const AuctionScopeItemSchema = strictObject({
+  target_key: Type.String({ pattern: "^(position:[A-Za-z0-9._-]+|attention:[0-9]+)$", maxLength: 80 }),
+  conclusion: Type.Union([
+    Type.Literal("plan_aligned"), Type.Literal("risk_alert"), Type.Literal("confirmed"),
+    Type.Literal("wait"), Type.Literal("give_up"), Type.Literal("unavailable"),
+  ]),
+  metrics_summary: Type.String({ minLength: 1, maxLength: 1_000 }),
+  assessment_summary: Type.String({ minLength: 1, maxLength: 2_000 }),
+  data_status: Type.Union([Type.Literal("ready"), Type.Literal("not_ready"), Type.Literal("missing"), Type.Literal("stale")]),
+  data_time: Type.Optional(Type.String({ minLength: 20, maxLength: 40 })),
+});
 export const AuctionAssessmentWriteSchema = strictObject({
-  items: Type.Array(AuctionAssessmentItemSchema, { minItems: 1, maxItems: 4 }),
+  items: Type.Array(AuctionAssessmentItemSchema, { maxItems: 4 }),
+  scope_items: Type.Array(AuctionScopeItemSchema, { maxItems: 5_000 }),
 });
 export type AuctionAssessmentWriteInput = Static<typeof AuctionAssessmentWriteSchema>;
 
@@ -1095,6 +1107,22 @@ export function validateAuctionAssessmentWriteInput(input: unknown): AuctionAsse
   );
   const codes = parsed.items.map((item) => item.code);
   if (new Set(codes).size !== codes.length) throw new Error("auction_assessment_write 存在重复标的");
+  const scopeKeys = parsed.scope_items.map((item) => item.target_key);
+  if (new Set(scopeKeys).size !== scopeKeys.length) throw new Error("auction_assessment_write scope_items 存在重复目标");
+  for (const item of parsed.scope_items) {
+    if (item.target_key.startsWith("position:") && !["plan_aligned", "risk_alert", "unavailable"].includes(item.conclusion)) {
+      throw new Error(`${item.target_key} 持仓竞价结论类型不匹配`);
+    }
+    if (item.target_key.startsWith("attention:") && !["confirmed", "wait", "give_up", "unavailable"].includes(item.conclusion)) {
+      throw new Error(`${item.target_key} 关注竞价结论类型不匹配`);
+    }
+    if (item.data_status !== "ready" && item.conclusion !== "unavailable") {
+      throw new Error(`${item.target_key} 竞价数据未就绪时只能标记 unavailable`);
+    }
+    if (item.data_time && Number.isNaN(new Date(item.data_time).getTime())) {
+      throw new Error(`${item.target_key} 竞价数据时间非法`);
+    }
+  }
   for (const item of parsed.items) {
     if (item.data_time && Number.isNaN(new Date(item.data_time).getTime())) {
       throw new Error(`竞价数据时间非法：${item.code}`);

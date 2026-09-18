@@ -70,7 +70,7 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
         if (context && object(context.market_day).should_run !== false) {
           required.push("strategy_document_query");
           if (Array.isArray(context.candidate_codes) && context.candidate_codes.length > 0) required.push("fetch_hithink_data");
-          if (Array.isArray(context.opportunities) && context.opportunities.length > 0) required.push("auction_assessment_write");
+          if ([context.positions, context.attentions, context.opportunities].some((items) => Array.isArray(items) && items.length > 0)) required.push("auction_assessment_write");
         }
       }
       const missing = required.filter((name) => !results.has(name));
@@ -115,11 +115,24 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
           missing.push("daily_plan_write（必须原样提交统一策略编排生成的 playbook_items）");
         }
       }
+      if (jobCode === "auction_opportunity_assessment" && results.has("auction_context_query")
+        && object(results.get("auction_context_query")?.market_day).should_run !== false
+        && results.has("strategy_document_query")) {
+        const requiredDocs = results.get("auction_context_query")?.required_strategy_documents;
+        const docs = results.get("strategy_document_query")?.documents;
+        if (Array.isArray(requiredDocs) && Array.isArray(docs)) {
+          const loaded = new Set(docs.map((item) => String(object(item).code)));
+          const absent = requiredDocs.map(String).filter((code) => !loaded.has(code));
+          if (absent.length) missing.push(`strategy_document_query（竞价缺少策略正文：${absent.join("、")}）`);
+        }
+      }
       if (jobCode === "auction_opportunity_assessment" && results.has("auction_assessment_write")
         && object(results.get("fetch_hithink_data")?.summary).succeeded === 0) {
         const items = successfulArgs.get("auction_assessment_write")?.items;
-        if (Array.isArray(items) && items.some((item) => object(item).conclusion !== "unavailable")) {
-          missing.push("auction_assessment_write（竞价取数全部失败时只能回写数据不足）");
+        const scopeItems = successfulArgs.get("auction_assessment_write")?.scope_items;
+        if ((Array.isArray(items) && items.some((item) => object(item).conclusion !== "unavailable"))
+          || (Array.isArray(scopeItems) && scopeItems.some((item) => object(item).conclusion !== "unavailable"))) {
+          missing.push("auction_assessment_write（竞价取数全部失败时各类目标只能回写数据不足）");
         }
       }
       return missing;

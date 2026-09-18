@@ -412,6 +412,28 @@ export interface DailyPlanBoard {
   position_actions: DailyPlanPlaybookItem[];
   opportunities: DailyPlanPlaybookItem[];
 }
+export interface AuctionScopeAssessment {
+  id: string;
+  target_key: string;
+  scope_kind: "position" | "attention";
+  code: string;
+  name: string;
+  attention_entry_id: string | null;
+  strategy_code: string | null;
+  strategy_name: string | null;
+  conclusion: "plan_aligned" | "risk_alert" | "confirmed" | "wait" | "give_up" | "unavailable";
+  metrics_summary: string;
+  assessment_summary: string;
+  data_status: "ready" | "not_ready" | "missing" | "stale";
+  data_time: string | null;
+}
+
+export interface AuctionScopeBoard {
+  output_id: string;
+  target_date: string;
+  items: AuctionScopeAssessment[];
+}
+
 
 export interface PositionChange {
   id: string;

@@ -112,6 +112,11 @@ it("任务完成门禁只接受本次正确日期的工具结果，并按真实�
   closed.observe({ type: "tool_end", data: { toolCallId: "closed", name: "auction_context_query", isError: false,
     result: { details: { market_day: { should_run: false } } } } });
   expect(closed.missing()).toEqual([]);
+  const crossScope = createJobCompletionGate("auction_opportunity_assessment", "2026-08-17");
+  crossScope.observe({ type: "tool_start", data: { toolCallId: "context", name: "auction_context_query", args: { date: "2026-08-17" } } });
+  crossScope.observe({ type: "tool_end", data: { toolCallId: "context", name: "auction_context_query", isError: false,
+    result: { details: { market_day: { should_run: true }, positions: [{ target_key: "position:600000.SH" }], attentions: [], opportunities: [], candidate_codes: ["600000.SH"], required_strategy_documents: ["daily_plan_strategy"] } } } });
+  expect(crossScope.missing()).toContain("auction_assessment_write");
 
   const nightly = createJobCompletionGate("nightly_sector_opportunity_scan", "2026-08-17");
   let nightlyCall = 0;
@@ -578,13 +583,15 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(auctionPrompt).toContain("auction_context_query");
     expect(auctionPrompt).toContain("auction_short_term_benchmark");
     expect(auctionPrompt).toContain("auction_snapshot");
-    expect(auctionPrompt).toContain('stage="final"');
-    expect(auctionPrompt).toContain("signal_passed/one_word_continue");
-    expect(auctionPrompt).toContain("signal_passed/turnover_advance");
-    expect(auctionPrompt).toContain("items` 必须与 `opportunities` 代码全集完全一致");
+    expect(auctionPrompt).toContain('auction_snapshot(stage=final)');
+    expect(auctionPrompt).toContain("打板机会严格按《打板策略》");
+    expect(auctionPrompt).toContain("`scope_items` 完整覆盖持仓与关注来源");
+    expect((await pool.query("SELECT agent_role,strategy_code FROM job_definition WHERE code='auction_opportunity_assessment'")).rows[0])
+      .toEqual({ agent_role: "auction_cross_scope", strategy_code: null });
+
     expect(auctionPrompt).not.toContain("worth_entering");
     expect(auctionPrompt).not.toContain("本节替代前文");
-    expect(auctionPrompt).toContain("不交易、不改持仓、不入池、不修改近期关注或策略");
+    expect(auctionPrompt).toContain("不交易、不改持仓或关注");
     expect(shanghaiDate(new Date("2026-08-16T16:30:00Z"))).toBe("2026-08-17");
     expect(
       cronOccurrences(
@@ -1625,7 +1632,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       faux.setResponses([
         fauxAssistantMessage([
           fauxToolCall("auction_context_query", { date: "2026-08-19" }),
-          fauxToolCall("strategy_document_query", { codes: ["limit_up_board"] }),
+          fauxToolCall("strategy_document_query", { codes: ["test_strategy", "limit_up_board"] }),
         ], { stopReason: "toolUse" }),
         fauxAssistantMessage(
           [fauxToolCall("fetch_hithink_data", { requests: [
@@ -1636,6 +1643,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         ),
         fauxAssistantMessage(
           [fauxToolCall("auction_assessment_write", {
+            scope_items: [],
             items: [{
               code: "990091.SZ",
               conclusion: "unavailable",

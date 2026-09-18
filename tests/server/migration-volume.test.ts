@@ -139,7 +139,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const manifest = await readPortableManifest(exported.payloadPath);
     expect(manifest.version).toBe(7);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(120);
+    expect(manifest.migration_max).toBe(121);
     expect(manifest.tables.strategy_document).toBeGreaterThan(0);
     expect(manifest.tables.strategy_definition).toBeGreaterThan(0);
     expect(manifest.tables.strategy_score_benchmark).toBe(1);
@@ -175,7 +175,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       "portfolio_position_change",
       "portfolio_realized_pnl_baseline",
       "daily_plan_playbook",
-      "daily_plan_auction_assessment",
+      "daily_plan_auction_assessment", "auction_scope_assessment",
       "pool_membership",
       "market_bar",
       "market_factor_series",
@@ -234,6 +234,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       expect((await target.query("SELECT count(*)::int AS count FROM market_bar")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM portfolio_position")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM daily_plan_auction_assessment")).rows[0]!.count).toBe(0);
+      expect((await target.query("SELECT count(*)::int AS count FROM auction_scope_assessment")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT to_regclass('strategy_paper_account')::text AS name")).rows[0]!.name).toBeNull();
       expect((await target.query("SELECT count(*)::int AS count FROM chat_session")).rows[0]!.count).toBe(0);
       expect((await target.query("SELECT count(*)::int AS count FROM pool_membership")).rows[0]!.count).toBe(0);

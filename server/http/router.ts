@@ -286,6 +286,7 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/positions/changes", positionRoutes.changes),
     route("GET", "/api/positions/realized-pnl", positionRoutes.realizedPnl),
     route("GET", "/api/plans/latest", plansRoutes.latest),
+    route("GET", "/api/auction/latest", plansRoutes.latestAuction),
     route("GET", "/api/pools", async ({ query }) => {
       const asOf = query.get("date") ?? undefined;
       if (asOf && !/^\d{4}-\d{2}-\d{2}$/u.test(asOf)) throw apiErrors.badRequest("date 必须是 YYYY-MM-DD");

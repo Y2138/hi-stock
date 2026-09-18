@@ -986,3 +986,7 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 `strategy_definition`、`strategy_evaluation_run`、`strategy_entry_signal` 和 `strategy_position_evaluation` 构成策略运行时。评估器只能引用代码注册表中的稳定编码；数据库不得保存模块路径、脚本或 SQL。相同策略、阶段、目标日、评估器版本和输入指纹只执行一次，成功结果复用，运行中等待，失败或部分结果重试，事实推进后生成新运行。
 
 每日计划通过 `daily_plan_strategy_query` 自动发现启用的入场/观察/组合策略以及当前持仓的主策略和兜底策略。结构化预案固化策略版本、主/兜底评估运行、各自动作、最终动作、数据日和缺口。旧 `daily_plan_context_query` 与垂直信号工具仅保留为兼容及专项查询能力，不再是每日计划编排入口。
+
+## 竞价跨域任务（当前有效）
+
+竞价任务 `agent_role=auction_cross_scope`、`strategy_code=NULL`。`auction_context_query` 提供目标交易日、原计划有效性、持仓、逐来源关注、打板机会及其目标键；`candidate_codes` 合并去重后批量取得最终竞价数据。`auction_assessment_write` 同事务校验打板 `items` 与持仓/关注 `scope_items` 的完整集合；持仓、关注分别限定结论类型，竞价数据不就绪只能标记不可用。任务成功后草稿与结果同时激活，历史结果保留；打板机会继续沿用 `daily_plan_auction_assessment`，其余两类保存于 `auction_scope_assessment`。查询 `/api/auction/latest` 仅返回已激活的持仓和关注来源研判。该任务不属于入场、出场评估器，不生成成交、关注变更或策略信号。

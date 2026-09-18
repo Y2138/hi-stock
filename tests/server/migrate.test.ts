@@ -40,6 +40,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "agent_tool_audit",
       "agent_tool_metric",
       "analysis_run",
+      "auction_scope_assessment",
       "chat_attachment",
       "chat_message",
       "chat_session",

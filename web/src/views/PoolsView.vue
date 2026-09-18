@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { apiClient } from "../api/client";
-import type { PoolAttentionEntry, PoolMember, PoolViewData } from "../api/types";
+import type { AuctionScopeBoard, PoolAttentionEntry, PoolMember, PoolViewData } from "../api/types";
 import StateBlock from "../components/StateBlock.vue";
 import UiInput from "../components/ui/UiInput.vue";
 import { useResource } from "../composables/useResource";
@@ -20,6 +20,12 @@ const searchFocused = ref(false);
 const detailMember = ref<PoolMember | null>(null);
 const removingAttention = ref<string | null>(null);
 const data = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools"));
+const auctionScope = useResource<AuctionScopeBoard>(() => apiClient.get<AuctionScopeBoard>("/api/auction/latest"));
+const auctionForEntry = (entry: PoolAttentionEntry) => (auctionScope.data.value?.items ?? []).find((item) =>
+  item.scope_kind === "attention" && item.attention_entry_id === entry.id);
+const AUCTION_CONCLUSION_LABELS: Record<string, string> = {
+  confirmed: "条件已确认", wait: "继续等待", give_up: "放弃", unavailable: "数据不足",
+};
 const focusedMemberCode = computed(() => typeof route.query.member === "string" ? route.query.member : null);
 const focusedMember = computed(() => (data.data.value?.members ?? []).find((member) => member.code === focusedMemberCode.value) ?? null);
 
@@ -176,10 +182,10 @@ function pct(value: number | null): string {
 watch(() => route.query.member, (code) => {
   if (typeof code === "string") selected.value = "all";
 }, { immediate: true });
-useUiRefresh("pools", data.reload);
+useUiRefresh("pools", async () => { await Promise.all([data.reload(), auctionScope.reload()]); });
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
-  void data.reload();
+  void Promise.all([data.reload(), auctionScope.reload()]);
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 </script>
@@ -374,6 +380,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                 <p>{{ entry.reason }}</p>
                 <div class="muted">{{ fmtDate(entry.valid_from) ?? "现在" }}–{{ fmtDate(entry.valid_until) ?? "持续" }}<template v-if="entry.data_date"> · 数据 {{ fmtDate(entry.data_date) }}</template></div>
                 <p v-if="entry.stale_reason" class="missing">{{ entry.stale_reason }}</p>
+                <div v-if="auctionForEntry(entry)" class="muted">竞价 {{ fmtDate(auctionScope.data.value?.target_date) }} · {{ AUCTION_CONCLUSION_LABELS[auctionForEntry(entry)?.conclusion ?? ''] ?? auctionForEntry(entry)?.conclusion }}：{{ auctionForEntry(entry)?.assessment_summary }}</div>
                 <div class="detail-attention-actions">
                   <button class="btn compact remove-attention" type="button" :disabled="removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}`" @click="removeAttention(detailMember, entry)">{{ removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}` ? "移除中" : "移除关注" }}</button>
                 </div>

@@ -31,6 +31,15 @@ export interface AuctionAssessmentInput {
   data_time?: string;
 }
 
+export interface AuctionScopeInput {
+  target_key: string;
+  conclusion: "plan_aligned" | "risk_alert" | "confirmed" | "wait" | "give_up" | "unavailable";
+  metrics_summary: string;
+  assessment_summary: string;
+  data_status: AuctionDataStatus;
+  data_time?: string;
+}
+
 export interface AuctionAssessmentRow extends AuctionAssessmentInput {
   id: string;
   output_id: string | null;
@@ -290,11 +299,11 @@ async function latestActiveOpportunityRows(db: Db): Promise<Array<{ id: string; 
 /** 暂存本次竞价任务对当前全部打板机会的判断；任务成功后统一激活。 */
 export async function replaceDraftAuctionAssessments(
   db: TransactionDb,
-  input: { source_job_run_id: string; items: AuctionAssessmentInput[] },
+  input: { source_job_run_id: string; items: AuctionAssessmentInput[]; scope_items: AuctionScopeInput[] },
 ): Promise<{ replaced: number }> {
   return inServiceTransaction(db, async (client) => {
-    const run = await client.query(
-      `SELECT run.id
+    const run = await client.query<{ id: string; target_date: string }>(
+      `SELECT run.id::text,run.target_date::text
          FROM job_run run
          JOIN job_definition definition ON definition.id = run.job_id
         WHERE run.id = $1 AND definition.code = 'auction_opportunity_assessment'`,
@@ -313,6 +322,41 @@ export async function replaceDraftAuctionAssessments(
       );
     }
 
+    const context = await queryAuctionAssessmentContext(client, run.rows[0]!.target_date);
+    if (!context.market_day.should_run && (input.items.length || input.scope_items.length)) {
+      throw apiErrors.badRequest("非交易日不得写入竞价研判");
+    }
+    const targets = new Map<string, { code: string; scope_kind: "position" | "attention"; attention_entry_id: string | null; strategy_code: string | null }>([
+      ...context.positions.map((item) => [item.target_key, { code: item.code, scope_kind: "position" as const,
+        attention_entry_id: null, strategy_code: item.strategy_code } ] as const),
+      ...context.attentions.map((item) => [item.target_key, { code: item.code, scope_kind: "attention" as const,
+        attention_entry_id: item.attention_entry_id, strategy_code: item.strategy_code } ] as const),
+    ]);
+    const submittedKeys = input.scope_items.map((item) => item.target_key);
+    if (new Set(submittedKeys).size !== submittedKeys.length || targets.size !== submittedKeys.length
+      || submittedKeys.some((key) => !targets.has(key))) {
+      throw apiErrors.badRequest(`竞价研判必须完整覆盖持仓和关注来源：期望 ${[...targets.keys()].join("、") || "无"}，实际 ${submittedKeys.join("、") || "无"}`);
+    }
+    const instrumentIds = await resolveInstruments(client, [...new Set([...targets.values()].map((item) => item.code))]);
+    await client.query("DELETE FROM auction_scope_assessment WHERE source_job_run_id=$1 AND status='draft'", [input.source_job_run_id]);
+    for (const item of input.scope_items) {
+      const target = targets.get(item.target_key)!;
+      const allowed = target.scope_kind === "position"
+        ? ["plan_aligned", "risk_alert", "unavailable"] : ["confirmed", "wait", "give_up", "unavailable"];
+      if (!allowed.includes(item.conclusion)) throw apiErrors.badRequest(`${item.target_key} 竞价结论类型与位置不匹配`);
+      if (item.data_status !== "ready" && item.conclusion !== "unavailable") {
+        throw apiErrors.badRequest(`${item.target_key} 竞价数据未就绪只能标记 unavailable`);
+      }
+      await client.query(
+        `INSERT INTO auction_scope_assessment
+           (source_job_run_id,target_date,target_key,scope_kind,instrument_id,attention_entry_id,strategy_code,
+            conclusion,metrics_summary,assessment_summary,data_status,data_time)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [input.source_job_run_id,run.rows[0]!.target_date,item.target_key,target.scope_kind,
+          instrumentIds.get(target.code)!.id.toString(),target.attention_entry_id,target.strategy_code,
+          item.conclusion,item.metrics_summary.trim(),item.assessment_summary.trim(),item.data_status,item.data_time ?? null],
+      );
+    }
     const opportunityByCode = new Map(opportunities.map((item) => [item.code, item]));
     await client.query(
       "DELETE FROM daily_plan_auction_assessment WHERE source_job_run_id = $1 AND status = 'draft'",
@@ -339,7 +383,7 @@ export async function replaceDraftAuctionAssessments(
         ],
       );
     }
-    return { replaced: input.items.length };
+    return { replaced: input.items.length, scope_replaced: input.scope_items.length };
   });
 }
 
@@ -361,6 +405,7 @@ export async function activateAuctionAssessmentsForRun(
   const runRow = run.rows[0];
   if (runRow?.code !== "auction_opportunity_assessment") return 0;
   const isOpen = runRow.is_open ?? isWeekdayDate(runRow.target_date);
+  const shouldRun = isOpen;
 
   const expected = await latestActiveOpportunityRows(db);
   const drafts = await db.query<{ playbook_item_id: string }>(
@@ -381,7 +426,18 @@ export async function activateAuctionAssessmentsForRun(
   if (!isOpen && draftIds.length > 0) {
     throw new Error("非交易日不得激活集合竞价判断");
   }
-  if (draftIds.length === 0) return 0;
+  const context = await queryAuctionAssessmentContext(db, runRow.target_date);
+  const requiredKeys = [...context.positions.map((item) => item.target_key), ...context.attentions.map((item) => item.target_key)].sort();
+  const scopeDrafts = await db.query<{ target_key: string }>(
+    "SELECT target_key FROM auction_scope_assessment WHERE source_job_run_id=$1 AND status='draft' ORDER BY target_key",
+    [sourceJobRunId],
+  );
+  if (shouldRun && (requiredKeys.length !== scopeDrafts.rows.length
+    || requiredKeys.some((key,index) => key !== scopeDrafts.rows[index]?.target_key))) {
+    throw new Error(`竞价任务未完整回写持仓与关注来源：期望 ${requiredKeys.length}，实际 ${scopeDrafts.rows.length}`);
+  }
+  if (!shouldRun && scopeDrafts.rows.length) throw new Error("非交易日不得激活持仓或关注竞价研判");
+  if (draftIds.length === 0 && scopeDrafts.rows.length === 0) return 0;
 
   await db.query(
     `UPDATE daily_plan_auction_assessment current
@@ -396,7 +452,17 @@ export async function activateAuctionAssessmentsForRun(
       WHERE source_job_run_id = $1 AND status = 'draft'`,
     [sourceJobRunId, outputId],
   );
-  return activated.rowCount ?? 0;
+  await db.query(
+    `UPDATE auction_scope_assessment previous SET status='superseded',updated_at=now()
+       WHERE previous.status='active' AND previous.target_key IN
+         (SELECT target_key FROM auction_scope_assessment WHERE source_job_run_id=$1 AND status='draft')`,
+    [sourceJobRunId],
+  );
+  const scopeActivated = await db.query(
+    `UPDATE auction_scope_assessment SET status='active',assessment_output_id=$2,updated_at=now()
+      WHERE source_job_run_id=$1 AND status='draft'`, [sourceJobRunId,outputId],
+  );
+  return (activated.rowCount ?? 0) + (scopeActivated.rowCount ?? 0);
 }
 
 export async function discardDraftAuctionAssessmentsForRun(db: Db, sourceJobRunId: string): Promise<number> {
@@ -404,7 +470,10 @@ export async function discardDraftAuctionAssessmentsForRun(db: Db, sourceJobRunI
     "DELETE FROM daily_plan_auction_assessment WHERE source_job_run_id = $1 AND status = 'draft'",
     [sourceJobRunId],
   );
-  return result.rowCount ?? 0;
+  const scope = await db.query(
+    "DELETE FROM auction_scope_assessment WHERE source_job_run_id=$1 AND status='draft'", [sourceJobRunId],
+  );
+  return (result.rowCount ?? 0) + (scope.rowCount ?? 0);
 }
 
 function toRow(row: Record<string, unknown>): PlaybookItemRow {
@@ -555,40 +624,42 @@ function compactPlaybookItem(item: PlaybookItemRow) {
 
 /** 集合竞价任务的完整紧凑输入；覆盖候选全集，但不返回无关池属性或历史正文。 */
 export async function queryAuctionAssessmentContext(db: Db, targetDate: string) {
-  const [calendarResult, previousOpenResult, outputResult, positions, poolResult] = await Promise.all([
-    db.query<{ is_open: boolean }>(
+  const calendarResult = await db.query<{ is_open: boolean }>(
       "SELECT is_open FROM market_trading_day WHERE trade_date = $1::date",
       [targetDate],
-    ),
-    db.query<{ trade_date: string | null }>(
+    );
+  const previousOpenResult = await db.query<{ trade_date: string | null }>(
       `SELECT max(trade_date)::text AS trade_date
          FROM market_trading_day
         WHERE trade_date < $1::date AND is_open = true`,
       [targetDate],
-    ),
-    db.query<{ id: string; target_date: string; status: string; created_at: string }>(
+    );
+  const outputResult = await db.query<{ id: string; target_date: string; status: string; created_at: string }>(
       `SELECT output.id::text, output.target_date::text, output.status, output.created_at::text
          FROM job_run_output output
          JOIN job_definition definition ON definition.id = output.job_id
         WHERE definition.code = 'daily_plan_flow'
         ORDER BY output.id DESC LIMIT 1`,
-    ),
-    listPositions(db),
-    db.query<{
+    );
+  const positions = await listPositions(db);
+  const poolResult = await db.query<{
       code: string;
       name: string;
       pool: "watch";
       role: string;
-      attention: Array<{ source_job: string; reason: string }>;
+      attention: Array<{ id: string; strategy_code: string | null; strategy_name: string | null; source_job: string; status: string; reason: string; missing_signals: string[]; stale_reason: string | null }>;
     }>(
       `SELECT instrument.code, instrument.name, membership.pool, membership.role,
               COALESCE(attention.entries, '[]'::jsonb) AS attention
          FROM pool_membership membership
          JOIN market_instrument instrument ON instrument.id = membership.instrument_id
          LEFT JOIN LATERAL (
-           SELECT jsonb_agg(jsonb_build_object('source_job', entry.source_job, 'reason', entry.reason)
-                            ORDER BY entry.source_job) AS entries
+           SELECT jsonb_agg(jsonb_build_object('id',entry.id::text,'strategy_code',entry.strategy_code,
+                  'strategy_name',strategy.name,'source_job',entry.source_job,'status',entry.status,
+                  'reason',entry.reason,'missing_signals',entry.missing_signals,'stale_reason',entry.stale_reason)
+                            ORDER BY entry.strategy_code NULLS LAST,entry.source_job) AS entries
              FROM pool_attention_entry entry
+             LEFT JOIN strategy_definition strategy ON strategy.code=entry.strategy_code
             WHERE entry.instrument_id = membership.instrument_id
               AND entry.valid_from <= $1::date
               AND (entry.valid_until IS NULL OR entry.valid_until >= $1::date)
@@ -596,8 +667,7 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
         WHERE membership.effective_to IS NULL
         ORDER BY membership.pool, instrument.code`,
       [targetDate],
-    ),
-  ]);
+    );
 
   const calendarRow = calendarResult.rows[0];
   const weekday = isWeekdayDate(targetDate);
@@ -652,22 +722,27 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
       ? "existing_position" as const
       : poolByCode.has(item.code) ? "existing_pool_member" as const : null;
     if (conflict) gaps.push({ scope: "opportunity", code: item.code, reason: `打板候选冲突：${conflict}` });
-    return { ...compactPlaybookItem(item), conflict };
+    return { ...compactPlaybookItem(item), target_key: `board:${item.id}`, conflict };
   });
   // 关注池多来源条目：同一标的多来源并列，不合成统一原因；已持仓标的不进入自动关注。
   const attentions = poolResult.rows
     .filter((member) => member.attention.length > 0)
     .filter((member) => !positionCodes.has(member.code))
-    .map((member) => ({
+    .flatMap((member) => member.attention.map((entry) => ({
+      target_key: `attention:${entry.id}`,
+      attention_entry_id: entry.id,
       code: member.code,
       name: member.name,
       pool: member.pool,
       role: member.role,
-      attention: member.attention,
-    }));
+      ...entry,
+    })));
   const positionItems = positions.map((position) => ({
+    target_key: `position:${position.code}`,
     code: position.code,
     name: position.name,
+    strategy_code: position.strategy_code,
+    strategy_name: position.strategy_name,
     quantity: position.quantity,
     cost_price: position.cost_price,
     close: position.close,
@@ -681,6 +756,17 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
     ...attentions.map((item) => item.code),
     ...opportunities.map((item) => item.code),
   ])].sort();
+  const relevantStrategies = [...new Set([
+    ...positions.map((position) => position.strategy_code),
+    ...attentions.map((item) => item.strategy_code),
+    'limit_up',
+  ].filter((code): code is string => Boolean(code)))];
+  const documents = await db.query<{ code: string }>(
+    `SELECT DISTINCT document.code FROM strategy_document document
+      LEFT JOIN strategy_definition strategy ON strategy.strategy_document_code=document.code
+     WHERE document.role='portfolio' OR strategy.code=ANY($1::text[])
+     ORDER BY document.code`, [relevantStrategies],
+  );
 
   return {
     requested_date: targetDate,
@@ -702,12 +788,40 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
       position_plan_count: positionItems.filter((item) => item.plan_action !== null).length,
       attention_count: attentions.length,
       opportunity_count: opportunities.length,
+      required_scope_keys: [...positionItems.map((item) => item.target_key), ...attentions.map((item) => item.target_key)],
       candidate_count: candidateCodes.length,
     },
     candidate_codes: candidateCodes,
+    required_strategy_documents: documents.rows.map((row) => row.code),
     positions: positionItems,
     attentions,
     opportunities,
     gaps,
   };
+}
+
+/** 最新成功竞价任务对持仓和各策略关注来源的结构化研判；打板仍从每日计划机会读取。 */
+export async function getLatestAuctionScopeAssessments(db: Db) {
+  const output = await db.query<{ id: string; target_date: string }>(
+    `SELECT output.id::text,output.target_date::text FROM job_run_output output
+      JOIN job_definition definition ON definition.id=output.job_id
+     WHERE definition.code='auction_opportunity_assessment' AND output.status IN ('generated','approved')
+     ORDER BY output.id DESC LIMIT 1`,
+  );
+  if (!output.rows[0]) throw apiErrors.notFound("尚无竞价研判结果");
+  const rows = await db.query<{
+    id: string; target_key: string; scope_kind: string; code: string; name: string;
+    attention_entry_id: string | null; strategy_code: string | null; strategy_name: string | null;
+    conclusion: string; metrics_summary: string; assessment_summary: string;
+    data_status: string; data_time: string | null;
+  }>(`SELECT assessment.id::text,assessment.target_key,assessment.scope_kind,instrument.code,instrument.name,
+             assessment.attention_entry_id::text,assessment.strategy_code,strategy.name AS strategy_name,
+             assessment.conclusion,assessment.metrics_summary,assessment.assessment_summary,
+             assessment.data_status,assessment.data_time::text
+        FROM auction_scope_assessment assessment
+        JOIN market_instrument instrument ON instrument.id=assessment.instrument_id
+        LEFT JOIN strategy_definition strategy ON strategy.code=assessment.strategy_code
+       WHERE assessment.assessment_output_id=$1 AND assessment.status='active'
+       ORDER BY assessment.scope_kind,instrument.code,assessment.target_key`, [output.rows[0].id]);
+  return { output_id: output.rows[0].id, target_date: output.rows[0].target_date, items: rows.rows };
 }

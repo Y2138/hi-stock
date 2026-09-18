@@ -238,6 +238,7 @@ export async function readPortableManifest(payloadPath: string): Promise<Portabl
 }
 
 const RESET_STATEMENTS = [
+  "DELETE FROM auction_scope_assessment",
   "DELETE FROM daily_plan_auction_assessment",
   "DELETE FROM daily_plan_playbook",
   "DELETE FROM agent_memory_artifact",
