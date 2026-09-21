@@ -8,7 +8,7 @@ import { loadConfig } from "../server/config.js";
 import {
   copperInventoryTargetExposure,
   inventoryInversePercentile,
-} from "../server/modules/market/copper-inventory-signal.js";
+} from "./commodity-inventory-utils.js";
 
 const START = "2016-09-12";
 const END = "2026-09-11";

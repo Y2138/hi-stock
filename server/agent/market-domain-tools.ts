@@ -21,6 +21,7 @@ import type { LimitUpSignalResult } from "../modules/market/limit-up-signals.js"
 import { queryDailyPlanContext } from "../modules/plans/daily-context.js";
 import { queryStockResearch } from "../modules/market/research.js";
 import { queryValueRank } from "../modules/value-ranking/service.js";
+import { reconcileStrategyAttention } from "../modules/strategy-runtime/attention.js";
 import { executeStrategyEvaluator } from "../modules/strategy-runtime/registry.js";
 import { ensureStrategyEvaluation } from "../modules/strategy-runtime/service.js";
 import { queryDailyPlanStrategyContext } from "../modules/strategy-runtime/daily-plan.js";
@@ -65,8 +66,6 @@ const LimitUpSignalSchema = strict({ date: DateString });
 const DailyPlanContextSchema = strict({ date: DateString });
 const DailyPlanStrategySchema = strict({ date: DateString });
 const SwingSignalSchema = strict({ date: DateString });
-const CopperInventorySignalSchema = strict({ date: DateString });
-const LithiumWarehouseSignalSchema = strict({ date: DateString });
 const ValueRankSchema = strict({ as_of: Type.Optional(DateString), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })), codes: Type.Optional(Type.Array(Code, { maxItems: 50, uniqueItems: true })) });
 const ValueAnchorSignalSchema = strict({ date: DateString });
 const TwoYearReversalSignalSchema = strict({ date: DateString });
@@ -161,7 +160,7 @@ export function buildStrategyEvaluationTool(deps: {
   return {
     name: "strategy_evaluation_query",
     label: "查询策略结构化评估",
-    description: "按策略、阶段和目标日确保一次结构化评估运行；相同输入成功结果直接复用，运行中请求返回 waiting，失败或部分结果可重试。任务会话只能执行任务绑定的策略与阶段，不得借此查询其他策略。",
+    description: "按策略、阶段和目标日确保一次结构化评估运行；相同输入成功结果直接复用，运行中请求返回 waiting，失败或部分结果可重试。独立入场任务会按结构化结果自动对账本策略关注来源。任务会话只能执行任务绑定的策略与阶段，不得借此查询其他策略。",
     parameters: StrategyEvaluationSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof StrategyEvaluationSchema>>(
@@ -169,6 +168,7 @@ export function buildStrategyEvaluationTool(deps: {
       );
       let strategyCode = input.strategy_code ?? null;
       let requestedByJobRunId: string | null = null;
+      let jobAgentRole: string | null = null;
       if (deps.jobCode) {
         const binding = await deps.pool.query<{
           strategy_code: string | null;
@@ -180,6 +180,7 @@ export function buildStrategyEvaluationTool(deps: {
              WHERE definition.code=$1`, [deps.jobCode]);
         const row = binding.rows[0];
         if (!row) throw new Error(`未知任务：${deps.jobCode}`);
+        jobAgentRole = row.agent_role;
         if (row.strategy_code) {
           if (strategyCode && strategyCode !== row.strategy_code) throw new Error(`任务 ${deps.jobCode} 只能评估策略 ${row.strategy_code}`);
           strategyCode = row.strategy_code;
@@ -196,11 +197,17 @@ export function buildStrategyEvaluationTool(deps: {
         }
       }
       if (!strategyCode) throw new Error("strategy_evaluation_query 必须提供 strategy_code");
-      return audited(deps, "strategy_evaluation_query", { ...input, strategy_code: strategyCode }, () =>
-        ensureStrategyEvaluation(deps.pool, {
+      return audited(deps, "strategy_evaluation_query", { ...input, strategy_code: strategyCode }, async () => {
+        const ensured = await ensureStrategyEvaluation(deps.pool, {
           strategy_code: strategyCode!, phase: input.phase, target_date: input.date,
           requested_by_job_run_id: requestedByJobRunId,
-        }));
+        });
+        const attentionChanges = deps.jobCode && jobAgentRole === "strategy_entry_report"
+          && input.phase === "entry" && ensured.execution !== "waiting"
+          ? await reconcileStrategyAttention(deps.pool, { run: ensured.run, source_job: deps.jobCode })
+          : [];
+        return { ...ensured, attention_changes: attentionChanges };
+      });
     },
   };
 }
@@ -249,12 +256,12 @@ export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: stri
   };
 }
 
-/** 波段四条件扫描始终可用，由每日计划单独调用，避免扩大通用上下文。 */
+/** 波段四条件扫描兼容查询；正式运行由独立策略任务调用结构化评估。 */
 export function buildSwingSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
   return {
     name: "swing_signal_query",
     label: "查询波段确定性信号",
-    description: "按目标日逐只扫描关注池全部成员，返回40日箱体、缩量/反转形态/RSI14/预期盈亏比四条件、T+1突破与价格上限、已有持仓抑制、正式信号、接近候选和逐只数据缺口；波段是当前唯一开仓信号，不得再用通用查询手算。",
+    description: "按目标日覆盖16个周期及新能源设备行业、从全部行业细分筛选高活跃代表标的并把总量固定在388只以内，返回40日箱体、缩量/反转形态/RSI14/预期盈亏比四条件、T+1突破与价格上限、已有持仓抑制、正式信号、接近候选和逐只数据缺口；正式运行由波段独立任务负责，不得用关注池或通用查询手工限定扫描范围。",
     parameters: SwingSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof SwingSignalSchema>>("swing_signal_query", SwingSignalSchema, raw);
@@ -330,34 +337,6 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
         const input = validateToolInput<Static<typeof StockResearchSchema>>("stock_research_query", StockResearchSchema, raw);
         const codes = [...new Set(input.codes.map((code) => code.toUpperCase()))];
         return audited(deps, "stock_research_query", { codes }, () => queryStockResearch(deps.pool, codes));
-      },
-    },
-    {
-      name: "copper_inventory_signal_query",
-      label: "查询铜库存防守仓位信号",
-      description: "按目标日使用服务端固定的《铜库存防守仓位一版》公式，返回SHFE铜库存4周变化、历史逆百分位、原始目标仓位、最近已执行调仓、待执行调仓、五只核心生产商等权目标与数据缺口。Agent不得自行重算、改公式或把研究目标仓位解释为交易指令。",
-      parameters: CopperInventorySignalSchema,
-      execute: async (_id, raw) => {
-        const input = validateToolInput<Static<typeof CopperInventorySignalSchema>>(
-          "copper_inventory_signal_query", CopperInventorySignalSchema, raw,
-        );
-        return audited(deps, "copper_inventory_signal_query", input, () => executeStrategyEvaluator("copper_inventory_context_v1", {
-          pool: deps.pool, targetDate: input.date,
-        }));
-      },
-    },
-    {
-      name: "lithium_warehouse_signal_query",
-      label: "查询碳酸锂低暴露防守信号",
-      description: "按目标日使用服务端固定的《碳酸锂仓单防守仓位一版》公式，返回仓单4周变化、历史逆百分位、10个百分点缓冲、五只固定核心公司和最近已执行调仓；Agent不得自行重算、改公司名单或改参数。",
-      parameters: LithiumWarehouseSignalSchema,
-      execute: async (_id, raw) => {
-        const input = validateToolInput<Static<typeof LithiumWarehouseSignalSchema>>(
-          "lithium_warehouse_signal_query", LithiumWarehouseSignalSchema, raw,
-        );
-        return audited(deps, "lithium_warehouse_signal_query", input, () => executeStrategyEvaluator("lithium_warehouse_context_v1", {
-          pool: deps.pool, targetDate: input.date,
-        }));
       },
     },
     {

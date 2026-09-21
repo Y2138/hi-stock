@@ -58,6 +58,7 @@ const DEFINITION_SELECT = `
 export async function listStrategyRuntimeDefinitions(db: Db): Promise<StrategyRuntimeDefinition[]> {
   const result = await db.query<StrategyRuntimeDefinition>(
     `${DEFINITION_SELECT}
+      WHERE definition.code NOT IN ('copper_inventory','lithium_warehouse')
       ORDER BY CASE definition.status WHEN 'active' THEN 1 WHEN 'exit_only' THEN 2 WHEN 'paused' THEN 3 ELSE 4 END,
                definition.name, definition.code`,
   );
@@ -65,7 +66,7 @@ export async function listStrategyRuntimeDefinitions(db: Db): Promise<StrategyRu
 }
 
 export async function getStrategyRuntimeDefinition(db: Db, code: string): Promise<StrategyRuntimeDefinition> {
-  const result = await db.query<StrategyRuntimeDefinition>(`${DEFINITION_SELECT} WHERE definition.code = $1`, [code]);
+  const result = await db.query<StrategyRuntimeDefinition>(`${DEFINITION_SELECT} WHERE definition.code = $1 AND definition.code NOT IN ('copper_inventory','lithium_warehouse')`, [code]);
   if (!result.rows[0]) throw apiErrors.notFound(`策略运行时不存在：${code}`);
   return result.rows[0];
 }
@@ -77,15 +78,18 @@ export async function listStrategyEvaluationRuns(
 ): Promise<StrategyEvaluationRunSummary[]> {
   await getStrategyRuntimeDefinition(db, strategyCode);
   const result = await db.query<StrategyEvaluationRunSummary>(
-    `SELECT id::text, strategy_code, phase, target_date::text, data_date::text,
-            evaluator_code, evaluator_version, strategy_runtime_version,
-            strategy_snapshot_hash, input_fingerprint, status,
-            requested_by_job_run_id::text, reused_from_run_id::text,
-            coverage, gaps, started_at::text, finished_at::text, created_at::text,
-            result, attempt_count, last_requested_at::text
-       FROM strategy_evaluation_run
-      WHERE strategy_code = $1
-      ORDER BY target_date DESC, created_at DESC
+    `SELECT run.id::text, run.strategy_code, run.phase, run.target_date::text, run.data_date::text,
+            run.evaluator_code, run.evaluator_version, run.strategy_runtime_version,
+            run.strategy_snapshot_hash, run.input_fingerprint, run.status,
+            run.requested_by_job_run_id::text, requested_job.code AS requested_by_job_code,
+            run.reused_from_run_id::text, run.coverage, run.gaps,
+            run.started_at::text, run.finished_at::text, run.created_at::text,
+            run.result, run.attempt_count, run.last_requested_at::text
+       FROM strategy_evaluation_run run
+       LEFT JOIN job_run requested_run ON requested_run.id=run.requested_by_job_run_id
+       LEFT JOIN job_definition requested_job ON requested_job.id=requested_run.job_id
+      WHERE run.strategy_code = $1
+      ORDER BY run.target_date DESC, run.created_at DESC
       LIMIT $2`,
     [strategyCode, limit],
   );

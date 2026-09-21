@@ -21,12 +21,8 @@ export async function queryTwoYearReversalCoverage(db: Db, date: string) {
   return coverage.rows.find((row) => peak > 0 && row.stocks >= peak * 0.8 && row.boards >= 80) ?? null;
 }
 
-export async function queryTwoYearReversalSignals(db: Db, date: string) {
-  const selected = await queryTwoYearReversalCoverage(db, date);
-  if (!selected) return { status: "unavailable" as const, date, qualified: [], near: [], gaps: ["近30个确认交易日无股票覆盖达近期峰值80%且881一级行业覆盖达80个的共同数据日"] };
-  const asOf = selected.date;
-  const gaps: string[] = [];
-  if (asOf !== date) gaps.push(`目标日行情不完整，使用共同数据日 ${asOf}；滞后数据仅供观察，不形成目标日新开仓信号`);
+/** 与正式扫描共享行业与成员筛选口径，供日更只补相关股票的未复权价。 */
+async function eligibleIndustryMembers(db: Db, asOf: string) {
   const boardBars = await db.query<Bar>(
     `SELECT board.code,board.name AS board_name,history.bar_date::text AS date,history.close::float8,history.low::float8,history.volume::float8
        FROM market_board catalog JOIN market_instrument board ON board.id=catalog.instrument_id
@@ -40,8 +36,6 @@ export async function queryTwoYearReversalSignals(db: Db, date: string) {
   for (const bar of boardBars.rows) histories.set(bar.code, [...(histories.get(bar.code) ?? []), bar]);
   const completeBoards = [...histories.values()].filter((history) => history.length >= 501
     && history.at(-1)?.date === asOf && history.every((bar) => bar.close > 0)).length;
-  if (completeBoards < 80) return { status: "unavailable" as const, date, data_date: asOf, qualified: [], near: [],
-    gaps: [...gaps, `881一级行业两年日线不足80个（${completeBoards}个）`] };
   const eligible = new Map<string, { name: string; return500: number; drawdown20: number; deviation500: number }>();
   for (const [code, history] of histories) {
     if (history.length < 501 || history.at(-1)?.date !== asOf || history.some((bar) => bar.close <= 0)) continue;
@@ -53,7 +47,6 @@ export async function queryTwoYearReversalSignals(db: Db, date: string) {
       eligible.set(code, { name: history[0]!.board_name ?? code, return500, deviation500, drawdown20 });
     }
   }
-  if (!eligible.size) return { status: "success" as const, date, data_date: asOf, coverage: { stocks: selected.stocks, boards: selected.boards, complete_boards: completeBoards, qualified_boards: 0, members: 0, completed: 0 }, eligible_industries: [], qualified: [], qualified_count: 0, near: [], near_count: 0, historical: [], held: [], gaps, evidence: "research_only" };
   const members = await db.query<Member>(
     `SELECT DISTINCT ON (stock.id) stock.code,stock.name,industry.code AS board_code,industry.name AS board_name,
             COALESCE(position.quantity,0)::float8 AS position_quantity, membership_pool.instrument_id IS NOT NULL AS in_pool
@@ -67,18 +60,36 @@ export async function queryTwoYearReversalSignals(db: Db, date: string) {
         AND stock.kind='stock' AND stock.lifecycle_status='active' AND stock.name !~* '^\\*?ST'
       ORDER BY stock.id,industry.code`, [[...eligible.keys()], asOf],
   );
+  return { completeBoards, eligible, members: members.rows };
+}
+
+export async function queryTwoYearReversalRawTargetCodes(db: Db, date: string): Promise<string[]> {
+  const selection = await eligibleIndustryMembers(db, date);
+  return selection.completeBoards >= 80 ? selection.members.map((member) => member.code) : [];
+}
+
+export async function queryTwoYearReversalSignals(db: Db, date: string) {
+  const selected = await queryTwoYearReversalCoverage(db, date);
+  if (!selected) return { status: "unavailable" as const, date, qualified: [], near: [], gaps: ["近30个确认交易日无股票覆盖达近期峰值80%且881一级行业覆盖达80个的共同数据日"] };
+  const asOf = selected.date;
+  const gaps: string[] = [];
+  if (asOf !== date) gaps.push(`目标日行情不完整，使用共同数据日 ${asOf}；滞后数据仅供观察，不形成目标日新开仓信号`);
+  const { completeBoards, eligible, members } = await eligibleIndustryMembers(db, asOf);
+  if (completeBoards < 80) return { status: "unavailable" as const, date, data_date: asOf, qualified: [], near: [],
+    gaps: [...gaps, `881一级行业两年日线不足80个（${completeBoards}个）`] };
+  if (!eligible.size) return { status: "success" as const, date, data_date: asOf, coverage: { stocks: selected.stocks, boards: selected.boards, complete_boards: completeBoards, qualified_boards: 0, members: 0, completed: 0 }, eligible_industries: [], qualified: [], qualified_count: 0, near: [], near_count: 0, historical: [], held: [], gaps, evidence: "research_only" };
   const bars = await db.query<Bar>(
     `SELECT stock.code,history.bar_date::text AS date,history.close::float8,history.low::float8,history.low_raw::float8,history.volume::float8
        FROM market_instrument stock JOIN LATERAL (
          SELECT bar_date,close,low,low_raw,volume FROM market_bar WHERE instrument_id=stock.id AND freq='day' AND bar_date <= $2::date
          ORDER BY bar_date DESC,bar_time DESC LIMIT 61) history ON true
-      WHERE stock.code=ANY($1::text[]) ORDER BY stock.code,history.bar_date`, [members.rows.map((row) => row.code), asOf],
+      WHERE stock.code=ANY($1::text[]) ORDER BY stock.code,history.bar_date`, [members.map((row) => row.code), asOf],
   );
   const stocks = new Map<string, Bar[]>();
   for (const bar of bars.rows) stocks.set(bar.code, [...(stocks.get(bar.code) ?? []), bar]);
   const observations: Array<{ member: Member; ret5: number; drawdown20: number; volumeRatio: number | null; low: number; lowRaw: number }> = [];
   const peers = new Map<string, number[]>();
-  for (const member of members.rows) {
+  for (const member of members) {
     const history = stocks.get(member.code) ?? [];
     if (history.length < 20 || history.at(-1)?.date !== asOf || history.at(-1)!.close <= 0 || history.at(-1)!.low <= 0 || !history.at(-1)!.low_raw || history.at(-6)!.close <= 0) continue;
     const current = history.at(-1)!;
@@ -89,8 +100,8 @@ export async function queryTwoYearReversalSignals(db: Db, date: string) {
     observations.push({ member, ret5, drawdown20, volumeRatio, low: current.low, lowRaw: current.low_raw! });
     peers.set(member.board_code, [...(peers.get(member.board_code) ?? []), ret5]);
   }
-  if (!members.rows.length || observations.length < members.rows.length * 0.8) {
-    return { status: "unavailable" as const, date, data_date: asOf, qualified: [], near: [], gaps: [...gaps, `合格行业成员日线覆盖不足80%（${observations.length}/${members.rows.length}）`] };
+  if (!members.length || observations.length < members.length * 0.8) {
+    return { status: "unavailable" as const, date, data_date: asOf, qualified: [], near: [], gaps: [...gaps, `合格行业成员日线覆盖不足80%（${observations.length}/${members.length}）`] };
   }
   const qualified: Record<string, unknown>[] = [], near: Record<string, unknown>[] = [], historical: Record<string, unknown>[] = [], held: Record<string, unknown>[] = [];
   for (const item of observations) {
@@ -122,7 +133,7 @@ export async function queryTwoYearReversalSignals(db: Db, date: string) {
   qualified.sort(sort); near.sort(sort); historical.sort(sort); held.sort(sort);
   return {
     status: "success" as const, date, data_date: asOf,
-    coverage: { stocks: selected.stocks, boards: selected.boards, complete_boards: completeBoards, qualified_boards: eligible.size, members: members.rows.length, completed: observations.length },
+    coverage: { stocks: selected.stocks, boards: selected.boards, complete_boards: completeBoards, qualified_boards: eligible.size, members: members.length, completed: observations.length },
     eligible_industries: [...eligible].map(([code, item]) => ({ code, ...item })),
     qualified: qualified.slice(0, 20), qualified_count: qualified.length, near: near.slice(0, 10), near_count: near.length,
     historical: historical.slice(0, 20), held: held.slice(0, 20),

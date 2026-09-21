@@ -63,10 +63,24 @@ export async function queryDailyPlanStrategyContext(
   pool: pg.Pool,
   input: { date: string; requested_by_job_run_id?: string | null },
 ) {
-  const [definitions, positions, legacyContext] = await Promise.all([
+  const [definitions, positions, legacyContext, activeAttentions] = await Promise.all([
     listStrategyRuntimeDefinitions(pool),
     listPositions(pool),
     queryDailyPlanContext(pool, input.date),
+    pool.query<{
+      code: string; name: string; strategy_code: string; strategy_name: string; status: string; reason: string;
+      missing_signals: string[]; data_date: string | null; stale_reason: string | null;
+    }>(
+      `SELECT instrument.code,instrument.name,entry.strategy_code,strategy.name AS strategy_name,
+              entry.status,entry.reason,entry.missing_signals,entry.data_date::text,entry.stale_reason
+         FROM pool_attention_entry entry
+         JOIN market_instrument instrument ON instrument.id=entry.instrument_id
+         JOIN strategy_definition strategy ON strategy.code=entry.strategy_code
+        WHERE entry.source_type='strategy' AND entry.valid_from <= $1::date
+          AND (entry.valid_until IS NULL OR entry.valid_until >= $1::date)
+        ORDER BY strategy.name,instrument.code`,
+      [input.date],
+    ),
   ]);
   const byCode = new Map(definitions.map((definition) => [definition.code, definition]));
   const requests = new Map<string, { strategy: StrategyRuntimeDefinition; phase: "entry" | "exit" | "context" }>();
@@ -198,6 +212,10 @@ export async function queryDailyPlanStrategyContext(
   );
   for (const document of portfolioDocuments.rows) requiredDocuments.add(document.code);
   for (const evaluation of evaluations) requiredDocuments.add(evaluation.strategy.strategy_document_code);
+  for (const attention of activeAttentions.rows) {
+    const strategy = byCode.get(attention.strategy_code);
+    if (strategy) requiredDocuments.add(strategy.strategy_document_code);
+  }
   const waitingCount = evaluations.filter((item) => item.ensured.execution === "waiting").length;
   const status = gaps.length || legacyContext.status !== "success" || waitingCount ? "partial" as const : "success" as const;
   return {
@@ -218,6 +236,7 @@ export async function queryDailyPlanStrategyContext(
       attributed_position_count: positions.filter((position) => position.strategy_code !== null).length,
       primary_position_count: positionEvaluations.filter((item) => item.primary !== null).length,
       fallback_position_count: positionEvaluations.filter((item) => item.fallback !== null).length,
+      attention_count: activeAttentions.rows.length,
       attention_change_count: attentionChanges.length,
     },
     required_strategy_documents: [...requiredDocuments],
@@ -226,6 +245,7 @@ export async function queryDailyPlanStrategyContext(
       execution: item.ensured.execution, run: item.ensured.run, result: item.ensured.result,
     })),
     position_evaluations: positionEvaluations,
+    active_attentions: activeAttentions.rows,
     attention_changes: attentionChanges,
     playbook_items: playbookItems,
     gaps: [...legacyContext.gaps, ...gaps],

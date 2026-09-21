@@ -1,4 +1,5 @@
 import { apiErrors } from "../http/router.js";
+import { jobFlowAvailableTools } from "../agent/tools.js";
 import {
   createJobDefinition,
   findJobByCode,
@@ -44,7 +45,7 @@ function parseLimit(query: URLSearchParams): number {
 
 export const jobRoutes = {
   async list({ pool }: Ctx) {
-    return { data: await listJobDefinitions(pool) };
+    return { data: (await listJobDefinitions(pool)).map((job) => ({ ...job, available_tools: job.job_type === "agent_flow" ? jobFlowAvailableTools(job.code) : [] })) };
   },
 
   async create({ pool, body }: Ctx) {
@@ -102,7 +103,20 @@ export const jobRoutes = {
   async runDetail({ pool, params }: Ctx) {
     const run = await findJobRunById(pool, params.id!);
     if (!run) throw apiErrors.notFound(`作业运行不存在：${params.id}`);
-    return { data: { ...run, outputs: await listRunOutputs(pool, run.id) } };
+    const [outputs, toolMetrics] = await Promise.all([
+      listRunOutputs(pool, run.id),
+      run.session_id && run.job.job_type === "agent_flow"
+        ? pool.query<{ tool_name: string; status: string; count: number }>(
+            `SELECT metric.tool_name, metric.status, count(*)::int AS count
+               FROM agent_tool_metric metric JOIN agent_run_metric agent_run ON agent_run.id=metric.run_metric_id
+              WHERE agent_run.session_id=$1 AND metric.started_at>=COALESCE($2::timestamptz, '-infinity'::timestamptz)
+                AND metric.started_at<=COALESCE($3::timestamptz, 'infinity'::timestamptz)
+              GROUP BY metric.tool_name, metric.status ORDER BY metric.tool_name, metric.status`,
+            [run.session_id, run.started_at, run.finished_at],
+          ).then((result) => result.rows)
+        : Promise.resolve([]),
+    ]);
+    return { data: { ...run, outputs, tool_usage: toolMetrics } };
   },
 
   async outputDetail({ pool, params }: Ctx) {

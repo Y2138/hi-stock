@@ -5,7 +5,7 @@ import "dotenv/config";
 import type pg from "pg";
 import { closePool, getPool } from "../server/db/client.js";
 import { loadConfig } from "../server/config.js";
-import { copperInventoryTargetExposure, inventoryInversePercentile } from "../server/modules/market/copper-inventory-signal.js";
+import { copperInventoryTargetExposure, inventoryInversePercentile } from "./commodity-inventory-utils.js";
 
 const START="2016-09-12", END="2019-06-21", SPLIT="2018-01-02";
 const INITIAL=100_000_000,LOT=100,COMMISSION=2.5,MIN_FEE=500,TAX=10,SLIP=10,PARTICIPATION=.02;

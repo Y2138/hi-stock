@@ -45,6 +45,7 @@ export interface StrategyEvaluationRun {
   input_fingerprint: string;
   status: StrategyEvaluationStatus;
   requested_by_job_run_id: string | null;
+  requested_by_job_code: string | null;
   reused_from_run_id: string | null;
   coverage: Record<string, unknown>;
   gaps: unknown[];
@@ -58,12 +59,21 @@ export interface StrategyEvaluationRun {
 
 export interface StrategyRuntimeTask {
   code: string;
+  available_tools: string[];
   name: string;
   enabled: boolean;
   agent_role: string | null;
   purpose: string | null;
   phase: string | null;
   priority: number | null;
+}
+
+export interface StrategyEvaluatorMetadata {
+  code: string;
+  label: string;
+  phase: StrategyEvaluationPhase | null;
+  status: "ready" | "pending" | "unregistered";
+  version: number | null;
 }
 
 export interface StrategyRuntimeDefinition {
@@ -89,6 +99,7 @@ export interface StrategyRuntimeDefinition {
   position_count: number;
   attention_count: number;
   latest_evaluation: StrategyEvaluationRun | null;
+  evaluators: { entry: StrategyEvaluatorMetadata | null; exit: StrategyEvaluatorMetadata | null; context: StrategyEvaluatorMetadata | null };
   tasks: StrategyRuntimeTask[];
 }
 
@@ -129,6 +140,7 @@ export interface JobDefinition {
   priority: number | null;
   strategy_code: string | null;
   agent_role: string | null;
+  available_tools: string[];
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -195,6 +207,7 @@ export interface JobPromptRevision {
 export interface JobRunDetail extends JobRun {
   job: Omit<JobDefinition, "latest_run" | "next_run">;
   outputs: JobRunOutput[];
+  tool_usage: Array<{ tool_name: string; status: string; count: number }>;
 }
 
 // ---- 行情与标的（server/modules/market） ----
@@ -387,7 +400,7 @@ export interface DailyPlanPlaybookItem {
   fallback_evaluation_run_id: string | null;
   primary_action: "hold" | "observe" | "reduce" | "exit" | null;
   fallback_action: "hold" | "observe" | "reduce" | "exit" | null;
-  effective_action: "hold" | "observe" | "reduce" | "exit" | null;
+  effective_action: "hold" | "observe" | "reduce" | "exit" | "buy" | null;
   evaluation_status: "success" | "partial" | "failed" | "waiting" | null;
   evaluation_data_date: string | null;
   evaluation_missing: string[];
@@ -846,6 +859,11 @@ export interface ConfirmationResultEvent {
 /** 工具名中文标签（与 server/agent/tools.ts 的 label 对齐） */
 export const TOOL_LABELS: Record<string, string> = {
   tool_catalog: "加载所需工具",
+  daily_plan_strategy_query: "统筹每日计划策略评估",
+  strategy_evaluation_query: "查询单策略结构化评估",
+  web_search: "搜索公开网页", web_fetch: "读取公开网页",
+  two_year_reversal_signal_query: "查询两年结构反转信号", value_anchor_signal_query: "查询价值错杀信号",
+  strategy_screen_query: "筛选策略条件",
   portfolio_context_query: "查询组合与持仓",
   pool_context_query: "查询标的池",
   job_context_query: "查询任务与历史结果",

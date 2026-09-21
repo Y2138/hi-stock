@@ -7,7 +7,7 @@ export type FuturesContractKind = (typeof FUTURES_CONTRACT_KINDS)[number];
 export const MARKET_FACTOR_METRIC_CODES = [
   "inventory", "warehouse_warrant", "cancelled_warrant", "spot_premium", "treatment_charge",
   "mine_production", "refined_production", "refined_usage", "import_volume", "export_volume",
-  "pmi", "industrial_production", "real_rate", "exchange_rate", "inventory_days",
+  "pmi", "leading_indicator", "industrial_production", "real_rate", "exchange_rate", "inventory_days",
 ] as const;
 export type MarketFactorMetricCode = (typeof MARKET_FACTOR_METRIC_CODES)[number];
 

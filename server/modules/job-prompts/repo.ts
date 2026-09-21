@@ -45,7 +45,7 @@ function assertContent(content: string): void {
 }
 
 export async function listJobPrompts(db: QueryDb): Promise<JobPromptRow[]> {
-  return (await db.query<JobPromptRow>(`${SELECT_PROMPT} ORDER BY p.status, p.code`)).rows;
+  return (await db.query<JobPromptRow>(`${SELECT_PROMPT} WHERE p.code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review') ORDER BY p.status, p.code`)).rows;
 }
 
 export async function findJobPrompt(db: QueryDb, idOrCode: string, includeContent = false): Promise<JobPromptRow | null> {
@@ -54,7 +54,7 @@ export async function findJobPrompt(db: QueryDb, idOrCode: string, includeConten
       "r.sha256 AS current_sha256",
       `r.sha256 AS current_sha256${includeContent ? ", r.content AS current_content" : ""}`,
     )}
-     WHERE ${/^\d+$/.test(idOrCode) ? "p.id = $1" : "p.code = $1"}`,
+     WHERE ${/^\d+$/.test(idOrCode) ? "p.id = $1" : "p.code = $1"} AND p.code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review')`,
     [idOrCode],
   );
   return result.rows[0] ?? null;

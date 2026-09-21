@@ -1,6 +1,6 @@
 import type pg from "pg";
 import { inServiceTransaction } from "../../db/transaction.js";
-import { setPoolAttentionEntry } from "../pools/repo.js";
+import { ensureStrategyPoolMemberProfile, setPoolAttentionEntry } from "../pools/repo.js";
 import type { StrategyEvaluationRunSummary } from "./types.js";
 
 export interface StrategyAttentionChange {
@@ -40,13 +40,11 @@ export async function reconcileStrategyAttention(
         changes.push({ code: signal.code, strategy_code: input.run.strategy_code, action: "skip", reason: "已有持仓" });
         continue;
       }
-      await client.query(
-        `INSERT INTO pool_membership
-           (instrument_id,pool,role,tags,stage,evaluation_summary,effective_from)
-         VALUES ($1,'watch','关注','["策略自动关注"]'::jsonb,'策略信号',$2,$3)
-         ON CONFLICT DO NOTHING`,
-        [signal.instrument_id, `${strategy.name}自动关注`, signal.valid_from],
-      );
+      await ensureStrategyPoolMemberProfile(client, {
+        code: signal.code,
+        effective_from: signal.valid_from,
+        strategy_name: strategy.name,
+      });
       kept.add(signal.code);
       const write = await setPoolAttentionEntry(client, {
         code: signal.code,

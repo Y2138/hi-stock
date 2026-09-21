@@ -9,6 +9,7 @@ import { buildSystemPrompt } from "../agent/prompt.js";
 import { appendMessage, nextMessageSeq, updateSessionStatus } from "../agent/repo.js";
 import { runAgentSessionTurn } from "../agent/session-runner.js";
 import { createJobCompletionGate } from "../agent/job-workflow.js";
+import { querySwingUniverse } from "../modules/plans/swing-signals.js";
 import { queryTwoYearReversalCoverage } from "../modules/plans/two-year-reversal-signal.js";
 import {
   activateAuctionAssessmentsForRun,
@@ -39,7 +40,7 @@ import {
 import { exportVolume, type VolumeExportResult } from "../volume/export.js";
 import { validateJobConfig } from "./config.js";
 import { findJobRunById } from "./repo.js";
-import { syncGfexLithiumWarehouse } from "../datasource/gfex-service.js";
+import { syncCopperMacroFactors, type CopperMacroSyncResult } from "../datasource/copper-macro-service.js";
 import { syncValueCandidates, type ValueCandidateSyncSummary } from "../modules/value-ranking/service.js";
 import {
   syncShfeCopperWeeklyInventory,
@@ -119,7 +120,7 @@ export interface RunnerDeps {
   ) => Promise<{ datasets: SpecialSyncSummary[]; gaps: unknown[] }>;
   commodityCopperSync?: (targetDate: string, jobRunId: string) => Promise<ShfeDailySyncResult>;
   commodityCopperInventorySync?: (targetDate: string, jobRunId: string) => Promise<ShfeInventorySyncResult>;
-  lithiumWarehouseSync?: (targetDate: string, jobRunId: string) => Promise<import("../datasource/gfex-service.js").GfexLithiumWarehouseSyncResult>;
+  commodityCopperMacroSync?: (targetDate: string, jobRunId: string) => Promise<CopperMacroSyncResult>;
   valueCandidateSync?: (targetDate: string, jobRunId: string) => Promise<ValueCandidateSyncSummary>;
   volumeExport?: () => Promise<VolumeExportResult>;
   analysisRun?: (request: AnalysisRequest) => Promise<{ id: string; status: string; data_gaps: unknown[] }>;
@@ -224,6 +225,7 @@ export async function resolveDailyUpdateScope(
                instrument.code`,
     [targetDate],
   );
+  const swingUniverse = await querySwingUniverse(pool, targetDate);
   const futures = await pool.query<{ code: string }>(
     "SELECT code FROM market_instrument WHERE kind = 'futures' ORDER BY code",
   );
@@ -236,9 +238,10 @@ export async function resolveDailyUpdateScope(
         )
       : null;
   const coreCodes = new Set([...day.rows, ...structureCandidates.rows].map((row) => row.code));
+  const signalCodes = new Set([...coreCodes, ...swingUniverse.map((row) => row.code)]);
   const allCodes = fullMarket
-    ? [...new Set([...coreCodes, ...fullMarket.rows.map((row) => row.code)])].sort()
-    : [...coreCodes].sort();
+    ? [...new Set([...signalCodes, ...fullMarket.rows.map((row) => row.code)])].sort()
+    : [...signalCodes].sort();
   const minute30 = await pool.query<{ code: string }>(
     `SELECT DISTINCT i.code
        FROM market_instrument i
@@ -252,8 +255,8 @@ export async function resolveDailyUpdateScope(
     dayMode,
     codes: allCodes,
     refetchCodes: fullMarket ? [...coreCodes].sort() : allCodes,
-    // 指标/均线只算信号相关范围，宽域标的交由每周全市场重算任务分批补齐。
-    indicatorCodes: fullMarket ? [...coreCodes].sort() : allCodes,
+    // 周期行业属于波段独立扫描的固定范围，每日同步并重算；其余宽域标的交由每周全市场任务补齐。
+    indicatorCodes: [...signalCodes].sort(),
     futures: futures.rows.map((row) => row.code),
     minute30: minute30.rows.map((row) => row.code),
   };
@@ -506,13 +509,13 @@ async function executeDatasource(
         artifacts: [{ kind: "market_fetch_run", id: summary.fetchRunId }],
         dataGaps: summary.gaps,
       };
-    } else if (config.pipeline === "commodity_lithium_warehouse_sync") {
-      const summary = deps.lithiumWarehouseSync
-        ? await deps.lithiumWarehouseSync(run.target_date, run.id)
-        : await syncGfexLithiumWarehouse(deps.pool, run.target_date, { jobRunId: run.id });
+    } else if (config.pipeline === "commodity_copper_macro_sync") {
+      const summary = deps.commodityCopperMacroSync
+        ? await deps.commodityCopperMacroSync(run.target_date, run.id)
+        : await syncCopperMacroFactors(deps.pool, run.target_date, { jobRunId: run.id, now: deps.now?.() });
       result = {
         status: summary.gaps.length > 0 ? "partial" : "success",
-        log: `碳酸锂仓单同步完成：${summary.quantity ?? "无数据"} 张，缺口 ${summary.gaps.length}。`,
+        log: `铜宏观因子同步完成：写入 ${summary.rowsWritten} 条，更新序列 ${summary.seriesUpdated.length} 个，缺口 ${summary.gaps.length}。`,
         artifacts: [{ kind: "market_fetch_run", id: summary.fetchRunId }],
         dataGaps: summary.gaps,
       };

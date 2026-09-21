@@ -2,9 +2,9 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { apiClient } from "../api/client";
-import type { AuctionScopeBoard, PoolAttentionEntry, PoolMember, PoolViewData } from "../api/types";
+import type { AuctionScopeBoard, Instrument, PoolAttentionEntry, PoolMember, PoolViewData } from "../api/types";
+import InstrumentPicker from "../components/InstrumentPicker.vue";
 import StateBlock from "../components/StateBlock.vue";
-import UiInput from "../components/ui/UiInput.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
 import { appMessage } from "../stores/message";
@@ -15,8 +15,6 @@ import { attentionSourceLabel, attentionStatusLabel, compareAttentionQuality } f
 const router = useRouter();
 const route = useRoute();
 const selected = ref("attention");
-const boardQuery = ref("");
-const searchFocused = ref(false);
 const detailMember = ref<PoolMember | null>(null);
 const removingAttention = ref<string | null>(null);
 const data = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools"));
@@ -35,24 +33,6 @@ const displayIndustries = (member: PoolMember) => {
   const secondary = member.boards.filter((board) => board.level === "secondary");
   return secondary.length ? secondary : member.boards.filter((board) => board.level === "primary");
 };
-const boardMatches = computed(() => {
-  const keyword = boardQuery.value.trim().toLocaleLowerCase("zh-CN");
-  const boards = data.data.value?.boards ?? [];
-  if (!keyword) return [];
-  return boards.filter((board) =>
-    [board.name, board.code]
-      .some((value) => value.toLocaleLowerCase("zh-CN").includes(keyword)),
-  ).slice(0, 8);
-});
-const memberMatches = computed(() => {
-  const keyword = boardQuery.value.trim().toLocaleLowerCase("zh-CN");
-  const members = data.data.value?.members ?? [];
-  if (!keyword) return [];
-  return members.filter((member) =>
-    [member.name, member.code]
-      .some((value) => value.toLocaleLowerCase("zh-CN").includes(keyword)),
-  ).slice(0, 8);
-});
 const visibleMembers = computed(() => {
   const members = data.data.value?.members ?? [];
   if (selected.value === "all") {
@@ -81,31 +61,12 @@ function memberStockCharacter(member: PoolMember): string {
   return member.stock_character ?? member.tags.find((tag) => tag.startsWith("股性："))?.slice(3) ?? "—";
 }
 
-function selectFirstMatch(): void {
-  const board = boardMatches.value[0];
-  if (board) {
-    selectBoard(board.code);
-    return;
-  }
-  const member = memberMatches.value[0];
-  if (member) selectMember(member.code);
-}
-
-function selectBoard(code: string): void {
-  selected.value = code;
-  boardQuery.value = "";
-  searchFocused.value = false;
-}
-
-function selectMember(code: string): void {
-  selected.value = "all";
-  boardQuery.value = "";
-  searchFocused.value = false;
-  void router.push({ path: route.path, query: { ...route.query, member: code } });
-}
-
 function goMarket(code: string): void {
   void router.push({ path: "/market", query: { code, view: "detail" } });
+}
+
+function openMarketInstrument(instrument: Instrument): void {
+  goMarket(instrument.code);
 }
 
 function openMemberDetail(member: PoolMember): void {
@@ -211,54 +172,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
         <div class="card pool-explorer">
           <div class="pool-toolbar">
             <div>
-              <div class="card-title">大行业导航</div>
-              <p class="card-desc">按大行业聚合池内标的，细分行业保留在列表中</p>
+              <div class="card-title">全市场标的搜索</div>
+              <p class="card-desc">搜索全市场代码或名称，点击候选直接查看行情详情；下方标签仅用于浏览池内标的</p>
             </div>
-            <div class="board-search">
-              <UiInput
-                v-model="boardQuery"
-                type="search"
-                aria-label="快速查找大行业或标的"
-                placeholder="快速定位大行业 / 标的"
-                role="combobox"
-                :aria-expanded="searchFocused && Boolean(boardQuery)"
-                aria-controls="board-search-results"
-                @focus="searchFocused = true"
-                @blur="searchFocused = false"
-                @keyup.enter="selectFirstMatch"
-                @keyup.esc="boardQuery = ''"
-              />
-              <button class="btn compact board-locate" type="button" :disabled="!boardMatches.length && !memberMatches.length" @click="selectFirstMatch">定位</button>
-              <div v-if="searchFocused && boardQuery" id="board-search-results" class="board-results" role="listbox">
-                <template v-if="boardMatches.length">
-                  <span class="results-group">大行业</span>
-                  <button
-                    v-for="board in boardMatches"
-                    :key="board.code"
-                    type="button"
-                    role="option"
-                    @mousedown.prevent
-                    @click="selectBoard(board.code)"
-                  >
-                    {{ board.name }}
-                  </button>
-                </template>
-                <template v-if="memberMatches.length">
-                  <span class="results-group">标的</span>
-                  <button
-                    v-for="member in memberMatches"
-                    :key="member.id"
-                    type="button"
-                    role="option"
-                    @mousedown.prevent
-                    @click="selectMember(member.code)"
-                  >
-                    {{ member.name }}<span class="num code-sub results-code">{{ member.code }}</span>
-                  </button>
-                </template>
-                <span v-if="!boardMatches.length && !memberMatches.length">没有匹配的大行业或标的</span>
-              </div>
-            </div>
+            <InstrumentPicker class="market-search" placeholder="搜索全市场标的…" @select="openMarketInstrument" />
           </div>
           <nav class="pool-tabs" aria-label="标的池视图">
             <button type="button" :class="{ active: selected === 'attention' }" @click="selected = 'attention'">
@@ -320,7 +237,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                       <div v-for="entry in member.attention_entries" :key="entry.id" class="attention-entry">
                         <div class="attention-entry-head">
                           <span class="badge signal-status" :class="entry.status">{{ attentionStatusLabel(entry) }}</span>
-                          <span class="muted source-tag">{{ attentionSourceLabel(entry) }}</span>
+                          <RouterLink v-if="entry.strategy_code" class="source-tag" :to="{ path: '/strategies', query: { strategy: entry.strategy_code } }" @click.stop>{{ attentionSourceLabel(entry) }} ↗</RouterLink><span v-else class="muted source-tag">人工关注</span>
                         <span v-if="entry.stale_reason" class="badge warn">待复核</span>
                         </div>
                         <ul v-if="entry.status === 'approaching'" class="signal-gaps">
@@ -371,14 +288,14 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
               <div v-for="entry in detailMember.attention_entries" :key="entry.id" class="attention-entry">
                 <div class="attention-entry-head">
                   <span class="badge signal-status" :class="entry.status">{{ attentionStatusLabel(entry) }}</span>
-                  <span class="muted source-tag">{{ attentionSourceLabel(entry) }}</span>
+                  <RouterLink v-if="entry.strategy_code" class="source-tag" :to="{ path: '/strategies', query: { strategy: entry.strategy_code } }" @click.stop>{{ attentionSourceLabel(entry) }} ↗</RouterLink><span v-else class="muted source-tag">人工关注</span>
                 </div>
                 <ul v-if="entry.status === 'approaching'" class="signal-gaps">
                   <li v-for="gap in entry.missing_signals" :key="gap">待确认：{{ gap }}</li>
                   <li v-if="!entry.missing_signals.length">缺口待补充，请结合关注原因核实</li>
                 </ul>
                 <p>{{ entry.reason }}</p>
-                <div class="muted">{{ fmtDate(entry.valid_from) ?? "现在" }}–{{ fmtDate(entry.valid_until) ?? "持续" }}<template v-if="entry.data_date"> · 数据 {{ fmtDate(entry.data_date) }}</template></div>
+                <div class="muted">{{ fmtDate(entry.valid_from) ?? "现在" }}–{{ fmtDate(entry.valid_until) ?? "持续" }}<template v-if="entry.data_date"> · 数据 {{ fmtDate(entry.data_date) }}</template><template v-if="entry.source_evaluation_run_id"> · 结构化评估已记录</template></div>
                 <p v-if="entry.stale_reason" class="missing">{{ entry.stale_reason }}</p>
                 <div v-if="auctionForEntry(entry)" class="muted">竞价 {{ fmtDate(auctionScope.data.value?.target_date) }} · {{ AUCTION_CONCLUSION_LABELS[auctionForEntry(entry)?.conclusion ?? ''] ?? auctionForEntry(entry)?.conclusion }}：{{ auctionForEntry(entry)?.assessment_summary }}</div>
                 <div class="detail-attention-actions">
@@ -409,15 +326,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .pool-explorer{position:relative;z-index:4;min-width:0;padding:0}
 .pool-toolbar{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:12px 14px;border-bottom:1px solid var(--line)}
 .pool-toolbar .card-title{margin:0 0 2px}
-.board-search{position:relative;display:grid;grid-template-columns:minmax(180px,280px) auto;gap:6px;width:min(350px,100%)}
-.board-locate:disabled{opacity:.45;cursor:not-allowed}
-.board-results{position:absolute;top:calc(100% + 6px);left:0;right:58px;z-index:8;display:grid;max-height:240px;overflow:auto;padding:4px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--card);box-shadow:var(--shadow-lift)}
-.board-results button{border:0;border-radius:6px;background:transparent;color:var(--ink);padding:8px 10px;text-align:left;cursor:pointer}
-.board-results button:hover{background:var(--accent-soft);color:var(--accent-ink)}
-.board-results span{padding:10px;color:var(--ink-faint);font-size:var(--fs-sm)}
-.board-results .results-group{padding:6px 10px 2px;font-weight:700;letter-spacing:.02em}
-.board-results .results-group:not(:first-child){margin-top:4px;border-top:1px solid var(--line)}
-.board-results .results-code{margin-left:6px;padding:0}
+.market-search{width:min(430px,100%);flex:none}
 .pool-tabs{display:flex;gap:2px;overflow-x:auto;padding:0 10px}
 .pool-tabs button{display:inline-flex;align-items:center;gap:5px;flex:none;min-height:40px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--ink-soft);padding:0 11px;white-space:nowrap;cursor:pointer;font:500 var(--fs-sm)/1 var(--font-body);transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease),color var(--dur) var(--ease)}
 .pool-tabs button:hover{background:var(--paper-deep);color:var(--ink)}
@@ -440,6 +349,6 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .attention-footer,.member-detail-head,.member-detail-actions{display:flex;align-items:center;justify-content:space-between;gap:8px}.attention-actions,.detail-attention-actions{display:flex;align-items:center;gap:8px}.detail-trigger{flex:none;border:0;background:transparent;padding:0;color:var(--accent-ink);font:600 11px var(--font-body);cursor:pointer}.detail-trigger:hover{text-decoration:underline}.remove-attention{color:var(--bad)}.remove-attention:disabled{cursor:wait;opacity:.55}.quote{display:flex;gap:8px;margin-top:5px}.cell-clamp{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.clamp-1{-webkit-line-clamp:1}.clamp-2{-webkit-line-clamp:2}.clamp-3{-webkit-line-clamp:3}.tag-preview{display:grid;gap:4px}.attention-cell{min-width:0}.attention-footer{margin-top:6px}.attention-footer>.muted{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-action-cell{vertical-align:middle!important}.row-action-cell .btn{white-space:nowrap}.data-table tbody tr:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}.market-link{display:block;border:0;background:transparent;padding:0;color:var(--accent-ink);text-align:left;cursor:pointer;font:inherit}.market-link:hover{text-decoration:underline}.industry-text{font-weight:600}.up{color:var(--up)}.down{color:var(--down)}
 .member-detail-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}.member-detail-panel{display:grid;width:min(620px,94vw);height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.member-detail-head{padding:14px 18px;border-bottom:1px solid var(--line);background:var(--card)}.member-detail-head>div:first-child{display:flex;align-items:center;min-width:0;gap:8px}.member-detail-head strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.detail-close{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:19px;line-height:1;cursor:pointer}.detail-close:hover{border-color:var(--accent);color:var(--accent-ink)}.member-detail-scroll{min-height:0;overflow:auto;padding:18px 20px 48px}.detail-overview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0;margin:0;border-block:1px solid var(--line)}.detail-overview>div{padding:12px 10px}.detail-overview>div:nth-child(odd){border-right:1px solid var(--line)}.detail-overview dt{margin-bottom:4px;color:var(--ink-faint);font-size:11px}.detail-overview dd{margin:0;overflow-wrap:anywhere;line-height:1.55}.detail-section{padding:18px 2px;border-bottom:1px solid var(--line)}.detail-section h3{margin:0 0 8px;font-size:var(--fs-md)}.detail-section p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);line-height:1.65}.detail-section .btn{margin-top:12px}.detail-tags{display:flex;align-items:flex-start;flex-wrap:wrap;gap:6px}.detail-tags .badge{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 .member-focus{display:flex;align-items:center;gap:10px;margin-bottom:12px;border-color:var(--accent);background:var(--accent-soft)}.focused-row{outline:2px solid var(--accent);outline-offset:-2px;background:var(--accent-soft)}
-@container business (max-width:720px){.pool-toolbar,.content-head{align-items:stretch;flex-direction:column}.board-search{width:100%;grid-template-columns:minmax(0,1fr) auto}.content-actions{align-self:flex-start}}
+@container business (max-width:720px){.pool-toolbar,.content-head{align-items:stretch;flex-direction:column}.market-search{width:100%}.content-actions{align-self:flex-start}}
 @media(max-width:720px){.pool-head{align-items:stretch;flex-direction:column}.member-detail-panel{width:100vw}.member-detail-head{align-items:flex-start}.member-detail-head>div:first-child{align-items:flex-start;flex-direction:column;gap:2px}.detail-overview{grid-template-columns:1fr}.detail-overview>div:nth-child(odd){border-right:0}.detail-overview>div+div{border-top:1px solid var(--line)}}
 </style>

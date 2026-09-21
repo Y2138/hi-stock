@@ -148,7 +148,7 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
     expect(bundle.documents.find((document) => document.code === "investment_strategy")!.content)
       .toContain("# 投资总策略：组合统筹");
     const currentDocuments = await pool.query<{ code: string; sha256: string }>(
-      `SELECT code, sha256 FROM strategy_document ORDER BY injection_order, id`,
+      `SELECT code, sha256 FROM strategy_document WHERE code NOT IN ('copper_inventory_strategy','lithium_warehouse_strategy') ORDER BY injection_order, id`,
     );
     expect(currentDocuments.rows.map((row) => row.code)).toEqual(bundle.documents.map((document) => document.code));
     const baseSeq = (await pool.query<{ change_seq: string }>("SELECT change_seq::text FROM strategy_state")).rows[0]!.change_seq;
@@ -241,10 +241,13 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
       code: string;
       status: string;
       daily_plan_scope: string[];
-      tasks: Array<{ code: string; agent_role: string }>;
+      evaluators: { entry: { code: string; label: string; status: string } | null };
+      tasks: Array<{ code: string; agent_role: string; available_tools: string[] }>;
     }>;
+    expect(definitions.find((item) => item.code === "swing")?.evaluators.entry).toMatchObject({ code: "swing_entry_v1", label: "波段入场", status: "ready" });
+    expect(definitions.find((item) => item.code === "nightly_sector")?.evaluators.entry?.status).toBe("pending");
     expect(definitions).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: "swing", status: "active", daily_plan_scope: ["entry", "exit", "attention"] }),
+      expect.objectContaining({ code: "swing", status: "active", daily_plan_scope: ["exit"] }),
       expect.objectContaining({ code: "legacy_left_reversal", status: "exit_only" }),
       expect.objectContaining({ code: "portfolio_fallback_exit", status: "active" }),
     ]));
@@ -258,10 +261,15 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
       exit_policy_mode: "dedicated_plus_fallback",
     });
 
+    const swing = await api(server.baseUrl, "GET", "/api/strategies/runtime/swing");
+    expect(swing.json.tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "swing_signal_scan", agent_role: "strategy_entry_report", available_tools: expect.arrayContaining(["strategy_evaluation_query"]) }),
+    ]));
+
     const reversal = await api(server.baseUrl, "GET", "/api/strategies/runtime/two_year_reversal");
     expect(reversal.status).toBe(200);
     expect(reversal.json.tasks).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: "two_year_reversal_scan", agent_role: "strategy_entry_report" }),
+      expect.objectContaining({ code: "two_year_reversal_scan", agent_role: "strategy_entry_report", available_tools: expect.arrayContaining(["strategy_evaluation_query"]) }),
     ]));
 
     const evaluations = await api(server.baseUrl, "GET", "/api/strategies/runtime/swing/evaluations?limit=10");

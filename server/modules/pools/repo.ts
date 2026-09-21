@@ -1,6 +1,7 @@
 // 关注池领域：当前成员、股性画像、板块投影、多来源近期关注与展示偏好。
 import type pg from "pg";
 import { inServiceTransaction, type TransactionDb } from "../../db/transaction.js";
+import { STOCK_CHARACTER_CALCULATION_VERSION } from "../../indicators/formulas.js";
 
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
 export type PoolKind = "watch";
@@ -331,6 +332,63 @@ export async function setPoolAttentionEntry(
       [instrument.rows[0].id, manual, strategyCode],
     );
     return { before, after: afterRows.rows[0] ?? null };
+  });
+}
+
+export async function ensureStrategyPoolMemberProfile(
+  db: TransactionDb,
+  input: { code: string; effective_from: string; strategy_name: string },
+): Promise<"created" | "repaired" | "existing"> {
+  if (!validDate(input.effective_from)) throw new Error("effective_from 必须是有效的 YYYY-MM-DD 日期");
+  return inServiceTransaction(db, async (client) => {
+    const profile = await client.query<{
+      instrument_id: string; as_of_date: string; calculation_version: string; input_sha256: string;
+      stock_character_profile: Record<string, unknown>; stage: string; stock_character: string; tags: string[];
+    }>(
+      `SELECT instrument.id::text AS instrument_id,metric.as_of_date::text,metric.calculation_version,run.input_sha256,
+              metric.stock_character_profile,metric.stage,metric.stock_character,metric.tags
+         FROM market_instrument instrument
+         JOIN market_stock_character_metric metric ON metric.instrument_id=instrument.id
+         JOIN market_indicator_run run ON run.id=metric.indicator_run_id
+        WHERE instrument.code=$1 AND metric.as_of_date <= $2::date
+          AND metric.calculation_version=$3 AND metric.input_row_count >= 120 AND run.status='success'
+          AND btrim(metric.stage) <> '' AND btrim(metric.stock_character) <> ''
+        ORDER BY metric.as_of_date DESC,metric.computed_at DESC LIMIT 1`,
+      [input.code, input.effective_from, STOCK_CHARACTER_CALCULATION_VERSION],
+    );
+    const currentProfile = profile.rows[0];
+    if (!currentProfile) throw new Error(`标的 ${input.code} 缺少截至 ${input.effective_from} 的完整五维画像，不能自动入池`);
+    const tags = [...new Set([...currentProfile.tags, "策略自动关注"])];
+    const summary = `${input.strategy_name}自动关注；画像数据截至${currentProfile.as_of_date}`;
+    const current = await client.query<{ id: string; stock_character: string | null; stage: string | null; profile_as_of: string | null }>(
+      `SELECT id::text,stock_character,stage,profile_as_of::text
+         FROM pool_membership WHERE instrument_id=$1 AND effective_to IS NULL
+        ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+      [currentProfile.instrument_id],
+    );
+    if (current.rows[0]) {
+      if (current.rows[0].stock_character && current.rows[0].stage && current.rows[0].profile_as_of) return "existing";
+      await client.query(
+        `UPDATE pool_membership SET tags=$2::jsonb,stock_character=$3,stock_character_profile=$4::jsonb,stage=$5,
+                evaluation_summary=$6,profile_as_of=$7,profile_calculation_version=$8,profile_input_sha256=$9,
+                note='由策略信号自动入池并采用最新五维画像'
+          WHERE id=$1`,
+        [current.rows[0].id, JSON.stringify(tags), currentProfile.stock_character,
+         JSON.stringify(currentProfile.stock_character_profile), currentProfile.stage, summary, currentProfile.as_of_date,
+         currentProfile.calculation_version, currentProfile.input_sha256],
+      );
+      return "repaired";
+    }
+    await client.query(
+      `INSERT INTO pool_membership
+         (instrument_id,pool,role,tags,stock_character,stock_character_profile,stage,evaluation_summary,
+          profile_as_of,profile_calculation_version,profile_input_sha256,effective_from,note)
+       VALUES ($1,'watch','关注',$2::jsonb,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,'由策略信号自动入池并采用最新五维画像')`,
+      [currentProfile.instrument_id, JSON.stringify(tags), currentProfile.stock_character,
+       JSON.stringify(currentProfile.stock_character_profile), currentProfile.stage, summary, currentProfile.as_of_date,
+       currentProfile.calculation_version, currentProfile.input_sha256, input.effective_from],
+    );
+    return "created";
   });
 }
 

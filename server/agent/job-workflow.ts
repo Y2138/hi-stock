@@ -3,9 +3,9 @@ import type { AgentCoreFrame } from "./core/loop.js";
 
 const REQUIRED_READS: Record<string, readonly string[]> = {
   daily_plan_flow: ["strategy_document_query", "daily_plan_strategy_query"],
-  copper_inventory_signal_review: ["strategy_document_query", "copper_inventory_signal_query"],
-  lithium_warehouse_signal_review: ["strategy_document_query", "lithium_warehouse_signal_query"],
   value_anchor_opportunity_scan: ["strategy_document_query", "value_anchor_signal_query"],
+  swing_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
+  copper_left_launch_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
   two_year_reversal_scan: ["strategy_document_query", "two_year_reversal_signal_query"],
   nightly_sector_opportunity_scan: [
     "strategy_document_query",
@@ -18,7 +18,7 @@ const REQUIRED_READS: Record<string, readonly string[]> = {
   ],
 };
 const TARGET_DATE_TOOLS = new Set([
-  "daily_plan_strategy_query", "daily_plan_context_query", "swing_signal_query", "auction_context_query", "copper_inventory_signal_query", "lithium_warehouse_signal_query",
+  "daily_plan_strategy_query", "daily_plan_context_query", "swing_signal_query", "auction_context_query",
   "value_anchor_signal_query", "two_year_reversal_signal_query", "strategy_evaluation_query",
 ]);
 
@@ -51,9 +51,11 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
     },
     unavailableGaps(): unknown[] {
       const signal = results.get("two_year_reversal_signal_query");
-      return jobCode === "two_year_reversal_scan" && signal
-        && (signal.status === "unavailable" || signal.data_date !== targetDate) && Array.isArray(signal.gaps)
-        ? signal.gaps : [];
+      if (jobCode === "two_year_reversal_scan" && signal
+        && (signal.status === "unavailable" || signal.data_date !== targetDate) && Array.isArray(signal.gaps)) return signal.gaps;
+      const evaluation = results.get("strategy_evaluation_query");
+      const run = object(evaluation?.run);
+      return jobCode === "swing_signal_scan" && run.status === "partial" && Array.isArray(run.gaps) ? run.gaps : [];
     },
     missing(): string[] {
       const required = [...(Object.hasOwn(REQUIRED_READS, jobCode) ? REQUIRED_READS[jobCode]! : [])];
@@ -82,6 +84,20 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
           const loaded = new Set(docs.map((item) => String(object(item).code)));
           const absent = requiredDocs.map(String).filter((code) => !loaded.has(code));
           if (absent.length) missing.push(`strategy_document_query（缺少统一编排要求的策略正文：${absent.join("、")}）`);
+        }
+      }
+      if (jobCode === "copper_left_launch_signal_scan" && results.has("strategy_document_query")) {
+        const docs = results.get("strategy_document_query")?.documents;
+        if (!Array.isArray(docs) || !docs.some((item) => object(item).code === "copper_left_launch_strategy")
+          || !docs.some((item) => object(item).role === "portfolio")) {
+          missing.push("strategy_document_query（必须读取铜左侧启动策略和投资总策略）");
+        }
+      }
+      if (jobCode === "swing_signal_scan" && results.has("strategy_document_query")) {
+        const docs = results.get("strategy_document_query")?.documents;
+        if (!Array.isArray(docs) || !docs.some((item) => object(item).code === "swing_strategy")
+          || !docs.some((item) => object(item).role === "portfolio")) {
+          missing.push("strategy_document_query（必须读取波段策略和投资总策略）");
         }
       }
       if (jobCode === "two_year_reversal_scan" && results.has("strategy_document_query")) {

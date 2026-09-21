@@ -4,6 +4,9 @@
 import type pg from "pg";
 import {
   HithinkChannel,
+  HithinkEnvelopeError,
+  HithinkHttpError,
+  fetchRawStockDaily,
   fetchLatestFundamental,
   fetchSnapshot,
   fetchValuationSnapshots,
@@ -15,6 +18,7 @@ import {
 } from "./hithink.js";
 import { SinaChannel, type AkshareDeps } from "./akshare.js";
 import type { Bar, Channel, FetchRequest, FetchResult, MarketFreq } from "./types.js";
+import { queryTwoYearReversalRawTargetCodes } from "../modules/plans/two-year-reversal-signal.js";
 
 /** 可查询对象：连接池或事务内客户端（与一期 repo 约定一致） */
 export type Db = Pick<pg.Pool, "query">;
@@ -414,6 +418,65 @@ export async function fetchAndStore(
   };
 }
 
+/** 补写已有股票日线的未复权成交价；不改前复权价、成交量或已有原始价。 */
+export async function fillRawStockDaily(db: Db, code: string, date: string, deps: ServiceDeps = {}): Promise<number> {
+  const existing = await db.query<{ id: string; missing: boolean; invalid: boolean }>(
+    `SELECT bar.instrument_id::text AS id,
+            (bar.open_raw IS NULL OR bar.high_raw IS NULL OR bar.low_raw IS NULL OR bar.close_raw IS NULL) AS missing,
+            (bar.open_raw<=0 OR bar.high_raw<=0 OR bar.low_raw<=0 OR bar.close_raw<=0) AS invalid
+       FROM market_instrument instrument JOIN market_bar bar ON bar.instrument_id=instrument.id
+      WHERE instrument.code=$1 AND instrument.kind='stock' AND bar.freq='day' AND bar.bar_date=$2::date
+      ORDER BY bar.bar_time DESC LIMIT 1`, [code, date],
+  );
+  const row = existing.rows[0];
+  if (!row) throw new Error(`${code} 在 ${date} 无已落库股票日线，拒绝单独补写原始价`);
+  if (row.invalid) throw new Error(`${code} 在 ${date} 已有未复权价非正，拒绝静默覆盖`);
+  if (!row.missing) return 0;
+  const raw = await fetchRawStockDaily(code, date, hithinkDeps(db, deps));
+  const written = await db.query(
+    `UPDATE market_bar SET open_raw=COALESCE(open_raw,$3), high_raw=COALESCE(high_raw,$4),
+            low_raw=COALESCE(low_raw,$5), close_raw=COALESCE(close_raw,$6)
+      WHERE instrument_id=$1 AND freq='day' AND bar_date=$2::date
+        AND (open_raw IS NULL OR high_raw IS NULL OR low_raw IS NULL OR close_raw IS NULL)`,
+    [row.id, date, raw.open, raw.high, raw.low, raw.close],
+  );
+  return written.rowCount ?? 0;
+}
+
+/** 用扫描器相同的合格行业口径，只补取原始价尚缺失的成员。 */
+export async function missingTwoYearRawCodes(db: Db, date: string): Promise<string[]> {
+  const codes = await queryTwoYearReversalRawTargetCodes(db, date);
+  if (!codes.length) return [];
+  const result = await db.query<{ code: string }>(
+    `SELECT requested.code FROM unnest($1::text[]) WITH ORDINALITY AS requested(code, sort)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM market_instrument instrument JOIN market_bar bar ON bar.instrument_id=instrument.id
+         WHERE instrument.code=requested.code AND bar.freq='day' AND bar.bar_date=$2::date
+           AND bar.open_raw>0 AND bar.high_raw>0 AND bar.low_raw>0 AND bar.close_raw>0
+      ) ORDER BY requested.sort`, [codes, date],
+  );
+  return result.rows.map((row) => row.code);
+}
+
+function rawPriceGapReason(error: unknown): string {
+  if (error instanceof HithinkHttpError) return `扶摇 HTTP ${error.status}`;
+  if (error instanceof HithinkEnvelopeError) return `扶摇业务码 ${error.code}`;
+  if (error instanceof Error && /^(扶摇未返回|扶摇 .*未复权 OHLC 无效|.*无已落库股票日线|.*已有未复权价非正)/.test(error.message)) return error.message;
+  return "扶摇未复权日线请求失败";
+}
+
+/** 每次仅触及策略所需的缺失标的，供应商故障留下任务缺口而不是伪造原始价。 */
+export async function repairTwoYearRawDaily(db: Db, date: string, deps: ServiceDeps = {}) {
+  const missing = await missingTwoYearRawCodes(db, date);
+  const gaps: Array<{ code: string; freq: "day"; reason: string }> = [];
+  let rows = 0;
+  for (const code of missing) {
+    try { rows += await fillRawStockDaily(db, code, date, deps); }
+    catch (error) { gaps.push({ code, freq: "day", reason: `未复权日线不可用: ${rawPriceGapReason(error)}` }); }
+  }
+  return { codes: missing, targets: missing.length, rows, gaps };
+}
+
 export interface DailyUpdateScope {
   /** 需要写入日线的全部代码（可含全市场宽域标的，只做快照追加） */
   codes: string[];
@@ -708,6 +771,20 @@ export async function dailyMarketUpdate(
     );
     summary.gaps.push(...groupGaps);
     summary.snapshotRows += groupRows;
+  }
+
+  // 合格行业成员须有目标日未复权最低价；只补缺失成员，不请求全市场第二份日线。
+  try {
+    const raw = await repairTwoYearRawDaily(db, scope.date, deps);
+    if (raw.targets) {
+      summary.gaps.push(...raw.gaps);
+      summary.fetchRunIds.push(await insertFetchRun(db, {
+        channel: "hithink", scope: { instruments: raw.codes, kind: "stock", freq: "day", date: scope.date, op: "two_year_raw" },
+        rowsWritten: raw.rows, gaps: raw.gaps, jobRunId: deps.jobRunId,
+      }));
+    }
+  } catch (error) {
+    summary.gaps.push({ freq: "day", date: scope.date, reason: `两年结构反转原始价目标发现失败: ${(error as Error).message}` });
   }
 
   // 第 2 步：补算 MA（fetchAndStore 内部已对重拉标的算过，这里补快照追加路径）

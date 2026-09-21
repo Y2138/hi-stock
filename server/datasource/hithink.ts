@@ -193,7 +193,7 @@ const KLINE_ROUTES = [
 const KLINE_FALLBACK_CODES = new Set([1002, 3001, 3002, 3004]);
 
 /** 单标的日线 kline：股票默认前复权，指数/ETF 路由无复权语义 */
-export async function fetchKline(req: FetchRequest, deps: HithinkDeps = {}): Promise<Bar[]> {
+export async function fetchKline(req: FetchRequest, deps: HithinkDeps = {}, stockAdjust: "forward" | "none" = "forward"): Promise<Bar[]> {
   validateKlineRequest(req);
   const failures: string[] = [];
   for (const route of KLINE_ROUTES) {
@@ -203,7 +203,7 @@ export async function fetchKline(req: FetchRequest, deps: HithinkDeps = {}): Pro
       start: toMs(req.start),
       end: toMs(req.end, true),
     };
-    if (route.supportsAdjust) params.adjust = "forward";
+    if (route.supportsAdjust) params.adjust = stockAdjust;
     let data: unknown;
     try {
       data = await hithinkGet(route.path, params, deps);
@@ -224,7 +224,7 @@ export async function fetchKline(req: FetchRequest, deps: HithinkDeps = {}): Pro
       .filter((r) => typeof r?.date_ms === "number")
       .sort((a, b) => a.date_ms! - b.date_ms!);
     if (rows.length === 0) throw new Error("kline 响应缺少 date_ms 字段");
-    const adjustment = route.supportsAdjust ? ("forward" as const) : ("none" as const);
+    const adjustment = route.supportsAdjust ? stockAdjust : ("none" as const);
     return rows.map((r) => ({
       date: msToDate(r.date_ms!),
       open: Number(r.open_price),
@@ -239,6 +239,19 @@ export async function fetchKline(req: FetchRequest, deps: HithinkDeps = {}): Pro
   throw new Error(
     `股票/指数/基金三个K线端点均未取到 ${req.code} 数据：${failures.join("；")}。检查代码、日期范围和停牌状态`,
   );
+}
+
+/** 股票未复权日线直接取供应商成交价，不从前复权价反推。 */
+export async function fetchRawStockDaily(code: string, date: string, deps: HithinkDeps = {}): Promise<Bar> {
+  if (!A_SHARE_CODE_RE.test(code)) throw new Error(`未复权补取仅支持A股股票：${code}`);
+  const bars = await fetchKline({ code, freq: "day", start: date, end: date }, deps, "none");
+  const bar = bars.find((item) => item.date === date);
+  if (!bar || bar.adjustment !== "none") throw new Error(`扶摇未返回 ${code} 在 ${date} 的未复权日线`);
+  if (![bar.open, bar.high, bar.low, bar.close].every((price) => Number.isFinite(price) && price > 0)
+    || bar.low > Math.min(bar.open, bar.close) || bar.high < Math.max(bar.open, bar.close) || bar.low > bar.high) {
+    throw new Error(`扶摇 ${code} 在 ${date} 的未复权 OHLC 无效`);
+  }
+  return bar;
 }
 
 /** 批量快照条目（字段以实测响应为准，2026-08-16 探测） */

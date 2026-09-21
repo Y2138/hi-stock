@@ -11,6 +11,7 @@ import {
   HithinkChannel,
   HithinkEnvelopeError,
   fetchKline,
+  fetchRawStockDaily,
   fetchSnapshot,
   fetchCorporateActions,
 } from "../../server/datasource/hithink.js";
@@ -48,6 +49,7 @@ import {
   dailyMarketUpdate,
   ensureInstrument,
   fetchAndStore,
+  fillRawStockDaily,
   fetchFinancialAndStore,
   storeBars,
 } from "../../server/datasource/service.js";
@@ -64,8 +66,8 @@ import {
 } from "../../server/datasource/commodity-service.js";
 import { fetchShfeCopperWeeklyInventory, fetchShfeDailyContracts } from "../../server/datasource/shfe.js";
 import { fetchCoastalPowerCoalHistory } from "../../server/datasource/jin10.js";
-import { fetchGfexLithiumWarehouseReceipt } from "../../server/datasource/gfex.js";
 import { syncShfeCopperWeeklyInventory, syncShfeFuturesDaily } from "../../server/datasource/shfe-service.js";
+import { syncCopperMacroFactors } from "../../server/datasource/copper-macro-service.js";
 
 const noopSleep = async () => {};
 const noWait = { limiter: new RateLimiter(0, noopSleep), sleep: noopSleep, apiKey: "test-placeholder" };
@@ -161,6 +163,54 @@ function klinePayload(dates: string[], closes: number[]): unknown {
     },
   };
 }
+
+describe("未复权日线获取", () => {
+  it("只补已有日线缺失原价，不改前复权 OHLC；请求失败不写库", async () => {
+    let rawLow: number | null = null;
+    let updates = 0;
+    const db = { query: vi.fn(async (sql: string, params: unknown[]) => {
+      if (sql.includes("SELECT bar.instrument_id")) return { rows: [{ id: "7", missing: rawLow === null, invalid: rawLow !== null && rawLow <= 0 }] };
+      if (!sql.includes("UPDATE market_bar")) throw new Error("未预期 SQL");
+      updates += 1;
+      expect(params.slice(0, 2)).toEqual(["7", "2026-09-17"]);
+      rawLow = params[4] as number;
+      return { rowCount: 1 };
+    }) } as unknown as Pick<pg.Pool, "query">;
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(klinePayload(["2026-09-17"], [20]))));
+    try {
+      expect(await fillRawStockDaily(db, "600489.SH", "2026-09-17", { hithinkDeps: noWait })).toBe(1);
+      expect(rawLow).toBe(19);
+      expect(await fillRawStockDaily(db, "600489.SH", "2026-09-17", { hithinkDeps: noWait })).toBe(0);
+      expect(updates).toBe(1);
+      rawLow = null;
+      vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(klinePayload(["2026-09-16"], [20]))));
+      await expect(fillRawStockDaily(db, "600489.SH", "2026-09-17", { hithinkDeps: noWait })).rejects.toThrow("未返回");
+      expect(updates).toBe(1);
+      rawLow = 0;
+      await expect(fillRawStockDaily(db, "600489.SH", "2026-09-17", { hithinkDeps: noWait })).rejects.toThrow("已有未复权价非正");
+      expect(updates).toBe(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("只请求股票 adjust=none，拒绝错日与无效价格", async () => {
+    const code = "600489.SH", date = "2026-09-17";
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: unknown) => {
+      const url = new URL(String(input));
+      seen.push(url.searchParams.get("adjust") ?? "missing");
+      return jsonResponse(klinePayload([date], [20]));
+    }));
+    try {
+      expect(await fetchRawStockDaily(code, date, noWait)).toMatchObject({ date, low: 19, adjustment: "none" });
+      expect(seen).toEqual(["none"]);
+      await expect(fetchRawStockDaily("881001.TI", date, noWait)).rejects.toThrow("仅支持A股");
+      vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(klinePayload(["2026-09-16"], [20]))));
+      await expect(fetchRawStockDaily(code, date, noWait)).rejects.toThrow("未返回");
+      vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(klinePayload([date], [0]))));
+      await expect(fetchRawStockDaily(code, date, noWait)).rejects.toThrow("OHLC 无效");
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
 
 /** 构造新浪 30 分钟 jsonp 文本（与 2026-08-16 实测格式一致：注释前缀 + var=(...)） */
 function sina30mText(times: string[]): string {
@@ -644,18 +694,6 @@ describe("datasource 限流与重试", () => {
     vi.unstubAllGlobals();
   });
 
-  it("广期所碳酸锂仓单日报只提取小计并校验数值", async () => {
-    const fetcher = vi.fn(async () => Response.json({ code: "0", data: [
-      { varietyOrder: "lc", variety: "碳酸锂", lastWbillQty: 10, wbillQty: 12, diff: 2 },
-      { varietyOrder: "lc", variety: "碳酸锂小计", lastWbillQty: 100, wbillQty: 90, diff: -10 },
-    ] }));
-    expect(await fetchGfexLithiumWarehouseReceipt("2026-09-15", { fetch: fetcher })).toEqual({
-      date: "2026-09-15", previousQuantity: 100, quantity: 90, change: -10,
-      sourceUrl: "http://www.gfex.com.cn/u/interfacesWebTdWbillWeeklyQuotes/loadList",
-    });
-    expect(fetcher).toHaveBeenCalledTimes(1);
-  });
-
   it("沿海六大电厂公开归档严格解析库存、日耗和存煤可用天数", async () => {
     const list = Array.from({ length: 120 }, (_, index) => {
       const date = new Date(Date.UTC(2016, 0, 1 + index)).toISOString().slice(0, 10).replaceAll("-", "");
@@ -981,6 +1019,30 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
         WHERE roll.trade_date='2026-09-15'`,
     )).rows).toEqual([{ continuous_code: "CU0", underlying_code: "CU2610", method_code: "open_interest_v1" }]);
     vi.unstubAllGlobals();
+  });
+
+  it("铜宏观因子按月频可获得时间落库并保持幂等", async () => {
+    const csv = [
+      "REF_AREA,TIME_PERIOD,OBS_VALUE,OBS_STATUS",
+      ...["2026-01","2026-02","2026-03","2026-04","2026-05","2026-06"].flatMap((month, index) => [
+        `G7,${month},${99.5 + index / 10},A`,
+        `CHN,${month},${98.5 + index / 10},A`,
+      ]),
+    ].join("\n");
+    const fetchImpl = vi.fn(async () => textResponse(csv));
+    const first = await syncCopperMacroFactors(pool, "2026-09-20", { fetchImpl: fetchImpl as typeof fetch, now: new Date("2026-09-20T10:00:00Z") });
+    const second = await syncCopperMacroFactors(pool, "2026-09-20", { fetchImpl: fetchImpl as typeof fetch, now: new Date("2026-09-20T10:00:00Z") });
+    expect(first).toMatchObject({ rowsWritten: 12, gaps: [] });
+    expect(second).toMatchObject({ rowsWritten: 0, gaps: [] });
+    const stored = await pool.query<{ code: string; count: number }>(
+      `SELECT series.series_code code,count(*)::int count FROM market_factor_observation observation
+       JOIN market_factor_series series ON series.id=observation.series_id
+       WHERE series.series_code=ANY($1::text[]) GROUP BY series.series_code ORDER BY series.series_code`,
+      [["oecd.g7.cli","oecd.chn.cli"]],
+    );
+    expect(stored.rows).toEqual([
+      { code: "oecd.chn.cli", count: 6 }, { code: "oecd.g7.cli", count: 6 },
+    ]);
   });
 
   it("上期所铜库存周报兼容历史JSON和当前HTML并按发布时间落库", async () => {

@@ -123,61 +123,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     await expect(tool.execute("research-invalid", { codes: ["990071.SZ"], sql: "select 1" } as never)).rejects.toThrow("参数校验失败");
   });
 
-  it("铜库存防守仓位工具只返回服务端固定公式与目标日点时信号", async () => {
-    await pool.query(
-      `INSERT INTO market_factor_series
-         (series_code,commodity_code,market,metric_code,frequency,unit,source,revision_policy)
-       VALUES ('shfe.cu.inventory.total','CU','SHFE','inventory','weekly','吨','test','revisable')
-       ON CONFLICT (series_code) DO NOTHING`,
-    );
-    const seriesId = (await pool.query<{ id: string }>(
-      "SELECT id::text FROM market_factor_series WHERE series_code='shfe.cu.inventory.total'",
-    )).rows[0]!.id;
-    const inventoryDates = ["2026-07-03", "2026-07-10", "2026-07-17", "2026-07-24", "2026-07-31", "2026-08-07"];
-    for (const [index, value] of [100, 110, 120, 130, 90, 80].entries()) {
-      const date = inventoryDates[index]!;
-      await pool.query(
-        `INSERT INTO market_factor_observation
-           (series_id,period_start,period_end,published_at,revision_no,value,source_ref)
-         VALUES ($1,$2,$2,($2::date + time '23:59:59') AT TIME ZONE 'Asia/Shanghai',0,$3,$4)
-         ON CONFLICT DO NOTHING`,
-        [seriesId, date, value, `test://inventory/${date}`],
-      );
-    }
-    for (const [index, code] of ["990081.SZ", "990082.SZ", "990083.SZ"].entries()) {
-      await pool.query(
-        `INSERT INTO market_instrument (code,name,kind) VALUES ($1,$2,'stock') ON CONFLICT (code) DO NOTHING`,
-        [code, `铜信号测试${index + 1}`],
-      );
-      await pool.query(
-        `INSERT INTO company_commodity_profile
-           (instrument_id,commodity_code,role,effective_from,published_at,source_ref)
-         SELECT id,'CU','integrated','2026-01-01','2026-01-02T00:00:00+08:00',$2
-           FROM market_instrument WHERE code=$1
-         ON CONFLICT DO NOTHING`,
-        [code, `test://profile/${code}`],
-      );
-    }
-    await pool.query(
-      `INSERT INTO market_trading_day (trade_date,is_open,source)
-       SELECT day,true,'test' FROM generate_series('2026-07-01'::date,'2026-08-31'::date,interval '1 day') day
-        WHERE extract(isodow FROM day) BETWEEN 1 AND 5
-       ON CONFLICT (trade_date) DO UPDATE SET is_open=true`,
-    );
-    const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "copper_inventory_signal_query")!;
-    const result = textOf(await tool.execute("copper-signal", { date: "2026-08-17" })) as {
-      status: string; rule_version: string; latest_observation: { action: string; inventory_4w_change: number };
-      current_target: { stock_exposure: number; per_stock_exposure: number; codes: unknown[] }; gaps: string[];
-    };
-    expect(result).toMatchObject({ status: "ready", rule_version: "铜库存防守仓位一版", gaps: [] });
-    expect(result.latest_observation.inventory_4w_change).toBeLessThan(0);
-    expect(result.current_target.codes).toHaveLength(3);
-    expect(result.current_target.stock_exposure).toBeGreaterThanOrEqual(0.5);
-    expect(result.current_target.per_stock_exposure).toBeCloseTo(result.current_target.stock_exposure / 3, 9);
-    await expect(tool.execute("copper-signal-invalid", { date: "2026-08-17", sql: "select 1" } as never))
-      .rejects.toThrow("参数校验失败");
-  });
-
   it("试盘启动按近10日试盘、缩量回调和放量突破逐只确定性匹配", () => {
     const rows = Array.from({ length: 15 }, (_, index) => ({
       code: "990003.SZ",
@@ -242,7 +187,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
   });
 
   it("波段四条件由独立工具全量扫描并排除已有持仓", async () => {
-    const code = "990003.SZ";
+    const code = "600993.SH";
     try {
       const rows = Array.from({ length: 40 }, (_, index) => {
         const close = index === 39 ? 11 : 20 - index * 0.25;
@@ -270,15 +215,20 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       });
 
       const instrument = await pool.query<{ id: string }>(
-        `INSERT INTO market_instrument (code, name, kind)
-         VALUES ($1, '波段扫描测试股份', 'stock') RETURNING id::text`,
+        `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
+         VALUES ($1, '波段扫描测试股份', 'stock', 'active') RETURNING id::text`,
         [code],
       );
       const instrumentId = instrument.rows[0]!.id;
+      const board = await pool.query<{ id: string }>(
+        `INSERT INTO market_instrument (code,name,kind)
+         VALUES ('881105.TI','煤炭开采加工','board') RETURNING id::text`,
+      );
+      await pool.query("INSERT INTO market_board (instrument_id,board_type,source,active) VALUES ($1,'industry','hithink',true)", [board.rows[0]!.id]);
       await pool.query(
-        `INSERT INTO pool_membership (instrument_id, pool, role, effective_from)
-         VALUES ($1, 'watch', '关注', '2026-07-01')`,
-        [instrumentId],
+        `INSERT INTO market_board_membership (board_instrument_id,member_instrument_id,effective_from)
+         VALUES ($1,$2,'2026-07-01')`,
+        [board.rows[0]!.id, instrumentId],
       );
       await storeBars(pool, instrumentId, "day", rows.map((row) => ({
         date: row.bar_date,
@@ -307,9 +257,9 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         signal_count: number;
         signals: Array<{ code: string; passed_count: number }>;
       };
-      // 关注池统一后扫描范围是全部成员（含 seed 的 990002.SZ），合格信号仍只有本用例标的。
-      // 关注池统一后扫描全部成员：990002.SZ 无日线计入缺口，合格信号仍只有本用例标的。
-      expect(signal).toMatchObject({ status: "partial", member_count: 2, completed_count: 1, signal_count: 1 });
+      expect(signal).toMatchObject({
+        status: "success", scan_scope: "cyclical_industry_representatives", member_count: 1, completed_count: 1, signal_count: 1,
+      });
       expect(signal.signals).toContainEqual(expect.objectContaining({ code, passed_count: 4 }));
 
       await pool.query(
@@ -330,10 +280,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         "DELETE FROM portfolio_position WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = $1)",
         [code],
       );
-      await pool.query(
-        "DELETE FROM pool_membership WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = $1)",
-        [code],
-      );
+      await pool.query("DELETE FROM market_instrument WHERE code = '881105.TI'");
     }
   });
 
@@ -348,8 +295,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "hithink_query",
       "instrument_search",
       "stock_research_query",
-      "copper_inventory_signal_query",
-      "lithium_warehouse_signal_query",
       "market_snapshot_query",
       "board_query",
       "market_event_query",
@@ -457,16 +402,18 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "web_fetch",
       "daily_plan_write",
     ]);
+    expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "swing_signal_scan" }).map((tool) => tool.name)).toEqual([
+      "strategy_document_query", "strategy_evaluation_query", "web_search", "web_fetch",
+    ]);
     // 每周评分与周中检查已随评分机制退役：不再有专属工具子集，与未知任务一样回退到完整交互目录。
     for (const retired of ["midweek_check", "weekly_review"]) {
       expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: retired }).map((tool) => tool.name))
         .toEqual(full.map((tool) => tool.name));
     }
-    // 防守评估任务接入任务级策略文档，必须能读取本任务策略正文。
-    const copper = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "copper_inventory_signal_review" });
-    expect(copper.map((tool) => tool.name)).toEqual([
-      "strategy_document_query", "copper_inventory_signal_query", "strategy_evaluation_query", "web_search", "web_fetch",
-    ]);
+    expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "copper_inventory_signal_review" }).map((tool) => tool.name))
+      .not.toContain("copper_inventory_signal_query");
+    expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "lithium_warehouse_signal_review" }).map((tool) => tool.name))
+      .not.toContain("lithium_warehouse_signal_query");
     // 左侧任务已停用：即使会话仍指定该 jobCode，也只回退到通用目录，不再获得专属工具。
     const leftReversal = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "left_reversal_opportunity_scan" });
     expect(leftReversal.map((tool) => tool.name)).not.toContain("left_reversal_opportunity_query");
@@ -1065,7 +1012,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     const candidateNames = [
       "instrument_search",
       "stock_research_query",
-      "copper_inventory_signal_query",
       "market_snapshot_query",
       "board_query",
       "market_event_query",

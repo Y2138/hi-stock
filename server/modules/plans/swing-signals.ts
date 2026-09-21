@@ -1,7 +1,82 @@
-// 波段入场确定性扫描：关注池唯一开仓信号，负责四条件、执行窗口与数据缺口。
+// 波段入场确定性扫描：独立扫描周期行业股票，负责四条件、执行窗口与数据缺口。
 import type pg from "pg";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
+
+export const SWING_CORE_INDUSTRY_CODES = [
+  "881105.TI", "881107.TI", "881108.TI", "881112.TI", "881115.TI", "881137.TI", "881148.TI",
+  "881168.TI", "881169.TI", "881170.TI", "881180.TI", "881264.TI", "881267.TI",
+] as const;
+
+export const SWING_EXPANDED_INDUSTRY_CODES = ["881266.TI", "881279.TI", "881280.TI"] as const;
+export const SWING_INDUSTRY_CODES = [...SWING_CORE_INDUSTRY_CODES, ...SWING_EXPANDED_INDUSTRY_CODES] as const;
+export const SWING_UNIVERSE_MAX_MEMBERS = 388;
+
+export const SWING_SUBINDUSTRY_REPRESENTATIVE_LIMIT = 10;
+
+export interface SwingUniverseMember {
+  instrument_id: string;
+  code: string;
+  name: string;
+  industry_code: string;
+  industry_name: string;
+  source_scope: "core" | "expanded";
+  median_turnover_60: number | null;
+}
+
+/** 每个细分先保留流动性前10名，其余标的按全域流动性补足，最终总量不超过固定上限。 */
+export async function querySwingUniverse(db: Db, date: string): Promise<SwingUniverseMember[]> {
+  const result = await db.query<SwingUniverseMember>(
+    `WITH primary_members AS (
+       SELECT DISTINCT ON (stock.id) stock.id AS instrument_id,stock.code,stock.name,
+              industry.code AS industry_code,industry.name AS industry_name,
+              COALESCE(secondary.code,industry.code) AS subindustry_code
+         FROM market_board_membership relation
+         JOIN market_board board ON board.instrument_id=relation.board_instrument_id
+         JOIN market_instrument industry ON industry.id=relation.board_instrument_id
+         JOIN market_instrument stock ON stock.id=relation.member_instrument_id
+         LEFT JOIN LATERAL (
+           SELECT child.code
+             FROM market_board_membership child_relation
+             JOIN market_board child_board ON child_board.instrument_id=child_relation.board_instrument_id
+             JOIN market_instrument child ON child.id=child_relation.board_instrument_id
+            WHERE child_relation.member_instrument_id=stock.id AND child.code LIKE '884%.TI'
+              AND child_board.active=true AND child_board.source='hithink' AND child_board.board_type='industry'
+              AND child_relation.effective_from <= $1::date
+              AND (child_relation.effective_to IS NULL OR child_relation.effective_to > $1::date)
+            ORDER BY child.code LIMIT 1
+         ) secondary ON true
+        WHERE industry.code=ANY($2::text[]) AND board.active=true AND board.source='hithink' AND board.board_type='industry'
+          AND relation.effective_from <= $1::date AND (relation.effective_to IS NULL OR relation.effective_to > $1::date)
+          AND stock.kind='stock' AND stock.lifecycle_status='active' AND stock.name !~* '^\\*?ST'
+          AND stock.code ~ '^(600|601|603|605|000|001|002|003)'
+        ORDER BY stock.id,industry.code
+     ), liquidity AS (
+       SELECT member.*,recent.median_turnover_60
+         FROM primary_members member
+         LEFT JOIN LATERAL (
+           SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY bars.turnover::float8)::float8 AS median_turnover_60
+             FROM (SELECT bar.turnover FROM market_bar bar
+                    WHERE bar.instrument_id=member.instrument_id AND bar.freq='day'
+                      AND bar.bar_date <= $1::date AND bar.turnover > 0
+                    ORDER BY bar.bar_date DESC,bar.bar_time DESC LIMIT 60) bars
+         ) recent ON true
+     ), ranked AS (
+       SELECT liquidity.*,row_number() OVER (PARTITION BY industry_code,subindustry_code
+                ORDER BY median_turnover_60 DESC NULLS LAST,code) AS subindustry_rank
+         FROM liquidity
+     )
+     SELECT instrument_id::text,code,name,industry_code,industry_name,
+            CASE WHEN industry_code=ANY($3::text[]) THEN 'expanded' ELSE 'core' END AS source_scope,
+            median_turnover_60
+       FROM ranked
+      ORDER BY (subindustry_rank <= $4) DESC,median_turnover_60 DESC NULLS LAST,code
+      LIMIT $5`,
+    [date, [...SWING_INDUSTRY_CODES], [...SWING_EXPANDED_INDUSTRY_CODES],
+     SWING_SUBINDUSTRY_REPRESENTATIVE_LIMIT, SWING_UNIVERSE_MAX_MEMBERS],
+  );
+  return result.rows;
+}
 
 interface SwingMember {
   instrument_id: string;
@@ -132,36 +207,37 @@ export function evaluateSwingSignal(
 }
 
 export async function querySwingSignals(db: Db, date: string) {
+  const universe = await querySwingUniverse(db, date);
+  const universeCodes = universe.map((item) => item.code);
+  const expandedMemberCount = universe.filter((item) => item.source_scope === "expanded").length;
   const members = await db.query<SwingMember>(
-    `SELECT membership.instrument_id::text, instrument.code, instrument.name, instrument.kind,
-            COALESCE(position.quantity, 0)::float8 AS quantity,
-            metric.as_of_date::text AS metric_date, metric_run.status AS metric_status,
-            metric.defense_recovery_ma10
-       FROM pool_membership membership
-       JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-       LEFT JOIN portfolio_position position ON position.instrument_id = membership.instrument_id
+    `SELECT instrument.id::text AS instrument_id,instrument.code,instrument.name,instrument.kind,
+            COALESCE(position.quantity,0)::float8 AS quantity,
+            metric.as_of_date::text AS metric_date,metric_run.status AS metric_status,metric.defense_recovery_ma10
+       FROM market_instrument instrument
+       LEFT JOIN portfolio_position position ON position.instrument_id=instrument.id
        LEFT JOIN LATERAL (
-         SELECT current.*
-           FROM market_stock_character_metric current
-          WHERE current.instrument_id = membership.instrument_id AND current.as_of_date <= $1::date
-          ORDER BY current.as_of_date DESC, current.computed_at DESC LIMIT 1
+         SELECT current.* FROM market_stock_character_metric current
+          WHERE current.instrument_id=instrument.id AND current.as_of_date <= $1::date
+          ORDER BY current.as_of_date DESC,current.computed_at DESC LIMIT 1
        ) metric ON true
-       LEFT JOIN market_indicator_run metric_run ON metric_run.id = metric.indicator_run_id
-      WHERE membership.pool = 'watch' AND membership.effective_to IS NULL
-      ORDER BY instrument.code`,
-    [date],
+       LEFT JOIN market_indicator_run metric_run ON metric_run.id=metric.indicator_run_id
+      WHERE instrument.code=ANY($2::text[]) ORDER BY instrument.code`,
+    [date, universeCodes],
   );
   const latest = await db.query<{ data_date: string | null }>(
-    `SELECT max(bar.bar_date)::text AS data_date
-       FROM pool_membership membership
-       JOIN market_bar bar ON bar.instrument_id = membership.instrument_id
-                          AND bar.freq = 'day' AND bar.bar_date <= $1::date
-      WHERE membership.pool = 'watch' AND membership.effective_to IS NULL`,
-    [date],
+    `SELECT max(bar.bar_date)::text AS data_date FROM market_bar bar
+      JOIN market_instrument instrument ON instrument.id=bar.instrument_id
+     WHERE instrument.code=ANY($2::text[]) AND bar.freq='day' AND bar.bar_date <= $1::date`,
+    [date, universeCodes],
   );
   const dataDate = latest.rows[0]?.data_date ?? null;
   if (members.rows.length === 0) return {
     requested_date: date,
+    scan_scope: "cyclical_industry_representatives" as const,
+    industry_codes: [...SWING_INDUSTRY_CODES],
+    max_member_count: SWING_UNIVERSE_MAX_MEMBERS,
+    expanded_member_count: expandedMemberCount,
     status: "success" as const,
     data_date: dataDate,
     member_count: 0,
@@ -179,24 +255,19 @@ export async function querySwingSignals(db: Db, date: string) {
 
   const bars = await db.query<SwingSignalBar & { code: string }>(
     `WITH ranked AS (
-       SELECT instrument.code, bar.bar_date::text,
-              bar.open::float8, bar.high::float8, bar.low::float8, bar.close::float8,
-              bar.volume::float8, indicator.rsi14::float8, indicator.status AS indicator_status,
-              row_number() OVER (
-                PARTITION BY bar.instrument_id ORDER BY bar.bar_date DESC, bar.bar_time DESC
-              ) AS row_no
-         FROM pool_membership membership
-         JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-         JOIN market_bar bar ON bar.instrument_id = membership.instrument_id
-                            AND bar.freq = 'day' AND bar.bar_date <= $1::date
+       SELECT instrument.code,bar.bar_date::text,bar.open::float8,bar.high::float8,bar.low::float8,
+              bar.close::float8,bar.volume::float8,indicator.rsi14::float8,indicator.status AS indicator_status,
+              row_number() OVER (PARTITION BY bar.instrument_id ORDER BY bar.bar_date DESC,bar.bar_time DESC) AS row_no
+         FROM market_instrument instrument
+         JOIN market_bar bar ON bar.instrument_id=instrument.id AND bar.freq='day' AND bar.bar_date <= $1::date
          LEFT JOIN market_indicator_value indicator
-           ON indicator.instrument_id = bar.instrument_id AND indicator.freq = bar.freq
-          AND indicator.bar_date = bar.bar_date AND indicator.bar_time = bar.bar_time
-        WHERE membership.pool = 'watch' AND membership.effective_to IS NULL
+           ON indicator.instrument_id=bar.instrument_id AND indicator.freq=bar.freq
+          AND indicator.bar_date=bar.bar_date AND indicator.bar_time=bar.bar_time
+        WHERE instrument.code=ANY($2::text[])
      )
-     SELECT code, bar_date, open, high, low, close, volume, rsi14, indicator_status
-       FROM ranked WHERE row_no <= 40 ORDER BY code, bar_date`,
-    [date],
+     SELECT code,bar_date,open,high,low,close,volume,rsi14,indicator_status
+       FROM ranked WHERE row_no <= 40 ORDER BY code,bar_date`,
+    [date, universeCodes],
   );
   const byCode = new Map<string, SwingSignalBar[]>();
   for (const bar of bars.rows) byCode.set(bar.code, [...(byCode.get(bar.code) ?? []), bar]);
@@ -257,6 +328,10 @@ export async function querySwingSignals(db: Db, date: string) {
   const detailedCodes = new Set([...signals, ...nearCandidates, ...suppressedMatches].map((item) => item.code));
   return {
     requested_date: date,
+    scan_scope: "cyclical_industry_representatives" as const,
+    industry_codes: [...SWING_INDUSTRY_CODES],
+    max_member_count: SWING_UNIVERSE_MAX_MEMBERS,
+    expanded_member_count: expandedMemberCount,
     status: gaps.length === 0 ? "success" as const : "partial" as const,
     data_date: dataDate,
     member_count: members.rows.length,

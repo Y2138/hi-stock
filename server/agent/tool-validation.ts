@@ -204,7 +204,7 @@ const ExecutionComplianceSchema = Type.Union([
 ]);
 export const EntrySignalTypeSchema = Type.Union([
   Type.Literal("right_side"), Type.Literal("left_reversal"), Type.Literal("two_year_reversal"), Type.Literal("trial_start"),
-  Type.Literal("swing"), Type.Literal("limit_up"), Type.Literal("discretionary"),
+  Type.Literal("swing"), Type.Literal("limit_up"), Type.Literal("copper_left_launch"), Type.Literal("discretionary"),
 ]);
 
 export const PortfolioContextQuerySchema = strictObject({
@@ -461,7 +461,7 @@ const DatasourceJobConfigSchema = strictObject({
     Type.Literal("full_market_indicator_refresh"),
     Type.Literal("commodity_copper_sync"),
     Type.Literal("commodity_copper_inventory_sync"),
-    Type.Literal("commodity_lithium_warehouse_sync"),
+    Type.Literal("commodity_copper_macro_sync"),
     Type.Literal("value_candidate_sync"),
   ]),
   export_volume: Type.Optional(Type.Boolean()),

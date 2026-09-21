@@ -21,7 +21,7 @@
 >
 > **v2.6 修订**：LLM 工具参数按不可信输入处理，服务端在 pi loop 校验之外再次执行严格结构与业务语义校验；所有会改变业务数据的对话工具共用 PostgreSQL 数据库级写锁，确认提案在执行前复核目标状态，防止多会话并发写入、重复确认和旧提案覆盖新状态。
 >
-> **当前实现**：M3 已交付 `job_definition` / `job_run`、Asia/Shanghai 30 秒调度、停机漏跑留痕、一次延迟重试、datasource/analysis/agent_flow Runner、作业 API、Agent `trigger_job` 与任务中心结果预览。作业配置和 LLM 工具输入均由服务端再次校验；不存在脚本 Runner，agent_flow 与普通 Agent 使用相同工具权限和确认制/YOLO 设置，策略发布仍必须由真实用户批准。集合竞价机会研判在交易日 09:30 调度，任务成功后把逐只复核分类和“信号通过/放弃/数据不足”更新到仪表盘；信号通过只进入用户自主的小额实盘验证，不自动交易、确定数量、入池或修改关注。用户报告成交时，持仓 service 按代码和成交日自动固化具体竞价复核及前一日计划来源。
+> **当前实现**：M3 已交付 `job_definition` / `job_run`、Asia/Shanghai 30 秒调度、停机漏跑留痕、一次延迟重试、datasource/analysis/agent_flow Runner、作业 API、Agent `trigger_job` 与任务中心结果预览。作业配置和 LLM 工具输入均由服务端再次校验；不存在脚本 Runner，agent_flow 与普通 Agent 使用相同工具权限和确认制/YOLO 设置，策略发布仍必须由真实用户批准。集合竞价机会研判在交易日 09:26 调度，任务成功后把逐只复核分类和“信号通过/放弃/数据不足”更新到仪表盘；信号通过只进入用户自主的小额实盘验证，不自动交易、确定数量、入池或修改关注。用户报告成交时，持仓 service 按代码和成交日自动固化具体竞价复核及前一日计划来源。
 >
 > **v2.8 修订**：数据库读取采用 `database_schema` 渐进发现 + `database_query` 结构化查询；查询执行时按当前结构重新校验表、字段和敏感列，不因历史 Schema 指纹失效而重试。删除通用 `database_change`，写入按持仓、自选、标的池、任务运行、回测五个领域工具划分并强制经过领域 service。确认制、YOLO、事务、审计、数据库写锁、敏感数据保护和状态冲突检测保持生效；旧 `database_change` 记录及 pending 提案不兼容。
 >
@@ -387,7 +387,7 @@ Agent 不占用左侧业务导航项，也不再以悬浮层遮挡主页面。�
 | 失败处理 | 失败运行保留日志；server 重启后补记停机期间缺口为 `missed`；不做无限重试（最多 1 次自动重试） |
 | 页面边界 | 任务中心只读定义、提示词版本、运行和结果；只允许启停、立即运行、失败重试及打开来源会话。创建、cron/类型/config 修改和提示词维护只经 `job_write` |
 
-内置作业清单：`market_catalog_sync`（工作日 07:10，默认启用）、`board_membership_sync`（工作日 07:30，默认启用；仅同步行业板块成分，概念/地域/特色板块成分经扶摇临时查询）、`auction_opportunity_assessment`（工作日 09:30，agent_flow）、`daily_data_update`（工作日 15:45，datasource）、`daily_market_structure`（工作日 15:40，默认暂停）、`daily_plan_flow`（每日 17:15，agent_flow）、`midweek_check`（周二 17:30，agent_flow）、`weekly_review`（周日 20:00，agent_flow）。四个 agent_flow 作业绑定数据库提示词并在运行时固化实际版本；当前提示词都是不拼接历史补丁的完整正文，只规定任务流程、覆盖与输出契约，策略参数来自 `strategy_state + strategy_document + strategy_document_revision` 当前最终版本，工具详情通过 `tool_catalog` 按需加载。集合竞价任务优先使用交易日历；目标日缺行时周末跳过、周一至周五继续获取最终竞价快照和短线风向标，以实际数据状态决定结果，不把日历同步失败作为阻断。逐只结构化判断必须完整覆盖当前池外机会，任务成功后更新仪表盘“今日池外机会”。显式非交易日、计划过期或竞价数据未就绪时显式报告，不推断、不自动成交、不自动入池或修改近期关注。暂停只停止 cron，用户仍可手动触发。
+内置作业清单：`market_catalog_sync`（工作日 07:10，默认启用）、`board_membership_sync`（工作日 07:30，默认启用；仅同步行业板块成分，概念/地域/特色板块成分经扶摇临时查询）、`auction_opportunity_assessment`（工作日 09:26，agent_flow）、`daily_data_update`（工作日 15:45，datasource）、`daily_market_structure`（工作日 15:40，默认暂停）、`daily_plan_flow`（每日 17:15，agent_flow）、`midweek_check`（周二 17:30，agent_flow）、`weekly_review`（周日 20:00，agent_flow）。四个 agent_flow 作业绑定数据库提示词并在运行时固化实际版本；当前提示词都是不拼接历史补丁的完整正文，只规定任务流程、覆盖与输出契约，策略参数来自 `strategy_state + strategy_document + strategy_document_revision` 当前最终版本，工具详情通过 `tool_catalog` 按需加载。集合竞价任务优先使用交易日历；目标日缺行时周末跳过、周一至周五继续获取最终竞价快照和短线风向标，以实际数据状态决定结果，不把日历同步失败作为阻断。逐只结构化判断必须完整覆盖当前池外机会，任务成功后更新仪表盘“今日池外机会”。显式非交易日、计划过期或竞价数据未就绪时显式报告，不推断、不自动成交、不自动入池或修改近期关注。暂停只停止 cron，用户仍可手动触发。
 
 ### 6.8 Agent 自驱回测边界（E30，第四阶段已完成）
 

@@ -38,6 +38,7 @@ interface PortableTableSpec {
   table: string;
   columns: readonly string[];
   orderBy: readonly string[];
+  where?: string;
   identity?: boolean;
   jsonColumns?: readonly string[];
   dateColumns?: readonly string[];
@@ -51,12 +52,12 @@ interface PortableTableSpec {
  * 表顺序同时是恢复插入顺序，必须满足外键依赖。
  */
 export const PORTABLE_TABLES: readonly PortableTableSpec[] = [
-  { table: "job_prompt", columns: ["id", "code", "name", "status", "current_revision_id", "created_at", "updated_at"], orderBy: ["id"], identity: true },
-  { table: "job_prompt_revision", columns: ["id", "prompt_id", "revision_no", "content", "sha256", "source", "base_revision_id", "change_summary", "created_at"], orderBy: ["id"], identity: true },
-  { table: "strategy_document", columns: ["id", "code", "title", "role", "injection_order", "job_code", "content", "sha256", "created_at", "updated_at"], orderBy: ["id"], identity: true },
-  { table: "strategy_definition", columns: ["code", "name", "strategy_type", "strategy_document_code", "status", "allow_new_entry", "entry_evaluator_code", "exit_evaluator_code", "context_evaluator_code", "fallback_strategy_code", "exit_policy_mode", "daily_plan_scope", "attention_policy", "runtime_version", "created_at", "updated_at"], orderBy: ["code"] },
-  { table: "job_definition", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "purpose", "phase", "priority", "strategy_code", "agent_role"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
-  { table: "strategy_score_benchmark", columns: ["id", "document_id", "benchmark_code", "training_start", "training_end", "methodology", "distributions", "sample_counts", "source_summary", "sha256", "created_at"], orderBy: ["id"], identity: true, jsonColumns: ["distributions", "sample_counts", "source_summary"], dateColumns: ["training_start", "training_end"] },
+  { table: "job_prompt", where: "code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review')", columns: ["id", "code", "name", "status", "current_revision_id", "created_at", "updated_at"], orderBy: ["id"], identity: true },
+  { table: "job_prompt_revision", where: "prompt_id NOT IN (SELECT id FROM job_prompt WHERE code IN ('copper_inventory_signal_review','lithium_warehouse_signal_review'))", columns: ["id", "prompt_id", "revision_no", "content", "sha256", "source", "base_revision_id", "change_summary", "created_at"], orderBy: ["id"], identity: true },
+  { table: "strategy_document", where: "code NOT IN ('copper_inventory_strategy','lithium_warehouse_strategy')", columns: ["id", "code", "title", "role", "injection_order", "job_code", "content", "sha256", "created_at", "updated_at"], orderBy: ["id"], identity: true },
+  { table: "strategy_definition", where: "code NOT IN ('copper_inventory','lithium_warehouse')", columns: ["code", "name", "strategy_type", "strategy_document_code", "status", "allow_new_entry", "entry_evaluator_code", "exit_evaluator_code", "context_evaluator_code", "fallback_strategy_code", "exit_policy_mode", "daily_plan_scope", "attention_policy", "runtime_version", "created_at", "updated_at"], orderBy: ["code"] },
+  { table: "job_definition", where: "code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review','commodity_lithium_warehouse_sync')", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "purpose", "phase", "priority", "strategy_code", "agent_role"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
+  { table: "strategy_score_benchmark", where: "document_id NOT IN (SELECT id FROM strategy_document WHERE code IN ('copper_inventory_strategy','lithium_warehouse_strategy'))", columns: ["id", "document_id", "benchmark_code", "training_start", "training_end", "methodology", "distributions", "sample_counts", "source_summary", "sha256", "created_at"], orderBy: ["id"], identity: true, jsonColumns: ["distributions", "sample_counts", "source_summary"], dateColumns: ["training_start", "training_end"] },
   { table: "strategy_state", columns: ["singleton", "change_seq", "current_hash", "updated_at"], orderBy: ["singleton"] },
 ] as const;
 
@@ -108,11 +109,12 @@ async function fileSha256(file: string): Promise<string> {
 async function revisionHashes(db: Db, kind: "strategy" | "prompt"): Promise<PortableHashRow[]> {
   const result = kind === "strategy"
     ? await db.query<PortableHashRow>(
-        `SELECT code, sha256 FROM strategy_document ORDER BY code`,
+        `SELECT code, sha256 FROM strategy_document WHERE code NOT IN ('copper_inventory_strategy','lithium_warehouse_strategy') ORDER BY code`,
       )
     : await db.query<PortableHashRow>(
         `SELECT p.code, r.sha256 FROM job_prompt_revision r
-          JOIN job_prompt p ON p.id = r.prompt_id ORDER BY p.code, r.revision_no`,
+          JOIN job_prompt p ON p.id = r.prompt_id
+         WHERE p.code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review') ORDER BY p.code, r.revision_no`,
       );
   return result.rows;
 }
@@ -126,7 +128,7 @@ async function packageFacts(db: Db): Promise<{
   const migration = await db.query<{ max: number }>("SELECT COALESCE(max(version), 0)::int AS max FROM schema_migrations");
   const tables: Record<string, number> = {};
   for (const spec of PORTABLE_TABLES) {
-    const result = await db.query<{ count: number }>(`SELECT count(*)::int AS count FROM ${quote(spec.table)}`);
+    const result = await db.query<{ count: number }>(`SELECT count(*)::int AS count FROM ${quote(spec.table)}${spec.where ? ` WHERE ${spec.where}` : ""}`);
     tables[spec.table] = result.rows[0]!.count;
   }
   // db 可能是单一事务 client；不能在同一 client 上并发 query。
@@ -145,6 +147,7 @@ async function* payloadLines(db: Db): AsyncGenerator<string> {
         `SELECT ${spec.columns.map((column) => spec.dateColumns?.includes(column)
           ? `${quote(column)}::text AS ${quote(column)}`
           : quote(column)).join(", ")} FROM ${quote(spec.table)}
+          ${spec.where ? `WHERE ${spec.where}` : ""}
           ORDER BY ${spec.orderBy.map(quote).join(", ")} LIMIT $1 OFFSET $2`,
         [pageSize, offset],
       );

@@ -225,16 +225,8 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "daily_plan_strategy_query",
     "daily_plan_write",
   ],
-  copper_inventory_signal_review: [
-    "strategy_document_query",
-    "strategy_evaluation_query",
-    "copper_inventory_signal_query",
-  ],
-  lithium_warehouse_signal_review: [
-    "strategy_document_query",
-    "strategy_evaluation_query",
-    "lithium_warehouse_signal_query",
-  ],
+  swing_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
+  copper_left_launch_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
   two_year_reversal_scan: ["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query"],
   value_anchor_opportunity_scan: [
     "strategy_document_query",
@@ -254,6 +246,12 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "pool_attention_write",
   ],
 };
+
+/** 展示任务明确授权的工具；未知任务不把交互工具回退目录伪装成专项授权。 */
+export function jobFlowAvailableTools(jobCode: string): string[] {
+  const bundle = Object.hasOwn(JOB_FLOW_TOOL_BUNDLES, jobCode) ? JOB_FLOW_TOOL_BUNDLES[jobCode] : undefined;
+  return bundle ? [...bundle, "web_search", "web_fetch"] : [];
+}
 
 /** 任务流程工具只挂到绑定任务会话；交互会话中它们本就无法通过运行期守卫。 */
 const JOB_FLOW_ONLY_TOOLS = new Set([

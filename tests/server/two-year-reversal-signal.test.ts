@@ -1,12 +1,14 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { prepareTestDb } from "./helpers.js";
+import { dailyMarketUpdate, missingTwoYearRawCodes } from "../../server/datasource/service.js";
 import { queryTwoYearReversalSignals } from "../../server/modules/plans/two-year-reversal-signal.js";
 import { evaluateStrategyExit } from "../../server/modules/strategy-runtime/exit-evaluators.js";
 import { ensureStrategyEvaluation } from "../../server/modules/strategy-runtime/service.js";
 
 const prepared = await prepareTestDb();
 describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
-  const pool = prepared!.pool;
+  if (!prepared) return;
+  const pool = prepared.pool;
   afterAll(async () => pool.end());
 
   it("无已确认共同数据日时拒绝产生信号", async () => {
@@ -55,6 +57,45 @@ describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
          FROM generate_series(0,19) n`, [row.rows[0]!.id, date, close],
       );
     }
+    await pool.query(
+      `UPDATE market_bar SET low_raw=NULL WHERE freq='day' AND bar_date=$1::date
+       AND instrument_id IN (SELECT id FROM market_instrument WHERE kind='stock')`, [date],
+    );
+    expect((await missingTwoYearRawCodes(pool, date)).sort()).toEqual(stocks.map(([code]) => code).sort());
+    const unavailable = await queryTwoYearReversalSignals(pool, date);
+    expect(unavailable).toMatchObject({ status: "unavailable", gaps: ["合格行业成员日线覆盖不足80%（0/4）"] });
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: unknown) => {
+      const url = new URL(String(input));
+      expect(url.searchParams.get("adjust")).toBe("none");
+      const code = url.searchParams.get("thscode")!;
+      requests.push(code);
+      const close = stocks.find(([stockCode]) => stockCode === code)?.[1];
+      if (close === undefined) throw new Error(`未预期的标的 ${code}`);
+      return { ok: true, status: 200, json: async () => ({ code: 0, data: { item: [{
+        date_ms: Date.parse(`${date}T00:00:00+08:00`), open_price: close,
+        high_price: close + 1, low_price: close - 1, close_price: close,
+      }] } }) };
+    }));
+    try {
+      const daily = await dailyMarketUpdate(pool, { codes: [], date, dayMode: "historical" }, {
+        hithinkDeps: { apiKey: "test-placeholder" },
+      });
+      expect(daily.gaps).toEqual([]);
+      expect(requests.sort()).toEqual(stocks.map(([code]) => code).sort());
+      expect(await missingTwoYearRawCodes(pool, date)).toEqual([]);
+      const repeat = await dailyMarketUpdate(pool, { codes: [], date, dayMode: "historical" }, {
+        hithinkDeps: { apiKey: "test-placeholder" },
+      });
+      expect(repeat.gaps).toEqual([]);
+      expect(requests).toHaveLength(4);
+      const bar = await pool.query<{ low: number; low_raw: number; close: number }>(
+        `SELECT bar.low::float8,bar.low_raw::float8,bar.close::float8 FROM market_bar bar
+         JOIN market_instrument instrument ON instrument.id=bar.instrument_id
+         WHERE instrument.code='000001.SZ' AND bar.bar_date=$1::date AND bar.freq='day'`, [date],
+      );
+      expect(bar.rows[0]).toEqual({ low: 84, low_raw: 84, close: 85 });
+    } finally { vi.unstubAllGlobals(); }
     const result = await queryTwoYearReversalSignals(pool, date);
     expect(result.status).toBe("success");
     expect(result.coverage).toMatchObject({ stocks: 4, boards: 80, complete_boards: 80, qualified_boards: 1 });
@@ -98,5 +139,5 @@ describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
         evidence: expect.objectContaining({ signal_low_raw: 84, current_close_raw: 90, ma20_reached: false }),
       }),
     ]);
-  });
+  }, 20_000);
 });

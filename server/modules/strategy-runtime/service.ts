@@ -74,7 +74,7 @@ async function loadBinding(db: Db, input: EnsureStrategyEvaluationInput): Promis
        FROM strategy_definition definition
        JOIN strategy_document document ON document.code=definition.strategy_document_code
        LEFT JOIN strategy_state state ON state.singleton=1
-      WHERE definition.code=$1`, [input.strategy_code]);
+      WHERE definition.code=$1 AND definition.status IN ('active','exit_only')`, [input.strategy_code]);
   const row = result.rows[0];
   if (!row) throw apiErrors.notFound(`策略运行时不存在：${input.strategy_code}`);
   if (!row.evaluator_code) throw apiErrors.badRequest(`策略 ${input.strategy_code} 未配置 ${input.phase} 评估器`);
@@ -175,7 +175,7 @@ function records(value: unknown): JsonRecord[] {
 
 function entryItems(strategyCode: string, result: unknown): Array<{ item: JsonRecord; status: "qualified" | "approaching" }> {
   const value = record(result);
-  if (strategyCode === "swing") return [
+  if (["swing", "copper_left_launch"].includes(strategyCode)) return [
     ...records(value.signals).map((item) => ({ item, status: "qualified" as const })),
     ...records(value.near_candidates).map((item) => ({ item, status: "approaching" as const })),
   ];

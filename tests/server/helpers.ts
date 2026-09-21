@@ -71,7 +71,7 @@ export async function seedTestStrategy(pool: pg.Pool, content = "# 测试当前�
     // 清单哈希：与 repo.calculateStrategyHash 同公式（code:sha256 按注入序），
     // 覆盖迁移产生的其他文档（如 0051 的打板策略）。
     const manifest = await client.query<{ code: string; sha256: string }>(
-      `SELECT code, sha256 FROM strategy_document ORDER BY injection_order, id`,
+      `SELECT code, sha256 FROM strategy_document WHERE code NOT IN ('copper_inventory_strategy','lithium_warehouse_strategy') ORDER BY injection_order, id`,
     );
     const stateHash = crypto.createHash("sha256")
       .update(manifest.rows.map((row) => `${row.code}:${row.sha256}`).join("\n"), "utf8")

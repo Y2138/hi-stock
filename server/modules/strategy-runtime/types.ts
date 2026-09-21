@@ -68,6 +68,7 @@ export interface StrategyEvaluationRunSummary {
   input_fingerprint: string;
   status: StrategyEvaluationStatus;
   requested_by_job_run_id: string | null;
+  requested_by_job_code?: string | null;
   reused_from_run_id: string | null;
   coverage: Record<string, unknown>;
   gaps: unknown[];

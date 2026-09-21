@@ -139,7 +139,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const manifest = await readPortableManifest(exported.payloadPath);
     expect(manifest.version).toBe(7);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(121);
+    expect(manifest.migration_max).toBe(129);
     expect(manifest.tables.strategy_document).toBeGreaterThan(0);
     expect(manifest.tables.strategy_definition).toBeGreaterThan(0);
     expect(manifest.tables.strategy_score_benchmark).toBe(1);
@@ -150,6 +150,12 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     expect(manifest.tables.portfolio_position).toBeUndefined();
     expect(manifest.tables.daily_plan_auction_assessment).toBeUndefined();
     expect(manifest.strategy_hashes.length).toBe(manifest.tables.strategy_document);
+    for (const code of ["copper_inventory_strategy", "lithium_warehouse_strategy"]) {
+      expect(manifest.strategy_hashes.some((row) => row.code === code)).toBe(false);
+    }
+    for (const code of ["copper_inventory_signal_review", "lithium_warehouse_signal_review"]) {
+      expect(manifest.prompt_hashes.some((row) => row.code === code)).toBe(false);
+    }
 
     const payload = gunzipSync(await fs.readFile(exported.payloadPath)).toString("utf8");
     expect(payload).not.toContain("sk-portable-must-never-export");
@@ -159,6 +165,9 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     expect(payload).not.toContain("PORTABLE_BACKTEST_SOURCE_MUST_NOT_EXPORT");
     expect(payload).not.toContain("FROZEN_INPUT_MUST_NOT_EXPORT");
     expect(payload).not.toContain("RUNTIME_EVENT_MUST_NOT_EXPORT");
+    for (const code of ["copper_inventory_strategy", "lithium_warehouse_strategy", "commodity_lithium_warehouse_sync", "copper_inventory_signal_review", "lithium_warehouse_signal_review"]) {
+      expect(payload).not.toContain(`"code":"${code}"`);
+    }
     expect(payload).not.toContain('"created_at":{}');
     expect(payload).toMatch(/"created_at":"\d{4}-\d{2}-\d{2}T/);
     expect(payload).toContain('"model_provider_key":"deepseek"');

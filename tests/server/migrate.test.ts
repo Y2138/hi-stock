@@ -164,11 +164,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     );
     const promptByCode = new Map(prompts.rows.map((row) => [row.code, row.content]));
     const dailyPlan = promptByCode.get("daily_plan_flow")!;
-    expect(dailyPlan).toContain("用 `tool_catalog` 加载");
     expect(dailyPlan).toContain("daily_plan_strategy_query(date=目标日)");
-    expect(dailyPlan).toContain("自动发现入场策略、观察策略、组合叠加策略、持仓主策略和兜底策略");
-    expect(dailyPlan).toContain("原样提交服务端生成的结构化行");
-    expect(dailyPlan).toContain("关注池已由服务端按策略完成对账");
+    expect(dailyPlan).toContain("独立入场任务已维护的关注状态");
+    expect(dailyPlan).toContain("原样提交");
+    expect(dailyPlan).toContain("不得以关注池为扫描范围");
     expect(dailyPlan).toContain("主策略动作、兜底动作、最终动作");
     expect(dailyPlan).toContain("系统保存到 `job_run_output`");
     expect(dailyPlan).not.toContain("daily_plan_context_query(date=目标日)");
@@ -225,7 +224,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     )).rows[0]!;
     expect(auction).toMatchObject({
       code: "auction_opportunity_assessment",
-      cron: "30 9 * * 1-5",
+      cron: "26 9 * * 1-5",
       job_type: "agent_flow",
       config: {},
     });
@@ -395,6 +394,38 @@ describe.skipIf(!prepared)("迁移运行器", () => {
         ]) AS name`,
       );
       expect(removed.rows.every((row) => row.name === null)).toBe(true);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("存量持仓买入预案前滚后保留历史动作", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "stock-legacy-playbook-"));
+    try {
+      const sourceDir = path.join(import.meta.dirname, "../../server/migrations");
+      const files = (await fs.readdir(sourceDir)).filter((file) => /^\d{4}_.+\.sql$/.test(file));
+      for (const file of files.filter((file) => Number(file.slice(0, 4)) <= 119)) {
+        await fs.copyFile(path.join(sourceDir, file), path.join(tmpDir, file));
+      }
+      await resetSchema(pool);
+      await runMigrations(pool, tmpDir);
+      await pool.query("INSERT INTO market_instrument (code,name,kind) VALUES ('990099.SZ','存量买入预案','stock')");
+      const run = await pool.query<{ id: string }>(
+        `INSERT INTO job_run (job_id,target_date,trigger_kind)
+         SELECT id,'2026-09-16','manual' FROM job_definition WHERE code='daily_plan_flow' RETURNING id::text`,
+      );
+      await pool.query(
+        `INSERT INTO daily_plan_playbook (source_job_run_id,target_date,item_kind,instrument_id,code,name,action,trigger_kind,headline)
+         SELECT $1,'2026-09-16','position_action',id,code,name,'buy','condition','历史增仓预案'
+           FROM market_instrument WHERE code='990099.SZ'`, [run.rows[0]!.id],
+      );
+      for (const file of files.filter((file) => Number(file.slice(0, 4)) >= 120)) {
+        await fs.copyFile(path.join(sourceDir, file), path.join(tmpDir, file));
+      }
+      expect((await runMigrations(pool, tmpDir)).applied).toEqual([120, 121, 122, 123, 124, 125, 126, 127, 128, 129]);
+      expect((await pool.query<{ action: string; effective_action: string; strategy_code: string | null }>(
+        "SELECT action,effective_action,strategy_code FROM daily_plan_playbook WHERE code='990099.SZ'",
+      )).rows).toEqual([{ action: "buy", effective_action: "buy", strategy_code: null }]);
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }

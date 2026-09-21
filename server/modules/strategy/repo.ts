@@ -30,6 +30,7 @@ const STATE_SELECT = `SELECT change_seq::text, current_hash, updated_at
 const DOCUMENT_SELECT = `SELECT d.id::text, d.code, d.title, d.role, d.injection_order, d.job_code,
        d.sha256, d.content, d.updated_at
   FROM strategy_document d
+ WHERE d.code NOT IN ('copper_inventory_strategy','lithium_warehouse_strategy')
  ORDER BY d.injection_order, d.id`;
 
 function sha256(value: string): string {

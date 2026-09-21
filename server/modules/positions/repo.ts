@@ -41,7 +41,7 @@ export const DECISION_ORIGINS = ["strategy_signal", "planned_discretionary", "un
 export type DecisionOrigin = (typeof DECISION_ORIGINS)[number];
 export const EXECUTION_COMPLIANCE = ["matched", "deviated", "not_applicable", "unknown"] as const;
 export type ExecutionCompliance = (typeof EXECUTION_COMPLIANCE)[number];
-export const ENTRY_SIGNAL_TYPES = ["right_side", "left_reversal", "two_year_reversal", "trial_start", "swing", "limit_up", "discretionary"] as const;
+export const ENTRY_SIGNAL_TYPES = ["right_side", "left_reversal", "two_year_reversal", "trial_start", "swing", "limit_up", "copper_left_launch", "discretionary"] as const;
 export type EntrySignalType = (typeof ENTRY_SIGNAL_TYPES)[number];
 
 export const ENTRY_SIGNAL_STRATEGY_MAP: Record<EntrySignalType, string> = {
@@ -51,6 +51,7 @@ export const ENTRY_SIGNAL_STRATEGY_MAP: Record<EntrySignalType, string> = {
   trial_start: "legacy_trial_start",
   swing: "swing",
   limit_up: "limit_up",
+  copper_left_launch: "copper_left_launch",
   discretionary: "discretionary",
 };
 

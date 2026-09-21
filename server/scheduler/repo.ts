@@ -78,6 +78,7 @@ export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLates
                FROM job_run r WHERE r.job_id = d.id
               ORDER BY r.id DESC LIMIT 1) AS latest_run
        FROM job_definition d
+      WHERE d.code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review','commodity_lithium_warehouse_sync')
       ORDER BY d.priority NULLS LAST, d.code`,
   );
   return result.rows.map((row) => ({
@@ -92,7 +93,8 @@ export async function findJobByCode(db: Db, code: string): Promise<JobDefinition
             to_jsonb(d)->>'model_id' AS model_id, d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
-       FROM job_definition d WHERE d.code = $1`,
+       FROM job_definition d WHERE d.code = $1
+         AND d.code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review','commodity_lithium_warehouse_sync')`,
     [code],
   );
   return result.rows[0] ?? null;

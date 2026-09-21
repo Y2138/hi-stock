@@ -3,9 +3,10 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { apiClient, type ApiFail } from "../api/client";
-import type { JobDefinition, JobPrompt, JobRun, JobRunDetail, JobRunOutput, LlmConfigCatalog } from "../api/types";
+import { TOOL_LABELS, type JobDefinition, type JobPrompt, type JobRun, type JobRunDetail, type JobRunOutput, type LlmConfigCatalog } from "../api/types";
 import MarkdownView from "../components/MarkdownView.vue";
 import StateBlock from "../components/StateBlock.vue";
+import UiInput from "../components/ui/UiInput.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
 import { appMessage } from "../stores/message";
@@ -55,10 +56,10 @@ const DATASOURCE_INFO: Record<string, { label: string; responsibility: string; r
     responsibility: "同步上期所铜总库存周报并保留官方发布时间。",
     result: "铜总库存点时观测和抓取记录。",
   },
-  commodity_lithium_warehouse_sync: {
-    label: "碳酸锂仓单同步",
-    responsibility: "同步广期所碳酸锂仓单日报小计。",
-    result: "碳酸锂仓单点时观测和抓取记录。",
+  commodity_copper_macro_sync: {
+    label: "铜宏观因子同步",
+    responsibility: "同步OECD G7与中国CLI，并按保守发布时间保存修订。",
+    result: "铜左侧启动策略使用的全球增长与中国需求点时因子。",
   },
   full_market_indicator_refresh: {
     label: "全市场指标重算",
@@ -68,20 +69,17 @@ const DATASOURCE_INFO: Record<string, { label: string; responsibility: string; r
 };
 const DATASOURCE_ORDER = [
   "market_catalog_sync", "board_membership_sync", "daily_market_update",
-  "commodity_copper_sync", "commodity_copper_inventory_sync",
-  "commodity_lithium_warehouse_sync",
+  "commodity_copper_sync", "commodity_copper_inventory_sync", "commodity_copper_macro_sync",
   "daily_market_structure", "full_market_indicator_refresh",
 ];
-const GROUP_INFO: Record<string, { title: string; description: string }> = {
-  datasource: { title: "数据链路", description: "调度器直接执行固定服务端代码，结果写入行情与市场数据表，不调用 Agent。" },
-  agent_flow: { title: "Agent 任务", description: "按版本化提示词启动任务对话，生成可查看、可继续追问的 Markdown 结果。" },
-  analysis: { title: "服务内分析", description: "服务端分析模块读取数据库计算，结果写入分析记录。" },
-};
-
 const jobs = useResource<JobDefinition[]>(() => apiClient.get<JobDefinition[]>("/api/jobs"));
 const prompts = useResource<JobPrompt[]>(() => apiClient.get<JobPrompt[]>("/api/job-prompts"));
 const llmCatalog = useResource<LlmConfigCatalog>(() => apiClient.get<LlmConfigCatalog>("/api/llm/providers"));
+type JobTab = "agent" | "data";
+const activeTab = ref<JobTab>("agent");
 const filter = ref<"all" | "enabled" | "paused">("all");
+const keyword = ref("");
+const expandedJobCode = ref<string | null>(null);
 const actionKey = ref<string | null>(null);
 const historyJob = ref<JobDefinition | null>(null);
 const runs = ref<JobRun[]>([]);
@@ -98,26 +96,40 @@ const promptError = ref<ApiFail | null>(null);
 const route = useRoute();
 const resultOpen = computed(() => Boolean(parseResultRef(route.query.result)));
 
-const visibleJobs = computed(() => (jobs.data.value ?? []).filter((job) =>
-  filter.value === "all" || (filter.value === "enabled" ? job.enabled : !job.enabled),
-));
-const jobGroups = computed(() => (["agent_flow", "datasource", "analysis"] as const)
-  .map((type) => ({
-    type,
-    ...GROUP_INFO[type]!,
-    jobs: visibleJobs.value
-      .filter((job) => job.job_type === type)
-      .sort((left, right) => compareJobs(left, right, type)),
-  }))
-  .filter((group) => group.jobs.length > 0));
+const tabJobs = computed(() => (jobs.data.value ?? [])
+  .filter((job) => activeTab.value === "agent" ? job.job_type === "agent_flow" : job.job_type !== "agent_flow")
+  .sort((left, right) => {
+    if (left.job_type !== right.job_type) return left.job_type === "datasource" ? -1 : 1;
+    return compareJobs(left, right, left.job_type);
+  }));
+const visibleJobs = computed(() => {
+  const q = keyword.value.trim().toLocaleLowerCase("zh-CN");
+  return tabJobs.value.filter((job) => {
+    const statusMatched = filter.value === "all" || (filter.value === "enabled" ? job.enabled : !job.enabled);
+    if (!statusMatched || !q) return statusMatched;
+    return [job.name, job.code, job.purpose, job.phase, job.agent_role, job.strategy_code, pipelineOf(job)]
+      .some((value) => value?.toLocaleLowerCase("zh-CN").includes(q));
+  });
+});
+const tabCounts = computed(() => {
+  const rows = jobs.data.value ?? [];
+  return {
+    agent: rows.filter((row) => row.job_type === "agent_flow").length,
+    data: rows.filter((row) => row.job_type !== "agent_flow").length,
+  };
+});
+const counts = computed(() => ({
+  all: tabJobs.value.length,
+  enabled: tabJobs.value.filter((row) => row.enabled).length,
+  paused: tabJobs.value.filter((row) => !row.enabled).length,
+}));
+const tabDescription = computed(() => activeTab.value === "agent"
+  ? "按版本化提示词执行的 Agent 任务，可查看对话、提示词与 Markdown 结果。"
+  : "固定数据同步与服务内分析，直接写入数据库，不经过 Agent 对话。");
 const detachedOutputs = computed(() => outputs.value.filter((output) =>
   !output.run_id || !runs.value.some((run) => run.id === output.run_id),
 ));
 const primaryOutput = computed(() => selectedRun.value?.outputs[0] ?? null);
-const counts = computed(() => {
-  const rows = jobs.data.value ?? [];
-  return { all: rows.length, enabled: rows.filter((row) => row.enabled).length, paused: rows.filter((row) => !row.enabled).length };
-});
 
 /** 组内排序：优先级权重优先（数值越小越靠前），缺失时数据链路退回固定顺序、其余按名称。 */
 function compareJobs(left: JobDefinition, right: JobDefinition, type: string): number {
@@ -166,6 +178,12 @@ function runtimeRole(job: JobDefinition): string {
   return job.strategy_code ? `${role} · ${job.strategy_code}` : role;
 }
 
+function roleScope(job: JobDefinition): string {
+  if (job.agent_role === "portfolio_aggregator") return "跨策略统筹：按策略运行时发现入场、持仓出场与兜底，不绑定单一策略";
+  if (job.agent_role === "auction_cross_scope") return "跨域竞价：持仓、逐条关注来源、打板机会分别评价，不绑定单一策略";
+  return job.strategy_code ? `单策略专项：${job.strategy_code}` : "不绑定单一策略";
+}
+function toolLabel(code: string): string { return TOOL_LABELS[code] ?? code; }
 function responsibility(job: JobDefinition): string {
   if (job.purpose) return job.purpose;
   if (job.job_type === "datasource") return DATASOURCE_INFO[pipelineOf(job)]?.responsibility ?? "执行受控服务端数据同步。";
@@ -189,6 +207,10 @@ function cadenceLabel(job: JobDefinition): string {
   if (/^\d$/.test(dow ?? "")) return `每周${names[Number(dow)]} ${at}`;
   if (dom === "*") return `每次 ${at}`;
   return `每月 ${dom} 日 ${at}`;
+}
+
+function toggleDetails(job: JobDefinition): void {
+  expandedJobCode.value = expandedJobCode.value === job.code ? null : job.code;
 }
 
 function createWithAgent(): void {
@@ -293,6 +315,7 @@ async function openRequestedJob(): Promise<void> {
   if (!requested) return;
   const job = (jobs.data.value ?? []).find((item) => item.id === requested || item.code === requested);
   const requestedRun = typeof route.query.run === "string" ? route.query.run : null;
+  if (job) activeTab.value = job.job_type === "agent_flow" ? "agent" : "data";
   if (job && historyJob.value?.id !== job.id) {
     await openHistory(job, requestedRun);
   } else if (job && requestedRun && selectedRunId.value !== requestedRun) {
@@ -333,58 +356,94 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
 <template>
   <section>
     <div class="page-head page-head-actions">
-      <div><h1>任务中心</h1><div class="sub">查看任务、运行与结果 · 任务定义和提示词只由 Agent 维护</div></div>
+      <div>
+        <h1>任务中心</h1>
+        <div class="sub">用列表集中管理任务、运行和结果 · 任务定义与提示词只由 Agent 维护</div>
+      </div>
       <button class="btn primary agent-entry" type="button" @click="createWithAgent">让 Agent 维护任务</button>
     </div>
 
-    <div class="filter-row">
-      <button class="btn" :class="{ primary: filter === 'all' }" type="button" @click="filter = 'all'">全部 {{ counts.all }}</button>
-      <button class="btn" :class="{ primary: filter === 'enabled' }" type="button" @click="filter = 'enabled'">运行中 {{ counts.enabled }}</button>
-      <button class="btn" :class="{ primary: filter === 'paused' }" type="button" @click="filter = 'paused'">已暂停 {{ counts.paused }}</button>
-    </div>
+    <nav class="job-tabs" role="tablist" aria-label="任务类型">
+      <button class="job-tab" :class="{ active: activeTab === 'agent' }" type="button" role="tab" :aria-selected="activeTab === 'agent'" @click="activeTab = 'agent'">
+        <span>Agent 任务</span><span class="tab-count num">{{ tabCounts.agent }}</span>
+      </button>
+      <button class="job-tab" :class="{ active: activeTab === 'data' }" type="button" role="tab" :aria-selected="activeTab === 'data'" @click="activeTab = 'data'">
+        <span>数据获取</span><span class="tab-count num">{{ tabCounts.data }}</span>
+      </button>
+    </nav>
 
-    <StateBlock :loading="jobs.loading.value" :error="jobs.error.value" :empty="visibleJobs.length === 0" empty-text="当前筛选下没有任务" :skeleton-rows="6" @retry="jobs.reload">
-      <div class="job-groups">
-        <section v-for="group in jobGroups" :key="group.type" class="job-group">
-          <div class="group-head">
-            <div><h2>{{ group.title }}</h2><p>{{ group.description }}</p></div>
-            <span class="badge">{{ group.jobs.length }} 个任务</span>
+    <section class="card job-panel">
+      <header class="job-toolbar">
+        <div class="toolbar-copy">
+          <strong>{{ activeTab === "agent" ? "Agent 任务" : "数据获取" }}</strong>
+          <span>{{ tabDescription }}</span>
+        </div>
+        <div class="toolbar-controls">
+          <UiInput v-model="keyword" class="job-search" type="search" placeholder="搜索任务名称、编码或职责" aria-label="搜索任务" />
+          <div class="status-filter" aria-label="任务状态筛选">
+            <button type="button" :class="{ active: filter === 'all' }" @click="filter = 'all'">全部 {{ counts.all }}</button>
+            <button type="button" :class="{ active: filter === 'enabled' }" @click="filter = 'enabled'">启用 {{ counts.enabled }}</button>
+            <button type="button" :class="{ active: filter === 'paused' }" @click="filter = 'paused'">暂停 {{ counts.paused }}</button>
           </div>
-          <div class="job-grid">
-            <article v-for="job in group.jobs" :key="job.id" class="card job-card">
-              <div class="job-title">
-                <div><strong>{{ job.name }}</strong><span class="code">{{ job.code }}</span></div>
-                <span class="badge" :class="job.enabled ? 'ok' : ''">{{ job.enabled ? "已启用" : "已暂停" }}</span>
-              </div>
-              <div class="meta-row">
-                <span class="badge accent">{{ TYPE_LABELS[job.job_type] }}</span>
-                <span v-if="job.phase" class="badge">{{ job.phase }}</span>
-                <span v-if="job.priority !== null" class="badge num" title="重要性排序权重，越小越靠前">P{{ job.priority }}</span>
-                <span v-if="job.agent_role" class="badge">{{ runtimeRole(job) }}</span>
-                <span class="num">{{ cadenceLabel(job) }}</span>
-                <span class="code num">{{ job.cron }}</span>
-              </div>
-              <p class="job-purpose-text">{{ responsibility(job) }}</p>
-              <dl class="job-kv job-purpose">
-                <dt>执行</dt><dd>{{ executionLabel(job) }}</dd>
-                <dt>运行时角色</dt><dd>{{ runtimeRole(job) }}</dd>
-                <dt>产出</dt><dd>{{ expectedResult(job) }}</dd>
-                <template v-if="job.job_type === 'agent_flow'"><dt>模型</dt><dd>{{ modelLabel(job) }}</dd></template>
-                <dt>下次运行</dt><dd>{{ job.next_run ? fmtTime(job.next_run) : "已暂停" }}</dd>
-                <dt>最近状态</dt><dd><span v-if="job.latest_run" class="badge" :class="STATUS_CLASS[job.latest_run.status]">{{ STATUS_LABELS[job.latest_run.status] }}</span><span v-else>尚未运行</span></dd>
-              </dl>
-              <div class="actions">
-                <button class="btn compact" type="button" :disabled="actionKey === `toggle:${job.code}`" @click="toggle(job)">{{ job.enabled ? "暂停" : "启用" }}</button>
-                <button class="btn compact primary" :class="{ 'agent-entry': job.job_type === 'agent_flow' }" type="button" :disabled="actionKey === `trigger:${job.code}`" @click="trigger(job)">立即运行</button>
-                <button v-if="job.latest_run && ['failed','partial','missed'].includes(job.latest_run.status)" class="btn compact" :class="{ 'agent-entry': job.job_type === 'agent_flow' }" type="button" @click="trigger(job, true)">重试</button>
-                <button v-if="job.job_type === 'agent_flow' && job.prompt_id" class="btn compact" type="button" @click="openPrompt(job)">查看提示词</button>
-                <button class="btn compact" type="button" @click="openHistory(job)">历史与结果</button>
-              </div>
-            </article>
-          </div>
-        </section>
-      </div>
-    </StateBlock>
+        </div>
+      </header>
+
+      <StateBlock :loading="jobs.loading.value" :error="jobs.error.value" :empty="visibleJobs.length === 0" empty-text="当前筛选下没有任务" :skeleton-rows="7" @retry="jobs.reload">
+        <div class="job-table-wrap">
+          <table class="data-table job-table">
+            <thead>
+              <tr><th class="col-task">任务</th><th class="col-schedule">调度</th><th class="col-status">状态</th><th class="col-actions">操作</th></tr>
+            </thead>
+            <tbody>
+              <template v-for="job in visibleJobs" :key="job.id">
+                <tr class="job-row" :class="{ expanded: expandedJobCode === job.code }">
+                  <td>
+                    <button class="job-name" type="button" :aria-expanded="expandedJobCode === job.code" @click="toggleDetails(job)">
+                      <span class="expand-mark" aria-hidden="true">{{ expandedJobCode === job.code ? "−" : "+" }}</span>
+                      <span><strong>{{ job.name }}</strong><small class="code">{{ job.code }}</small></span>
+                    </button>
+                    <div class="job-meta"><span class="badge accent">{{ TYPE_LABELS[job.job_type] }}</span><span v-if="job.phase" class="badge">{{ job.phase }}</span><span>{{ job.job_type === "agent_flow" ? runtimeRole(job) : executionLabel(job) }}</span></div>
+                    <p class="job-purpose-text">{{ responsibility(job) }}</p>
+                  </td>
+                  <td>
+                    <div class="cell-stack"><strong>{{ cadenceLabel(job) }}</strong><small class="code">{{ job.cron }}</small><small>下次 {{ job.next_run ? fmtTime(job.next_run) : "已暂停" }}</small></div>
+                  </td>
+                  <td>
+                    <div class="cell-stack">
+                      <span class="badge" :class="job.enabled ? 'ok' : ''">{{ job.enabled ? "已启用" : "已暂停" }}</span>
+                      <template v-if="job.latest_run"><span class="badge" :class="STATUS_CLASS[job.latest_run.status]">{{ STATUS_LABELS[job.latest_run.status] }}</span><small>{{ job.latest_run.target_date }}</small></template>
+                      <small v-else>尚未运行</small>
+                    </div>
+                  </td>
+                  <td>
+                    <div class="row-actions">
+                      <button class="btn compact primary" :class="{ 'agent-entry': job.job_type === 'agent_flow' }" type="button" :disabled="actionKey === `trigger:${job.code}`" @click="trigger(job)">立即运行</button>
+                      <button class="btn compact" type="button" @click="openHistory(job)">历史与结果</button>
+                      <button v-if="job.latest_run && ['failed','partial','missed'].includes(job.latest_run.status)" class="btn compact" :class="{ 'agent-entry': job.job_type === 'agent_flow' }" type="button" @click="trigger(job, true)">重试</button>
+                    </div>
+                  </td>
+                </tr>
+                <tr v-if="expandedJobCode === job.code" class="job-detail-row">
+                  <td colspan="4">
+                    <div class="job-detail-grid">
+                      <dl class="job-kv">
+                        <dt>执行方式</dt><dd>{{ executionLabel(job) }}</dd>
+                        <template v-if="job.job_type === 'agent_flow'"><dt>运行时角色</dt><dd>{{ runtimeRole(job) }} · {{ roleScope(job) }} <RouterLink v-if="job.strategy_code" :to="{ path: '/strategies', query: { strategy: job.strategy_code } }">查看策略 ↗</RouterLink></dd><dt>模型</dt><dd>{{ modelLabel(job) }}</dd></template>
+                        <dt>产出</dt><dd>{{ expectedResult(job) }}</dd>
+                      </dl>
+                      <div v-if="job.job_type === 'agent_flow'" class="job-detail-side">
+                        <div><span>可用工具</span><details v-if="job.available_tools.length"><summary>{{ job.available_tools.length }} 项授权能力</summary><div class="tool-list"><span v-for="tool in job.available_tools" :key="tool" class="badge" :title="tool">{{ toolLabel(tool) }}</span></div></details><strong v-else>受限交互工具目录</strong></div>
+                        <div class="detail-actions"><button class="btn compact" type="button" :disabled="actionKey === `toggle:${job.code}`" @click="toggle(job)">{{ job.enabled ? "暂停任务" : "启用任务" }}</button><button v-if="job.prompt_id" class="btn compact" type="button" @click="openPrompt(job)">查看当前提示词</button></div>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </StateBlock>
+    </section>
 
     <div v-if="promptJob" class="history-mask" @click.self="closePrompt">
       <aside class="prompt-panel" role="dialog" aria-modal="true" :aria-label="`${promptJob.name} 当前提示词`">
@@ -427,6 +486,11 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
               <div v-if="runLoading" class="detail-state">正在读取运行详情…</div>
               <template v-else-if="selectedRun">
                 <div class="detail-head"><div><strong>运行 #{{ selectedRun.id }}</strong><span class="code">{{ selectedRun.target_date }}</span></div><button v-if="selectedRun.session_id" class="btn compact agent-entry" type="button" @click="openAgentSession(selectedRun.session_id)">打开任务对话</button></div>
+                <div class="run-context">
+                  <strong>{{ roleScope(historyJob) }}</strong>
+                  <RouterLink v-if="historyJob.strategy_code" :to="{ path: '/strategies', query: { strategy: historyJob.strategy_code } }">查看关联策略 ↗</RouterLink>
+                  <details v-if="historyJob.available_tools.length"><summary>任务授权工具（{{ historyJob.available_tools.length }} 项；不代表本次调用）</summary><div class="tool-list"><span v-for="tool in historyJob.available_tools" :key="tool" class="badge" :title="tool">{{ toolLabel(tool) }}</span></div></details>
+                </div>
                 <div class="run-summary">
                   <div><span>状态</span><strong><span class="badge" :class="STATUS_CLASS[selectedRun.status]">{{ STATUS_LABELS[selectedRun.status] }}</span></strong></div>
                   <div><span>触发方式</span><strong>{{ selectedRun.trigger_kind === "cron" ? "自动调度" : "手动运行" }}</strong></div>
@@ -434,6 +498,11 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
                   <div><span>完成时间</span><strong>{{ fmtTime(selectedRun.finished_at) ?? "—" }}</strong></div>
                 </div>
 
+                <section v-if="selectedRun.job.job_type === 'agent_flow'" class="run-section">
+                  <div class="section-title"><strong>本次实际工具调用</strong></div>
+                  <div v-if="selectedRun.tool_usage.length" class="tool-list"><span v-for="item in selectedRun.tool_usage" :key="`${item.tool_name}:${item.status}`" class="badge" :class="{ warn: item.status !== 'ok' }" :title="item.tool_name">{{ toolLabel(item.tool_name) }} · {{ item.status }} × {{ item.count }}</span></div>
+                  <p v-else class="muted">暂无工具调用遥测；不能据此断定任务没有调用工具。</p>
+                </section>
                 <section class="run-section output-section">
                   <div class="section-title"><div><strong>任务结果</strong><span v-if="selectedRun.outputs.length > 1">共 {{ selectedRun.outputs.length }} 份，展示最新结果</span></div><button v-if="primaryOutput" class="btn compact" type="button" @click="openOutput(primaryOutput.id)">专注阅读 ↗</button></div>
                   <article v-if="primaryOutput" class="inline-output">
@@ -457,5 +526,51 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
 </template>
 
 <style scoped>
-.page-head-actions,.job-title,.actions,.history-head,.detail-head,.meta-row,.group-head,.section-title{display:flex;align-items:center;gap:8px}.page-head-actions,.job-title,.history-head,.detail-head,.group-head,.section-title{justify-content:space-between}.filter-row{display:flex;gap:7px;margin-bottom:14px}.job-groups,.job-group{display:grid;gap:14px}.job-group+.job-group{margin-top:8px}.group-head{align-items:flex-start}.group-head h2{margin:0;font-size:var(--fs-lg)}.group-head p{margin:3px 0 0;color:var(--ink-soft);font-size:var(--fs-sm)}.job-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}.job-card{display:grid;gap:10px}.job-title>div,.history-head>div,.detail-head>div{display:grid;gap:2px}.code{font:11px var(--font-mono);color:var(--ink-faint)}.context{margin:0;color:var(--ink-soft);font:11px var(--font-mono);overflow-wrap:anywhere}.job-purpose-text{margin:0;color:var(--ink);line-height:1.5;font-size:12.5px}.job-kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 12px;margin:0}.job-kv dt{color:var(--ink-faint)}.job-kv dd{margin:0;min-width:0}.job-purpose dd{line-height:1.45}.actions{flex-wrap:wrap;border-top:1px solid var(--line);padding-top:10px}.history-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}.history-panel,.prompt-panel{display:grid;height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.history-panel{width:min(1040px,96vw)}.prompt-panel{width:min(820px,96vw)}.history-head{padding:15px 18px;background:var(--paper);border-bottom:1px solid var(--line)}.icon-btn{display:grid;width:32px;height:32px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:20px;line-height:1;cursor:pointer}.icon-btn:hover{border-color:var(--accent);color:var(--accent-ink)}.history-panel>:deep(.state-block),.prompt-panel>:deep(.state-block){min-height:0}.prompt-body{height:100%;overflow:auto;padding:18px 22px 48px}.prompt-meta{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:18px;color:var(--ink-faint);font-size:var(--fs-sm)}.history-body{display:grid;height:100%;min-height:0;grid-template-columns:minmax(240px,290px) minmax(0,1fr)}.history-list-pane,.run-detail-pane{min-height:0;overflow:auto}.history-list-pane{padding:14px;border-right:1px solid var(--line);background:var(--paper-deep)}.run-detail-pane{padding:18px 20px 48px}.pane-title{display:flex;align-items:center;justify-content:space-between;margin:0 2px 8px;color:var(--ink-soft);font-size:var(--fs-sm)}.pane-title span{font:11px var(--font-mono)}.detached-title{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}.history-list{display:grid;gap:6px}.history-item{position:relative;display:grid;gap:5px;width:100%;padding:10px 11px;text-align:left;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm);cursor:pointer}.history-item:hover{border-color:var(--accent)}.history-item.active{border-color:var(--accent);background:var(--accent-soft)}.history-item-main{display:flex;align-items:center;justify-content:space-between;gap:8px}.history-item small{padding-right:48px;color:var(--ink-faint);font-size:10.5px}.result-mark{position:absolute;right:10px;bottom:9px;color:var(--accent-ink);font-size:10.5px;font-weight:600}.output-item{grid-template-columns:minmax(0,1fr) auto}.output-item small{grid-column:1/-1}.detail-head{padding-bottom:14px;border-bottom:1px solid var(--line)}.run-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:14px 0}.run-summary>div{display:grid;gap:5px;padding:10px;background:var(--paper-deep);border-radius:var(--radius-sm)}.run-summary span{color:var(--ink-faint);font-size:11px}.run-summary strong{font-size:12px}.run-section{margin-top:18px}.section-title{margin-bottom:8px}.section-title>div{display:grid;gap:2px}.section-title span{color:var(--ink-faint);font-size:11px}.inline-output{padding:16px 18px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm)}.output-meta{display:flex;align-items:center;gap:8px;margin-bottom:14px;color:var(--ink-faint);font-size:11px}.empty-output,.detail-state{display:grid;place-items:center;min-height:120px;margin:0;color:var(--ink-faint);text-align:center;background:var(--paper-deep);border:1px dashed var(--line);border-radius:var(--radius-sm)}.detail-json,.run-log{margin:0;padding:11px 12px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);background:var(--paper-deep);border-radius:var(--radius-sm);font:11.5px/1.55 var(--font-mono)}.mobile-back{display:none}@media(max-width:800px){.run-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.page-head-actions,.group-head{align-items:flex-start;flex-direction:column}.job-grid{grid-template-columns:1fr}.history-panel,.prompt-panel{width:100vw}.prompt-body{padding:16px 16px 40px}.history-body{grid-template-columns:1fr}.history-body.detail-open .history-list-pane{display:none}.history-body:not(.detail-open) .run-detail-pane{display:none}.history-list-pane,.run-detail-pane{border-right:0}.mobile-back{display:inline-flex;margin-bottom:12px;border:0;background:transparent;color:var(--accent-ink);padding:0;cursor:pointer}.run-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.section-title{align-items:flex-start}.inline-output{padding:13px}}
+.page-head-actions,.history-head,.detail-head,.section-title{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.job-tabs{display:flex;gap:3px;margin-bottom:12px;border-bottom:1px solid var(--line)}
+.job-tab{display:inline-flex;align-items:center;gap:8px;min-height:42px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--ink-soft);padding:0 16px;cursor:pointer;font:600 var(--fs-sm) var(--font-body)}
+.job-tab:hover{background:var(--paper-deep);color:var(--ink)}
+.job-tab.active{border-bottom-color:var(--accent);background:var(--accent-soft);color:var(--accent-ink)}
+.tab-count{display:grid;min-width:22px;height:22px;place-items:center;border-radius:999px;background:var(--paper-deep);font-size:11px}
+.job-tab.active .tab-count{background:var(--card)}
+.job-panel{padding:0;overflow:hidden}
+.job-toolbar{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:13px 16px;border-bottom:1px solid var(--line)}
+.toolbar-copy{display:grid;gap:3px;min-width:0}.toolbar-copy>span{color:var(--ink-soft);font-size:var(--fs-sm)}
+.toolbar-controls{display:flex;align-items:center;justify-content:flex-end;gap:10px;min-width:min(560px,60%)}
+.job-search{width:min(300px,100%)}
+.status-filter{display:flex;gap:2px;padding:3px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--paper-deep)}
+.status-filter button{min-height:28px;border:0;border-radius:6px;background:transparent;color:var(--ink-soft);padding:2px 9px;white-space:nowrap;cursor:pointer;font:500 var(--fs-xs) var(--font-body)}
+.status-filter button.active{background:var(--card);color:var(--accent-ink);box-shadow:var(--shadow-soft)}
+.job-table-wrap{overflow:auto}.job-table{min-width:720px;table-layout:fixed}
+.job-table th{position:sticky;top:0;z-index:2;padding:9px 12px;background:var(--paper-deep);box-shadow:0 1px 0 var(--line);font-size:11px;letter-spacing:.02em}
+.job-table td{padding:12px;vertical-align:middle}.job-row:hover{background:var(--accent-soft)}.job-row.expanded{background:var(--paper-deep)}
+.col-task{width:42%}.col-schedule{width:22%}.col-status{width:14%}.col-actions{width:22%}
+.job-name{display:flex;align-items:flex-start;gap:9px;width:100%;border:0;background:transparent;color:var(--ink);padding:0;text-align:left;cursor:pointer;font:inherit}
+.job-name>span:last-child,.cell-stack{display:grid;gap:4px;min-width:0}.job-name strong{overflow-wrap:anywhere}.job-name small,.cell-stack small{color:var(--ink-faint)}
+.expand-mark{display:grid;flex:none;width:20px;height:20px;place-items:center;margin-top:1px;border:1px solid var(--line);border-radius:6px;color:var(--accent-ink);font-weight:700}
+.job-meta{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin:5px 0 0 29px;color:var(--ink-soft);font-size:11px}.job-meta>span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.job-purpose-text{display:-webkit-box;margin:5px 0 0 29px;overflow:hidden;color:var(--ink-soft);font-size:12px;line-height:1.45;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+.cell-stack>span:first-child{display:flex;flex-wrap:wrap;gap:5px}.cell-stack strong{overflow-wrap:anywhere;font-size:12px;line-height:1.4}
+.row-actions{display:flex;flex-wrap:wrap;gap:6px}.row-actions .btn{white-space:nowrap}
+.job-detail-row td{padding:0 12px 14px;background:var(--paper-deep)}
+.job-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,34%);gap:24px;padding:14px 16px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--card)}
+.job-kv{display:grid;grid-template-columns:76px minmax(0,1fr);gap:8px 12px;margin:0}.job-kv dt{color:var(--ink-faint)}.job-kv dd{min-width:0;margin:0;overflow-wrap:anywhere;line-height:1.5}
+.job-detail-side{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding-left:20px;border-left:1px solid var(--line)}
+.job-detail-side>div{display:grid;gap:5px;min-width:0}.detail-actions{display:flex!important;align-items:flex-start;flex-wrap:wrap;justify-content:flex-end}.job-detail-side>div>span{color:var(--ink-faint);font-size:11px}.job-detail-side summary{color:var(--accent-ink);cursor:pointer}.tool-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.tool-list .badge{min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.code{font:11px var(--font-mono);color:var(--ink-faint)}.muted{color:var(--ink-faint);font-size:var(--fs-sm)}
+.history-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}
+.history-panel,.prompt-panel{display:grid;height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.history-panel{width:min(1040px,96vw)}.prompt-panel{width:min(820px,96vw)}
+.history-head{padding:15px 18px;background:var(--paper);border-bottom:1px solid var(--line)}.history-head>div,.detail-head>div{display:grid;gap:2px;min-width:0}
+.icon-btn{display:grid;width:32px;height:32px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:20px;line-height:1;cursor:pointer}.icon-btn:hover{border-color:var(--accent);color:var(--accent-ink)}
+.history-panel>:deep(.state-block),.prompt-panel>:deep(.state-block){min-height:0}.prompt-body{height:100%;overflow:auto;padding:18px 22px 48px}.prompt-meta{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:18px;color:var(--ink-faint);font-size:var(--fs-sm)}
+.history-body{display:grid;height:100%;min-height:0;grid-template-columns:minmax(240px,290px) minmax(0,1fr)}.history-list-pane,.run-detail-pane{min-height:0;overflow:auto}.history-list-pane{padding:14px;border-right:1px solid var(--line);background:var(--paper-deep)}.run-detail-pane{min-width:0;padding:18px 20px 48px}
+.pane-title{display:flex;align-items:center;justify-content:space-between;margin:0 2px 8px;color:var(--ink-soft);font-size:var(--fs-sm)}.pane-title span{font:11px var(--font-mono)}.detached-title{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
+.history-list{display:grid;gap:6px}.history-item{position:relative;display:grid;gap:5px;width:100%;padding:10px 11px;text-align:left;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm);cursor:pointer}.history-item:hover{border-color:var(--accent)}.history-item.active{border-color:var(--accent);background:var(--accent-soft)}
+.history-item-main{display:flex;align-items:center;justify-content:space-between;gap:8px}.history-item small{padding-right:48px;color:var(--ink-faint);font-size:10.5px}.result-mark{position:absolute;right:10px;bottom:9px;color:var(--accent-ink);font-size:10.5px;font-weight:600}.output-item{grid-template-columns:minmax(0,1fr) auto}.output-item small{grid-column:1/-1}
+.detail-head{padding-bottom:14px;border-bottom:1px solid var(--line)}.run-context{display:grid;gap:6px;margin:12px 0;padding:10px;overflow:hidden;background:var(--paper-deep);border-radius:var(--radius-sm)}.run-context summary{white-space:normal;overflow-wrap:anywhere;color:var(--accent-ink);cursor:pointer}
+.run-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:14px 0}.run-summary>div{display:grid;gap:5px;padding:10px;background:var(--paper-deep);border-radius:var(--radius-sm)}.run-summary span{color:var(--ink-faint);font-size:11px}.run-summary strong{font-size:12px}
+.run-section{margin-top:18px}.section-title{margin-bottom:8px}.section-title>div{display:grid;gap:2px;min-width:0}.section-title span{color:var(--ink-faint);font-size:11px}.inline-output{min-width:0;padding:16px 18px;overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm)}.output-meta{display:flex;align-items:center;gap:8px;margin-bottom:14px;color:var(--ink-faint);font-size:11px}
+.empty-output,.detail-state{display:grid;place-items:center;min-height:120px;margin:0;color:var(--ink-faint);text-align:center;background:var(--paper-deep);border:1px dashed var(--line);border-radius:var(--radius-sm)}.detail-json,.run-log{margin:0;padding:11px 12px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);background:var(--paper-deep);border-radius:var(--radius-sm);font:11.5px/1.55 var(--font-mono)}.mobile-back{display:none}
+@media(max-width:900px){.job-toolbar{align-items:stretch;flex-direction:column}.toolbar-controls{justify-content:space-between;min-width:0}.job-search{flex:1}.run-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:700px){.page-head-actions{align-items:flex-start;flex-direction:column}.job-tabs{overflow-x:auto}.job-toolbar{padding:12px}.toolbar-controls{align-items:stretch;flex-direction:column}.job-search{width:100%}.status-filter{align-self:flex-start}.job-detail-grid{grid-template-columns:1fr}.job-detail-side{padding:14px 0 0;border-top:1px solid var(--line);border-left:0}.history-panel,.prompt-panel{width:100vw}.prompt-body{padding:16px 16px 40px}.history-body{grid-template-columns:1fr}.history-body.detail-open .history-list-pane{display:none}.history-body:not(.detail-open) .run-detail-pane{display:none}.history-list-pane,.run-detail-pane{border-right:0}.mobile-back{display:inline-flex;margin-bottom:12px;border:0;background:transparent;color:var(--accent-ink);padding:0;cursor:pointer}.section-title{align-items:flex-start}.inline-output{padding:13px}}
 </style>

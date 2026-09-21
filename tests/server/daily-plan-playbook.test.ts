@@ -246,7 +246,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     expect(context.coverage).toMatchObject({ position_count: 1, attention_count: 2, opportunity_count: 1, candidate_count: 3 });
     expect(context.attentions.map((item) => item.strategy_code).sort()).toEqual(['swing', 'two_year_reversal']);
     expect(context.attentions.map((item) => item.target_key)).toHaveLength(2);
-    expect(context.required_strategy_documents).toEqual(expect.arrayContaining(['daily_plan_strategy','two_year_reversal_strategy','limit_up_board']));
+    expect(context.required_strategy_documents).toEqual(expect.arrayContaining(['swing_strategy','two_year_reversal_strategy','limit_up_board']));
     expect(context.market_day).toMatchObject({ should_run: true, previous_open_date: "2026-08-27" });
     expect(context.plan).toMatchObject({ target_date: "2026-08-27", validity: "valid" });
     expect(context.coverage.opportunity_count).toBe(1);

@@ -288,7 +288,7 @@ onMounted(reloadPositionsData);
               <tr v-for="item in positionActions" :key="item.id">
                 <td><strong>{{ item.name }}</strong><br /><small class="num">{{ item.code }}</small></td>
                 <td>
-                  <span v-if="item.strategy_code" class="badge accent">{{ item.strategy_code }}</span>
+                  <RouterLink v-if="item.strategy_code" class="badge accent" :to="{ path: '/strategies', query: { strategy: item.strategy_code } }">{{ item.strategy_code }} ↗</RouterLink>
                   <span class="num" :class="triggerClass(item)">{{ ACTION_LABELS[item.effective_action ?? item.action] }}</span>
                   <div class="code-sub">主 {{ item.primary_action ? ACTION_LABELS[item.primary_action] : "—" }} · 兜底 {{ item.fallback_action ? ACTION_LABELS[item.fallback_action] : "—" }}</div>
                   <span v-if="item.evaluation_status" class="badge" :class="{ warn:item.evaluation_status !== 'success' }">{{ item.evaluation_status }}</span>
@@ -392,9 +392,9 @@ onMounted(reloadPositionsData);
                      : `${((p.market_value / totalMarketValue) * 100).toFixed(1)}%` }}
                 </td>
                 <td>
-                  <span v-if="p.strategy_code" class="badge accent">{{ p.strategy_name ?? p.strategy_code }}</span>
+                  <RouterLink v-if="p.strategy_code" class="badge accent" :to="{ path: '/strategies', query: { strategy: p.strategy_code } }">{{ p.strategy_name ?? p.strategy_code }} ↗</RouterLink>
                   <span v-else class="missing">待归因</span>
-                  <div v-if="p.fallback_strategy_code" class="code-sub">兜底：{{ p.fallback_strategy_name ?? p.fallback_strategy_code }}</div>
+                  <div v-if="p.fallback_strategy_code" class="code-sub">兜底：<RouterLink :to="{ path: '/strategies', query: { strategy: p.fallback_strategy_code } }">{{ p.fallback_strategy_name ?? p.fallback_strategy_code }} ↗</RouterLink></div>
                 </td>
                 <td class="attribution-cell">{{ attributionText(p.attribution_breakdown) }}</td>
               </tr>
@@ -441,7 +441,7 @@ onMounted(reloadPositionsData);
                 <td><RouterLink :to="{ path: '/market', query: { code: c.code, view: 'detail' } }">{{ c.name }}</RouterLink> <span class="num code-sub">{{ c.code }}</span></td>
                 <td>
                   <span class="badge" :class="{ accent: c.kind === 'buy', warn: c.kind === 'sell' }">{{ CHANGE_KIND_LABELS[c.kind] ?? c.kind }}</span>
-                  <span v-if="c.kind === 'buy' && c.strategy_code" class="badge accent">{{ c.strategy_code }}</span>
+                  <RouterLink v-if="c.kind === 'buy' && c.strategy_code" class="badge accent" :to="{ path: '/strategies', query: { strategy: c.strategy_code } }">{{ c.strategy_code }} ↗</RouterLink>
                   <span v-else-if="c.kind === 'buy'" class="missing">策略未记录</span>
                 </td>
                 <td class="num">{{ c.quantity === null ? "—" : fmtNum(c.quantity) }}</td>

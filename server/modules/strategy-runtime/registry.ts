@@ -1,7 +1,6 @@
 import type pg from "pg";
 import { queryLimitUpSignals } from "../market/limit-up-signals.js";
-import { queryCopperInventorySignal } from "../market/copper-inventory-signal.js";
-import { queryLithiumWarehouseSignal } from "../market/lithium-warehouse-signal.js";
+import { queryCopperLeftLaunchEntry, queryCopperLeftLaunchExit } from "../market/copper-left-launch-signal.js";
 import { querySwingSignals } from "../plans/swing-signals.js";
 import { queryTwoYearReversalSignals } from "../plans/two-year-reversal-signal.js";
 import { queryValueAnchorSignals } from "../plans/value-anchor-signal.js";
@@ -45,8 +44,8 @@ const DEFINITIONS: readonly StrategyEvaluatorDefinition[] = [
   ready("limit_up_observation_v1", "entry", ({ pool, targetDate, strategyDocumentId }) =>
     queryLimitUpSignals(pool, targetDate, strategyDocumentId)),
   ready("value_anchor_entry_v1", "entry", ({ pool, targetDate }) => queryValueAnchorSignals(pool, targetDate)),
-  ready("copper_inventory_context_v1", "context", ({ pool, targetDate }) => queryCopperInventorySignal(pool, targetDate)),
-  ready("lithium_warehouse_context_v1", "context", ({ pool, targetDate }) => queryLithiumWarehouseSignal(pool, targetDate)),
+  ready("copper_left_launch_entry_v1", "entry", ({ pool, targetDate }) => queryCopperLeftLaunchEntry(pool, targetDate)),
+  ready("copper_left_launch_exit_v1", "exit", ({ pool, targetDate }) => queryCopperLeftLaunchExit(pool, targetDate)),
   pending("nightly_sector_attention_v1", "entry"),
   pending("manual_entry_v1", "entry"),
   ready("swing_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "swing" })),
@@ -60,6 +59,24 @@ const REGISTRY = new Map(DEFINITIONS.map((definition) => [definition.code, defin
 
 export function listStrategyEvaluatorDefinitions(): StrategyEvaluatorDefinition[] {
   return [...DEFINITIONS];
+}
+
+/** 只读展示信息；业务执行仍只认稳定编码与注册表状态。 */
+const EVALUATOR_LABELS: Record<string, string> = {
+  swing_entry_v1: "波段入场", two_year_reversal_entry_v1: "两年结构反转入场",
+  limit_up_observation_v1: "打板机会观察", value_anchor_entry_v1: "价值错杀关注",
+  copper_left_launch_entry_v1: "铜左侧启动入场",
+  copper_left_launch_exit_v1: "铜价格结构出场",
+  nightly_sector_attention_v1: "夜间板块关注", manual_entry_v1: "自主决策入场",
+  swing_exit_v1: "波段出场", two_year_reversal_exit_v1: "两年结构反转出场",
+  legacy_right_side_exit_v1: "旧右侧持仓出场", legacy_left_reversal_exit_v1: "旧左侧持仓出场",
+  fallback_exit_v1: "分批止盈与移动止损兜底",
+};
+
+export function strategyEvaluatorMetadata(code: string | null): { code: string; label: string; phase: StrategyEvaluationPhase | null; status: "ready" | "pending" | "unregistered"; version: number | null } | null {
+  if (!code) return null;
+  const definition = REGISTRY.get(code);
+  return { code, label: EVALUATOR_LABELS[code] ?? code, phase: definition?.phase ?? null, status: definition?.status ?? "unregistered", version: definition?.version ?? null };
 }
 
 export function getStrategyEvaluatorDefinition(code: string): StrategyEvaluatorDefinition {
@@ -96,7 +113,7 @@ export async function findStrategyEvaluatorBindingGaps(
     exit_evaluator_code: string | null;
     context_evaluator_code: string | null;
   }>(`SELECT code, entry_evaluator_code, exit_evaluator_code, context_evaluator_code
-        FROM strategy_definition ORDER BY code`);
+        FROM strategy_definition WHERE status <> 'retired' ORDER BY code`);
   const gaps: StrategyEvaluatorBindingGap[] = [];
   const fields = [
     ["entry_evaluator_code", "entry"],

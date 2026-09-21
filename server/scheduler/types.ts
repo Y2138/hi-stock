@@ -92,7 +92,7 @@ export type DatasourcePipeline =
   | "full_market_indicator_refresh"
   | "commodity_copper_sync"
   | "commodity_copper_inventory_sync"
-  | "commodity_lithium_warehouse_sync"
+  | "commodity_copper_macro_sync"
   | "value_candidate_sync";
 
 export interface DatasourceJobConfig {

@@ -15,6 +15,12 @@ import { closePool, getPool } from "./client.js";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_MIGRATIONS_DIR = path.join(here, "..", "migrations");
 
+// 0120 曾在本地实例首次应用前修正过存量 buy 兼容条件；提交版恢复原始文件，
+// 仅允许这一条已知哈希继续向前迁移，0128 会将两种旧库收敛到同一约束。
+const LEGACY_APPLIED_HASHES: Readonly<Record<number, readonly string[]>> = {
+  120: ["4c7908240f0703146397288035526fea7ff82657da1d971248be9894d8a9e0e4"],
+};
+
 export interface MigrationFile {
   version: number;
   name: string;
@@ -81,7 +87,9 @@ export async function runMigrations(
   const applied = new Map(appliedRows.map((r) => [r.version, r]));
 
   const conflicts = migrations
-    .filter((m) => applied.has(m.version) && applied.get(m.version)!.sha256 !== m.sha256)
+    .filter((m) => applied.has(m.version)
+      && applied.get(m.version)!.sha256 !== m.sha256
+      && !(LEGACY_APPLIED_HASHES[m.version] ?? []).includes(applied.get(m.version)!.sha256))
     .map((m) => ({ version: m.version, name: m.name }));
   if (conflicts.length > 0) throw new MigrationConflictError(conflicts);
 
@@ -94,6 +102,30 @@ export async function runMigrations(
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      // 已发布的0120不接受存量 buy 动作。先在迁移事务中暂存这些行，
+      // 0129 在放宽约束后恢复；不改写0120文件，也不丢失原动作。
+      if (m.version === 120 && m.name === "每日计划策略编排切换") {
+        await client.query(`CREATE TABLE migration_0120_legacy_buy (playbook_id bigint PRIMARY KEY)`);
+        await client.query(`INSERT INTO migration_0120_legacy_buy (playbook_id)
+          SELECT id FROM daily_plan_playbook WHERE item_kind='position_action' AND action='buy'`);
+        await client.query(`UPDATE daily_plan_playbook SET action='hold'
+          WHERE id IN (SELECT playbook_id FROM migration_0120_legacy_buy)`);
+      }
+      // 0120 的单列约束在旧库中名为 *_effective_action_check；
+      // 本地修正版同时引用 strategy_code，PostgreSQL 自动命名为 *_check。
+      // 0128 执行前只统一约束名称，不改变任何业务行或历史迁移文件。
+      if (m.version === 128 && m.name === "历史买入预案约束兼容") {
+        await client.query(`DO $compat$
+          BEGIN
+            IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='daily_plan_playbook'::regclass
+              AND conname='daily_plan_playbook_effective_action_check')
+              AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='daily_plan_playbook'::regclass
+                AND conname='daily_plan_playbook_check') THEN
+              ALTER TABLE daily_plan_playbook RENAME CONSTRAINT daily_plan_playbook_effective_action_check
+                TO daily_plan_playbook_check;
+            END IF;
+          END $compat$`);
+      }
       await client.query(m.sql);
       await client.query(
         "INSERT INTO schema_migrations (version, name, sha256) VALUES ($1, $2, $3)",

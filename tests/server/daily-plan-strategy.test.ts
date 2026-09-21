@@ -22,21 +22,21 @@ describe.skipIf(!prepared)("每日计划策略统一编排", () => {
   it("自动发现入场、观察与组合策略并复用评估运行", async () => {
     const first = await queryDailyPlanStrategyContext(pool, { date: "2026-09-17" });
     expect(first.strategy_coverage).toMatchObject({
-      expected_evaluations: 5,
+      expected_evaluations: 2,
       position_count: 0,
       attributed_position_count: 0,
-      executed_evaluations: 5,
+      executed_evaluations: 2,
     });
     expect(first.required_strategy_documents).toEqual(expect.arrayContaining([
       "daily_plan_strategy", "two_year_reversal_strategy", "limit_up_board",
-      "copper_inventory_strategy", "lithium_warehouse_strategy",
+
     ]));
     expect(first.playbook_items).toEqual([]);
     const second = await queryDailyPlanStrategyContext(pool, { date: "2026-09-17" });
     expect(second.strategy_coverage.reused_evaluations).toBeGreaterThanOrEqual(1);
     expect((await pool.query(
       "SELECT count(*)::int AS count FROM strategy_evaluation_run WHERE target_date='2026-09-17'",
-    )).rows[0]!.count).toBeGreaterThanOrEqual(5);
+    )).rows[0]!.count).toBeGreaterThanOrEqual(2);
   });
 
   it("持仓自动调用兜底策略并生成可原样写入的结构化预案", async () => {
