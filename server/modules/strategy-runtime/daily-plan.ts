@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { queryDailyPlanContext } from "../plans/daily-context.js";
+import { replaceDraftPlaybook, type PlaybookItemInput } from "../plans/repo.js";
 import { listPositions } from "../positions/repo.js";
 import { mergeExitEvaluations } from "./exit-evaluators.js";
 import { reconcileStrategyAttention, type StrategyAttentionChange } from "./attention.js";
@@ -22,6 +23,12 @@ function positionItems(evaluation: EvaluationRecord | undefined): StrategyPositi
   return Array.isArray(items) ? items as StrategyPositionEvaluation[] : [];
 }
 
+function gapsForPosition(evaluation: EvaluationRecord | undefined, code: string): unknown[] {
+  return (evaluation?.ensured.run.gaps ?? []).filter((gap) =>
+    !gap || typeof gap !== "object" || Array.isArray(gap)
+      || !("code" in gap) || (gap as { code?: unknown }).code === code);
+}
+
 function evaluationGap(evaluation: EvaluationRecord): Record<string, unknown> | null {
   if (evaluation.ensured.execution === "waiting") return {
     strategy_code: evaluation.strategy.code, phase: evaluation.phase, reason: "评估运行中，等待完成",
@@ -33,31 +40,6 @@ function evaluationGap(evaluation: EvaluationRecord): Record<string, unknown> | 
   return null;
 }
 
-function observationItems(evaluation: EvaluationRecord | undefined) {
-  const signals = resultRecord(evaluation?.ensured.result).signals;
-  if (!Array.isArray(signals)) return [];
-  return signals.slice(0, 4).map((raw, index) => {
-    const item = resultRecord(raw);
-    const grade = item.signal_grade === "A" ? "A" : "B";
-    return {
-      item_kind: "off_pool_opportunity" as const,
-      code: String(item.code),
-      grade,
-      priority: index + 1,
-      action: "observe" as const,
-      trigger_kind: "condition" as const,
-      headline: `${String(item.name ?? item.code)}｜${String(item.signal_grade ?? grade)} 打板观察`,
-      evidence_md: `抱团分 ${String(item.cluster_score ?? "—")}；主升分 ${String(item.momentum_score ?? "—")}；抱团名次 ${String(item.cluster_rank ?? "—")}；主升名次 ${String(item.momentum_rank ?? "—")}`,
-      strategy_code: evaluation!.strategy.code,
-      strategy_runtime_version: evaluation!.strategy.runtime_version,
-      primary_evaluation_run_id: evaluation!.ensured.run.id,
-      effective_action: "observe" as const,
-      evaluation_status: evaluation!.ensured.run.status,
-      evaluation_data_date: evaluation!.ensured.run.data_date,
-      evaluation_missing: evaluation!.ensured.run.gaps,
-    };
-  });
-}
 
 export async function queryDailyPlanStrategyContext(
   pool: pg.Pool,
@@ -87,11 +69,6 @@ export async function queryDailyPlanStrategyContext(
   const add = (strategy: StrategyRuntimeDefinition, phase: "entry" | "exit" | "context") =>
     requests.set(`${strategy.code}:${phase}`, { strategy, phase });
 
-  for (const strategy of definitions) {
-    if (strategy.status === "active" && strategy.allow_new_entry && strategy.daily_plan_scope.includes("entry")) add(strategy, "entry");
-    if (strategy.status === "active" && strategy.daily_plan_scope.includes("observe")) add(strategy, "entry");
-    if (strategy.status === "active" && strategy.daily_plan_scope.includes("context")) add(strategy, "context");
-  }
   const gaps: Record<string, unknown>[] = [];
   for (const position of positions) {
     if (!position.strategy_code) {
@@ -111,7 +88,8 @@ export async function queryDailyPlanStrategyContext(
     }
   }
 
-  const evaluations = await Promise.all([...requests.values()].map(async ({ strategy, phase }): Promise<EvaluationRecord> => ({
+  const requested = [...requests.values()];
+  const settled = await Promise.allSettled(requested.map(async ({ strategy, phase }): Promise<EvaluationRecord> => ({
     strategy,
     phase,
     ensured: await ensureStrategyEvaluation(pool, {
@@ -121,6 +99,12 @@ export async function queryDailyPlanStrategyContext(
       requested_by_job_run_id: input.requested_by_job_run_id ?? null,
     }),
   })));
+  const evaluations = settled.flatMap((result, index) => {
+    if (result.status === "fulfilled") return [result.value];
+    gaps.push({ strategy_code: requested[index]!.strategy.code, phase: requested[index]!.phase,
+      reason: "策略评估不可用；对应持仓仅展示为待复核" });
+    return [];
+  });
   const evaluationByKey = new Map(evaluations.map((evaluation) => [`${evaluation.strategy.code}:${evaluation.phase}`, evaluation]));
   for (const evaluation of evaluations) {
     const gap = evaluationGap(evaluation);
@@ -138,14 +122,14 @@ export async function queryDailyPlanStrategyContext(
   }
 
   const positionEvaluations = positions.map((position) => {
-    if (!position.strategy_code) return {
-      code: position.code, name: position.name, strategy_code: null, strategy_name: null,
+    if (!position.strategy_code || !byCode.has(position.strategy_code)) return {
+      code: position.code, name: position.name, strategy_code: position.strategy_code, strategy_name: null,
       exit_policy_mode: null, primary: null, fallback: null,
       effective_action: "observe" as const, effective_source: "none" as const,
-      effective_reason: "持仓待归因，无法选择出场策略",
+      effective_reason: "持仓策略未归因或不可用，无法选择出场策略",
       primary_evaluation_run_id: null, fallback_evaluation_run_id: null,
       evaluation_status: "partial" as const, data_date: legacyContext.market.data_date,
-      missing_items: ["持仓待归因"], strategy_runtime_version: null,
+      missing_items: ["持仓策略未归因或不可用"], strategy_runtime_version: null,
     };
     const strategy = byCode.get(position.strategy_code)!;
     const primaryRun = strategy.exit_evaluator_code ? evaluationByKey.get(`${strategy.code}:exit`) : undefined;
@@ -155,15 +139,27 @@ export async function queryDailyPlanStrategyContext(
     const fallback = positionItems(fallbackRun).find((item) => item.code === position.code) ?? null;
     const merged = mergeExitEvaluations(position.strategy_code, position.exit_policy_mode ?? strategy.exit_policy_mode, primary, fallback);
     const missingItems = [
+      ...(strategy.exit_evaluator_code && !primaryRun ? ["主策略退出评估不可用"] : []),
+      ...(position.fallback_strategy_code && !fallbackRun ? ["兜底退出评估不可用"] : []),
+      ...(strategy.exit_evaluator_code && primaryRun && !primary ? ["主策略未返回该持仓评估"] : []),
+      ...(position.fallback_strategy_code && fallbackRun && !fallback ? ["兜底策略未返回该持仓评估"] : []),
       ...(primary?.missing_items ?? []), ...(fallback?.missing_items ?? []),
-      ...(primaryRun?.ensured.run.gaps ?? []), ...(fallbackRun?.ensured.run.gaps ?? []),
+      ...gapsForPosition(primaryRun, position.code), ...gapsForPosition(fallbackRun, position.code),
     ];
+    const incomplete = Boolean(missingItems.length) || [primaryRun, fallbackRun]
+      .some((run) => run && ["failed", "running", "queued"].includes(run.ensured.run.status));
     const evaluationStatus = primaryRun?.ensured.execution === "waiting" || fallbackRun?.ensured.execution === "waiting"
-      ? "waiting" as const
-      : primaryRun?.ensured.run.status === "partial" || fallbackRun?.ensured.run.status === "partial" || missingItems.length
-        ? "partial" as const : "success" as const;
+      ? "waiting" as const : incomplete ? "partial" as const : "success" as const;
+    const uncertain = evaluationStatus !== "success" && ["hold", "observe"].includes(merged.effective_action);
     return {
       ...merged,
+      code: position.code,
+      name: position.name,
+      ...(uncertain ? {
+        effective_action: "observe" as const,
+        effective_source: "none" as const,
+        effective_reason: "退出评估不完整，不能判断继续持有；需人工复核",
+      } : {}),
       strategy_name: strategy.name,
       strategy_runtime_version: position.strategy_runtime_version ?? strategy.runtime_version,
       primary_evaluation_run_id: primaryRun?.ensured.run.id ?? null,
@@ -174,16 +170,17 @@ export async function queryDailyPlanStrategyContext(
     };
   });
 
-  const observation = evaluationByKey.get("limit_up:entry");
-  const playbookItems = [
-    ...positionEvaluations.map((item) => {
+  const playbookItems: PlaybookItemInput[] = [
+    ...positionEvaluations.map((item): PlaybookItemInput => {
       const effective = item.effective_source === "primary" ? item.primary : item.effective_source === "fallback" ? item.fallback : null;
+      const triggerKind: PlaybookItemInput["trigger_kind"] =
+        effective?.trigger_kind === "open" || effective?.trigger_kind === "price_range"
+          ? effective.trigger_kind : "condition";
       return {
         item_kind: "position_action" as const,
         code: item.code,
         action: item.effective_action,
-        trigger_kind: (effective?.trigger_kind === "open" || effective?.trigger_kind === "price_range")
-          ? effective.trigger_kind : "condition" as const,
+        trigger_kind: triggerKind,
         ...(effective?.trigger_price_lower !== null && effective?.trigger_price_lower !== undefined
           ? { price_lower: effective.trigger_price_lower } : {}),
         ...(effective?.trigger_price_upper !== null && effective?.trigger_price_upper !== undefined
@@ -203,8 +200,11 @@ export async function queryDailyPlanStrategyContext(
         evaluation_missing: item.missing_items.map((value) => typeof value === "string" ? value : JSON.stringify(value)),
       };
     }),
-    ...observationItems(observation),
   ];
+
+  const playbookWrite = input.requested_by_job_run_id
+    ? await replaceDraftPlaybook(pool, { source_job_run_id: input.requested_by_job_run_id, items: playbookItems })
+    : null;
 
   const requiredDocuments = new Set<string>(["daily_plan_strategy"]);
   const portfolioDocuments = await pool.query<{ code: string }>(
@@ -212,10 +212,6 @@ export async function queryDailyPlanStrategyContext(
   );
   for (const document of portfolioDocuments.rows) requiredDocuments.add(document.code);
   for (const evaluation of evaluations) requiredDocuments.add(evaluation.strategy.strategy_document_code);
-  for (const attention of activeAttentions.rows) {
-    const strategy = byCode.get(attention.strategy_code);
-    if (strategy) requiredDocuments.add(strategy.strategy_document_code);
-  }
   const waitingCount = evaluations.filter((item) => item.ensured.execution === "waiting").length;
   const status = gaps.length || legacyContext.status !== "success" || waitingCount ? "partial" as const : "success" as const;
   return {
@@ -248,6 +244,7 @@ export async function queryDailyPlanStrategyContext(
     active_attentions: activeAttentions.rows,
     attention_changes: attentionChanges,
     playbook_items: playbookItems,
+    playbook_write: playbookWrite,
     gaps: [...legacyContext.gaps, ...gaps],
   };
 }

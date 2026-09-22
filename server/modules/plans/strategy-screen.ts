@@ -53,6 +53,8 @@ export interface StrategyScreenResult {
   rules: StrategyScreenRule[];
   code_count: number;
   status: "success" | "partial";
+  completed_count: number;
+  skipped_count: number;
   notice: string;
   instruction: string;
   items: StrategyScreenResultItem[];
@@ -261,11 +263,14 @@ export async function queryStrategyScreen(
     };
   });
 
+  const completedCount = items.filter((item) => item.rules.every((rule) => rule.status === "evaluated")).length;
   return {
     requested_date: request.date,
     rules,
     code_count: codes.length,
-    status: dataGaps.length === 0 ? "success" : "partial",
+    completed_count: completedCount,
+    skipped_count: codes.length - completedCount,
+    status: completedCount > 0 ? "success" : "partial",
     notice:
       "参考口径：逐只条件布尔与证据，不产生 signal_grade，不做“右侧>左侧>试盘”唯一信号合并，也不评估大盘环境门禁；正式口径经 pool_onboard 入池后由每日计划产出。",
     instruction:

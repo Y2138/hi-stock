@@ -35,12 +35,15 @@ import {
   STOCK_CHARACTER_CALCULATION_VERSION,
 } from "../../server/indicators/formulas.js";
 import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
+import { repairInvalidForwardOhlc } from "../../server/datasource/forward-ohlc-repair.js";
 import { buildOnDemandBars } from "../../server/modules/market/routes.js";
 import { queryMarketStructure } from "../../server/modules/market/structure.js";
 import {
   buildLimitUpFeatureRows,
   empiricalMidrank,
   scoreLimitUpFeatureRows,
+  queryLimitUpSignals,
+  limitUpBenchmarkSha,
   type LimitUpBenchmark,
 } from "../../server/modules/market/limit-up-signals.js";
 import indicatorFixture from "../fixtures/指标金样本.json";
@@ -126,6 +129,44 @@ describe("打板固定基准评分", () => {
     expect(candidates.find((item) => item.code === "600003.SH")).toMatchObject({
       cluster_rank: 3, momentum_rank: 3, signal_grade: null,
     });
+  });
+
+  it("单只停牌股缺基准日K线只剔除该股，不传染同题材或使全任务部分完成", async () => {
+    const tradingDates = Array.from({ length: 22 }, (_, index) =>
+      new Date(Date.UTC(2026, 7, index + 1)).toISOString().slice(0, 10));
+    const target = tradingDates.at(-1)!;
+    const events = tradingDates.flatMap((date) => ["600001.SH", "600002.SH"].map((code) => ({
+      date, event_type: "up" as const, code, name: code, streak_count: 1,
+      open_count: 0, first_event_time: `${date}T01:30:00Z`, reason: "机器人",
+      is_st: false, is_new: false, seal_money: 100, max_seal_money: 100, turnover: 100,
+    })));
+    const bars = tradingDates.flatMap((date, index) => ["600001.SH", "600002.SH"]
+      .filter((code) => !(code === "600002.SH" && index === tradingDates.length - 7))
+      .map((code) => ({ date, code, open: 10, close: 10 + index / 10, turnover: 100 })));
+    const distributions = Object.fromEntries([
+      "theme_share", "theme_max_streak", "theme_tier_count", "market_hhi",
+      "market_limit_up_count", "theme_turnover_log", "seal_turnover_ratio", "seal_minutes",
+      "theme_pre5_return", "theme_width", "stock_pre5_return",
+    ].map((key) => [key, [0, 1]])) as LimitUpBenchmark["distributions"];
+    const payload: Omit<LimitUpBenchmark, "sha256"> = {
+      code: "test", document_id: "1", training_start: "2025-01-01", training_end: "2025-06-30",
+      methodology: "test", distributions, sample_counts: {}, source_summary: {},
+    };
+    const benchmark = { ...payload, sha256: limitUpBenchmarkSha(payload) };
+    const db = { query: async (sql: string) => {
+      if (sql.includes("FROM strategy_document document")) return { rows: [{ id: "1" }] };
+      if (sql.includes("FROM strategy_score_benchmark benchmark")) return { rows: [{ ...benchmark, benchmark_code: benchmark.code }] };
+      if (sql.includes("FROM market_limit_event event")) return { rows: events };
+      if (sql.includes("FROM market_bar bar JOIN market_instrument")) return { rows: bars };
+      if (sql.includes("FROM market_trading_day")) return { rows: tradingDates.map((date) => ({ date })) };
+      if (sql.includes("FROM strategy_entry_signal signal")) return { rows: [] };
+      throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
+    } } as unknown as Parameters<typeof queryLimitUpSignals>[0];
+    const result = await queryLimitUpSignals(db, target);
+    expect(result).toMatchObject({ status: "success", candidate_count: 1, skipped_count: 1, gaps: [] });
+    expect(result.skipped).toEqual([{ code: "600002.SH", missing_inputs: ["stock_pre5_return"] }]);
+    expect(result.candidates.map((item) => item.code)).toEqual(["600001.SH"]);
+    expect(result.candidates[0]!.features.theme_pre5_return).not.toBeNull();
   });
 
   it("09:25一字板按0分钟处理，近5日持续性不把T日自身计入且名称可兜底排除ST", () => {
@@ -1877,6 +1918,32 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       "SELECT count(*) FROM market_indicator_dirty WHERE instrument_id = $1 AND freq = 'day'",
       [wideInstrumentId],
     )).rows[0]!.count)).toBe(0);
+  });
+
+  it("按公司行为修复负前复权比率导致的倒置 OHLC，不更改收盘价或原始价", async () => {
+    const code = "600488.SH";
+    const instrumentId = await ensureInstrument(pool, code, "复权修复样本", "day");
+    await pool.query(
+      `INSERT INTO market_bar
+         (instrument_id,freq,bar_date,bar_time,open,high,low,close,
+          open_raw,high_raw,low_raw,close_raw,adjustment,channel)
+       VALUES ($1,'day','2020-01-02','2020-01-02T00:00:00Z',-1,-1.04,-0.96,-1,
+               5,5.2,4.8,5,'forward','hithink_dump'),
+              ($1,'day','2026-01-02','2026-01-02T00:00:00Z',10,10.2,9.8,10,
+               10,10.2,9.8,10,'forward','hithink_dump')`,
+      [instrumentId],
+    );
+    const events = [{ ex_date: "2024-01-02", dividend: 6, bonus: 0, rights_ratio: 0, rights_price: 0 }];
+    await expect(repairInvalidForwardOhlc(pool, [{ code, events: [] }])).rejects.toThrow("不完整");
+    expect(await repairInvalidForwardOhlc(pool, [{ code, events }])).toEqual([{ code, repaired: 1 }]);
+    expect((await pool.query(
+      `SELECT open::float8,high::float8,low::float8,close::float8,high_raw::float8
+         FROM market_bar WHERE instrument_id=$1 AND bar_date='2020-01-02'`, [instrumentId],
+    )).rows[0]).toEqual({ open: -1, high: -0.8, low: -1.2, close: -1, high_raw: 5.2 });
+    expect((await pool.query(
+      "SELECT reason FROM market_indicator_dirty WHERE instrument_id=$1 AND freq='day'", [instrumentId],
+    )).rows[0]).toEqual({ reason: "前复权 OHLC 修复" });
+    expect(await repairInvalidForwardOhlc(pool, [{ code, events }])).toEqual([{ code, repaired: 0 }]);
   });
 
   it("历史零价日线标为不可信且不阻塞指标队列", async () => {

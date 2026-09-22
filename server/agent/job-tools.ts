@@ -1,7 +1,7 @@
 // 结构化计划工具属于所有持久化 Agent 会话的共享目录；关联任务运行由会话自动解析。
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
-import { WATCH_POOL, setPoolAttentionEntry } from "../modules/pools/repo.js";
+import { ensureStrategyPoolMemberProfile, WATCH_POOL, setPoolAttentionEntry } from "../modules/pools/repo.js";
 import { replaceDraftAuctionAssessments, replaceDraftPlaybook } from "../modules/plans/repo.js";
 import { withAgentMutationLock } from "./mutation-lock.js";
 import { insertToolAudit } from "./repo.js";
@@ -70,7 +70,7 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
     name: "pool_attention_write",
     label: "批量维护关注池自动关注",
     description:
-      "一次提交本轮应保留的全部自动关注并在同一事务按策略来源对账。items 中的 mark 是本任务来源的完整保留集合，遗漏的本策略历史关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧本来源关注；其他策略来源与人工关注互不影响、不得覆盖。只维护已在关注池中的标的，不得新增标的、改变角色或研究属性。qualified 表示信号已成立，不得有缺失条件；approaching 必须在 missing_signals 中逐项列出尚未成立的信号和次日确认标准（包含策略名称与实际阈值，只使用查询证据，不得臆造）。不同策略来源的关注在页面并列展示，不合成统一质量分。",
+      "一次提交本轮应保留的全部自动关注并在同一事务按策略来源对账。items 中的 mark 是本任务来源的完整保留集合，遗漏的本策略历史关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧本来源关注；其他策略来源与人工关注互不影响、不得覆盖。夜间板块任务可将板块内个股观察信号自动初始化到关注池，前提是已有完整五维画像；其他任务仍只维护已有关注池成员。qualified 表示信号已成立，不得有缺失条件；approaching 必须在 missing_signals 中逐项列出尚未成立的信号和次日确认标准（包含策略名称与实际阈值，只使用查询证据，不得臆造）。不同策略来源的关注在页面并列展示，不合成统一质量分。",
     parameters: ScheduledPoolAttentionSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {
@@ -107,6 +107,19 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
                 WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL`,
               [item.code, WATCH_POOL],
             );
+            if (!membership.rows[0] && item.action === "mark" && !held && jobCode === "nightly_sector_opportunity_scan") {
+              await ensureStrategyPoolMemberProfile(client, {
+                code: item.code,
+                effective_from: item.attention_from!,
+                strategy_name: "夜间板块结构观察",
+              });
+              membership.rows = (await client.query<{ id: string }>(
+                `SELECT membership.id::text FROM pool_membership membership
+                   JOIN market_instrument instrument ON instrument.id = membership.instrument_id
+                  WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL`,
+                [item.code, WATCH_POOL],
+              )).rows;
+            }
             if (!membership.rows[0]) {
               throw new Error(`标的 ${item.code} 不在关注池中，自动作业不得绕过完整入池评估`);
             }

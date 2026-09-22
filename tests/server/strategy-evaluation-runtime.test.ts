@@ -2,10 +2,30 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type pg from "pg";
 import { runMigrations } from "../../server/db/migrate.js";
 import { reconcileStrategyAttention } from "../../server/modules/strategy-runtime/attention.js";
-import { ensureStrategyEvaluation } from "../../server/modules/strategy-runtime/service.js";
+import { describeEntryMissingSignals, ensureStrategyEvaluation } from "../../server/modules/strategy-runtime/service.js";
 import { prepareTestDb, resetSchema } from "./helpers.js";
 
 const prepared = await prepareTestDb();
+
+
+it("接近候选缺口包含当前值和目标值", () => {
+  expect(describeEntryMissingSignals("swing", {
+    failed_conditions: ["rsi_oversold"], evidence: { rsi14: 42.823 },
+  }, "approaching")).toEqual(["RSI14：当前 42.82，目标 < 40.00"]);
+  expect(describeEntryMissingSignals("two_year_reversal", {
+    missing_conditions: ["个股5日跌幅未达8%", "相对行业5日额外落后未达5个百分点"],
+    stock_return_5: -0.0671, relative_return_5: -0.0438,
+  }, "approaching")).toEqual([
+    "个股5日收益：当前 -6.7%，目标 ≤ -8.0%",
+    "相对行业5日收益：当前 -4.4%，目标 ≤ -5.0%",
+  ]);
+  expect(describeEntryMissingSignals("copper_left_launch", {
+    failed_conditions: ["low_within_30_days"], evidence: { low_age: 45 },
+  }, "approaching")).toEqual(["近60日低点距今：当前 45 个交易日，目标 ≤ 30 个交易日"]);
+  expect(describeEntryMissingSignals("value_anchor", {
+    failed_conditions: ["below_ma250"], ma250_deviation: -0.082,
+  }, "approaching")).toEqual(["相对MA250偏离：当前 -8.2%，目标 ≤ -10.0%"]);
+});
 
 describe.skipIf(!prepared)("策略评估运行幂等复用", () => {
   let pool: pg.Pool;

@@ -3,7 +3,7 @@ import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../server/db/migrate.js";
 import { executeAnalysis } from "../../server/analysis/service.js";
-import { listValueCandidates, queryValueRank } from "../../server/modules/value-ranking/service.js";
+import { generateValueMonthlyRank, listValueCandidates, queryValueRank } from "../../server/modules/value-ranking/service.js";
 import { queryValueAnchorSignals } from "../../server/modules/plans/value-anchor-signal.js";
 import { prepareTestDb, resetSchema } from "./helpers";
 
@@ -18,6 +18,37 @@ interface SectorItem {
 function resultSectors(row: { result_json: unknown }): SectorItem[] {
   return (row.result_json as { sectors: SectorItem[] }).sectors;
 }
+
+describe("月度价值排名批量缺数隔离", () => {
+  it("十只正式候选中一只缺数据仍完成其余九只排名", async () => {
+    const candidates = Array.from({ length: 10 }, (_, index) => ({
+      id: String(index + 1), code: `6000${String(index).padStart(2, "0")}.SH`, name: `候选${index}`,
+      industry_code: "881145.TI", industry_name: "电力", in_value: true, in_csi300: true,
+      median_turnover_60: 200_000_000, turnover_count_60: 60,
+    }));
+    const rows = candidates.map((candidate, index) => ({
+      id: candidate.id, code: candidate.code, name: candidate.name,
+      bar_date: index === 9 ? "2026-01-30" : "2026-02-02", close: 10,
+      fundamental_date: "2025-12-31", net_profit: 100, operating_cashflow: 100,
+      roe: 12, debt_ratio: 40, previous_net_profit: 90,
+      valuation_date: "2026-02-02", pe_ttm: 10, pb: 1, ps_ttm: 2,
+      latest_ex_date: "2025-06-01", dividend_ttm: 0.5, dividend_years_3y: 3,
+    }));
+    let persisted = 0;
+    const db = { query: async (sql: string) => {
+      if (sql.includes("WITH value_members AS")) return { rows: candidates };
+      if (sql.includes("COALESCE(close_raw,close) AS close")) return { rows };
+      if (sql.includes("SELECT trade_date::text AS date FROM market_trading_day")) return { rows: [{ date: "2026-02-03" }] };
+      if (sql.includes("INSERT INTO value_rank_snapshot")) { persisted++; return { rowCount: 1, rows: [] }; }
+      throw new Error(`unexpected query: ${sql.slice(0, 100)}`);
+    } } as unknown as Parameters<typeof generateValueMonthlyRank>[0];
+    const result = await generateValueMonthlyRank(db, "1", "2026-02-02");
+    expect(result.gaps).toEqual([]);
+    expect(result.result).toMatchObject({ eligible_count: 9, skipped: [expect.objectContaining({ code: candidates[9]!.code })] });
+    expect(result.result.top50).toHaveLength(9);
+    expect(persisted).toBe(10); // 保留异常行的审计快照，但不参与排序。
+  });
+});
 
 describe.skipIf(!prepared)("板块温度同花顺口径", () => {
   let pool: pg.Pool;
@@ -94,7 +125,10 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
     expect(result.available_average_temperature).toBe(75);
     expect(result.state).toBe("数据不足");
     expect(result.market_regime).toMatchObject({ status: "partial", state: null });
-    expect(row.data_gaps).toEqual([{ code: "881103.TI", reason: "日线不足 20 条（5）" }]);
+    expect(row.data_gaps).toEqual(expect.arrayContaining([
+      { code: "881103.TI", reason: "日线不足 20 条（5）" },
+      expect.objectContaining({ scope: "market_regime" }),
+    ]));
   });
 
   it("显式 codes 可下钻 884 或旧指数，名称取自 market_instrument", async () => {
@@ -131,6 +165,65 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
       `UPDATE market_board SET active = true WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = '881103.TI')`,
     );
   });
+  it("单个一级行业缺日线只跳过该行业，九成覆盖仍输出可用市场状态", async () => {
+    const codes = Array.from({ length: 7 }, (_, i) => `88111${i}.TI`);
+    try {
+      await pool.query(`INSERT INTO market_instrument(code,name,kind)
+        SELECT code,code,'board' FROM unnest($1::text[]) code`, [codes]);
+      await pool.query(`INSERT INTO market_board(instrument_id,board_type,source,active)
+        SELECT id,'industry','hithink',true FROM market_instrument WHERE code=ANY($1::text[])`, [codes]);
+      await pool.query(`INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,channel)
+        SELECT instrument.id,'day',date '2026-01-01'+n,
+               (date '2026-01-01'+n)::timestamp AT TIME ZONE 'UTC',10,11,9,10+n*0.1,1000,'test'
+          FROM market_instrument instrument CROSS JOIN generate_series(0,29) n
+         WHERE instrument.code=ANY($1::text[])`, [codes]);
+      const row = await executeAnalysis(pool, { analysis_type: "sector_temperature" });
+      expect(row.status).toBe("success");
+      expect(row.data_gaps).toEqual([]);
+      expect(row.result_json).toMatchObject({
+        market_regime: { status: "success", coverage: { expected_boards: 10, available_boards: 9 } },
+        skipped: [expect.objectContaining({ code: "881103.TI" })],
+      });
+    } finally {
+      await pool.query("DELETE FROM market_board WHERE instrument_id IN (SELECT id FROM market_instrument WHERE code=ANY($1::text[]))", [codes]);
+      await pool.query("DELETE FROM market_bar WHERE instrument_id IN (SELECT id FROM market_instrument WHERE code=ANY($1::text[]))", [codes]);
+      await pool.query("DELETE FROM market_instrument WHERE code=ANY($1::text[])", [codes]);
+    }
+  });
+
+  it("关键位和估值批量分析只跳过异常标的，保留其他完整结果", async () => {
+    const levels = await executeAnalysis(pool, {
+      analysis_type: "key_levels", as_of: "2026-01-30", codes: ["881101.TI", "881103.TI"],
+    });
+    expect(levels.status).toBe("success");
+    expect(levels.result_json).toMatchObject({
+      items: [expect.objectContaining({ code: "881101.TI" })],
+      skipped: [expect.objectContaining({ code: "881103.TI" })],
+      warnings: [expect.objectContaining({ code: "881101.TI" })],
+    });
+    const codes = ["600901.SH", "600902.SH"];
+    try {
+      await pool.query(`INSERT INTO market_instrument(code,name,kind)
+        SELECT code,code,'stock' FROM unnest($1::text[]) code`, [codes]);
+      await pool.query(`INSERT INTO valuation_snapshot(instrument_id,as_of_date,pe_ttm,pb,source)
+        SELECT id,'2026-01-30',10,1,'test' FROM market_instrument WHERE code=$1`, [codes[0]]);
+      await pool.query(`INSERT INTO fundamental_snapshot(instrument_id,as_of_date,report_period,net_profit,source)
+        SELECT id,'2026-01-30','2025-12-31',100,'test' FROM market_instrument WHERE code=$1`, [codes[0]]);
+      const value = await executeAnalysis(pool, {
+        analysis_type: "long_valuation", as_of: "2026-01-30", codes,
+      });
+      expect(value.status).toBe("success");
+      expect(value.result_json).toMatchObject({
+        items: [expect.objectContaining({ code: codes[0] })],
+        skipped: [expect.objectContaining({ code: codes[1] })],
+      });
+    } finally {
+      await pool.query("DELETE FROM valuation_snapshot WHERE instrument_id IN (SELECT id FROM market_instrument WHERE code=ANY($1::text[]))", [codes]);
+      await pool.query("DELETE FROM fundamental_snapshot WHERE instrument_id IN (SELECT id FROM market_instrument WHERE code=ANY($1::text[]))", [codes]);
+      await pool.query("DELETE FROM market_instrument WHERE code=ANY($1::text[])", [codes]);
+    }
+  });
+
   it("价值排名缺交易日历时拒绝激活，候选以行业与沪深300并集且保留流动性资格", async () => {
     const missingCalendar = await executeAnalysis(pool, { analysis_type: "value_monthly_rank", as_of: "2026-01-29" });
     expect(missingCalendar.status).toBe("partial");
@@ -199,8 +292,10 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
       SELECT id,'2026-02-02'::timestamptz,'2025-06-01','success' FROM market_instrument WHERE code='600001.SH'`);
     const scan = await queryValueAnchorSignals(pool, "2026-02-02");
     expect(scan.qualified).toEqual([]);
-    expect(scan.status).toBe("partial"); // 无公司行动同步状态的大盘股仅报告缺口，不误发信号。
-    expect(scan.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ code: "600002.SH" })]));
+    expect(scan.status).toBe("success"); // 无公司行动同步状态的个股被跳过，不拖累完整候选。
+    expect(scan.gaps).toEqual([]);
+    expect(scan).toMatchObject({ completed_count: 1, skipped_count: 1,
+      skipped: [expect.objectContaining({ code: "600002.SH" })] });
     await pool.query("DELETE FROM market_trading_day WHERE trade_date > '2026-02-02'");
     const missingReviewDate = await queryValueAnchorSignals(pool, "2026-02-02");
     expect(missingReviewDate.status).toBe("partial");

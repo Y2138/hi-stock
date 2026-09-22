@@ -94,7 +94,18 @@ export interface LimitUpSignalResult {
   status: "success" | "partial" | "unavailable";
   gaps: string[];
   candidate_count: number;
+  skipped_count: number;
+  skipped: Array<{ code: string; missing_inputs: string[] }>;
   signal_count: number;
+  intraday_review_count: number;
+  intraday_reviews: Array<{
+    code: string;
+    name: string;
+    intraday_streak_count: number | null;
+    intraday_route: string | null;
+    close_status: "confirmed_signal" | "sealed_not_selected" | "not_sealed";
+    close_signal_grade: LimitUpSignalCandidate["signal_grade"];
+  }>;
   signals: LimitUpSignalCandidate[];
   candidates: LimitUpSignalCandidate[];
 }
@@ -372,10 +383,10 @@ export function buildLimitUpFeatureRows(input: {
         const previousMembers = (previousContext.themes.get(mainTheme)?.members ?? [])
           .filter((member) => member.event.is_new === false);
         const ratios = [
-          weightedRatio(previousMembers.map((member) => {
+          weightedRatio(previousMembers.flatMap((member) => {
             const currentBar = maps.byKey.get(`${member.event.code}:${date}`);
             const priorBar = maps.byKey.get(`${member.event.code}:${priorDate}`);
-            return { weight: member.weight, hit: Boolean(currentBar && priorBar && currentBar.open < priorBar.close) };
+            return currentBar && priorBar ? [{ weight: member.weight, hit: currentBar.open < priorBar.close }] : [];
           })),
           weightedRatio(previousMembers.map((member) => ({ weight: member.weight, hit: currentSets?.down.has(member.event.code) ?? false }))),
           weightedRatio(previousMembers.map((member) => ({ weight: member.weight, hit: currentSets?.break.has(member.event.code) ?? false }))),
@@ -409,9 +420,10 @@ export function buildLimitUpFeatureRows(input: {
         first_board_share: firstBoardShare,
         core_position: theme.maxStreak > 0 ? clamp01(event.streak_count / theme.maxStreak) : null,
       };
-      if (turnovers.length < theme.members.length) missingInputs.push("theme_turnover_log");
-      if (themePreReturns.length < theme.members.length) missingInputs.push("theme_pre5_return");
-      if (ma20Values.length < theme.members.length) missingInputs.push("above_ma20");
+      // 板块聚合只使用有效成员；停牌成员不得把其他成员的完整数据标为缺失。
+      if (!turnovers.length) missingInputs.push("theme_turnover_log");
+      if (!themePreReturns.length) missingInputs.push("theme_pre5_return");
+      if (!ma20Values.length) missingInputs.push("above_ma20");
       if (stockReturn === null) missingInputs.push("stock_pre5_return");
       if (persistence === null) missingInputs.push("persistence_5d");
       if (priorDate && !previousContext) missingInputs.push("promotion_rate", "negative_feedback");
@@ -620,7 +632,11 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
       status: "unavailable",
       gaps: ["当前打板策略未发布"],
       candidate_count: 0,
+      skipped_count: 0,
+      skipped: [],
       signal_count: 0,
+      intraday_review_count: 0,
+      intraday_reviews: [],
       signals: [],
       candidates: [],
     };
@@ -656,7 +672,11 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
       status: "unavailable",
       gaps: ["当前打板策略没有可用的评分基准"],
       candidate_count: 0,
+      skipped_count: 0,
+      skipped: [],
       signal_count: 0,
+      intraday_review_count: 0,
+      intraday_reviews: [],
       signals: [],
       candidates: [],
     };
@@ -710,9 +730,39 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
     ? calendar.rows.map((row) => row.date)
     : [...new Set(bars.rows.map((bar) => bar.date))].sort();
   const featureRows = buildLimitUpFeatureRows({ events: events.rows, bars: bars.rows, tradingDates, targetDates: [date] });
-  const candidates = scoreLimitUpFeatureRows(featureRows, benchmark);
-  const gaps = [...new Set(candidates.flatMap((candidate) => candidate.missing_inputs))];
+  const skipped = featureRows.filter((row) => row.missingInputs.length > 0)
+    .map((row) => ({ code: row.event.code, missing_inputs: [...new Set(row.missingInputs)] }));
+  // 异常标的不能用 0.5 中性排名混进正式信号；只对可完整评估的标的排序。
+  const candidates = scoreLimitUpFeatureRows(featureRows.filter((row) => row.missingInputs.length === 0), benchmark);
+  const gaps = featureRows.length > 0 && !candidates.length ? ["本轮候选均缺少必要评分数据"] : [];
   const signals = candidates.filter((candidate) => candidate.signal_grade !== null).slice(0, 4);
+  const intradayRows = await db.query<{ code: string; name: string; evidence: Record<string, unknown> }>(
+    `SELECT instrument.code,instrument.name,signal.evidence
+       FROM strategy_entry_signal signal
+       JOIN market_instrument instrument ON instrument.id=signal.instrument_id
+      WHERE signal.run_id=(
+        SELECT id FROM strategy_evaluation_run
+         WHERE strategy_code='first_board_advance' AND phase='entry' AND target_date=$1::date
+           AND status IN ('success','partial')
+         ORDER BY created_at DESC,id DESC LIMIT 1
+      ) AND signal.signal_status='qualified'
+      ORDER BY signal.id`,
+    [date],
+  );
+  const closeByCode = new Map(candidates.map((candidate) => [candidate.code, candidate]));
+  const sealedCodes = new Set(events.rows.filter((event) => event.date === date && event.event_type === "up")
+    .map((event) => event.code));
+  const intradayReviews = intradayRows.rows.map((row) => {
+    const close = closeByCode.get(row.code);
+    return {
+      code: row.code, name: row.name,
+      intraday_streak_count: typeof row.evidence.streak_count === "number" ? row.evidence.streak_count : null,
+      intraday_route: typeof row.evidence.route === "string" ? row.evidence.route : null,
+      close_status: !sealedCodes.has(row.code) ? "not_sealed" as const
+        : close?.signal_grade ? "confirmed_signal" as const : "sealed_not_selected" as const,
+      close_signal_grade: close?.signal_grade ?? null,
+    };
+  });
   const { distributions: _distributions, ...publicBenchmark } = benchmark;
   const { sha256: _sha256, ...benchmarkPayload } = benchmark;
   if (limitUpBenchmarkSha(benchmarkPayload) !== benchmark.sha256) gaps.push("评分基准哈希校验失败");
@@ -723,7 +773,11 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
     status: gaps.length ? "partial" : "success",
     gaps,
     candidate_count: candidates.length,
+    skipped_count: skipped.length,
+    skipped,
     signal_count: signals.length,
+    intraday_review_count: intradayReviews.length,
+    intraday_reviews: intradayReviews,
     signals,
     candidates,
   };

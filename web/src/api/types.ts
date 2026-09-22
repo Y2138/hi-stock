@@ -907,16 +907,27 @@ export const TOOL_LABELS: Record<string, string> = {
 export interface NotificationSettings {
   enabled: boolean;
   job_codes: string[] | null;
+  strategy_job_codes: string[] | null;
   jobs: Array<{ code: string; name: string; enabled: boolean }>;
+  strategy_jobs: Array<{ code: string; name: string; enabled: boolean }>;
+  personal_enabled: boolean;
+  personal_webhook_configured: boolean;
+  personal_sign_secret_configured: boolean;
+  strategy_enabled: boolean;
+  strategy_webhook_configured: boolean;
+  strategy_sign_secret_configured: boolean;
   webhook_configured: boolean;
   sign_secret_configured: boolean;
   revision: number;
+  personal_revision: number;
+  strategy_revision: number;
   updated_at: string;
 }
 export interface NotificationDelivery {
   id: string;
   output_id: string | null;
   kind: "daily_plan" | "agent_result" | "test";
+  channel: "personal" | "strategy";
   job_code: string | null;
   job_name: string | null;
   content: string;

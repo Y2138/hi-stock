@@ -183,21 +183,108 @@ function entryItems(strategyCode: string, result: unknown): Array<{ item: JsonRe
     ...records(value.qualified).map((item) => ({ item, status: "qualified" as const })),
     ...records(value.near).map((item) => ({ item, status: "approaching" as const })),
   ];
-  if (strategyCode === "limit_up") return records(value.signals)
+  if (["limit_up", "first_board_advance"].includes(strategyCode)) return records(value.signals)
     .map((item) => ({ item, status: "qualified" as const }));
   return [];
 }
 
-function missingSignals(item: JsonRecord, status: "qualified" | "approaching"): string[] {
+function finiteNumber(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function decimal(value: unknown, digits = 2): string | null {
+  const number = finiteNumber(value);
+  return number === null ? null : number.toFixed(digits);
+}
+
+function percent(value: unknown, digits = 1): string | null {
+  const number = finiteNumber(value);
+  return number === null ? null : `${(number * 100).toFixed(digits)}%`;
+}
+
+/** 关注池缺口统一带当前值和目标值；无法识别的新条件保留评估器原文。 */
+export function describeEntryMissingSignals(
+  strategyCode: string,
+  item: JsonRecord,
+  status: "qualified" | "approaching",
+): string[] {
   if (status === "qualified") return [];
+  let raw: string[] = [];
   for (const key of ["failed_conditions", "missing_conditions", "missing_signals"]) {
     const values = item[key] ?? record(item.evidence)[key];
     if (Array.isArray(values)) {
-      const normalized = values.map(String).filter(Boolean);
-      if (normalized.length) return normalized;
+      raw = values.map(String).filter(Boolean);
+      if (raw.length) break;
     }
   }
-  return ["尚未满足全部策略条件"];
+  if (!raw.length) return ["尚未满足全部策略条件（当前值和目标值待评估器补充）"];
+  const evidence = record(item.evidence);
+  return raw.map((condition) => {
+    if (strategyCode === "swing") {
+      if (condition === "volume_contracted") {
+        const current = decimal(evidence.volume_ratio_5, 3);
+        if (current) return `5日量比：当前 ${current}，目标 < 0.850`;
+      }
+      if (condition === "rsi_oversold") {
+        const current = decimal(evidence.rsi14);
+        if (current) return `RSI14：当前 ${current}，目标 < 40.00`;
+      }
+      if (condition === "reward_risk_acceptable") {
+        const current = decimal(evidence.expected_reward_risk);
+        if (current) return `预期盈亏比：当前 ${current}，目标 ≥ 1.80`;
+      }
+      if (condition === "reversal_candle") {
+        const open = decimal(evidence.open);
+        const close = decimal(evidence.close);
+        const shadow = percent(evidence.lower_shadow_ratio, 2);
+        if (open && close && shadow) return `反转形态：当前开盘/收盘 ${open}/${close}、下影线 ${shadow}，目标 收盘>开盘或下影线>0.50%`;
+      }
+    }
+    if (strategyCode === "two_year_reversal") {
+      if (condition.includes("个股5日跌幅")) {
+        const current = percent(item.stock_return_5);
+        if (current) return `个股5日收益：当前 ${current}，目标 ≤ -8.0%`;
+      }
+      if (condition.includes("相对行业5日额外落后")) {
+        const current = percent(item.relative_return_5);
+        if (current) return `相对行业5日收益：当前 ${current}，目标 ≤ -5.0%`;
+      }
+    }
+    if (strategyCode === "copper_left_launch") {
+      if (condition === "low_within_30_days") {
+        const current = decimal(evidence.low_age, 0);
+        if (current) return `近60日低点距今：当前 ${current} 个交易日，目标 ≤ 30 个交易日`;
+      }
+      if (condition === "rebound_8_to_15") {
+        const current = percent(evidence.rebound_60);
+        if (current) return `较近60日低点反弹：当前 ${current}，目标 8.0%–15.0%`;
+      }
+      if (condition === "drawdown_15_to_40") {
+        const current = percent(evidence.drawdown_252);
+        if (current) return `较近252日高点回撤：当前 ${current}，目标 -40.0%–-15.0%`;
+      }
+      if (condition === "macro_two_of_three") {
+        const current = decimal(record(evidence.macro).ok_count, 0);
+        if (current) return `宏观满足项：当前 ${current}/3，目标 ≥ 2/3`;
+      }
+    }
+    if (strategyCode === "value_anchor") {
+      if (condition === "below_ma250") {
+        const current = percent(item.ma250_deviation);
+        if (current) return `相对MA250偏离：当前 ${current}，目标 ≤ -10.0%`;
+      }
+      if (condition === "drawdown20") {
+        const current = percent(item.drawdown_20);
+        if (current) return `20日回撤：当前 ${current}，目标 > -30.0% 且 ≤ -10.0%`;
+      }
+      if (condition === "decline5") {
+        const current = percent(item.return_5);
+        if (current) return `5日收益：当前 ${current}，目标 ≤ -4.0%`;
+      }
+    }
+    return condition;
+  });
 }
 
 async function persistEntrySignals(
@@ -221,7 +308,7 @@ async function persistEntrySignals(
     const evidence = record(item.evidence);
     const lower = evidence.confirmation_must_exceed ?? item.trigger_price_lower ?? null;
     const upper = evidence.confirmation_price_cap ?? item.trigger_price_upper ?? null;
-    const missing = missingSignals(item, status);
+    const missing = describeEntryMissingSignals(strategyCode, item, status);
     await client.query(
       `INSERT INTO strategy_entry_signal
          (run_id,strategy_code,instrument_id,signal_status,trigger_kind,trigger_price_lower,

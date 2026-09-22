@@ -18,7 +18,13 @@ export const notificationRoutes = {
     return { data: await updateNotificationSettings(pool, body as Record<string, unknown>) };
   },
   async preview({ pool, query }: Ctx) { return { data: await previewJobConclusion(pool, undefined, jobCode(query)) }; },
-  async test({ pool }: Ctx) { return { status: 202, data: await queueTestNotification(pool) }; },
+  async test({ pool, body }: Ctx) {
+    const channel = body && typeof body === "object" && !Array.isArray(body) && (body as Record<string, unknown>).channel !== undefined
+      ? (body as Record<string, unknown>).channel
+      : "personal";
+    if (channel !== "personal" && channel !== "strategy") throw apiErrors.badRequest("通知通道不合法");
+    return { status: 202, data: await queueTestNotification(pool, channel) };
+  },
   async list({ pool, query }: Ctx) {
     const status = query.get("status") ?? undefined;
     if (status !== undefined && !["pending", "sending", "sent", "failed", "cancelled"].includes(status)) throw apiErrors.badRequest("通知状态不合法");

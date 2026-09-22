@@ -248,7 +248,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "auction_context_query",
       label: "查询集合竞价任务上下文",
       description:
-        "按目标日一次返回交易日门禁、前一开市日、最新每日计划有效性，以及全部持仓、有效近期关注、打板候选、候选代码、覆盖计数和逐项缺口。集合竞价任务只用本工具取得候选全集，不得调用完整标的池、每日计划扫描或通用数据库工具重复拼装。",
+        "按目标日一次返回交易日门禁、前一开市日、最新每日计划持仓有效性、前一开市日独立收盘打板任务有效性，以及全部持仓、有效近期关注、收盘涨停接力候选、前一日盘中涨停梯队先手候选、候选代码、覆盖计数和逐项缺口。集合竞价任务只用本工具取得候选全集，不得调用完整标的池、每日计划扫描或通用数据库工具重复拼装。",
       parameters: AuctionContextQuerySchema,
       execute: async (_id, raw) => audited<AuctionContextQueryInput>(
         deps, "auction_context_query", raw, validateAuctionContextQueryInput,

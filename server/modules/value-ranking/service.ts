@@ -1,10 +1,11 @@
 import crypto from "node:crypto";
 import type pg from "pg";
 import { fetchCorporateActions, fetchValuationSnapshots } from "../../datasource/hithink.js";
+import { fetchBatchIsolated } from "../../datasource/batch-isolation.js";
 import { syncBoardMembership } from "../../datasource/catalog-service.js";
 import { fetchAndStore, fetchFinancialAndStore, insertFetchRun, storeCorporateActions } from "../../datasource/service.js";
 
-export const VALUE_RANK_VERSION = "value-rank-v1";
+export const VALUE_RANK_VERSION = "value-rank-v2";
 export const VALUE_INDUSTRY_CODES = [
   "881145.TI", "881146.TI", "881148.TI", "881155.TI", "881156.TI", "884154.TI", "884268.TI",
 ] as const;
@@ -158,11 +159,26 @@ export async function syncValueCandidates(
   }
   for (let offset = 0; !rateLimited && offset < candidates.length; offset += 100) {
     const batch = candidates.slice(offset, offset + 100);
+    let quotes: Awaited<ReturnType<typeof fetchValuationSnapshots>> = [];
     try {
-      const quotes = await fetchValuationSnapshots(batch.map((item) => item.code), { db, priority: "scheduled-low" });
-      for (const quote of quotes) {
-        const instrument = batch.find((item) => item.code === quote.code);
-        if (!instrument) continue;
+      const isolated = await fetchBatchIsolated(batch.map((item) => item.code), (codes) =>
+        fetchValuationSnapshots(codes, { db, priority: "scheduled-low" }));
+      quotes = isolated.rows;
+      for (const code of isolated.skipped) gaps.push({ code, domain: "valuation", reason: "该标的估值快照不可用" });
+      const returned = new Set(quotes.map((quote) => quote.code));
+      for (const item of batch) {
+        if (!returned.has(item.code) && !isolated.skipped.includes(item.code))
+          gaps.push({ code: item.code, domain: "valuation", reason: "批量估值未返回该标的" });
+      }
+    } catch (error) {
+      gaps.push({ code: `batch:${offset}`, domain: "valuation", reason: (error as Error).message });
+      if (/429|4001|request limit exceeded/i.test((error as Error).message)) rateLimited = true;
+      continue;
+    }
+    for (const quote of quotes) {
+      const instrument = batch.find((item) => item.code === quote.code);
+      if (!instrument) continue;
+      try {
         const result = await db.query(
           `INSERT INTO valuation_snapshot (instrument_id,as_of_date,pe_ttm,pb,ps_ttm,source,raw_summary)
            VALUES ($1,$2,$3,$4,$5,'hithink',$6)
@@ -171,10 +187,9 @@ export async function syncValueCandidates(
           [instrument.id, quote.asOfDate, quote.peTtm, quote.pb, quote.psTtm, JSON.stringify(quote.rawSummary)],
         );
         valuationSynced += result.rowCount ?? 0;
+      } catch {
+        gaps.push({ code: quote.code, domain: "valuation", reason: "该标的估值落库失败" });
       }
-    } catch (error) {
-      gaps.push({ code: `batch:${offset}`, domain: "valuation", reason: (error as Error).message });
-      if (/429|4001|request limit exceeded/i.test((error as Error).message)) rateLimited = true;
     }
   }
   const dueActions = await db.query<{ id: string; code: string; latest_ex_date: string | null }>(
@@ -367,6 +382,7 @@ export async function generateValueMonthlyRank(db: Db, analysisRunId: string, ra
     result: {
       rank_date: rankDate, effective_from: effectiveFrom, source_count: candidates.length,
       formal_count: candidates.filter((item) => item.formal).length, eligible_count: eligible.length,
+      skipped: prepared.filter((item) => item.gaps.length).map((item) => ({ code: item.candidate.code, gaps: item.gaps })),
       top50: ranked.slice(0, 50).map((entry, index) => ({
         rank: index + 1, code: entry.item.candidate.code, name: entry.item.candidate.name,
         industry: entry.item.industry, adapter: entry.item.adapter,
@@ -374,7 +390,8 @@ export async function generateValueMonthlyRank(db: Db, analysisRunId: string, ra
         total_score: Number(entry.score.total.toFixed(2)),
       })),
     },
-    gaps: prepared.filter((item) => item.gaps.length).map((item) => ({ code: item.candidate.code, gaps: item.gaps })),
+    // 完整覆盖已通过九成门禁；其余单股缺口只保留在快照行和结果的 skipped 中。
+    gaps: [],
     input: { source_count: candidates.length, formal_count: candidates.filter((item) => item.formal).length,
       eligible_count: eligible.length, input_sha256: inputHash },
   };

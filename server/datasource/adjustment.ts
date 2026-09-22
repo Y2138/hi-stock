@@ -78,6 +78,24 @@ export function computeForwardCloses(
   return result;
 }
 
+/** 前复权 OHLC 对原始价格做同一个正斜率仿射变换；不能用收盘价比率缩放（前复权收盘价可能为负）。 */
+export function computeForwardOhlc(
+  raw: Array<RawPoint & { open: number; high: number; low: number }>,
+  events: AdjustmentEvent[],
+  anchor: string,
+): Map<string, { open: number; high: number; low: number; close: number }> {
+  const adjusted = (key: "open" | "high" | "low" | "close") =>
+    computeForwardCloses(raw.map((row) => ({ date: row.date, close: row[key] })), events, anchor);
+  const open = adjusted("open");
+  const high = adjusted("high");
+  const low = adjusted("low");
+  const close = adjusted("close");
+  return new Map(raw.map((row) => [row.date, {
+    open: open.get(row.date)!, high: high.get(row.date)!,
+    low: low.get(row.date)!, close: close.get(row.date)!,
+  }]));
+}
+
 /**
  * 计算「交易所前收盘」序列：上一交易日原始收盘价，若当日除权则按公司行为折算为除权参考价。
  * 这是涨跌停与真实涨跌幅的官方基准，不能用当日 close/prevClose 比例的简单套用代替。

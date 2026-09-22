@@ -37,7 +37,12 @@
     "datasource:value-candidates": "tsx scripts/backfill-value-candidate-data.ts",
     "datasource:shfe-metal-inventory": "tsx scripts/shfe-metal-inventory-backfill.ts",
     "backtest:aluminum-inventory": "tsx scripts/aluminum-inventory-backtest.ts",
-    "backtest:zinc-inventory": "tsx scripts/zinc-inventory-backtest.ts"
+    "backtest:zinc-inventory": "tsx scripts/zinc-inventory-backtest.ts",
+    "research:box-volume": "tsx scripts/box-volume-confirmation-research.ts",
+    "research:box-volume:all": "tsx scripts/box-volume-confirmation-research.ts --all-market",
+    "research:box-volume:prospective": "tsx scripts/box-volume-confirmation-research.ts --all-market --prospective",
+    "research:structure-entry-exit": "tsx scripts/structure-entry-exit-research.ts",
+    "research:structure-entry-exit:all": "tsx scripts/structure-entry-exit-research.ts --all-market"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.2",

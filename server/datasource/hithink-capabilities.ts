@@ -378,12 +378,12 @@ const capabilities: HithinkCapabilityDefinition[] = [
   }),
   datasetDefinition({
     name: "auction_snapshot", label: "查询集合竞价快照", domain: "auction",
-    description: "批量查询最多100只A股的竞价实时或终态快照。",
+    description: "批量查询最多100只A股的竞价实时或终态快照。只接受 codes 和可选 stage，不接受 date；竞价任务固定使用 stage=final。",
     parameters: strictObject({ codes: codeList100, stage: Type.Optional(literalUnion(["live", "final"])) }),
   }),
   datasetDefinition({
     name: "auction_short_term_benchmark", label: "查询竞价短线基准", domain: "auction",
-    description: "查询指定日期或上海时区当日的竞价短线风向标。",
+    description: "查询指定日期或上海时区当日的竞价短线风向标。只接受可选 date，不接受 codes 或 stage。",
     parameters: strictObject({ date: Type.Optional(date()) }),
   }),
   directDefinition({

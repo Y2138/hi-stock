@@ -388,7 +388,8 @@ async function scanTrialSignals(db: Db, date: string, expectedDataDate: string |
     items.push({ code: member.code, name: member.name, ...evaluateTrialStartSignal(rows) });
   }
   return {
-    status: items.length === stockMembers.length ? "success" as const : "partial" as const,
+    status: items.length || stockMembers.length === 0 ? "success" as const : "partial" as const,
+    skipped: gaps,
     data_date: expectedDataDate,
     member_count: members.rows.length,
     stock_member_count: stockMembers.length,
@@ -396,7 +397,7 @@ async function scanTrialSignals(db: Db, date: string, expectedDataDate: string |
     completed_count: items.length,
     pattern_matched_count: items.filter((item) => item.price_signal).length,
     items,
-    gaps,
+    gaps: items.length || stockMembers.length === 0 ? [] : gaps,
   };
 }
 
@@ -467,7 +468,8 @@ async function scanRightSideSignals(
     });
   }
   return {
-    status: gaps.length === 0 ? "success" as const : "partial" as const,
+    status: items.length || stockMembers.length === 0 ? "success" as const : "partial" as const,
+    skipped: gaps,
     data_date: expectedDataDate,
     member_count: members.rows.length,
     stock_member_count: stockMembers.length,
@@ -475,7 +477,7 @@ async function scanRightSideSignals(
     completed_count: items.length,
     matched_count: items.filter((item) => item.price_signal).length,
     items,
-    gaps,
+    gaps: items.length || stockMembers.length === 0 ? [] : gaps,
   };
 }
 
@@ -976,6 +978,7 @@ export async function queryDailyPlanContext(db: Db, date: string) {
       .filter((item) => !detailedRightSideItems.includes(item))
       .map((item) => ({ code: item.code, passed_count: item.passed_count })),
     gaps: rightSide.gaps,
+    skipped: rightSide.skipped,
   };
   const trialNearCandidates = finalizedTrialItems.filter((item) =>
     !item.price_signal && item.conditions.trial_day_found && item.failed_conditions.length <= 2,
@@ -1018,6 +1021,7 @@ export async function queryDailyPlanContext(db: Db, date: string) {
         score: item.score,
       })),
     gaps: trial.gaps,
+    skipped: trial.skipped,
   };
   const temperatureStatus = sector.result.average_temperature === null
     ? (sector.input.available_codes > 0 ? "partial" : "unavailable")

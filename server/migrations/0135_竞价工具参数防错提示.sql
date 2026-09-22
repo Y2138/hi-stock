@@ -1,0 +1,5 @@
+-- 0135_竞价工具参数防错提示.sql：固定竞价取数参数与写入时间格式，避免重复试错。
+WITH p AS (SELECT p.id,p.current_revision_id,r.revision_no,r.content FROM job_prompt p JOIN job_prompt_revision r ON r.id=p.current_revision_id WHERE p.code='auction_opportunity_assessment'), i AS (
+ INSERT INTO job_prompt_revision(prompt_id,revision_no,content,sha256,source,base_revision_id,change_summary)
+ SELECT id,revision_no+1,content || E'\n\n工具参数硬约束：`auction_snapshot` 只能传 `codes` 与 `stage=final`，禁止传 `date`；`auction_short_term_benchmark` 只能传目标日 `date`，禁止传 `codes` 或 `stage`。`data_time` 只能原样填写 ISO 8601 时间戳，不得追加 capability、final 等说明文字；说明文字写入 metrics_summary。先一次批量取齐全部 candidate_codes，不得逐股重复查询。',encode(sha256(convert_to(content || E'\n\n工具参数硬约束：`auction_snapshot` 只能传 `codes` 与 `stage=final`，禁止传 `date`；`auction_short_term_benchmark` 只能传目标日 `date`，禁止传 `codes` 或 `stage`。`data_time` 只能原样填写 ISO 8601 时间戳，不得追加 capability、final 等说明文字；说明文字写入 metrics_summary。先一次批量取齐全部 candidate_codes，不得逐股重复查询。','UTF8')),'hex'),'user',current_revision_id,'增加竞价工具参数防错提示' FROM p RETURNING id,prompt_id)
+UPDATE job_prompt p SET current_revision_id=i.id,updated_at=now() FROM i WHERE p.id=i.prompt_id;

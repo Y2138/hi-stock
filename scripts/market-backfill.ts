@@ -27,7 +27,7 @@ import path from "node:path";
 import type pg from "pg";
 import { loadConfig } from "../server/config.js";
 import { closePool, getPool } from "../server/db/client.js";
-import { computeForwardCloses, computeOfficialPrevCloses, type AdjustmentEvent } from "../server/datasource/adjustment.js";
+import { computeForwardOhlc, computeOfficialPrevCloses, type AdjustmentEvent } from "../server/datasource/adjustment.js";
 
 const BACKFILL_CHANNEL = "hithink_dump";
 const BATCH_ROWS = 2000;
@@ -279,11 +279,7 @@ async function writeGroup(
   const valid = group.rows.filter((row) =>
     [row.open, row.high, row.low, row.close].every((v) => Number.isFinite(v) && v > 0));
   if (valid.length === 0) return;
-  const forward = computeForwardCloses(
-    valid.map((row) => ({ date: row.date, close: row.close })),
-    events,
-    anchor,
-  );
+  const forward = computeForwardOhlc(valid, events, anchor);
   const prevCloseByDate = computeOfficialPrevCloses(
     valid.map((row) => ({ date: row.date, close: row.close })),
     events,
@@ -298,18 +294,13 @@ async function writeGroup(
     const highs = batch.map((row) => row.high);
     const lows = batch.map((row) => row.low);
     const closes = batch.map((row) => row.close);
-    const fCloses = batch.map((row) => forward.get(row.date) ?? row.close);
+    const fOpens = batch.map((row) => forward.get(row.date)!.open);
+    const fHighs = batch.map((row) => forward.get(row.date)!.high);
+    const fLows = batch.map((row) => forward.get(row.date)!.low);
+    const fCloses = batch.map((row) => forward.get(row.date)!.close);
     const prevCloses = batchPrev;
     const volumes = batch.map((row) => row.volume);
     const amounts = batch.map((row) => row.amount);
-    // 前复权按比例缩放到 OHLC（仅收盘价有精确口径，其余按同比例缩放，保证 K 线形态一致）
-    const ratios = batch.map((row) => {
-      const f = forward.get(row.date);
-      return f === undefined || row.close === 0 ? 1 : f / row.close;
-    });
-    const fOpens = batch.map((row, i) => Math.round(row.open * ratios[i]! * 1e6) / 1e6);
-    const fHighs = batch.map((row, i) => Math.round(row.high * ratios[i]! * 1e6) / 1e6);
-    const fLows = batch.map((row, i) => Math.round(row.low * ratios[i]! * 1e6) / 1e6);
 
     await pool.query(
       `INSERT INTO market_bar

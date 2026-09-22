@@ -66,20 +66,21 @@ export async function queryValueAnchorSignals(db: Db, date: string) {
     `SELECT trade_date::text AS date FROM market_trading_day WHERE is_open AND trade_date>$1::date ORDER BY trade_date OFFSET 19 LIMIT 1`, [date],
   );
   const qualified: unknown[] = [], near: unknown[] = [], rejected: unknown[] = [], gaps: unknown[] = [];
+  const skipped: Array<{ code: string; reason: string }> = [];
   if (!reviewDate.rows[0]) gaps.push({ domain: "calendar", reason: "未来20个开市日尚未确认，复核日期暂缺但不阻断当日扫描" });
   for (const item of rankItems) {
     const code = String(item.code), series = byCode.get(code) ?? [];
     if (series.length < 250 || series.at(-1)?.bar_date !== date) {
-      gaps.push({ code, reason: `目标日未复权日线不足250根或数据日不符（${series.at(-1)?.bar_date ?? "无"}）` }); continue;
+      skipped.push({ code, reason: `目标日未复权日线不足250根或数据日不符（${series.at(-1)?.bar_date ?? "无"}）` }); continue;
     }
     const state = actionStateByCode.get(code);
     const lastChecked = state ? state.last_checked_at.slice(0, 10) : null;
     if (!lastChecked || lastChecked > date || Date.parse(`${date}T00:00:00Z`) - Date.parse(`${lastChecked}T00:00:00Z`) > 10 * 86_400_000 || state?.status === "failed") {
-      gaps.push({ code, reason: "公司行动数据超过10天未同步" }); continue;
+      skipped.push({ code, reason: "公司行动数据超过10天未同步" }); continue;
     }
     const quality = qualityByCode.get(code);
     if (!quality || !quality.fundamental_date || quality.fundamental_date < new Date(Date.parse(`${date}T00:00:00Z`) - 540 * 86_400_000).toISOString().slice(0, 10) || quality.net_profit === null || quality.roe === null) {
-      gaps.push({ code, reason: "目标日有效期内财务质量缺失" }); continue;
+      skipped.push({ code, reason: "目标日有效期内财务质量缺失" }); continue;
     }
     const current = series.at(-1)!, closes = series.map((row) => row.close);
     const ma250 = mean(closes.slice(-250))!, high20 = Math.max(...closes.slice(-20));
@@ -120,9 +121,13 @@ export async function queryValueAnchorSignals(db: Db, date: string) {
     else if (failed.length === 1 && ["below_ma250", "drawdown20", "decline5"].includes(failed[0]!)) near.push(evidence);
     else rejected.push(evidence);
   }
+  const completedCount = rankItems.length - skipped.length;
+  // 单标的缺数不阻断已完成的候选；全部缺数仍明确返回部分完成，不能伪装成“无机会”。
+  if (rankItems.length > 0 && completedCount === 0) gaps.push(...skipped);
   return {
     status: gaps.length ? "partial" : "success", date, rank_date: rank.rank_date,
-    scanned_count: rankItems.length, qualified, near, rejected: rejected.slice(0, 20),
+    scanned_count: rankItems.length, completed_count: completedCount, skipped_count: skipped.length, skipped,
+    qualified, near, rejected: rejected.slice(0, 20),
     rejected_count: rejected.length, gaps,
     evidence: "research_only", writes_business_data: false,
   };

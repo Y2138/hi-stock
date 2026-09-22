@@ -434,10 +434,10 @@ const AuctionAssessmentItemSchema = strictObject({
   data_time: Type.Optional(Type.String({ minLength: 20, maxLength: 40 })),
 });
 const AuctionScopeItemSchema = strictObject({
-  target_key: Type.String({ pattern: "^(position:[A-Za-z0-9._-]+|attention:[0-9]+)$", maxLength: 80 }),
+  target_key: Type.String({ pattern: "^(position:[A-Za-z0-9._-]+|attention:[0-9]+|ladder:[0-9]+)$", maxLength: 80 }),
   conclusion: Type.Union([
     Type.Literal("plan_aligned"), Type.Literal("risk_alert"), Type.Literal("confirmed"),
-    Type.Literal("wait"), Type.Literal("give_up"), Type.Literal("unavailable"),
+    Type.Literal("wait"), Type.Literal("give_up"), Type.Literal("promotion_strong"), Type.Literal("promotion_normal"), Type.Literal("divergence_hold"), Type.Literal("weak_exit"), Type.Literal("unavailable"),
   ]),
   metrics_summary: Type.String({ minLength: 1, maxLength: 1_000 }),
   assessment_summary: Type.String({ minLength: 1, maxLength: 2_000 }),
@@ -1115,6 +1115,9 @@ export function validateAuctionAssessmentWriteInput(input: unknown): AuctionAsse
     }
     if (item.target_key.startsWith("attention:") && !["confirmed", "wait", "give_up", "unavailable"].includes(item.conclusion)) {
       throw new Error(`${item.target_key} 关注竞价结论类型不匹配`);
+    }
+    if (item.target_key.startsWith("ladder:") && !["promotion_strong", "promotion_normal", "divergence_hold", "weak_exit", "unavailable"].includes(item.conclusion)) {
+      throw new Error(`${item.target_key} 涨停梯队先手竞价结论类型不匹配`);
     }
     if (item.data_status !== "ready" && item.conclusion !== "unavailable") {
       throw new Error(`${item.target_key} 竞价数据未就绪时只能标记 unavailable`);

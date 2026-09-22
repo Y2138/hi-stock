@@ -76,6 +76,12 @@ function normalizeAgentFlowMarkdown(text: string): string | null {
   return body ? `${RESULT_BANNER}\n\n${body}` : null;
 }
 
+function hasSubstantiveAgentFlowText(text: string): boolean {
+  if (normalizeAgentFlowMarkdown(text)) return true;
+  const trimmed = text.trim();
+  return trimmed.length >= 50 && /^## 结论摘要$/m.test(trimmed);
+}
+
 class AgentRunAbortedError extends Error {
   constructor() {
     super("用户中断了任务 Agent");
@@ -364,13 +370,15 @@ async function runAgentFlow(
     historyMode: "session",
     systemPrompt,
     systemPromptSuffix:
-      "内置任务的固定领域工具已预加载，直接调用即可，无需重复 tool_catalog；其他能力以当前目录为准按需加载。任务只有本次执行的必需读取和条件写入均完成且输出完整正文后才完成；历史成功记录不能代替本次运行。取数缺口必须如实报告，不能称为有效信号。策略发布仍只能创建待真人审核提案。任务结果由 Runner 关联本次运行保存。",
+      "内置任务的固定领域工具已预加载，直接调用即可，无需重复 tool_catalog；其他能力以当前目录为准按需加载。优先完成本次执行的必需读取和条件写入；工具明确失败且再次调用没有意义时，应在完整正文中如实列为数据缺口，不得伪造有效信号或反复盲重试。历史成功记录不能代替本次运行。策略发布仍只能创建待真人审核提案。任务结果由 Runner 关联本次运行保存。",
     manageSessionStatus: false,
     toolScope: { kind: "job", jobCode },
     text: prompt,
     onFrame: (frame) => completion.observe(frame),
-    continuationPrompt: () => `${AGENT_FLOW_FINALIZE_PROMPT}\n本次尚未成功完成的必需工具：${completion.missing().join("、") || "无"}。日期查询必须使用任务目标日。`,
-    isCompleteAssistantText: (text) => normalizeAgentFlowMarkdown(text) !== null && completion.missing().length === 0,
+    continuationPrompt: () => `${AGENT_FLOW_FINALIZE_PROMPT}\n本次尚未成功完成的必需工具：${completion.missing().join("、") || "无"}。已明确失败的工具：${completion.failures().map((item) => `${item.tool}（${item.reason}）`).join("、") || "无"}。明确失败且重试无意义时直接列为数据缺口，不要重复调用；日期查询必须使用任务目标日。`,
+    isCompleteAssistantText: (text) => hasSubstantiveAgentFlowText(text) && completion.canFinalize(),
+    maxContinuationTurns: null,
+    maxDurationMs: 20 * 60_000,
   });
   if (turn.aborted) throw new AgentRunAbortedError();
   if (turn.toolLoopError) throw new Error(turn.toolLoopError);
@@ -379,8 +387,12 @@ async function runAgentFlow(
   if (stopReason === "error") {
     throw new Error(turn.lastAssistant?.role === "assistant" ? turn.lastAssistant.errorMessage ?? "LLM 调用失败" : "LLM 调用失败");
   }
-  const markdown = normalizeAgentFlowMarkdown(textOfAssistant(turn.lastAssistant));
-  if (!markdown) throw new Error("agent_flow 未产生带完成标记的最终 Markdown");
+  const rawMarkdown = textOfAssistant(turn.lastAssistant);
+  const markdown = normalizeAgentFlowMarkdown(rawMarkdown)
+    ?? (completion.canFinalize() && rawMarkdown ? `${RESULT_BANNER}
+
+${rawMarkdown}` : null);
+  if (!markdown) throw new Error("agent_flow 未产生完整最终 Markdown");
   return { markdown, unavailableGaps: completion.unavailableGaps() };
 }
 
@@ -459,6 +471,17 @@ async function enqueueFullMarketIndicatorRefresh(pool: pg.Pool): Promise<number>
   return result.rowCount ?? 0;
 }
 
+/** 单个候选缺数留审计但不拖垮整批；全局来源故障、全部失败和真实持仓缺口仍降级。 */
+function batchStatus(gaps: unknown[], completed: number, protectedCodes: Set<string> = new Set()): "success" | "partial" {
+  if (!gaps.length) return "success";
+  if (completed <= 0) return "partial";
+  return gaps.some((gap) => {
+    const code = gap && typeof gap === "object" && !Array.isArray(gap)
+      ? (gap as Record<string, unknown>).code : null;
+    return typeof code !== "string" || !/^[A-Z0-9][A-Z0-9._-]*$/.test(code) || protectedCodes.has(code);
+  }) ? "partial" : "success";
+}
+
 async function executeDatasource(
   deps: RunnerDeps,
   run: JobRunRow,
@@ -482,8 +505,13 @@ async function executeDatasource(
         ? await deps.dailyUpdate(scope, run.id)
         : await dailyMarketUpdate(deps.pool, scope, { jobRunId: run.id });
       const gaps = summary.gaps ?? [];
+      const holdings = gaps.length ? await deps.pool.query<{ code: string }>(
+        `SELECT instrument.code FROM portfolio_position position
+          JOIN market_instrument instrument ON instrument.id=position.instrument_id WHERE position.quantity>0`,
+      ) : { rows: [] as Array<{ code: string }> };
       result = {
-        status: gaps.length > 0 ? "partial" : "success",
+        status: batchStatus(gaps, summary.snapshotRows + summary.futuresRows + summary.minute30Rows,
+          new Set(holdings.rows.map((row) => row.code))),
         log:
           `行情更新完成：日线/快照 ${summary.snapshotRows} 行，期货 ${summary.futuresRows} 行，` +
           `30分钟 ${summary.minute30Rows} 行，缺口 ${gaps.length} 项。`,
@@ -524,7 +552,8 @@ async function executeDatasource(
         ? await deps.valueCandidateSync(run.target_date, run.id)
         : await syncValueCandidates(deps.pool, run.target_date, { jobRunId: run.id });
       result = {
-        status: summary.gaps.length > 0 ? "partial" : "success",
+        status: batchStatus(summary.gaps, summary.sourceCount - new Set(summary.gaps
+          .map((gap) => gap.code).filter((code) => code !== "*" && !code.startsWith("batch:"))).size),
         log: `价值候选同步完成：来源 ${summary.sourceCount}、正式 ${summary.formalCount}、日线 ${summary.barSynced ?? 0}、财务 ${summary.financialSynced}、估值 ${summary.valuationSynced}、公司行动 ${summary.corporateActionSynced}、缺口 ${summary.gaps.length}。`,
         artifacts: summary.fetchRunIds.map((id) => ({ kind: "market_fetch_run", id })),
         dataGaps: summary.gaps,
@@ -546,7 +575,7 @@ async function executeDatasource(
       const opened = summary.completed.reduce((sum, item) => sum + item.opened, 0);
       const closed = summary.completed.reduce((sum, item) => sum + item.closed, 0);
       result = {
-        status: summary.gaps.length > 0 ? "partial" : "success",
+        status: batchStatus(summary.gaps, summary.completed.length),
         log: `板块成分同步完成：板块 ${summary.completed.length}、成分 ${memberCount}、新增 ${opened}、关闭 ${closed}、缺口 ${summary.gaps.length}。`,
         dataGaps: summary.gaps,
       };

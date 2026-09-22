@@ -1,4 +1,4 @@
-import { getLatestDailyPlanBoard, getLatestAuctionScopeAssessments } from "./repo.js";
+import { getLatestDailyPlanBoard, getLatestAuctionScopeAssessments, getLatestLimitUpOpportunities } from "./repo.js";
 
 interface Ctx {
   pool: import("pg").Pool;
@@ -7,6 +7,9 @@ interface Ctx {
 export const plansRoutes = {
   async latest({ pool }: Ctx) {
     return { data: await getLatestDailyPlanBoard(pool) };
+  },
+  async latestLimitUp({ pool }: Ctx) {
+    return { data: await getLatestLimitUpOpportunities(pool) };
   },
   async latestAuction({ pool }: Ctx) {
     return { data: await getLatestAuctionScopeAssessments(pool) };

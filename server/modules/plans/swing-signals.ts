@@ -13,6 +13,7 @@ export const SWING_INDUSTRY_CODES = [...SWING_CORE_INDUSTRY_CODES, ...SWING_EXPA
 export const SWING_UNIVERSE_MAX_MEMBERS = 388;
 
 export const SWING_SUBINDUSTRY_REPRESENTATIVE_LIMIT = 10;
+export const SWING_NEAR_CANDIDATE_LIMIT = 5;
 
 export interface SwingUniverseMember {
   instrument_id: string;
@@ -54,6 +55,13 @@ export async function querySwingUniverse(db: Db, date: string): Promise<SwingUni
      ), liquidity AS (
        SELECT member.*,recent.median_turnover_60
          FROM primary_members member
+         JOIN LATERAL (
+           SELECT count(*) AS bar_count FROM (
+             SELECT 1 FROM market_bar bar WHERE bar.instrument_id=member.instrument_id
+               AND bar.freq='day' AND bar.bar_date <= $1::date
+             ORDER BY bar.bar_date DESC,bar.bar_time DESC LIMIT 40
+           ) history
+         ) history ON history.bar_count=40
          LEFT JOIN LATERAL (
            SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY bars.turnover::float8)::float8 AS median_turnover_60
              FROM (SELECT bar.turnover FROM market_bar bar
@@ -112,6 +120,7 @@ export interface SwingSignalEvaluation {
     reward_risk_acceptable: boolean;
   };
   evidence: {
+    open: number;
     close: number;
     high: number;
     volume: number;
@@ -185,6 +194,7 @@ export function evaluateSwingSignal(
     failed_conditions: failedConditions,
     conditions,
     evidence: {
+      open: current.open,
       close: current.close,
       high: current.high,
       volume: current.volume!,
@@ -204,6 +214,35 @@ export function evaluateSwingSignal(
       confirmation_window_available: current.high < confirmationPriceCap,
     },
   };
+}
+
+/** 接近候选按唯一未达条件距阈值的归一化缺口排序，只保留最接近正式信号的前5只。 */
+export function selectTopSwingNearCandidates<
+  T extends SwingSignalEvaluation & { code: string },
+>(items: T[]): Array<T & { signal_quality_score: number }> {
+  return items
+    .map((item) => {
+      const failed = item.failed_conditions[0];
+      const evidence = item.evidence;
+      const gap = failed === "volume_contracted"
+        ? evidence.volume_ratio_5 / 0.85 - 1
+        : failed === "reversal_candle"
+          ? Math.min(
+              Math.max(0, (evidence.open - evidence.close) / evidence.close) / 0.01,
+              Math.max(0, 0.005 - evidence.lower_shadow_ratio) / 0.005,
+            )
+          : failed === "rsi_oversold"
+            ? evidence.rsi14 / 40 - 1
+            : failed === "reward_risk_acceptable" && evidence.expected_reward_risk !== null
+              ? 1 - evidence.expected_reward_risk / 1.8
+              : 1;
+      return {
+        ...item,
+        signal_quality_score: Math.round(Math.max(0, 1 - Math.max(0, gap)) * 1000) / 10,
+      };
+    })
+    .sort((left, right) => right.signal_quality_score - left.signal_quality_score || left.code.localeCompare(right.code))
+    .slice(0, SWING_NEAR_CANDIDATE_LIMIT);
 }
 
 export async function querySwingSignals(db: Db, date: string) {
@@ -246,10 +285,14 @@ export async function querySwingSignals(db: Db, date: string) {
     signal_count: 0,
     held_matched_count: 0,
     near_candidate_count: 0,
+    near_candidate_total_count: 0,
+    near_candidate_limit: SWING_NEAR_CANDIDATE_LIMIT,
     signals: [],
     near_candidates: [],
     suppressed_matches: [],
     screened_out: [],
+    excluded_count: 0,
+    excluded: [],
     gaps: [],
   };
 
@@ -272,7 +315,7 @@ export async function querySwingSignals(db: Db, date: string) {
   const byCode = new Map<string, SwingSignalBar[]>();
   for (const bar of bars.rows) byCode.set(bar.code, [...(byCode.get(bar.code) ?? []), bar]);
 
-  const gaps: Array<{ code: string; reason: string }> = [];
+  const excluded: Array<{ code: string; reason: string }> = [];
   const items: Array<SwingSignalEvaluation & {
     code: string;
     name: string;
@@ -284,26 +327,26 @@ export async function querySwingSignals(db: Db, date: string) {
   for (const member of members.rows) {
     const rows = byCode.get(member.code) ?? [];
     if (!["stock", "etf"].includes(member.kind)) {
-      gaps.push({ code: member.code, reason: `波段扫描不支持标的类型 ${member.kind}` });
+      excluded.push({ code: member.code, reason: `波段扫描不支持标的类型 ${member.kind}` });
       continue;
     }
     if (rows.length < 40) {
-      gaps.push({ code: member.code, reason: `波段扫描至少需要40根日线，当前${rows.length}根` });
+      excluded.push({ code: member.code, reason: `波段扫描至少需要40根日线，当前${rows.length}根` });
       continue;
     }
     if (dataDate && rows.at(-1)!.bar_date !== dataDate) {
-      gaps.push({ code: member.code, reason: `最新日线为${rows.at(-1)!.bar_date}，波段数据日为${dataDate}` });
+      excluded.push({ code: member.code, reason: `最新日线为${rows.at(-1)!.bar_date}，波段数据日为${dataDate}` });
       continue;
     }
     if (member.kind === "stock" && (
       member.metric_date !== dataDate || member.metric_status !== "success" || member.defense_recovery_ma10 === null
     )) {
-      gaps.push({ code: member.code, reason: "缺少数据日一致的可信护盘收回率" });
+      excluded.push({ code: member.code, reason: "缺少数据日一致的可信护盘收回率" });
       continue;
     }
     const evaluation = evaluateSwingSignal(rows, member.kind, member.defense_recovery_ma10);
     if (!evaluation) {
-      gaps.push({ code: member.code, reason: "波段扫描缺少可信RSI14/OHLCV或止损输入" });
+      excluded.push({ code: member.code, reason: "波段扫描缺少可信RSI14/OHLCV或止损输入" });
       continue;
     }
     const held = member.quantity > 0;
@@ -321,9 +364,10 @@ export async function querySwingSignals(db: Db, date: string) {
     });
   }
   const signals = items.filter((item) => item.signal);
-  const nearCandidates = items.filter((item) =>
+  const allNearCandidates = items.filter((item) =>
     !item.held && !item.price_signal && item.passed_count === 3 && item.evidence.confirmation_window_available,
   );
+  const nearCandidates = selectTopSwingNearCandidates(allNearCandidates);
   const suppressedMatches = items.filter((item) => item.price_signal && !item.signal);
   const detailedCodes = new Set([...signals, ...nearCandidates, ...suppressedMatches].map((item) => item.code));
   return {
@@ -332,7 +376,7 @@ export async function querySwingSignals(db: Db, date: string) {
     industry_codes: [...SWING_INDUSTRY_CODES],
     max_member_count: SWING_UNIVERSE_MAX_MEMBERS,
     expanded_member_count: expandedMemberCount,
-    status: gaps.length === 0 ? "success" as const : "partial" as const,
+    status: items.length > 0 ? "success" as const : "partial" as const,
     data_date: dataDate,
     member_count: members.rows.length,
     completed_count: items.length,
@@ -340,6 +384,8 @@ export async function querySwingSignals(db: Db, date: string) {
     signal_count: signals.length,
     held_matched_count: items.filter((item) => item.price_signal && item.held).length,
     near_candidate_count: nearCandidates.length,
+    near_candidate_total_count: allNearCandidates.length,
+    near_candidate_limit: SWING_NEAR_CANDIDATE_LIMIT,
     signals,
     near_candidates: nearCandidates,
     suppressed_matches: suppressedMatches,
@@ -351,6 +397,8 @@ export async function querySwingSignals(db: Db, date: string) {
         passed_count: item.passed_count,
         failed_conditions: item.failed_conditions,
       })),
-    gaps,
+    excluded_count: excluded.length,
+    excluded,
+    gaps: items.length ? [] : [{ reason: "候选均因数据不可信被剔除，无法完成有效扫描", excluded_count: excluded.length }],
   };
 }

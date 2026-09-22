@@ -25,6 +25,9 @@ import { reconcileStrategyAttention } from "../modules/strategy-runtime/attentio
 import { executeStrategyEvaluator } from "../modules/strategy-runtime/registry.js";
 import { ensureStrategyEvaluation } from "../modules/strategy-runtime/service.js";
 import { queryDailyPlanStrategyContext } from "../modules/strategy-runtime/daily-plan.js";
+import { limitUpOpportunityItems } from "../modules/strategy-runtime/limit-up-opportunities.js";
+import { replaceDraftPlaybook } from "../modules/plans/repo.js";
+import { listStrategyRuntimeDefinitions } from "../modules/strategy-runtime/repo.js";
 import { strategyForSession } from "./business-context-tools.js";
 import { insertToolAudit } from "./repo.js";
 import { sha256Json } from "./hash.js";
@@ -202,11 +205,20 @@ export function buildStrategyEvaluationTool(deps: {
           strategy_code: strategyCode!, phase: input.phase, target_date: input.date,
           requested_by_job_run_id: requestedByJobRunId,
         });
+        let opportunityWrite: { replaced: number } | null = null;
+        if (deps.jobCode === "limit_up_close_scan" && input.phase === "entry"
+          && requestedByJobRunId && ensured.execution !== "waiting" && ensured.run.status === "success") {
+          const strategy = (await listStrategyRuntimeDefinitions(deps.pool)).find((item) => item.code === "limit_up");
+          if (!strategy) throw new Error("收盘打板策略定义不可用");
+          opportunityWrite = await replaceDraftPlaybook(deps.pool, {
+            source_job_run_id: requestedByJobRunId, items: limitUpOpportunityItems({ strategy, ensured }),
+          });
+        }
         const attentionChanges = deps.jobCode && jobAgentRole === "strategy_entry_report"
           && input.phase === "entry" && ensured.execution !== "waiting"
           ? await reconcileStrategyAttention(deps.pool, { run: ensured.run, source_job: deps.jobCode })
           : [];
-        return { ...ensured, attention_changes: attentionChanges };
+        return { ...ensured, attention_changes: attentionChanges, opportunity_write: opportunityWrite };
       });
     },
   };
@@ -220,7 +232,7 @@ export function buildDailyPlanStrategyTool(deps: {
   return {
     name: "daily_plan_strategy_query",
     label: "查询每日计划策略统筹",
-    description: "按目标日自动发现入场、观察、组合叠加、持仓主策略和兜底策略，执行或复用结构化评估运行，按策略维护关注集合，并返回服务端合并后的持仓动作、覆盖门禁和可原样写入的 playbook_items。不得再逐工具手工拼装每日计划。",
+    description: "按目标日自动发现入场、观察、组合叠加、持仓主策略和兜底策略，执行或复用结构化评估运行，按策略维护关注集合，并由服务端直接写入合并后的结构化预案；同时返回持仓动作、覆盖门禁、playbook_items 与 playbook_write。不得再调用 daily_plan_write 或逐工具手工拼装每日计划。",
     parameters: DailyPlanStrategySchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof DailyPlanStrategySchema>>(
@@ -261,7 +273,7 @@ export function buildSwingSignalTool(deps: { pool: pg.Pool; sessionId: string | 
   return {
     name: "swing_signal_query",
     label: "查询波段确定性信号",
-    description: "按目标日覆盖16个周期及新能源设备行业、从全部行业细分筛选高活跃代表标的并把总量固定在388只以内，返回40日箱体、缩量/反转形态/RSI14/预期盈亏比四条件、T+1突破与价格上限、已有持仓抑制、正式信号、接近候选和逐只数据缺口；正式运行由波段独立任务负责，不得用关注池或通用查询手工限定扫描范围。",
+    description: "按目标日覆盖16个周期及新能源设备行业、从全部行业细分筛选高活跃代表标的并把总量固定在388只以内，返回40日箱体、缩量/反转形态/RSI14/预期盈亏比四条件、T+1突破与价格上限、已有持仓抑制、正式信号、按唯一未达条件距阈值的信号质量排序后前5只接近候选和逐只数据缺口；正式运行由波段独立任务负责，不得用关注池或通用查询手工限定扫描范围。",
     parameters: SwingSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof SwingSignalSchema>>("swing_signal_query", SwingSignalSchema, raw);

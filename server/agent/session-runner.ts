@@ -92,7 +92,9 @@ export interface AgentSessionTurnInput {
   /** 缺省以非空普通 stop 为完成；自动作业可额外要求结果横幅等业务完成标记。 */
   isCompleteAssistantText?: (text: string) => boolean;
   continuationPrompt?: string | (() => string);
-  maxContinuationTurns?: number;
+  maxContinuationTurns?: number | null;
+  /** 自动任务可取消执行段数量限制，改用总耗时上限防止失控。 */
+  maxDurationMs?: number;
 }
 
 export interface AgentSessionTurnResult extends AgentTurnResult {
@@ -293,10 +295,11 @@ export async function runAgentSessionTurn(
 
     try {
       const isCompleteText = input.isCompleteAssistantText ?? ((text: string) => text.length > 0);
-      const maxContinuationTurns = Math.min(
-        Math.max(input.maxContinuationTurns ?? DEFAULT_MAX_AGENT_CONTINUATION_TURNS, 0),
-        DEFAULT_MAX_AGENT_CONTINUATION_TURNS,
-      );
+      const maxContinuationTurns = input.maxContinuationTurns === null
+        ? null
+        : Math.max(input.maxContinuationTurns ?? DEFAULT_MAX_AGENT_CONTINUATION_TURNS, 0);
+      const startedAt = Date.now();
+      const maxDurationMs = input.maxDurationMs && input.maxDurationMs > 0 ? input.maxDurationMs : null;
       let nextText = input.text;
       let messages = context.messages;
       let continuationTurns = 0;
@@ -321,11 +324,14 @@ export async function runAgentSessionTurn(
           : undefined;
         if (turn.aborted || turn.llmError || turn.toolLoopError || stopReason === "aborted" || stopReason === "error" ||
             agentTurnCompleted(turn, isCompleteText)) break;
-        if (continuationTurns >= maxContinuationTurns) {
+        if (maxContinuationTurns !== null && continuationTurns >= maxContinuationTurns) {
           throw new Error(
             `Agent 未在 ${maxContinuationTurns + 1} 个受控执行段内生成完整最终结果` +
             `（最后 stopReason=${stopReason ?? "missing"}）`,
           );
+        }
+        if (maxDurationMs !== null && Date.now() - startedAt >= maxDurationMs) {
+          throw new Error(`Agent 未在 ${Math.ceil(maxDurationMs / 60_000)} 分钟内生成完整最终结果（最后 stopReason=${stopReason ?? "missing"}）`);
         }
         continuationTurns += 1;
         messages = turn.messages;

@@ -610,6 +610,10 @@ async function fetchSnapshotWithIsolation(
     try {
       quotes.push(...(await fetchSnapshot(batch, hithinkDeps(db, deps), kind)));
     } catch (err) {
+      if (/429|4001|request limit exceeded|throttl/i.test((err as Error).message)) {
+        gaps.push({ code: "*", freq: "day", reason: `${kind} 批量快照触发供应商限流` });
+        return;
+      }
       if (batch.length === 1) {
         gaps.push({ code: batch[0]!, freq: "day", reason: `${kind} 快照不可用: ${(err as Error).message}` });
         return;

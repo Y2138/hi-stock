@@ -23,6 +23,7 @@ artifacts/
 .idea/
 .zcode/
 .pi-subagents/
+.playwright-mcp/
 
 # 本机业务数据、附件与私有备份
 datavolume/

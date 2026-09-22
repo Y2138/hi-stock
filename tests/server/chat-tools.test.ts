@@ -23,7 +23,7 @@ import {
   findTrialStartMatch,
   inferStopLossMode,
 } from "../../server/modules/plans/daily-context.js";
-import { evaluateSwingSignal } from "../../server/modules/plans/swing-signals.js";
+import { evaluateSwingSignal, selectTopSwingNearCandidates } from "../../server/modules/plans/swing-signals.js";
 import { mergeExitEvaluations, queryPositionExitEvaluationBundle } from "../../server/modules/strategy-runtime/exit-evaluators.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
 
@@ -214,6 +214,20 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         evidence: { confirmation_window_available: true },
       });
 
+      const rankedNearCandidates = selectTopSwingNearCandidates(
+        [45, 41, 40.5, 44, 43, 42].map((rsi14, index) => ({
+          code: `60099${index}.SH`,
+          ...evaluateSwingSignal(
+            rows.map((row, rowIndex) => rowIndex === 39 ? { ...row, rsi14 } : row),
+            "stock",
+            0.4,
+          )!,
+        })),
+      );
+      expect(rankedNearCandidates).toHaveLength(5);
+      expect(rankedNearCandidates.map((item) => item.evidence.rsi14)).toEqual([40.5, 41, 42, 43, 44]);
+      expect(rankedNearCandidates[0]!.signal_quality_score).toBeGreaterThan(rankedNearCandidates[4]!.signal_quality_score);
+
       const instrument = await pool.query<{ id: string }>(
         `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
          VALUES ($1, '波段扫描测试股份', 'stock', 'active') RETURNING id::text`,
@@ -249,6 +263,35 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         [instrumentId],
       );
 
+      const immature = await pool.query<{ id: string }>(
+        `INSERT INTO market_instrument (code,name,kind,lifecycle_status)
+         VALUES ('601123.SH','不足40日的高流动性样本','stock','active') RETURNING id::text`,
+      );
+      await pool.query(
+        `INSERT INTO market_board_membership (board_instrument_id,member_instrument_id,effective_from)
+         VALUES ($1,$2,'2026-07-01')`, [board.rows[0]!.id, immature.rows[0]!.id],
+      );
+      await pool.query(
+        `INSERT INTO market_bar
+           (instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,turnover,adjustment,channel)
+         SELECT $1,'day',day::date,day::date::timestamptz,10,10.2,9.8,10,100,1000000,'forward','test'
+           FROM generate_series('2026-08-03'::date,'2026-08-18'::date,'1 day') day`,
+        [immature.rows[0]!.id],
+      );
+
+      const badData = await pool.query<{ id: string }>(
+        `INSERT INTO market_instrument (code,name,kind,lifecycle_status)
+         VALUES ('600994.SH','无可信股性指标的高流动性样本','stock','active') RETURNING id::text`,
+      );
+      await pool.query(
+        `INSERT INTO market_board_membership (board_instrument_id,member_instrument_id,effective_from)
+         VALUES ($1,$2,'2026-07-01')`, [board.rows[0]!.id, badData.rows[0]!.id],
+      );
+      await storeBars(pool, badData.rows[0]!.id, "day", rows.map((row) => ({
+        date: row.bar_date, open: row.open, high: row.high, low: row.low,
+        close: row.close, volume: row.volume!, turnover: 1000000, adjustment: "forward",
+      })), "test", { markIndicator: false });
+
       const tool = buildChatTools({ pool, sessionId }).find((item) => item.name === "swing_signal_query")!;
       const signal = textOf(await tool.execute("tc-swing-signal", { date: "2026-08-18" })) as {
         status: string;
@@ -256,10 +299,14 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         completed_count: number;
         signal_count: number;
         signals: Array<{ code: string; passed_count: number }>;
+        excluded_count: number;
+        excluded: Array<{ code: string; reason: string }>;
       };
       expect(signal).toMatchObject({
-        status: "success", scan_scope: "cyclical_industry_representatives", member_count: 1, completed_count: 1, signal_count: 1,
+        status: "success", scan_scope: "cyclical_industry_representatives", member_count: 2,
+        completed_count: 1, excluded_count: 1, signal_count: 1,
       });
+      expect(signal.excluded).toContainEqual({ code: "600994.SH", reason: "缺少数据日一致的可信护盘收回率" });
       expect(signal.signals).toContainEqual(expect.objectContaining({ code, passed_count: 4 }));
 
       await pool.query(
@@ -273,6 +320,14 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       };
       expect(held).toMatchObject({ signal_count: 0, held_matched_count: 1 });
       expect(held.suppressed_matches).toContainEqual(expect.objectContaining({ code, suppressed_by: "existing_position" }));
+      await pool.query("DELETE FROM market_board_membership WHERE member_instrument_id=$1", [instrumentId]);
+      const unavailable = textOf(await tool.execute("tc-swing-all-excluded", { date: "2026-08-18" })) as {
+        status: string; member_count: number; completed_count: number; excluded_count: number; gaps: unknown[];
+      };
+      expect(unavailable).toMatchObject({
+        status: "partial", member_count: 1, completed_count: 0, excluded_count: 1,
+        gaps: [{ reason: "候选均因数据不可信被剔除，无法完成有效扫描", excluded_count: 1 }],
+      });
       await expect(tool.execute("tc-swing-strict", { date: "2026-08-18", sql: "select 1" } as never))
         .rejects.toThrow("参数校验失败");
     } finally {
@@ -400,7 +455,6 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "daily_plan_strategy_query",
       "web_search",
       "web_fetch",
-      "daily_plan_write",
     ]);
     expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "swing_signal_scan" }).map((tool) => tool.name)).toEqual([
       "strategy_document_query", "strategy_evaluation_query", "web_search", "web_fetch",
@@ -1614,6 +1668,10 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(normal).not.toContain("# 测试当前策略");
     expect(normal).toContain("迁移证据不是业务事实");
     expect(normal).toContain("不能声称“无法直接写入”");
+    expect(normal).toContain("买入归因对用户隐藏 strategy_code");
+    expect(normal).toContain("不得要求用户手动输入策略编码");
+    expect(normal).toContain("若存在多个候选或没有明确候选");
+    expect(normal).toContain("用户未确认前不得调用 portfolio_write");
     expect(normal).toContain("实盘例外");
     expect(normal).toContain("策略正文只读");
     expect(normal).toContain("回测已完全迁出系统");

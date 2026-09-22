@@ -82,6 +82,21 @@ async function recordFailedRun(
   );
 }
 
+/** 已有日线的信号候选进入每日计算范围后，可显式排队补算当前日指标。 */
+export async function queueIndicatorRecompute(pool: pg.Pool, code: string): Promise<void> {
+  const queued = await pool.query(
+    `INSERT INTO market_indicator_dirty (instrument_id,freq,earliest_date,generation,reason,updated_at)
+     SELECT instrument.id,'day',min(bar.bar_date),1,'信号候选指标补算',now()
+       FROM market_instrument instrument JOIN market_bar bar ON bar.instrument_id=instrument.id AND bar.freq='day'
+      WHERE instrument.code=$1 GROUP BY instrument.id
+     ON CONFLICT (instrument_id,freq) DO UPDATE SET
+       earliest_date=LEAST(market_indicator_dirty.earliest_date,EXCLUDED.earliest_date),
+       generation=market_indicator_dirty.generation+1,reason=EXCLUDED.reason,updated_at=now()
+     RETURNING 1`, [code],
+  );
+  if (!queued.rowCount) throw new Error(`标的 ${code} 没有日线，无法补算指标`);
+}
+
 export async function nextDirtyIndicator(pool: pg.Pool): Promise<DirtyRow | null> {
   const result = await pool.query<DirtyRow>(
     `SELECT instrument_id::text, freq, generation::text

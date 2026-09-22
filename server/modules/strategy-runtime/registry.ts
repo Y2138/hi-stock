@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { queryLimitUpSignals } from "../market/limit-up-signals.js";
+import { queryIntradayLimitLadder } from "../market/first-board-advance.js";
 import { queryCopperLeftLaunchEntry, queryCopperLeftLaunchExit } from "../market/copper-left-launch-signal.js";
 import { querySwingSignals } from "../plans/swing-signals.js";
 import { queryTwoYearReversalSignals } from "../plans/two-year-reversal-signal.js";
@@ -25,7 +26,8 @@ const ready = <T>(
   code: string,
   phase: StrategyEvaluationPhase,
   execute: (context: StrategyEvaluatorContext) => Promise<T>,
-): StrategyEvaluatorDefinition<T> => ({ code, phase, version: 1, status: "ready", execute });
+  version = 1,
+): StrategyEvaluatorDefinition<T> => ({ code, phase, version, status: "ready", execute });
 
 const pending = (code: string, phase: StrategyEvaluationPhase): StrategyEvaluatorDefinition => ({
   code,
@@ -42,8 +44,9 @@ const DEFINITIONS: readonly StrategyEvaluatorDefinition[] = [
   ready("swing_entry_v1", "entry", ({ pool, targetDate }) => querySwingSignals(pool, targetDate)),
   ready("two_year_reversal_entry_v1", "entry", ({ pool, targetDate }) => queryTwoYearReversalSignals(pool, targetDate)),
   ready("limit_up_observation_v1", "entry", ({ pool, targetDate, strategyDocumentId }) =>
-    queryLimitUpSignals(pool, targetDate, strategyDocumentId)),
-  ready("value_anchor_entry_v1", "entry", ({ pool, targetDate }) => queryValueAnchorSignals(pool, targetDate)),
+    queryLimitUpSignals(pool, targetDate, strategyDocumentId), 2),
+  ready("first_board_advance_entry_v1", "entry", ({ pool, targetDate }) => queryIntradayLimitLadder(pool, targetDate), 2),
+  ready("value_anchor_entry_v1", "entry", ({ pool, targetDate }) => queryValueAnchorSignals(pool, targetDate), 2),
   ready("copper_left_launch_entry_v1", "entry", ({ pool, targetDate }) => queryCopperLeftLaunchEntry(pool, targetDate)),
   ready("copper_left_launch_exit_v1", "exit", ({ pool, targetDate }) => queryCopperLeftLaunchExit(pool, targetDate)),
   pending("nightly_sector_attention_v1", "entry"),
@@ -64,7 +67,7 @@ export function listStrategyEvaluatorDefinitions(): StrategyEvaluatorDefinition[
 /** 只读展示信息；业务执行仍只认稳定编码与注册表状态。 */
 const EVALUATOR_LABELS: Record<string, string> = {
   swing_entry_v1: "波段入场", two_year_reversal_entry_v1: "两年结构反转入场",
-  limit_up_observation_v1: "打板机会观察", value_anchor_entry_v1: "价值错杀关注",
+  limit_up_observation_v1: "涨停接力观察", first_board_advance_entry_v1: "涨停梯队盘中先手", value_anchor_entry_v1: "价值错杀关注",
   copper_left_launch_entry_v1: "铜左侧启动入场",
   copper_left_launch_exit_v1: "铜价格结构出场",
   nightly_sector_attention_v1: "夜间板块关注", manual_entry_v1: "自主决策入场",

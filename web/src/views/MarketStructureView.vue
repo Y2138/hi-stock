@@ -147,7 +147,7 @@ async function loadPlan(): Promise<void> {
   planLoading.value = true;
   planError.value = null;
   planMissing.value = false;
-  const response = await apiClient.get<DailyPlanBoard>("/api/plans/latest");
+  const response = await apiClient.get<DailyPlanBoard>("/api/plans/limit-up/latest");
   planLoading.value = false;
   if (response.ok) {
     plan.value = response.data;
@@ -255,23 +255,23 @@ onMounted(() => void loadAll());
           <div>
             <h2>打板机会</h2>
             <span class="plan-subtitle">
-              每日计划 · {{ plan?.plan.target_date ?? "—" }}
+              收盘打板扫描 · {{ plan?.plan.target_date ?? "—" }}
               <template v-if="opportunities.length > 0"> · 有效信号 {{ opportunities.length }}</template>
             </span>
           </div>
         </header>
         <p class="plan-scope">
-          T 日收盘按当前《打板策略》筛选，信号来自每日计划的结构化预案；是否成交及数量由用户自主决定。
+          T 日收盘按当前《打板策略》筛选，信号来自独立收盘打板策略任务的结构化结果；是否成交及数量由用户自主决定。
         </p>
         <StateBlock
           :loading="planLoading"
           :error="planError"
           :empty="!planMissing && plan !== null && opportunities.length === 0"
-          empty-text="本计划没有形成有效打板信号"
+          empty-text="本轮扫描没有形成有效打板信号"
           :skeleton-rows="3"
           @retry="loadPlan"
         >
-          <p v-if="planMissing" class="no-runs">每日计划尚未生成结构化预案，生成后此处展示打板机会。</p>
+          <p v-if="planMissing" class="no-runs">收盘打板任务尚未生成结果，完成后此处展示打板机会。</p>
           <div v-else-if="opportunities.length > 0" class="plan-opportunity-table-wrap">
             <table class="data-table plan-opportunity-table">
               <thead>

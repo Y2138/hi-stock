@@ -223,10 +223,11 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "strategy_document_query",
     "job_context_query",
     "daily_plan_strategy_query",
-    "daily_plan_write",
   ],
   swing_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
   copper_left_launch_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
+  first_board_intraday_scan: ["strategy_document_query", "strategy_evaluation_query"],
+  limit_up_close_scan: ["strategy_document_query", "strategy_evaluation_query"],
   two_year_reversal_scan: ["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query"],
   value_anchor_opportunity_scan: [
     "strategy_document_query",
@@ -596,7 +597,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
       name: "fetch_market_data",
       label: "批量补拉数据",
       description:
-        "一次批量补拉行情及 A 股财务/估值并幂等落库。行情放 requests，最新财务三表与估值放 financial_requests；服务端顺序执行并流式汇报进度，不要为每个标的分别调用。默认单项失败后继续其余项。",
+        "一次批量补拉行情及 A 股财务/估值并幂等落库。行情放 requests，最新财务三表与估值放 financial_requests；服务端顺序执行并流式汇报进度，不要为每个标的分别调用。默认单项失败后继续其余项。集合竞价参数固定：auction_snapshot 只传 codes+stage（不得传 date）；auction_short_term_benchmark 只传 date（不得传 codes/stage）。",
       parameters: FetchMarketDataSchema,
       executionMode: "sequential",
       execute: guard<FetchMarketDataInput>(deps, "fetch_market_data", validateFetchMarketDataInput, async (params, context) => {
@@ -685,7 +686,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
       name: "fetch_hithink_data",
       label: "补拉扶摇研究数据",
       description:
-        "批量查询并缓存扶摇官方集合竞价、热榜、个股异动和基金资料/净值/收益/回撤/披露持仓/配置/经理/财务/资讯等数据。每项 capability 只接受白名单参数，结果先写入 PostgreSQL hithink_dataset_snapshot 再返回；基金持仓均为定期披露而非实时持仓。ETF/LOF 行情继续使用 fetch_market_data。默认单项失败后继续其余项。",
+        "批量查询并缓存扶摇官方集合竞价、热榜、个股异动和基金资料/净值/收益/回撤/披露持仓/配置/经理/财务/资讯等数据。每项 capability 只接受白名单参数，结果先写入 PostgreSQL hithink_dataset_snapshot 再返回；基金持仓均为定期披露而非实时持仓。ETF/LOF 行情继续使用 fetch_market_data。默认单项失败后继续其余项。集合竞价参数固定：auction_snapshot 只传 codes+stage（不得传 date）；auction_short_term_benchmark 只传 date（不得传 codes/stage）。",
       parameters: FetchHithinkDataSchema,
       executionMode: "sequential",
       execute: guard<FetchHithinkDataInput>(deps, "fetch_hithink_data", validateFetchHithinkDataInput, async (params, context) => {

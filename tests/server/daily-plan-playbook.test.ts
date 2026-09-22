@@ -9,6 +9,7 @@ import {
   activateAuctionAssessmentsForRun,
   activatePlaybookForRun,
   getLatestDailyPlanBoard,
+  getLatestLimitUpOpportunities,
   queryAuctionAssessmentContext,
   getLatestAuctionScopeAssessments,
   queryHistoricalPlanItems,
@@ -33,13 +34,13 @@ interface SeedIds {
   outputId: string;
 }
 
-async function seedDailyPlanRun(pool: pg.Pool, outputType: string): Promise<SeedIds> {
+async function seedDailyPlanRun(pool: pg.Pool, outputType: string, jobCode = "daily_plan_flow"): Promise<SeedIds> {
   await pool.query(
     `INSERT INTO job_definition (code, name, cron, job_type, config)
      VALUES ('daily_plan_flow', '每日交易计划', '0 30 16 * * 1-5', 'agent_flow', '{"daily_plan_write": true}')
      ON CONFLICT (code) DO NOTHING`,
   );
-  const jobId = (await pool.query<{ id: string }>("SELECT id::text FROM job_definition WHERE code = 'daily_plan_flow'")).rows[0]!.id;
+  const jobId = (await pool.query<{ id: string }>("SELECT id::text FROM job_definition WHERE code = $1", [jobCode])).rows[0]!.id;
   const run = await pool.query<{ id: string }>(
     `INSERT INTO job_run (job_id, target_date, trigger_kind, status)
      VALUES ($1, date '2026-08-27', 'manual', 'success') RETURNING id::text`,
@@ -104,18 +105,6 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
           intraday_md: "首次触及 10 元下方即市价卖出",
           invalidation_md: "全天收于 10.3 上方则维持持有",
         },
-        {
-          item_kind: "off_pool_opportunity",
-          code: "300750.SZ",
-          grade: "A",
-          priority: 1,
-          action: "observe",
-          trigger_kind: "condition",
-          headline: "涨停+龙虎榜净买共振，待验证候选",
-          evidence_md: "涨停 52 家中板块聚集第一，龙虎榜净买 +1.1 亿",
-          missing_md: "未做行情六条件复核",
-          risk_md: "连板换血期追高风险",
-        },
       ],
     });
     // 全量替换：第二次提交只剩持仓一行
@@ -137,8 +126,9 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
       ...base,
       items: [{ item_kind: "position_action", code: "600519.SH", action: "hold", trigger_kind: "open", headline: "x" }],
     })).rejects.toThrow();
+    const boardRun = await seedDailyPlanRun(pool, "limit_up_close_scan", "limit_up_close_scan");
     await expect(replaceDraftPlaybook(pool, {
-      ...base,
+      source_job_run_id: boardRun.jobRunId,
       items: [{
         item_kind: "off_pool_opportunity",
         code: "600519.SH",
@@ -214,8 +204,13 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
 
   it("竞价复核在任务成功后激活到最新打板机会，草稿不会提前展示", async () => {
     const plan = await seedDailyPlanRun(pool, "daily_plan");
+    await replaceDraftPlaybook(pool, { source_job_run_id: plan.jobRunId, items: [{
+      item_kind: "position_action", code: "600000.SH", action: "hold", trigger_kind: "condition", headline: "持仓竞价复核",
+    }] });
+    await activatePlaybookForRun(pool, plan.jobRunId, plan.outputId);
+    const boardRun = await seedDailyPlanRun(pool, "limit_up_close_scan", "limit_up_close_scan");
     await replaceDraftPlaybook(pool, {
-      source_job_run_id: plan.jobRunId,
+      source_job_run_id: boardRun.jobRunId,
       items: [{
         item_kind: "off_pool_opportunity",
         code: "300750.SZ",
@@ -228,7 +223,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
         risk_md: "高开回落风险",
       }],
     });
-    await activatePlaybookForRun(pool, plan.jobRunId, plan.outputId);
+    await activatePlaybookForRun(pool, boardRun.jobRunId, boardRun.outputId);
     await pool.query(
       `INSERT INTO market_trading_day (trade_date, is_open, source)
        VALUES ('2026-08-27', true, 'test'), ('2026-08-28', true, 'test')
@@ -290,7 +285,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
         data_time: "2026-08-28T09:30:12+08:00",
       }],
     });
-    expect((await getLatestDailyPlanBoard(pool)).opportunities[0]!.auction_assessment).toBeNull();
+    expect((await getLatestLimitUpOpportunities(pool)).opportunities[0]!.auction_assessment).toBeNull();
 
     const markdown = "# 集合竞价机会研判\n\n信号通过。";
     const output = await pool.query<{ id: string }>(
@@ -311,7 +306,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     expect(auctionResponse.status).toBe(200);
     expect((auctionResponse.json as { items: unknown[] }).items).toHaveLength(3);
 
-    expect((await getLatestDailyPlanBoard(pool)).opportunities[0]!.auction_assessment).toMatchObject({
+    expect((await getLatestLimitUpOpportunities(pool)).opportunities[0]!.auction_assessment).toMatchObject({
       output_id: output.rows[0]!.id,
       conclusion: "signal_passed",
       review_type: "turnover_advance",
@@ -326,7 +321,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
       signal_date: "2026-08-27",
       assessment_date: "2026-08-28",
       review_type: "turnover_advance",
-      plan_output_id: plan.outputId,
+      plan_output_id: boardRun.outputId,
     }]);
     const sessionId = (await pool.query<{ id: string }>(
       "INSERT INTO chat_session (title) VALUES ('打板归因测试') RETURNING id::text",
@@ -338,7 +333,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
       decision_origin: "strategy_signal", execution_compliance: "matched",
     });
     expect(bought.change).toMatchObject({
-      plan_output_id: plan.outputId,
+      plan_output_id: boardRun.outputId,
       entry_auction_assessment_id: expect.any(String),
     });
     const exitPlan = await seedDailyPlanRun(pool, "daily_plan");
@@ -363,7 +358,7 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     await pool.query("INSERT INTO market_trading_day(trade_date,is_open,source) VALUES ('2026-08-29',true,'test') ON CONFLICT(trade_date) DO UPDATE SET is_open=true");
     const context = await queryAuctionAssessmentContext(pool, "2026-08-29");
     expect(context.opportunities).toEqual([]);
-    expect(context.coverage).toMatchObject({ position_count: 1, attention_count: 2, opportunity_count: 0 });
+    expect(context.coverage).toMatchObject({ position_count: 1, opportunity_count: 0 });
     const run = (await pool.query<{ id: string }>(
       `INSERT INTO job_run(job_id,target_date,trigger_kind,status)
        SELECT id,'2026-08-29','manual','running' FROM job_definition WHERE code='auction_opportunity_assessment'
@@ -385,6 +380,38 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     )).rows[0]!.id;
     expect(await activateAuctionAssessmentsForRun(pool, run, output)).toBe(3);
     expect((await getLatestAuctionScopeAssessments(pool)).items).toHaveLength(3);
+  });
+
+  it("策略关注清除后历史竞价评估保留且来源外键置空", async () => {
+    const instrument = (await pool.query<{ id: string }>(
+      "INSERT INTO market_instrument(code,name,kind) VALUES ('990142.SZ','历史竞价关注','stock') RETURNING id::text",
+    )).rows[0]!;
+    await pool.query(
+      "INSERT INTO pool_membership(instrument_id,pool,role,effective_from) VALUES ($1,'watch','candidate','2026-08-28')",
+      [instrument.id],
+    );
+    const attention = (await pool.query<{ id: string }>(
+      `INSERT INTO pool_attention_entry
+         (instrument_id,source_type,strategy_code,source_job,status,reason,missing_signals,valid_from)
+       VALUES ($1,'strategy','swing','swing_signal_scan','qualified','等待复核','[]'::jsonb,'2026-08-28')
+       RETURNING id::text`, [instrument.id],
+    )).rows[0]!;
+    const run = (await pool.query<{ id: string }>(
+      `INSERT INTO job_run(job_id,target_date,trigger_kind,status)
+       SELECT id,'2026-08-29','manual','success' FROM job_definition WHERE code='auction_opportunity_assessment'
+       RETURNING id::text`,
+    )).rows[0]!;
+    await pool.query(
+      `INSERT INTO auction_scope_assessment
+         (source_job_run_id,target_date,target_key,scope_kind,instrument_id,attention_entry_id,strategy_code,
+          conclusion,metrics_summary,assessment_summary,data_status,status)
+       VALUES ($1,'2026-08-29',$2,'attention',$3,$4,'swing','wait','量能待核','继续等待','ready','active')`,
+      [run.id, `attention:${attention.id}`, instrument.id, attention.id],
+    );
+    await expect(pool.query("DELETE FROM pool_attention_entry WHERE id=$1", [attention.id])).resolves.toBeTruthy();
+    expect((await pool.query<{ attention_entry_id: string | null }>(
+      "SELECT attention_entry_id::text FROM auction_scope_assessment WHERE source_job_run_id=$1", [run.id],
+    )).rows[0]!.attention_entry_id).toBeNull();
   });
 
   it("输入校验：评级缺失、priority 规则与触发区间倒挂被拒绝", () => {

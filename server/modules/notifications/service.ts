@@ -3,12 +3,21 @@ import type pg from "pg";
 import { apiErrors } from "../../http/router.js";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
-const SAFE_SETTINGS = `enabled, job_codes, webhook IS NOT NULL AS webhook_configured,
-  sign_secret IS NOT NULL AS sign_secret_configured, revision, updated_at`;
-const SAFE_DELIVERY = `id::text, output_id::text, kind, content, status, attempts, error, created_at, sent_at, next_attempt_at`;
+const SAFE_SETTINGS = `enabled, job_codes,
+  CASE WHEN personal_webhook IS NULL AND personal_sign_secret IS NULL THEN enabled ELSE personal_enabled END AS personal_enabled,
+  COALESCE(personal_webhook, webhook) IS NOT NULL AS personal_webhook_configured,
+  COALESCE(personal_sign_secret, sign_secret) IS NOT NULL AS personal_sign_secret_configured,
+  CASE WHEN strategy_webhook IS NULL AND strategy_sign_secret IS NULL THEN enabled ELSE strategy_enabled END AS strategy_enabled,
+  COALESCE(strategy_webhook, webhook) IS NOT NULL AS strategy_webhook_configured,
+  COALESCE(strategy_sign_secret, sign_secret) IS NOT NULL AS strategy_sign_secret_configured,
+  webhook IS NOT NULL AS webhook_configured, sign_secret IS NOT NULL AS sign_secret_configured,
+  revision, personal_revision, strategy_revision, updated_at`;
+const SAFE_DELIVERY = `id::text, output_id::text, kind, channel, content, status, attempts, error, created_at, sent_at, next_attempt_at`;
 export const TEST_MESSAGE =
   "Stock 飞书推送测试\n连接验证消息，不包含持仓或计划内容。\n收到此消息表示当前群机器人配置可用。";
 export const AGENT_NOTIFICATION_SUMMARY_MAX_CHARS = 600;
+
+export type NotificationChannel = "personal" | "strategy";
 
 export function validateWebhook(value: string): string {
   // 固定官方 HTTPS 地址、无重定向；不提供可请求任意内网地址的通用 Webhook。
@@ -35,88 +44,92 @@ export async function getNotificationSettings(db: Db) {
       "SELECT code, name, enabled FROM job_definition WHERE job_type='agent_flow' ORDER BY id",
     )
   ).rows;
-  return { ...settings, jobs };
+  return { ...settings, jobs, strategy_jobs: jobs.filter((job) => job.code !== "daily_plan_flow"), strategy_job_codes: settings.job_codes };
 }
 
 export async function updateNotificationSettings(
   pool: pg.Pool,
   input: Record<string, unknown>,
 ) {
-  if (
-    Object.keys(input).some(
-      (key) =>
-        !["enabled", "webhook", "sign_secret", "job_codes"].includes(key),
-    )
-  ) {
+  const allowed = new Set([
+    "personal_enabled", "personal_webhook", "personal_sign_secret",
+    "strategy_enabled", "strategy_webhook", "strategy_sign_secret",
+    "strategy_job_codes", "enabled", "webhook", "sign_secret", "job_codes",
+  ]);
+  if (Object.keys(input).some((key) => !allowed.has(key)))
     throw apiErrors.badRequest("推送设置包含未知字段");
+
+  const booleans = ["personal_enabled", "strategy_enabled", "enabled"];
+  for (const key of booleans) {
+    if (input[key] !== undefined && typeof input[key] !== "boolean")
+      throw apiErrors.badRequest(`${key} 必须为布尔值`);
   }
-  if (input.enabled !== undefined && typeof input.enabled !== "boolean")
-    throw apiErrors.badRequest("enabled 必须为布尔值");
-  for (const field of ["webhook", "sign_secret"]) {
+  const credentialFields = [
+    "personal_webhook", "personal_sign_secret", "strategy_webhook", "strategy_sign_secret",
+    "webhook", "sign_secret",
+  ];
+  for (const field of credentialFields) {
     if (
       input[field] !== undefined &&
-      (typeof input[field] !== "string" ||
-        (input[field] as string).length > 1024)
-    ) {
-      throw apiErrors.badRequest("推送凭据必须为不超过 1024 字符的字符串");
-    }
+      (typeof input[field] !== "string" || (input[field] as string).length > 1024)
+    ) throw apiErrors.badRequest("推送凭据必须为不超过 1024 字符的字符串");
   }
+  const rawJobCodes = input.strategy_job_codes ?? input.job_codes;
   if (
-    input.job_codes !== undefined &&
-    input.job_codes !== null &&
-    (!Array.isArray(input.job_codes) ||
-      input.job_codes.length > 100 ||
-      input.job_codes.some(
-        (code) =>
-          typeof code !== "string" || !/^[a-z][a-z0-9_]{0,99}$/.test(code),
-      ))
-  ) {
-    throw apiErrors.badRequest("推送任务必须为任务编码数组或空值（全部任务）");
-  }
+    rawJobCodes !== undefined && rawJobCodes !== null &&
+    (!Array.isArray(rawJobCodes) || rawJobCodes.length > 100 ||
+      rawJobCodes.some((code) => typeof code !== "string" || !/^[a-z][a-z0-9_]{0,99}$/.test(code)))
+  ) throw apiErrors.badRequest("策略任务必须为任务编码数组或空值（全部任务）");
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const old = (
-      await client.query(
-        "SELECT * FROM notification_setting WHERE singleton FOR UPDATE",
-      )
+      await client.query("SELECT * FROM notification_setting WHERE singleton FOR UPDATE")
     ).rows[0]!;
-    const webhook =
-      input.webhook === undefined
-        ? old.webhook
-        : (input.webhook as string).trim() || null;
-    const secret =
-      input.sign_secret === undefined
-        ? old.sign_secret
-        : (input.sign_secret as string).trim() || null;
-    if (webhook) validateWebhook(webhook);
-    const enabled = input.enabled ?? old.enabled;
-    const jobCodes =
-      input.job_codes === undefined
-        ? old.job_codes
-        : input.job_codes === null
-          ? null
-          : [...new Set(input.job_codes as string[])];
+    const legacy = input.webhook !== undefined || input.sign_secret !== undefined || input.enabled !== undefined;
+    const value = (key: string, fallback: unknown): string | null => {
+      if (input[key] === undefined) return typeof fallback === "string" ? fallback : null;
+      return (input[key] as string).trim() || null;
+    };
+    const personalWebhook = value("personal_webhook", legacy ? (input.webhook === undefined ? old.personal_webhook ?? old.webhook : input.webhook) : old.personal_webhook ?? old.webhook);
+    const personalSecret = value("personal_sign_secret", legacy ? (input.sign_secret === undefined ? old.personal_sign_secret ?? old.sign_secret : input.sign_secret) : old.personal_sign_secret ?? old.sign_secret);
+    const strategyWebhook = value("strategy_webhook", legacy ? (input.webhook === undefined ? old.strategy_webhook ?? old.webhook : input.webhook) : old.strategy_webhook ?? old.webhook);
+    const strategySecret = value("strategy_sign_secret", legacy ? (input.sign_secret === undefined ? old.strategy_sign_secret ?? old.sign_secret : input.sign_secret) : old.strategy_sign_secret ?? old.sign_secret);
+    if (personalWebhook) validateWebhook(personalWebhook);
+    if (strategyWebhook) validateWebhook(strategyWebhook);
+    const personalEnabled = input.personal_enabled ?? (legacy ? input.enabled ?? old.personal_enabled ?? old.enabled : old.personal_enabled ?? old.enabled);
+    const strategyEnabled = input.strategy_enabled ?? (legacy ? input.enabled ?? old.strategy_enabled ?? old.enabled : old.strategy_enabled ?? old.enabled);
+    const jobCodes = rawJobCodes === undefined
+      ? old.job_codes
+      : rawJobCodes === null ? null : [...new Set(rawJobCodes as string[])];
     if (jobCodes?.length) {
       const valid = await client.query(
-        "SELECT code FROM job_definition WHERE job_type='agent_flow' AND code=ANY($1::text[])",
+        "SELECT code FROM job_definition WHERE job_type='agent_flow' AND code <> 'daily_plan_flow' AND code=ANY($1::text[])",
         [jobCodes],
       );
-      if (valid.rows.length !== jobCodes.length)
-        throw apiErrors.badRequest("只能订阅现有 Agent 任务");
+      if (valid.rows.length !== jobCodes.length) throw apiErrors.badRequest("只能订阅现有策略任务");
     }
-    if (enabled && (!webhook || !secret))
-      throw apiErrors.badRequest("启用前请填写 Webhook 和签名密钥");
-    const changed = webhook !== old.webhook || secret !== old.sign_secret;
+    if (personalEnabled && (!personalWebhook || !personalSecret))
+      throw apiErrors.badRequest("启用个人消息前请填写个人 Webhook 和签名密钥");
+    if (strategyEnabled && (!strategyWebhook || !strategySecret))
+      throw apiErrors.badRequest("启用策略任务消息前请填写策略 Webhook 和签名密钥");
+    const changedPersonal = personalWebhook !== (old.personal_webhook ?? old.webhook) || personalSecret !== (old.personal_sign_secret ?? old.sign_secret);
+    const changedStrategy = strategyWebhook !== (old.strategy_webhook ?? old.webhook) || strategySecret !== (old.strategy_sign_secret ?? old.sign_secret);
+    const changed = changedPersonal || changedStrategy;
     await client.query(
-      `UPDATE notification_setting SET enabled=$1, webhook=$2, sign_secret=$3,
-      revision=revision+$4, job_codes=$5, updated_at=now() WHERE singleton`,
-      [enabled, webhook, secret, changed ? 1 : 0, jobCodes],
+      `UPDATE notification_setting SET
+        enabled=$1, webhook=$2, sign_secret=$3,
+        personal_enabled=$4, personal_webhook=$5, personal_sign_secret=$6,
+        strategy_enabled=$7, strategy_webhook=$8, strategy_sign_secret=$9,
+        revision=revision+$10, personal_revision=personal_revision+$11,
+        strategy_revision=strategy_revision+$12, job_codes=$13, updated_at=now() WHERE singleton`,
+      [personalEnabled, personalWebhook, personalSecret,
+        personalEnabled, personalWebhook, personalSecret, strategyEnabled, strategyWebhook, strategySecret,
+        changed ? 1 : 0, changedPersonal ? 1 : 0, changedStrategy ? 1 : 0, jobCodes],
     );
-    if (changed) {
-      await client.query(`UPDATE notification_delivery SET status='cancelled', error='推送凭据已变更，请等待新的任务结果', lease_until=NULL
-        WHERE status IN ('pending','failed')`);
-    }
+    if (changedPersonal) await client.query(`UPDATE notification_delivery SET status='cancelled', error='个人消息凭据已变更，请等待新的每日计划', lease_until=NULL WHERE channel='personal' AND status IN ('pending','failed')`);
+    if (changedStrategy) await client.query(`UPDATE notification_delivery SET status='cancelled', error='策略任务凭据已变更，请等待新的策略任务结果', lease_until=NULL WHERE channel='strategy' AND status IN ('pending','failed')`);
     const settings = await getNotificationSettings(client);
     await client.query("COMMIT");
     return settings;
@@ -127,7 +140,6 @@ export async function updateNotificationSettings(
     client.release();
   }
 }
-
 // 保留完整短字段；过长条件不截成可能改变含义的半句。
 function field(value: unknown, max: number): string {
   const plain = String(value ?? "")
@@ -291,6 +303,7 @@ async function buildDailyPlanConclusion(
   header: string,
   footer: string,
   conclusion: string | null,
+  personalOnly = false,
 ): Promise<string | null> {
   const playbook = await db.query<DailyPlanItem>(
     `SELECT item_kind, code, name, grade, priority, action, trigger_kind,
@@ -300,7 +313,7 @@ async function buildDailyPlanConclusion(
       CASE action WHEN 'exit' THEN 0 WHEN 'reduce' THEN 1 ELSE 2 END, priority, id`,
     [output.id],
   );
-  const signals = output.session_id
+  const signals = !personalOnly && output.session_id
     ? await db.query<DailyPlanSignal>(
         `WITH latest_write AS (
       SELECT args FROM agent_tool_audit WHERE session_id=$1 AND tool_name='pool_attention_write'
@@ -327,8 +340,7 @@ async function buildDailyPlanConclusion(
   if (
     !conclusion &&
     !positions.length &&
-    !signals.rows.length &&
-    !opportunities.length
+    (personalOnly || (!signals.rows.length && !opportunities.length))
   )
     return null;
 
@@ -354,7 +366,7 @@ async function buildDailyPlanConclusion(
     "项持仓预案",
   );
 
-  const signalBlocks = signals.rows.map((signal, index) => {
+  const signalBlocks = personalOnly ? [] : signals.rows.map((signal, index) => {
     const pool =
       signal.pool === "short"
         ? "短线"
@@ -368,7 +380,7 @@ async function buildDailyPlanConclusion(
       detailLine("信号", signal.attention_reason, 180),
     ].filter((line): line is string => line !== null);
   });
-  appendBudgetedSection(
+  if (!personalOnly) appendBudgetedSection(
     lines,
     `【标的信号｜${signals.rows.length} 项】`,
     "本轮没有保留池内已符合或即将符合的标的信号。",
@@ -377,14 +389,14 @@ async function buildDailyPlanConclusion(
     "项标的信号",
   );
 
-  const opportunityBlocks = opportunities.map((item, index) => [
+  const opportunityBlocks = personalOnly ? [] : opportunities.map((item, index) => [
     `${index + 1}. ${field(item.name, 20)} ${item.code}｜${item.grade ? `${item.grade} 级` : "未评级"}｜顺序 ${item.priority}`,
     `   预案：${field(item.headline, 100)}`,
     detailLine("竞价/盘中", [item.auction_md, item.intraday_md].filter(Boolean).join("；"), 140),
     detailLine("证据", item.evidence_md, 100),
     detailLine("风险/失效", [item.risk_md, item.invalidation_md, item.missing_md].filter(Boolean).join("；"), 130),
   ].filter((line): line is string => line !== null));
-  appendBudgetedSection(
+  if (!personalOnly) appendBudgetedSection(
     lines,
     `【打板机会预案｜${opportunities.length} 项】`,
     "本轮没有形成有效打板机会。",
@@ -407,7 +419,9 @@ async function buildDailyPlanConclusion(
       header,
       `生成：${new Date(output.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`,
       "每日计划内容较多，已压缩为数量摘要；请在 Stock 工作台查看完整预案。",
-      `持仓预案 ${positions.length} 项｜标的信号 ${signals.rows.length} 项｜打板机会 ${opportunities.length} 项`,
+      personalOnly
+        ? `持仓预案 ${positions.length} 项`
+        : `持仓预案 ${positions.length} 项｜标的信号 ${signals.rows.length} 项｜打板机会 ${opportunities.length} 项`,
       "",
       footer,
     ].join("\n");
@@ -419,6 +433,7 @@ export async function previewJobConclusion(
   db: Db,
   outputId?: string,
   jobCode?: string,
+  options: { personalOnly?: boolean } = {},
 ): Promise<{
   output_id: string;
   job_code: string;
@@ -455,6 +470,7 @@ export async function previewJobConclusion(
       header,
       footer,
       conclusion,
+      options.personalOnly ?? false,
     );
     return content ? wrap(content) : null;
   }
@@ -481,33 +497,43 @@ export async function enqueueJobConclusion(
 ): Promise<void> {
   const settings = (
     await db.query(
-      "SELECT enabled, revision, job_codes FROM notification_setting WHERE singleton FOR SHARE",
+      `SELECT personal_enabled, personal_webhook, personal_sign_secret,
+        strategy_enabled, strategy_webhook, strategy_sign_secret,
+        enabled, webhook, sign_secret, revision, personal_revision, strategy_revision, job_codes
+       FROM notification_setting WHERE singleton FOR SHARE`,
     )
   ).rows[0]!;
-  if (!settings.enabled) return;
-  const summary = await previewJobConclusion(db, outputId);
-  if (
-    !summary ||
-    (settings.job_codes !== null &&
-      !settings.job_codes.includes(summary.job_code))
-  )
-    return;
+  const summary = await previewJobConclusion(db, outputId, undefined, { personalOnly: true });
+  if (!summary) return;
+  const personal = summary.job_code === "daily_plan_flow";
+  const legacyChannel = personal
+    ? settings.personal_webhook == null && settings.personal_sign_secret == null
+    : settings.strategy_webhook == null && settings.strategy_sign_secret == null;
+  const enabled = personal
+    ? (legacyChannel ? settings.enabled : settings.personal_enabled)
+    : (legacyChannel ? settings.enabled : settings.strategy_enabled);
+  const webhook = personal ? (settings.personal_webhook ?? settings.webhook) : (settings.strategy_webhook ?? settings.webhook);
+  const secret = personal ? (settings.personal_sign_secret ?? settings.sign_secret) : (settings.strategy_sign_secret ?? settings.sign_secret);
+  if (!enabled || !webhook || !secret) return;
+  if (!personal && settings.job_codes !== null && !settings.job_codes.includes(summary.job_code)) return;
   await db.query(
-    `INSERT INTO notification_delivery (output_id, kind, channel_revision, content)
-    VALUES ($1, 'agent_result', $2, $3) ON CONFLICT (output_id) DO NOTHING`,
-    [outputId, settings.revision, summary.content],
+    `INSERT INTO notification_delivery (output_id, kind, channel, channel_revision, content)
+    VALUES ($1, $2, $3, $4, $5) ON CONFLICT (output_id) DO NOTHING`,
+    [outputId, personal ? "daily_plan" : "agent_result", personal ? "personal" : "strategy", personal ? settings.personal_revision : settings.strategy_revision, summary.content],
   );
 }
 
-export async function queueTestNotification(db: Db) {
+export async function queueTestNotification(db: Db, channel: NotificationChannel = "personal") {
   const result = await db.query(
-    `INSERT INTO notification_delivery (kind, channel_revision, content)
-    SELECT 'test', revision, $1 FROM notification_setting WHERE singleton AND webhook IS NOT NULL AND sign_secret IS NOT NULL
+    `INSERT INTO notification_delivery (kind, channel, channel_revision, content)
+    SELECT 'test', $1, CASE WHEN $1='personal' THEN personal_revision ELSE strategy_revision END, $2 FROM notification_setting
+     WHERE singleton
+       AND CASE WHEN $1='personal' THEN COALESCE(personal_webhook, webhook) IS NOT NULL AND COALESCE(personal_sign_secret, sign_secret) IS NOT NULL
+                ELSE COALESCE(strategy_webhook, webhook) IS NOT NULL AND COALESCE(strategy_sign_secret, sign_secret) IS NOT NULL END
     RETURNING ${SAFE_DELIVERY}`,
-    [TEST_MESSAGE],
+    [channel, TEST_MESSAGE.replace("飞书推送测试", channel === "personal" ? "飞书个人消息推送测试" : "飞书策略任务推送测试")],
   );
-  if (!result.rows[0])
-    throw apiErrors.badRequest("请先保存 Webhook 和签名密钥");
+  if (!result.rows[0]) throw apiErrors.badRequest("请先保存对应 Webhook 和签名密钥");
   return result.rows[0];
 }
 
@@ -520,7 +546,7 @@ const DELIVERY_JOIN = `FROM notification_delivery d LEFT JOIN job_run_output o O
   LEFT JOIN job_definition j ON j.id=o.job_id`;
 export async function listNotifications(db: Db, query: NotificationQuery = {}) {
   const result = await db.query(
-    `SELECT d.id::text, d.output_id::text, d.kind, d.status, d.attempts, d.error,
+    `SELECT d.id::text, d.output_id::text, d.kind, d.channel, d.status, d.attempts, d.error,
       d.created_at, d.sent_at, d.next_attempt_at, j.code AS job_code, j.name AS job_name
     ${DELIVERY_JOIN} WHERE ($1::bigint IS NULL OR d.id<$1) AND ($2::text IS NULL OR d.status=$2)
       AND ($3::text IS NULL OR j.code=$3)
@@ -535,7 +561,7 @@ export async function listNotifications(db: Db, query: NotificationQuery = {}) {
 }
 export async function getNotification(db: Db, id: string) {
   const result = await db.query(
-    `SELECT d.id::text, d.output_id::text, d.kind, d.content, d.status, d.attempts, d.error,
+    `SELECT d.id::text, d.output_id::text, d.kind, d.channel, d.content, d.status, d.attempts, d.error,
       d.created_at, d.sent_at, d.next_attempt_at, j.code AS job_code, j.name AS job_name ${DELIVERY_JOIN} WHERE d.id=$1`,
     [id],
   );
@@ -544,7 +570,8 @@ export async function getNotification(db: Db, id: string) {
 }
 
 // 订阅暂停只影响尚未领取的任务结果；连接测试不受总开关或任务选择影响。
-const SUBSCRIBED = `(d.kind='test' OR (s.enabled AND (s.job_codes IS NULL OR EXISTS (
+const SUBSCRIBED = `(d.kind='test' OR (CASE WHEN d.channel='personal' THEN CASE WHEN s.personal_webhook IS NULL AND s.personal_sign_secret IS NULL THEN s.enabled ELSE s.personal_enabled END
+  ELSE CASE WHEN s.strategy_webhook IS NULL AND s.strategy_sign_secret IS NULL THEN s.enabled ELSE s.strategy_enabled END END AND (d.channel='personal' OR s.job_codes IS NULL OR EXISTS (
   SELECT 1 FROM job_run_output source JOIN job_definition job ON job.id=source.job_id
   WHERE source.id=d.output_id AND job.code=ANY(s.job_codes)))))`;
 const SUPERSEDED = `EXISTS (SELECT 1 FROM job_run_output newer JOIN job_run_output original ON original.id=d.output_id
@@ -557,7 +584,7 @@ export async function retryNotification(db: Db, id: string) {
     `UPDATE notification_delivery d SET status='pending', attempts=0,
       next_attempt_at=now(), lease_until=NULL, error=NULL
     FROM notification_setting s WHERE s.singleton AND d.id=$1 AND d.status='failed'
-      AND d.channel_revision=s.revision AND s.webhook IS NOT NULL AND s.sign_secret IS NOT NULL
+      AND d.channel_revision=CASE WHEN d.channel='personal' THEN s.personal_revision ELSE s.strategy_revision END AND CASE WHEN d.channel='personal' THEN COALESCE(s.personal_webhook, s.webhook) IS NOT NULL AND COALESCE(s.personal_sign_secret, s.sign_secret) IS NOT NULL ELSE COALESCE(s.strategy_webhook, s.webhook) IS NOT NULL AND COALESCE(s.strategy_sign_secret, s.sign_secret) IS NOT NULL END
       AND ${SUBSCRIBED} AND d.created_at > now()-interval '1 day'
       AND NOT ${SUPERSEDED}
     RETURNING d.id::text`,
@@ -639,19 +666,19 @@ export async function deliverNextNotification(
   await pool.query(`UPDATE notification_delivery d SET status='cancelled', lease_until=NULL,
     error='通知过期、渠道已变更或同任务同日期已有更新结果'
     FROM notification_setting s WHERE s.singleton AND (d.status IN ('pending','failed') OR (d.status='sending' AND d.lease_until<=now()))
-      AND (d.created_at<=now()-interval '1 day' OR d.channel_revision<>s.revision
+      AND (d.created_at<=now()-interval '1 day' OR d.channel_revision<>CASE WHEN d.channel='personal' THEN s.personal_revision ELSE s.strategy_revision END
         OR ${SUPERSEDED})`);
   await pool.query(`UPDATE notification_delivery SET status='failed', error='发送中断且已达到重试上限', lease_until=NULL
     WHERE status='sending' AND lease_until<=now() AND attempts>=3`);
   const claimed = await pool.query(`WITH candidate AS (
     SELECT d.id FROM notification_delivery d CROSS JOIN notification_setting s
-    WHERE s.singleton AND s.webhook IS NOT NULL AND s.sign_secret IS NOT NULL AND d.channel_revision=s.revision
+    WHERE s.singleton AND CASE WHEN d.channel='personal' THEN COALESCE(s.personal_webhook, s.webhook) IS NOT NULL AND COALESCE(s.personal_sign_secret, s.sign_secret) IS NOT NULL ELSE COALESCE(s.strategy_webhook, s.webhook) IS NOT NULL AND COALESCE(s.strategy_sign_secret, s.sign_secret) IS NOT NULL END AND d.channel_revision=CASE WHEN d.channel='personal' THEN s.personal_revision ELSE s.strategy_revision END
       AND ${SUBSCRIBED} AND d.attempts<3
       AND ((d.status='pending' AND d.next_attempt_at<=now()) OR (d.status='sending' AND d.lease_until<=now()))
     ORDER BY d.next_attempt_at, d.id FOR UPDATE OF d SKIP LOCKED LIMIT 1
   ) UPDATE notification_delivery d SET status='sending', attempts=attempts+1, lease_until=now()+interval '1 minute'
     FROM candidate c, notification_setting s WHERE d.id=c.id AND s.singleton
-    RETURNING d.id::text, d.content, d.attempts, s.webhook, s.sign_secret`);
+    RETURNING d.id::text, d.content, d.attempts, CASE WHEN d.channel='personal' THEN COALESCE(s.personal_webhook, s.webhook) ELSE COALESCE(s.strategy_webhook, s.webhook) END AS webhook, CASE WHEN d.channel='personal' THEN COALESCE(s.personal_sign_secret, s.sign_secret) ELSE COALESCE(s.strategy_sign_secret, s.sign_secret) END AS sign_secret`);
   const item = claimed.rows[0];
   if (!item) return false;
   try {

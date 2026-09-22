@@ -65,6 +65,15 @@ describe.skipIf(!prepared)("策略条件参考筛选（stock_test 真实库）",
     ]));
   });
 
+  it("完整标的可继续评估，单只缺日线不把整批标为部分完成", async () => {
+    const result = await queryStrategyScreen(pool, {
+      codes: ["990100.SZ", "990101.SZ"], rules: ["trial"], date: "2026-07-31",
+    });
+    expect(result).toMatchObject({ status: "success", completed_count: 1, skipped_count: 1 });
+    expect(result.items.find((item) => item.code === "990100.SZ")?.rules[0]?.status).toBe("evaluated");
+    expect(result.items.find((item) => item.code === "990101.SZ")?.rules[0]?.status).toBe("gap");
+  });
+
   it("缺日线时逐规则返回缺口并指引批量补拉后重跑", async () => {
     const result = await queryStrategyScreen(pool, {
       codes: ["990101.SZ"],

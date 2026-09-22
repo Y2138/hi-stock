@@ -3,6 +3,7 @@
 import { describe, expect, it } from "vitest";
 import {
   computeForwardCloses,
+  computeForwardOhlc,
   computeOfficialPrevCloses,
   type AdjustmentEvent,
   type RawPoint,
@@ -81,6 +82,18 @@ describe("computeForwardCloses", () => {
     const result = computeForwardCloses(raw, events, "2020-12-31");
     // (30.72 - (0 - 0.12*12.92)) / 1.12 = (30.72 + 1.5504) / 1.12
     expect(result.get("2020-01-02")).toBeCloseTo((30.72 + 1.5504) / 1.12, 5);
+  });
+});
+
+describe("computeForwardOhlc", () => {
+  it("累计现金分红令历史前复权收盘为负时仍保留最高价、最低价顺序", () => {
+    const rows = [{ date: "2020-01-02", open: 5, high: 5.2, low: 4.8, close: 5 },
+      { date: "2026-01-02", open: 10, high: 10.2, low: 9.8, close: 10 }];
+    const result = computeForwardOhlc(rows, [
+      { ex_date: "2024-01-02", dividend: 6, bonus: 0, rights_ratio: 0, rights_price: 0 },
+    ], "2026-01-02");
+    expect(result.get("2020-01-02")).toEqual({ open: -1, high: -0.8, low: -1.2, close: -1 });
+    expect(result.get("2026-01-02")).toEqual({ open: 10, high: 10.2, low: 9.8, close: 10 });
   });
 });
 

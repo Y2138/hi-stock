@@ -3,7 +3,7 @@ import type pg from "pg";
 import { apiErrors } from "../http/router.js";
 import { generateValueMonthlyRank } from "../modules/value-ranking/service.js";
 
-export const ANALYSIS_SERVICE_VERSION = "analysis-v2";
+export const ANALYSIS_SERVICE_VERSION = "analysis-v3";
 export const ANALYSIS_TYPES = ["sector_temperature", "key_levels", "long_valuation", "value_monthly_rank"] as const;
 export type AnalysisType = (typeof ANALYSIS_TYPES)[number];
 type Db = Pick<pg.Pool, "query">;
@@ -125,7 +125,7 @@ function unavailableMarketRegime(expectedBoards: number, reason: string): Market
   };
 }
 
-/** 全部一级行业等权日收益合成综合指数；窗口内任一板块缺数时不输出伪完整状态。 */
+/** 一级行业可用样本等权合成综合指数；低于九成覆盖时不输出市场状态。 */
 function marketRegime(codes: string[], bars: Map<string, Bar[]>): MarketRegimeResult {
   if (codes.length === 0) return unavailableMarketRegime(0, "没有有效的 881 一级行业板块");
   const dates = [...new Set(codes.flatMap((code) => (bars.get(code) ?? []).map((bar) => bar.bar_date)))].sort();
@@ -150,9 +150,9 @@ function marketRegime(codes: string[], bars: Map<string, Bar[]>): MarketRegimeRe
     available_dates: requiredDates.length,
     missing_codes: missingCodes,
   };
-  if (missingCodes.length > 0) {
+  if (completeCodes.length < Math.ceil(codes.length * 0.9)) {
     return {
-      ...unavailableMarketRegime(codes.length, `综合指数窗口有 ${missingCodes.length} 个一级行业缺数`),
+      ...unavailableMarketRegime(codes.length, `综合指数有效一级行业不足九成（${completeCodes.length}/${codes.length}）`),
       status: "partial",
       as_of: requiredDates.at(-1)!,
       base_date: requiredDates.at(0)!,
@@ -164,7 +164,7 @@ function marketRegime(codes: string[], bars: Map<string, Bar[]>): MarketRegimeRe
   for (let index = 1; index < requiredDates.length; index += 1) {
     const date = requiredDates[index]!;
     const previousDate = requiredDates[index - 1]!;
-    const dailyReturn = mean(codes.map((code) => closes.get(code)!.get(date)! / closes.get(code)!.get(previousDate)! - 1))!;
+    const dailyReturn = mean(completeCodes.map((code) => closes.get(code)!.get(date)! / closes.get(code)!.get(previousDate)! - 1))!;
     points.push(points.at(-1)! * (1 + dailyReturn));
   }
   const composite = points.at(-1)!;
@@ -182,7 +182,7 @@ function marketRegime(codes: string[], bars: Map<string, Bar[]>): MarketRegimeRe
     ma20,
     roc5_pct: roc5Pct,
     coverage,
-    reason: null,
+    reason: missingCodes.length ? `跳过 ${missingCodes.length} 个缺少完整窗口的一级行业` : null,
   };
 }
 
@@ -205,6 +205,7 @@ export interface SectorTemperatureOutcome {
     available_average_temperature: number | null;
     state: string;
     market_regime: MarketRegimeResult;
+    skipped: Array<{ code: string; reason: string }>;
     sectors: Array<{
       sector: string;
       code: string;
@@ -235,11 +236,11 @@ export async function querySectorTemperature(db: Db, request: AnalysisRequest): 
     for (const row of extra.rows) namesByCode.set(row.code, row.name);
   }
   const bars = grouped(await selectBars(db, codes, "day", request.as_of, Math.max(60, request.lookback ?? 60)));
-  const gaps: unknown[] = [];
+  const skipped: Array<{ code: string; reason: string }> = [];
   const items = codes.map((code) => {
     const rows = bars.get(code) ?? [];
     if (rows.length < 20) {
-      gaps.push({ code, reason: `日线不足 20 条（${rows.length}）` });
+      skipped.push({ code, reason: `日线不足 20 条（${rows.length}）` });
       return null;
     }
     const closes = rows.map((row) => number(row.close)).filter((value): value is number => value !== null);
@@ -262,11 +263,12 @@ export async function querySectorTemperature(db: Db, request: AnalysisRequest): 
     };
   }).filter((item): item is NonNullable<typeof item> => item !== null);
   const availableAverage = mean(items.map((item) => item!.temperature));
-  const average = items.length === codes.length ? availableAverage : null;
+  const average = codes.length > 0 && items.length >= Math.ceil(codes.length * 0.9) ? availableAverage : null;
   const regime = defaultUniverse
     ? marketRegime(codes, bars)
     : unavailableMarketRegime(codes.length, "市场状态只使用完整的 881 一级行业全集计算");
-  if (defaultUniverse && regime.status !== "success" && gaps.length === 0) {
+  const gaps: unknown[] = average === null ? [...skipped] : [];
+  if (defaultUniverse && regime.status !== "success") {
     gaps.push({ scope: "market_regime", reason: regime.reason });
   }
   return {
@@ -275,6 +277,7 @@ export async function querySectorTemperature(db: Db, request: AnalysisRequest): 
       available_average_temperature: availableAverage,
       state: average === null ? "数据不足" : average < 30 ? "低温" : average < 50 ? "偏冷" : average < 60 ? "中性" : average < 75 ? "偏暖" : "高温",
       market_regime: regime,
+      skipped,
       sectors: items,
     },
     gaps,
@@ -334,11 +337,12 @@ async function keyLevels(db: Db, request: AnalysisRequest) {
   ]);
   const dayMap = grouped(daily);
   const minuteMap = grouped(minute);
-  const gaps: unknown[] = [];
+  const skipped: Array<{ code: string; reason: string }> = [];
+  const warnings: Array<{ code: string; reason: string }> = [];
   const items = codes.map((code) => {
     const days = dayMap.get(code) ?? [];
     if (days.length < 20) {
-      gaps.push({ code, reason: `日线不足 20 条（${days.length}）` });
+      skipped.push({ code, reason: `日线不足 20 条（${days.length}）` });
       return null;
     }
     const atr = atr14(days);
@@ -346,7 +350,7 @@ async function keyLevels(db: Db, request: AnalysisRequest) {
     const support = Math.min(...recent.map((row) => Number(row.low)));
     const resistance = Math.max(...recent.map((row) => Number(row.high)));
     const intraday = minuteMap.get(code) ?? [];
-    if (!intraday.length) gaps.push({ code, reason: "缺少 30 分钟线，量价区域仅用日线" });
+    if (!intraday.length) warnings.push({ code, reason: "缺少 30 分钟线，量价区域仅用日线" });
     return {
       code,
       as_of: days.at(-1)!.bar_date,
@@ -358,7 +362,8 @@ async function keyLevels(db: Db, request: AnalysisRequest) {
       volume_zones: volumeZones(intraday.length ? intraday : days.slice(-60), atr),
     };
   }).filter(Boolean);
-  return { result: { items }, gaps, input: { requested_codes: codes.length, daily_rows: daily.length, minute30_rows: minute.length } };
+  return { result: { items, skipped, warnings }, gaps: items.length ? [] : skipped,
+    input: { requested_codes: codes.length, available_codes: items.length, daily_rows: daily.length, minute30_rows: minute.length } };
 }
 
 async function longValuation(db: Db, request: AnalysisRequest) {
@@ -386,18 +391,19 @@ async function longValuation(db: Db, request: AnalysisRequest) {
     [codes, request.as_of ?? null],
   );
   const byCode = new Map(rows.rows.map((row) => [String(row.code), row]));
-  const gaps: unknown[] = [];
+  const skipped: Array<{ code: string; reason: string }> = [];
   const items = codes.map((code) => {
     const row = byCode.get(code);
-    if (!row) {
-      gaps.push({ code, reason: "标的不存在" });
+    const reason = !row ? "标的不存在" : !row.valuation_date ? "缺少估值快照"
+      : !row.fundamental_date ? "缺少基本面快照" : null;
+    if (reason) {
+      skipped.push({ code, reason });
       return null;
     }
-    if (!row.valuation_date) gaps.push({ code, reason: "缺少估值快照" });
-    if (!row.fundamental_date) gaps.push({ code, reason: "缺少基本面快照" });
     return row;
   }).filter(Boolean);
-  return { result: { items }, gaps, input: { requested_codes: codes.length, matched_codes: items.length } };
+  return { result: { items, skipped }, gaps: items.length || codes.length === 0 ? [] : skipped,
+    input: { requested_codes: codes.length, matched_codes: items.length } };
 }
 
 function validateRequest(input: AnalysisRequest): AnalysisRequest {
