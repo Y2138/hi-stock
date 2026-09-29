@@ -9,7 +9,7 @@ import { queryRiskGate, recordDailyEquity } from "./risk-gate.js";
 import { MARKET_STRUCTURE_DATASETS, type MarketStructureDataset } from "../market/structure.js";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
-type StopLossMode = "ma5" | "ma10" | "fixed_90";
+type StopLossMode = "ma5" | "ma10" | "fixed_90" | "fixed_93";
 
 interface SyncRunRow {
   id: string;
@@ -88,7 +88,16 @@ interface PositionContextRow {
   indicator_date: string | null;
   ma5: number | null;
   ma10: number | null;
+  ma20: number | null;
   indicator_status: "ready" | "untrusted" | null;
+  high_10d: number | null;
+  low_10d: number | null;
+  high_20d: number | null;
+  low_20d: number | null;
+  prev_open: number | null;
+  prev_high: number | null;
+  prev_low: number | null;
+  prev_close: number | null;
   metric_date: string | null;
   calculation_version: string | null;
   input_row_count: number | null;
@@ -106,6 +115,7 @@ interface PositionContextRow {
   exit_policy_mode: "dedicated" | "fallback_only" | "dedicated_plus_fallback" | null;
   entry_buy_date: string | null;
   current_close: number | null;
+  current_close_date: string | null;
   entry_metric_date: string | null;
   entry_defense_recovery_ma10: number | null;
   entry_metric_status: string | null;
@@ -202,6 +212,7 @@ export function inferStopLossMode(stockCharacter: string | null, tags: string[])
   if (/止损[:：]?MA5/i.test(text)) return "ma5";
   if (/止损[:：]?MA10/i.test(text)) return "ma10";
   if (/止损[:：]?(买入价[×x*])?0[.]90/i.test(text)) return "fixed_90";
+  if (/止损[:：]?(买入价[×x*])?0[.]93/i.test(text)) return "fixed_93";
   const fast = text.includes("快拉");
   const slow = text.includes("慢拉") || text.includes("温吞");
   if (fast !== slow) return fast ? "ma5" : "ma10";
@@ -407,10 +418,13 @@ async function scanRightSideSignals(
   expectedDataDate: string | null,
 ) {
   const members = await db.query<PoolMember>(
-    `SELECT membership.instrument_id::text, instrument.code, instrument.name, instrument.kind
-       FROM pool_membership membership
-       JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-      WHERE membership.pool = 'watch' AND membership.effective_to IS NULL
+    `SELECT instrument.id::text AS instrument_id, instrument.code, instrument.name, instrument.kind
+       FROM market_instrument instrument
+      WHERE EXISTS (SELECT 1 FROM pool_membership membership WHERE membership.instrument_id=instrument.id
+                      AND membership.pool='watch' AND membership.effective_to IS NULL)
+         OR EXISTS (SELECT 1 FROM portfolio_position position WHERE position.instrument_id=instrument.id
+                      AND position.quantity>0 AND COALESCE(position.strategy_code,
+                        CASE WHEN position.entry_signal_type='right_side' THEN 'legacy_right_side' END)='legacy_right_side')
       ORDER BY instrument.code`,
   );
   const stockMembers = members.rows.filter((member) => member.kind === "stock");
@@ -425,19 +439,18 @@ async function scanRightSideSignals(
               row_number() OVER (
                 PARTITION BY bar.instrument_id ORDER BY bar.bar_date DESC, bar.bar_time DESC
               ) AS row_no
-         FROM pool_membership membership
-         JOIN market_instrument instrument ON instrument.id = membership.instrument_id AND instrument.kind = 'stock'
-         JOIN market_bar bar ON bar.instrument_id = membership.instrument_id
+         FROM market_instrument instrument
+         JOIN market_bar bar ON bar.instrument_id = instrument.id
                             AND bar.freq = 'day' AND bar.bar_date <= $1::date
          LEFT JOIN market_indicator_value indicator
            ON indicator.instrument_id = bar.instrument_id AND indicator.freq = bar.freq
           AND indicator.bar_date = bar.bar_date AND indicator.bar_time = bar.bar_time
-        WHERE membership.pool = 'watch' AND membership.effective_to IS NULL
+        WHERE instrument.kind='stock' AND instrument.id=ANY($2::bigint[])
      )
      SELECT code, bar_date, open, high, low, close, volume,
             ma5, ma10, ma20, dif, macd_hist, indicator_status
        FROM ranked WHERE row_no <= 5 ORDER BY code, bar_date`,
-    [date],
+    [date, stockMembers.map((member) => member.instrument_id)],
   );
   const byCode = new Map<string, RightSideSignalBar[]>();
   for (const bar of bars.rows) byCode.set(bar.code, [...(byCode.get(bar.code) ?? []), bar]);
@@ -646,6 +659,7 @@ async function queryPositionContext(
   date: string,
   expectedDataDate: string | null,
   rightSideByCode: Map<string, RightSideSignalEvaluation>,
+  strategyCode?: string,
 ) {
   const rows = await db.query<PositionContextRow>(
     `SELECT instrument.code, instrument.name, instrument.kind,
@@ -663,9 +677,15 @@ async function queryPositionContext(
               WHEN 'limit_up' THEN 'fallback_only' WHEN 'discretionary' THEN 'fallback_only'
               WHEN 'swing' THEN 'dedicated' WHEN 'left_reversal' THEN 'dedicated'
               WHEN 'two_year_reversal' THEN 'dedicated' END) AS exit_policy_mode,
-            membership.pool, membership.role, COALESCE(membership.tags, '[]'::jsonb) AS tags, membership.stock_character,
+            membership.pool, membership.role,
+            COALESCE(membership.tags, '[]'::jsonb) ||
+              CASE WHEN metric_run.status='success' THEN COALESCE(metric.tags, '[]'::jsonb) ELSE '[]'::jsonb END AS tags,
+            COALESCE(CASE WHEN metric_run.status='success' THEN metric.stock_character END, membership.stock_character) AS stock_character,
             indicator.bar_date::text AS indicator_date,
-            indicator.ma5::float8, indicator.ma10::float8, indicator.status AS indicator_status,
+            indicator.ma5::float8, indicator.ma10::float8, indicator.ma20::float8,
+            indicator.status AS indicator_status,
+            levels.high_10d, levels.low_10d, levels.high_20d, levels.low_20d,
+            levels.prev_open, levels.prev_high, levels.prev_low, levels.prev_close,
             metric.as_of_date::text AS metric_date, metric.calculation_version,
             metric.input_row_count, metric.defense_break_count, metric.defense_recovered_count,
             metric.defense_recovery_ma10,
@@ -673,7 +693,7 @@ async function queryPositionContext(
             COALESCE(holding.holding_trade_days, 0)::int AS holding_trade_days,
             holding.highest_high::float8, holding.highest_close::float8,
             COALESCE(entry_buy.change_date, position.opened_at)::text AS entry_buy_date,
-            lastbar.close::float8 AS current_close,
+            lastbar.close::float8 AS current_close, lastbar.bar_date::text AS current_close_date,
             entry_metric.as_of_date::text AS entry_metric_date,
             entry_metric.defense_recovery_ma10::float8 AS entry_defense_recovery_ma10,
             entry_metric_run.status AS entry_metric_status
@@ -682,12 +702,29 @@ async function queryPositionContext(
        LEFT JOIN pool_membership membership
          ON membership.instrument_id = position.instrument_id AND membership.effective_to IS NULL
        LEFT JOIN LATERAL (
-         SELECT value.bar_date, value.ma5, value.ma10, value.status
+         SELECT value.bar_date, value.ma5, value.ma10, value.ma20, value.status
            FROM market_indicator_value value
           WHERE value.instrument_id = position.instrument_id AND value.freq = 'day'
             AND value.bar_date <= $1::date
           ORDER BY value.bar_date DESC, value.bar_time DESC LIMIT 1
        ) indicator ON true
+       LEFT JOIN LATERAL (
+         SELECT max(CASE WHEN ranked.row_no <= 10 THEN ranked.high END)::float8 AS high_10d,
+                min(CASE WHEN ranked.row_no <= 10 THEN ranked.low END)::float8 AS low_10d,
+                max(CASE WHEN ranked.row_no <= 20 THEN ranked.high END)::float8 AS high_20d,
+                min(CASE WHEN ranked.row_no <= 20 THEN ranked.low END)::float8 AS low_20d,
+                max(CASE WHEN ranked.row_no = 2 THEN ranked.open END)::float8 AS prev_open,
+                max(CASE WHEN ranked.row_no = 2 THEN ranked.high END)::float8 AS prev_high,
+                min(CASE WHEN ranked.row_no = 2 THEN ranked.low END)::float8 AS prev_low,
+                max(CASE WHEN ranked.row_no = 2 THEN ranked.close END)::float8 AS prev_close
+           FROM (
+             SELECT bar.open, bar.high, bar.low, bar.close,
+                    row_number() OVER (ORDER BY bar.bar_date DESC, bar.bar_time DESC) AS row_no
+               FROM market_bar bar
+              WHERE bar.instrument_id = position.instrument_id AND bar.freq = 'day'
+                AND bar.bar_date <= $1::date
+           ) ranked
+       ) levels ON true
        LEFT JOIN LATERAL (
          SELECT current.*
            FROM market_stock_character_metric current
@@ -704,7 +741,7 @@ async function queryPositionContext(
           ORDER BY change.change_date DESC, change.id DESC LIMIT 1
        ) entry_buy ON true
        LEFT JOIN LATERAL (
-         SELECT bar.close
+         SELECT bar.close, bar.bar_date
            FROM market_bar bar
           WHERE bar.instrument_id = position.instrument_id AND bar.freq = 'day'
             AND bar.bar_date <= $1::date
@@ -731,7 +768,10 @@ async function queryPositionContext(
       ORDER BY instrument.code`,
     [date],
   );
-  const entryWindows = await loadEntryWindows(db, rows.rows
+  const selectedRows = rows.rows.filter((row) => !strategyCode || (strategyCode === "portfolio_fallback_exit"
+    ? row.fallback_strategy_code === strategyCode && ["fallback_only", "dedicated_plus_fallback"].includes(row.exit_policy_mode ?? "")
+    : row.strategy_code === strategyCode && row.exit_policy_mode !== "fallback_only"));
+  const entryWindows = await loadEntryWindows(db, selectedRows
     .filter((row) => row.strategy_code === "swing" || row.strategy_code === "legacy_left_reversal"
       || row.strategy_code === "two_year_reversal")
     .map((row) => ({ code: row.code, buy_date: row.entry_buy_date }))
@@ -739,30 +779,39 @@ async function queryPositionContext(
   const gaps: Array<{ code: string; reason: string }> = [];
   const swingItems: Array<{ code: string; resolved: boolean }> = [];
   const leftReversalItems: Array<{ code: string; resolved: boolean }> = [];
-  const items = rows.rows.map((row) => {
-    if (row.pool === null) gaps.push({ code: row.code, reason: "持仓缺少当前策略角色" });
+  const items = selectedRows.map((row) => {
+    if (!row.strategy_code) gaps.push({ code: row.code, reason: "持仓未绑定管理策略" });
     // 评估口径由买入信号类型决定：波段与左侧（存量）独立评估；其余回退短线口径做持有评估。
     const evaluationBasis: PositionEvaluationBasis = row.strategy_code === "swing"
       ? "swing"
       : row.strategy_code === "legacy_left_reversal"
         ? "left_reversal"
         : row.strategy_code === "two_year_reversal" ? "two_year_reversal" : "short_term";
-    if (evaluationBasis === "two_year_reversal") gaps.push({ code: row.code, reason: "两年结构反转新策略持仓按独立策略A方案人工核对风险线、MA20分批与ATR移动止损；旧左侧和短线退出位不适用" });
+
     const stopRequired = evaluationBasis === "short_term";
     const stopLossMode = inferStopLossMode(row.stock_character, row.tags);
     const stopLossModeSource = stopLossMode === null ? "missing" as const : "strategy" as const;
-    if (stopRequired && stopLossMode === null) gaps.push({ code: row.code, reason: "每日评估无法按当前策略与股性确定止损档位" });
+    const stopInputsRequired = stopRequired && strategyCode !== "legacy_right_side";
+    if (!row.opened_at) gaps.push({ code: row.code, reason: "持仓缺少开仓日期，无法确定持有天数与冷却期" });
+    if (row.current_close === null) gaps.push({ code: row.code, reason: "持仓缺少可用收盘价" });
+    if (expectedDataDate && row.current_close_date !== expectedDataDate) gaps.push({ code: row.code,
+      reason: `持仓日线尚未更新至 ${expectedDataDate}（当前 ${row.current_close_date ?? "无"}）` });
     let stopReference: number | null = null;
     const indicatorReady = row.indicator_status === "ready" && (!expectedDataDate || row.indicator_date === expectedDataDate);
     if (stopLossMode === "fixed_90") stopReference = row.cost_price * 0.9;
+    if (stopLossMode === "fixed_93") stopReference = row.cost_price * 0.93;
     if (stopLossMode === "ma5" && indicatorReady) stopReference = row.ma5;
     if (stopLossMode === "ma10" && indicatorReady) stopReference = row.ma10;
-    if (stopRequired && stopLossMode !== null && stopReference === null) {
-      gaps.push({ code: row.code, reason: `止损档位 ${stopLossMode} 缺少可信指标值` });
-    }
     const fastPullUp = isFastPullUp(row.stock_character, row.tags);
     const cooldownTradingDays = fastPullUp ? 2 : 3;
-    const cooldownActive = stopRequired && row.holding_trade_days <= cooldownTradingDays;
+    const cooldownActive = stopRequired && row.opened_at !== null && row.holding_trade_days > 0 && row.holding_trade_days <= cooldownTradingDays;
+    if (stopInputsRequired && !cooldownActive && stopLossMode !== null && stopReference === null) {
+      gaps.push({ code: row.code, reason: `止损档位 ${stopLossMode} 缺少可信指标值` });
+    }
+    if (stopInputsRequired && !cooldownActive && stopLossMode === null) gaps.push({ code: row.code,
+      reason: row.stock_character
+        ? "止损规则缺口：当前股性未定义 MA5、MA10 或买入价×0.90 档位，需补齐绑定策略规则"
+        : "股性数据缺口：缺少可用于绑定策略止损档位判定的画像" });
     const technicalStop = stopReference === null
       ? null
       : roundPrice(Math.min(Math.max(stopReference, row.cost_price * 0.88), row.cost_price * 0.95));
@@ -775,7 +824,9 @@ async function queryPositionContext(
         : highestCloseRatio >= 0.3 ? row.cost_price * 1.2
           : highestCloseRatio >= 0.15 ? row.cost_price * 1.1
             : highestCloseRatio >= 0.08 ? row.cost_price * 1.08 : null;
-    const currentClose = rightSideByCode.get(row.code)?.evidence.close ?? null;
+    const currentClose = row.current_close;
+    if (stopInputsRequired && !cooldownActive && currentClose !== null && currentClose / row.cost_price - 1 > 0.08
+      && (!indicatorReady || row.ma5 === null)) gaps.push({ code: row.code, reason: "移动保护缺少当日可信 MA5 指标，需重算持仓日线指标" });
     const ma5Protection = indicatorReady && row.ma5 !== null && currentClose !== null && currentClose / row.cost_price - 1 > 0.08
       ? row.ma5 * 0.99
       : null;
@@ -785,7 +836,7 @@ async function queryPositionContext(
       ? roundPrice(Math.max(...postTakeProfitCandidates))
       : null;
     const rightSide = rightSideByCode.get(row.code) ?? null;
-    if (stopRequired && rightSide === null) {
+    if (row.strategy_code === "legacy_right_side" && strategyCode !== "portfolio_fallback_exit" && rightSide === null) {
       gaps.push({ code: row.code, reason: "短线持仓右侧六条件重算未完成" });
     }
     const macdWeaknessExit = rightSide !== null && !cooldownActive &&
@@ -802,7 +853,7 @@ async function queryPositionContext(
     const metricReady = row.kind !== "stock" || (
       row.metric_date !== null && row.metric_run_status === "success" && (!expectedDataDate || row.metric_date === expectedDataDate)
     );
-    if (!metricReady) gaps.push({
+    if (!metricReady && row.strategy_code === "swing") gaps.push({
       code: row.code,
       reason: row.metric_date && expectedDataDate && row.metric_date !== expectedDataDate
         ? `护盘收回率数据日为${row.metric_date}，市场数据日为${expectedDataDate}`
@@ -867,17 +918,37 @@ async function queryPositionContext(
       highest_high: row.highest_high,
       highest_close: row.highest_close,
       holding_trade_days: row.holding_trade_days,
+      // 情景/做T预案的技术面事实：全部为机械计算值，不做任何策略化判断。
+      technical_levels: {
+        data_date: row.current_close_date,
+        close: row.current_close,
+        ma5: row.ma5,
+        ma10: row.ma10,
+        ma20: row.ma20,
+        high_10d: row.high_10d,
+        low_10d: row.low_10d,
+        high_20d: row.high_20d,
+        low_20d: row.low_20d,
+        prev_open: row.prev_open,
+        prev_high: row.prev_high,
+        prev_low: row.prev_low,
+        prev_close: row.prev_close,
+        ...(row.kind === "stock" && row.current_close !== null ? {
+          limit_up_price: roundPrice(row.current_close * (/^(30|68)/.test(row.code) ? 1.2 : 1.1)),
+          limit_down_price: roundPrice(row.current_close * (/^(30|68)/.test(row.code) ? 0.8 : 0.9)),
+        } : {}),
+      },
     };
   });
   const positionBasis = (row: PositionContextRow): PositionEvaluationBasis =>
     row.strategy_code === "swing" ? "swing"
       : row.strategy_code === "legacy_left_reversal" ? "left_reversal"
         : row.strategy_code === "two_year_reversal" ? "two_year_reversal" : "short_term";
-  const requiredStops = rows.rows.filter((row) => positionBasis(row) === "short_term");
-  const requiredMetrics = rows.rows.filter((row) => row.kind === "stock");
+  const requiredStops = selectedRows.filter((row) => positionBasis(row) === "short_term");
+  const requiredMetrics = selectedRows.filter((row) => row.kind === "stock");
   return {
     status: gaps.length === 0 ? "success" as const : "partial" as const,
-    position_count: rows.rows.length,
+    position_count: selectedRows.length,
     stop_loss_required_count: requiredStops.length,
     stop_loss_strategy_count: requiredStops.filter((row) =>
       inferStopLossMode(row.stock_character, row.tags) !== null,
@@ -898,7 +969,7 @@ async function queryPositionContext(
   };
 }
 
-export async function queryPositionCompatibilityContext(db: Db, date: string) {
+export async function queryPositionCompatibilityContext(db: Db, date: string, strategyCode?: string) {
   const latest = await db.query<{ data_date: string | null }>(
     `SELECT max(bar.bar_date)::text AS data_date FROM market_bar bar
       JOIN market_instrument instrument ON instrument.id=bar.instrument_id
@@ -906,14 +977,69 @@ export async function queryPositionCompatibilityContext(db: Db, date: string) {
     [date],
   );
   const dataDate = latest.rows[0]?.data_date ?? null;
-  const rightSide = await scanRightSideSignals(db, date, dataDate);
+  const rightSide = !strategyCode || strategyCode === "legacy_right_side"
+    ? await scanRightSideSignals(db, date, dataDate)
+    : { items: [], gaps: [] };
   const positions = await queryPositionContext(
     db,
     date,
     dataDate,
     new Map(rightSide.items.map((item) => [item.code, item])),
+    strategyCode,
   );
   return { requested_date: date, data_date: dataDate, right_side: rightSide, positions };
+}
+
+/** 持仓板块归属与当日表现：对立板块盯盘的数据基础；缺归属或缺板块行情时列为缺口，不臆测。 */
+async function queryPositionBoards(
+  db: Db,
+  positionCodes: Array<{ code: string; name: string; kind: string }>,
+  sectorByCode: Map<string, { day_return_pct: number; five_day_return_pct: number; temperature: number }>,
+) {
+  if (positionCodes.length === 0) return { items: [], gaps: [] };
+  const rows = await db.query<{ member_code: string; board_type: string; board_code: string; board_name: string }>(
+    `SELECT member.code AS member_code, board.board_type,
+            board_instrument.code AS board_code, board_instrument.name AS board_name
+       FROM market_instrument member
+       JOIN market_board_membership membership
+         ON membership.member_instrument_id = member.id AND membership.effective_to IS NULL
+       JOIN market_board board
+         ON board.instrument_id = membership.board_instrument_id AND board.active = true
+       JOIN market_instrument board_instrument ON board_instrument.id = board.instrument_id
+      WHERE member.code = ANY($1::text[])
+      ORDER BY member.code, board.board_type, board_instrument.code`,
+    [positionCodes.map((position) => position.code)],
+  );
+  const grouped = new Map<string, Array<{ board_type: string; board_code: string; board_name: string }>>();
+  for (const row of rows.rows) {
+    grouped.set(row.member_code, [...(grouped.get(row.member_code) ?? []),
+      { board_type: row.board_type, board_code: row.board_code, board_name: row.board_name }]);
+  }
+  const gaps: Array<{ code: string; reason: string }> = [];
+  const items = positionCodes.map((position) => {
+    const memberships = grouped.get(position.code) ?? [];
+    const industries = memberships.filter((membership) => membership.board_type === "industry").map((membership) => {
+      const summary = sectorByCode.get(membership.board_code) ?? null;
+      return {
+        code: membership.board_code,
+        name: membership.board_name,
+        day_return_pct: summary?.day_return_pct ?? null,
+        five_day_return_pct: summary?.five_day_return_pct ?? null,
+        temperature: summary?.temperature ?? null,
+        performance_missing: !summary,
+      };
+    });
+    if (position.kind === "stock" && industries.length === 0) {
+      gaps.push({ code: position.code, reason: "无有效一级行业归属，板块盯盘缺失" });
+    }
+    return {
+      code: position.code,
+      name: position.name,
+      industries,
+      concepts: memberships.filter((membership) => membership.board_type === "concept").map((membership) => membership.board_name),
+    };
+  });
+  return { items, gaps };
 }
 
 export async function queryDailyPlanContext(db: Db, date: string) {
@@ -935,6 +1061,21 @@ export async function queryDailyPlanContext(db: Db, date: string) {
     dataDate,
     new Map(rightSide.items.map((item) => [item.code, item])),
   );
+  const positionBoards = await queryPositionBoards(
+    db,
+    positions.items.map((item) => ({ code: item.code, name: item.name, kind: item.kind })),
+    new Map(sector.result.sectors.map((sector) => [sector.code, sector])),
+  );
+  const sectorsByDayReturn = [...sector.result.sectors].sort((left, right) => right.day_return_pct - left.day_return_pct);
+  const boardDayRanking = {
+    data_date: dataDate,
+    strongest: sectorsByDayReturn.slice(0, 5).map((sector) => ({
+      code: sector.code, name: sector.sector, day_return_pct: sector.day_return_pct,
+    })),
+    weakest: [...sectorsByDayReturn].reverse().slice(0, 5).map((sector) => ({
+      code: sector.code, name: sector.sector, day_return_pct: sector.day_return_pct,
+    })),
+  };
   const positionCodes = new Set(positions.items.map((item) => item.code));
   const detailedRightSideItems = rightSide.items.filter((item) =>
     item.passed_count >= 4 || positionCodes.has(item.code),
@@ -1038,6 +1179,7 @@ export async function queryDailyPlanContext(db: Db, date: string) {
     ...rightSide.gaps.map((gap) => ({ scope: "right_side_evaluation", detail: gap })),
     ...trial.gaps.map((gap) => ({ scope: "trial_evaluation", detail: gap })),
     ...positions.gaps.map((gap) => ({ scope: "position", detail: gap })),
+    ...positionBoards.gaps.map((gap) => ({ scope: "position_boards", detail: gap })),
   ];
   return {
     requested_date: date,
@@ -1058,6 +1200,11 @@ export async function queryDailyPlanContext(db: Db, date: string) {
     right_side_evaluation: compactRightSide,
     trial_evaluation: compactTrial,
     positions,
+    position_boards: {
+      items: positionBoards.items,
+      note: "industries 为所属一级行业及当日表现（数据日口径）；concepts 仅名称；用于对立板块盯盘与情景预案",
+    },
+    board_day_ranking: boardDayRanking,
     gaps,
   };
 }

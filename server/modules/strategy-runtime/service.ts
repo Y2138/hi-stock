@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { attentionValidUntil, strategyAttentionCodes } from "../pools/attention-lifecycle.js";
 import type pg from "pg";
 import { inServiceTransaction } from "../../db/transaction.js";
 import { apiErrors } from "../../http/router.js";
@@ -142,6 +143,7 @@ async function inputFacts(db: Db, input: EnsureStrategyEvaluationInput, binding:
     market: market.rows[0] ?? {},
     positions: positions.rows,
     pool: pool.rows,
+    attention_review_codes: input.phase === "entry" ? await strategyAttentionCodes(db, input.strategy_code) : [],
     value_rank: ranks.rows[0] ?? {},
   };
 }
@@ -228,7 +230,7 @@ export function describeEntryMissingSignals(
       }
       if (condition === "rsi_oversold") {
         const current = decimal(evidence.rsi14);
-        if (current) return `RSI14：当前 ${current}，目标 < 40.00`;
+        if (current) return `RSI14：当前 ${current}，目标 < 30.00`;
       }
       if (condition === "reward_risk_acceptable") {
         const current = decimal(evidence.expected_reward_risk);
@@ -296,6 +298,7 @@ async function persistEntrySignals(
 ): Promise<void> {
   const items = entryItems(strategyCode, result);
   if (!items.length) return;
+  const validUntil = await attentionValidUntil(client, targetDate);
   const codes = [...new Set(items.map(({ item }) => String(item.code).toUpperCase()))];
   const instruments = await client.query<{ id: string; code: string }>(
     "SELECT id::text,code FROM market_instrument WHERE code=ANY($1::text[])", [codes],
@@ -313,12 +316,12 @@ async function persistEntrySignals(
       `INSERT INTO strategy_entry_signal
          (run_id,strategy_code,instrument_id,signal_status,trigger_kind,trigger_price_lower,
           trigger_price_upper,invalidation,reason,evidence,missing_signals,valid_from,valid_until)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,NULL)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13)`,
       [runId, strategyCode, instrumentId, status,
        lower !== null || upper !== null ? "price_range" : "condition",
        lower, upper, item.invalidation ?? null,
        `${strategyCode} ${status === "qualified" ? "正式信号" : "接近候选"}`,
-       JSON.stringify(item), JSON.stringify(missing), targetDate],
+       JSON.stringify(item), JSON.stringify(missing), targetDate, validUntil],
     );
   }
 }

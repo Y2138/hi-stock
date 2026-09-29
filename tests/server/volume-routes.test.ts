@@ -10,7 +10,7 @@ import path from "node:path";
 import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPool } from "../../server/db/client.js";
-import { runMigrations } from "../../server/db/migrate.js";
+import { loadMigrations, runMigrations } from "../../server/db/migrate.js";
 import { insertFetchRun } from "../../server/datasource/service.js";
 import { findPgTool, serverMajorVersion } from "../../server/volume/export.js";
 import { PROJECT_ROOT, resolveTestDatabaseUrl } from "../../server/config.js";
@@ -108,7 +108,7 @@ describe.skipIf(!prepared)("数据卷 HTTP 路由（stock_test 真实库）", ()
     expect(exported.status).toBe(201);
     const data = exported.json as { path: string; manifest_path: string; migration_max: number; strategy_revision_count: number; strategy_definition_count: number; job_definition_count: number };
     expect(data.path).toMatch(/\.ndjson\.gz$/);
-    expect(data.migration_max).toBe(144);
+    expect(data.migration_max).toBe(Math.max(...(await loadMigrations(path.join(import.meta.dirname, "../../server/migrations"))).map((migration) => migration.version)));
     expect(data.strategy_revision_count).toBeGreaterThan(0);
     expect(data.strategy_definition_count).toBeGreaterThan(0);
     expect(data.job_definition_count).toBeGreaterThan(0);
@@ -116,7 +116,7 @@ describe.skipIf(!prepared)("数据卷 HTTP 路由（stock_test 真实库）", ()
     const listed = await api(server.baseUrl, "GET", "/api/volume/portable");
     expect(listed.status).toBe(200);
     expect(listed.json).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: data.path, migration_max: 144, strategy_revision_count: data.strategy_revision_count, strategy_definition_count: data.strategy_definition_count }),
+      expect.objectContaining({ path: data.path, migration_max: data.migration_max, strategy_revision_count: data.strategy_revision_count, strategy_definition_count: data.strategy_definition_count }),
     ]));
   });
 
@@ -153,7 +153,7 @@ describe.skipIf(!prepared)("数据卷 HTTP 路由（stock_test 真实库）", ()
       expect(rows).toHaveLength(1);
       expect(rows[0]!.path).toBe(data.path);
       expect(rows[0]!.kind).toBe("manual");
-      expect(rows[0]!.manifest.database).toContain("stock_test");
+      expect(rows[0]!.manifest.database).toBe(new URL(resolveTestDatabaseUrl()!).pathname.slice(1));
       expect(rows[0]!.manifest.table_count).toBeGreaterThan(0);
     },
   );

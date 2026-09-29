@@ -1,18 +1,25 @@
 // 结构化计划工具属于所有持久化 Agent 会话的共享目录；关联任务运行由会话自动解析。
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
+import { attentionValidUntil, reconcileAttentionRemainder, strategyAttentionCodes } from "../modules/pools/attention-lifecycle.js";
 import { ensureStrategyPoolMemberProfile, WATCH_POOL, setPoolAttentionEntry } from "../modules/pools/repo.js";
-import { replaceDraftAuctionAssessments, replaceDraftPlaybook } from "../modules/plans/repo.js";
+import { replaceDraftAuctionAssessments, replaceDraftPlaybook, replaceDraftScenarios } from "../modules/plans/repo.js";
 import { withAgentMutationLock } from "./mutation-lock.js";
 import { insertToolAudit } from "./repo.js";
 import { sha256Json } from "./hash.js";
+import { writeMarketNews } from "../modules/market-news/repo.js";
 import {
   ScheduledPoolAttentionSchema,
   AuctionAssessmentWriteSchema,
   DailyPlanWriteSchema,
+  DailyPlanScenarioWriteSchema,
   validateScheduledPoolAttentionInput,
   validateAuctionAssessmentWriteInput,
   validateDailyPlanWriteInput,
+  validateDailyPlanScenarioWriteInput,
+  PoolNewsWriteSchema,
+  validatePoolNewsWriteInput,
+  type PoolNewsWriteInput,
 } from "./tool-validation.js";
 
 function result(value: unknown): AgentToolResult<unknown> {
@@ -41,10 +48,10 @@ async function associatedRunningJob(
   pool: pg.Pool,
   sessionId: string | null,
   codes: readonly string[],
-): Promise<{ id: string; code: string; strategy_code: string | null }> {
+): Promise<{ id: string; code: string; strategy_code: string | null; target_date: string }> {
   if (!sessionId) throw new Error(`${codes.join("/")} 结构化写入需要持久化 Agent 会话`);
-  const result = await pool.query<{ id: string; code: string; strategy_code: string | null }>(
-    `SELECT run.id::text, definition.code, definition.strategy_code
+  const result = await pool.query<{ id: string; code: string; strategy_code: string | null; target_date: string }>(
+    `SELECT run.id::text, definition.code, definition.strategy_code, run.target_date::text
        FROM job_run run
        JOIN job_definition definition ON definition.id = run.job_id
       WHERE run.session_id = $1
@@ -60,135 +67,97 @@ async function associatedRunningJob(
 
 /** 允许向关注池写入自动关注的定时评估任务；来源隔离，各自对账，互不清除。 */
 const POOL_ATTENTION_JOBS = [
-  "daily_plan_flow",
   "nightly_sector_opportunity_scan",
-  "value_anchor_opportunity_scan",
 ] as const;
+
+export function buildPoolNewsWriteTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+  return {
+    name: "pool_news_write",
+    label: "写入盘前消息面快照",
+    description: "一次性写入本次盘前消息快照和消息卡片。只保存最近 48 小时内已核验的公开消息，并将 codes 关联到标的；不修改策略、关注池或交易数据。",
+    parameters: PoolNewsWriteSchema,
+    executionMode: "sequential",
+    execute: async (_toolCallId, rawInput, signal) => {
+      if (signal?.aborted) throw new Error("消息面写入已中断");
+      const input: PoolNewsWriteInput = validatePoolNewsWriteInput(rawInput);
+      const running = await associatedRunningJob(deps.pool, deps.sessionId, ["pre_market_news_scan"]);
+      const outcome = await withAgentMutationLock(deps.pool, async (client) => {
+        const written = await writeMarketNews(client, input, running.id);
+        await insertToolAudit(client, { session_id: deps.sessionId, tool_name: "pool_news_write", args: { args_sha256: sha256Json(input) }, result_sha256: sha256Json(written), status: "ok" });
+        return written;
+      });
+      return result(outcome);
+    },
+  };
+}
 
 export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
   return {
     name: "pool_attention_write",
     label: "批量维护关注池自动关注",
     description:
-      "一次提交本轮应保留的全部自动关注并在同一事务按策略来源对账。items 中的 mark 是本任务来源的完整保留集合，遗漏的本策略历史关注会被清除；没有候选时提交空 items。已持仓标的不会进入自动关注，误提交时服务端跳过并清除其旧本来源关注；其他策略来源与人工关注互不影响、不得覆盖。夜间板块任务可将板块内个股观察信号自动初始化到关注池，前提是已有完整五维画像；其他任务仍只维护已有关注池成员。qualified 表示信号已成立，不得有缺失条件；approaching 必须在 missing_signals 中逐项列出尚未成立的信号和次日确认标准（包含策略名称与实际阈值，只使用查询证据，不得臆造）。不同策略来源的关注在页面并列展示，不合成统一质量分。",
+      "复核夜间板块策略全部存量关注后提交结果。先读取 pool_context_query，逐项研究、优先补齐缺数。mark 更新符合或接近条件的信号；clear 仅用于明确失效。reviewed_codes 列出确已完成复核的全部代码（包括不再符合者），review_gaps 列出缺数代码和具体原因。未覆盖条目必须提交 partial，不得凭未入选推断失效。数据不足不续期，过期自动退出；仅自动入池且无其他有效来源的标的退出关注池。人工关注、其他策略和持仓独立保留。",
     parameters: ScheduledPoolAttentionSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {
       try {
         if (signal?.aborted) throw new Error("关注池维护已中断");
         const input = validateScheduledPoolAttentionInput(rawInput);
-        const { code: jobCode, strategy_code: boundStrategyCode } = await associatedRunningJob(deps.pool, deps.sessionId, POOL_ATTENTION_JOBS);
-        const strategyCode = boundStrategyCode ?? (jobCode === "daily_plan_flow" ? "swing" : null);
+        const running = await associatedRunningJob(deps.pool, deps.sessionId, POOL_ATTENTION_JOBS);
+        const { code: jobCode, strategy_code: strategyCode, target_date: date } = running;
         if (!strategyCode) throw new Error(`任务 ${jobCode} 未绑定关注策略`);
+        if (input.data_date && input.data_date !== date) throw new Error("关注复核数据日必须与任务目标日一致");
+        if ((input.reviewed_codes.length || input.items.length) && !input.data_date) throw new Error("实际复核必须提供目标日 data_date");
+        if (input.evaluation_status === "failed" && input.items.length) throw new Error("评估失败不能更新或清除信号");
         const outcome = await withAgentMutationLock(deps.pool, async (client) => {
-          const items = [];
-          const kept = new Set<string>();
+          await client.query("SELECT pg_advisory_xact_lock(hashtext('pool-attention-lifecycle'))");
+          await client.query("SELECT code FROM strategy_definition WHERE code=$1 FOR UPDATE", [strategyCode]);
+          const newer = await client.query(`SELECT 1 FROM job_run run JOIN job_definition definition ON definition.id=run.job_id
+            WHERE definition.strategy_code=$1 AND run.target_date>$2::date AND run.status IN ('running','success') LIMIT 1`, [strategyCode, date]);
+          if (newer.rows.length) throw new Error("已有更新日期的策略任务，拒绝历史运行覆盖关注池");
+          const existing = await strategyAttentionCodes(client, strategyCode);
+          const covered = new Set([...input.reviewed_codes, ...input.items.map((item) => item.code)]);
+          if (input.evaluation_status === "success" && (input.review_gaps.length || existing.some((code) => !covered.has(code)))) {
+            throw new Error("尚未逐项复核全部存量关注；请补齐 reviewed_codes，缺数时提交 partial 和 review_gaps");
+          }
+          const items: Array<Record<string, unknown>> = [];
+          const kept: string[] = [];
+          const validUntil = await attentionValidUntil(client, date);
           for (const item of input.items) {
-            const current = await client.query<{ quantity: number }>(
-              `SELECT COALESCE(position.quantity, 0)::float8 AS quantity
-                 FROM market_instrument instrument
-                 LEFT JOIN portfolio_position position ON position.instrument_id = instrument.id
-                WHERE instrument.code = $1`,
-              [item.code],
-            );
-            const held = (current.rows[0]?.quantity ?? 0) > 0;
-            const existing = held
-              ? await client.query<{ source_job: string }>(
-                  `SELECT entry.source_job FROM pool_attention_entry entry
-                    JOIN market_instrument instrument ON instrument.id = entry.instrument_id
-                   WHERE instrument.code = $1 AND entry.source_job = $2`,
-                  [item.code, jobCode],
-                )
-              : { rows: [] as Array<{ source_job: string }> };
-            if (!current.rows[0]) throw new Error(`未知标的代码：${item.code}`);
-            const membership = await client.query<{ id: string }>(
-              `SELECT membership.id::text FROM pool_membership membership
-                 JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-                WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL`,
-              [item.code, WATCH_POOL],
-            );
-            if (!membership.rows[0] && item.action === "mark" && !held && jobCode === "nightly_sector_opportunity_scan") {
-              await ensureStrategyPoolMemberProfile(client, {
-                code: item.code,
-                effective_from: item.attention_from!,
-                strategy_name: "夜间板块结构观察",
-              });
-              membership.rows = (await client.query<{ id: string }>(
-                `SELECT membership.id::text FROM pool_membership membership
-                   JOIN market_instrument instrument ON instrument.id = membership.instrument_id
-                  WHERE instrument.code = $1 AND membership.pool = $2 AND membership.effective_to IS NULL`,
-                [item.code, WATCH_POOL],
-              )).rows;
-            }
-            if (!membership.rows[0]) {
-              throw new Error(`标的 ${item.code} 不在关注池中，自动作业不得绕过完整入池评估`);
-            }
-            if (item.action === "mark" && held) {
-              if (existing.rows[0]) {
-                const write = await setPoolAttentionEntry(client, {
-                  code: item.code, source_job: jobCode, strategy_code: strategyCode, status: item.attention_status!,
-                  reason: null,
-                });
-                items.push({
-                  code: item.code, action: "clear",
-                  previous_reason: write.before?.reason ?? null,
-                  suppressed_by: "existing_position",
-                });
-              } else {
+            if (input.review_gaps.some((gap) => gap.code === item.code)) throw new Error(`${item.code} 缺数据时不能续期或判定失效`);
+            if (item.action === "mark") {
+              if (!input.data_date || item.attention_from !== date) throw new Error("更新关注必须提供目标日 data_date，attention_from 必须与任务日期一致");
+              const held = await client.query(`SELECT 1 FROM portfolio_position position JOIN market_instrument instrument
+                ON instrument.id=position.instrument_id WHERE instrument.code=$1 AND position.quantity>0`, [item.code]);
+              if (held.rows.length) {
                 items.push({ code: item.code, action: "skip", suppressed_by: "existing_position" });
+                continue;
               }
-              continue;
+              const membership = await client.query(`SELECT 1 FROM pool_membership membership JOIN market_instrument instrument
+                ON instrument.id=membership.instrument_id WHERE instrument.code=$1 AND membership.pool=$2 AND membership.effective_to IS NULL`, [item.code, WATCH_POOL]);
+              if (!membership.rows.length) await ensureStrategyPoolMemberProfile(client, {
+                code: item.code, effective_from: date, strategy_name: "夜间板块结构观察",
+              });
+              const write = await setPoolAttentionEntry(client, {
+                code: item.code, source_job: jobCode, strategy_code: strategyCode, data_date: date,
+                status: item.attention_status!, reason: item.attention_reason!, missing_signals: item.missing_signals,
+                valid_from: date, valid_until: item.attention_until! < validUntil ? item.attention_until : validUntil,
+                stale_reason: null,
+              });
+              kept.push(item.code);
+              items.push({ code: item.code, action: "mark", reason: write.after?.reason,
+                attention_from: write.after?.valid_from, attention_until: write.after?.valid_until });
             }
-            if (item.action === "mark") kept.add(item.code);
-            const write = await setPoolAttentionEntry(client, {
-              code: item.code,
-              source_job: jobCode,
-              strategy_code: strategyCode,
-              data_date: input.data_date ?? null,
-              stale_reason: null,
-              status: item.action === "mark" ? item.attention_status! : "qualified",
-              reason: item.action === "mark" ? item.attention_reason! : null,
-              missing_signals: item.action === "mark" ? item.missing_signals ?? [] : [],
-              valid_from: item.attention_from ?? undefined,
-              valid_until: item.action === "mark" ? item.attention_until ?? null : null,
-            });
-            items.push({
-              code: item.code,
-              action: item.action,
-              previous_reason: write.before?.reason ?? null,
-              reason: write.after?.reason ?? null,
-              attention_from: write.after?.valid_from ?? null,
-              attention_until: write.after?.valid_until ?? null,
-            });
           }
-          if (input.evaluation_status === "partial") {
-            await client.query(
-              `UPDATE pool_attention_entry SET stale_reason=$2, updated_at=now()
-                WHERE source_type='strategy' AND strategy_code=$1
-                  AND NOT (instrument_id IN (SELECT id FROM market_instrument WHERE code = ANY($3::text[])))`,
-              [strategyCode, input.reason, [...kept]],
-            );
-          }
-          const stale = input.evaluation_status === "success" ? await client.query<{ code: string }>(
-            `SELECT instrument.code
-               FROM pool_attention_entry entry
-               JOIN market_instrument instrument ON instrument.id = entry.instrument_id
-              WHERE entry.source_type = 'strategy' AND entry.strategy_code = $1
-                AND NOT (instrument.code = ANY($2::text[]))
-              ORDER BY instrument.code`,
-            [strategyCode, [...kept]],
-          ) : { rows: [] as Array<{ code: string }> };
-          for (const item of stale.rows) {
-            const write = await setPoolAttentionEntry(client, {
-              code: item.code, source_job: jobCode, strategy_code: strategyCode, status: "qualified", reason: null,
-            });
-            items.push({
-              code: item.code, action: "clear",
-              previous_reason: write.before?.reason ?? null,
-              reconciled: true,
-            });
-          }
-          const summary = { source_job: jobCode, strategy_code: strategyCode, evaluation_status: input.evaluation_status, total: items.length, items };
+          const remainder = await reconcileAttentionRemainder(client, {
+            strategy_code: strategyCode, date, kept,
+            reviewed: input.evaluation_status === "failed" ? [] : [...input.reviewed_codes,
+              ...input.items.filter((item) => item.action === "clear").map((item) => item.code)],
+            gaps: input.review_gaps, reason: input.reason,
+          });
+          items.push(...remainder.changes.map((item) => ({ ...item, reconciled: true })));
+          const summary = { source_job: jobCode, strategy_code: strategyCode, evaluation_status: input.evaluation_status,
+            total: items.length, items, pool_removed: remainder.removed };
           await insertToolAudit(client, {
             session_id: deps.sessionId,
             tool_name: "pool_attention_write",
@@ -240,6 +209,45 @@ export function buildJobDailyPlanTool(deps: {
         return result(outcome);
       } catch (error) {
         await auditError(deps.pool, deps.sessionId, "daily_plan_write", rawInput);
+        throw error;
+      }
+    },
+  };
+}
+
+export function buildJobDailyPlanScenarioTool(deps: {
+  pool: pg.Pool;
+  sessionId: string | null;
+}): AgentTool {
+  return {
+    name: "daily_plan_scenario_write",
+    label: "写入每日计划情景与做T预案",
+    description:
+      "一次性提交每笔持仓的情景预案矩阵（冲高回落/开盘下砸/全天宽幅波动/强势延续/弱势破位按适用取舍）、做T区间与集合竞价、分时盯防、失效改判、风险字段。情景与做T只依据 daily_plan_strategy_query 返回的关键点位、市场与所属板块当日表现和盘前消息面，不以冷却期、止盈核对期等为由缺省；做T默认给低吸/兑现区间，仅一字板、停牌等流动性极端可用 skip_reason 显式说明。全量替换式写入，只能调用一次。",
+    parameters: DailyPlanScenarioWriteSchema,
+    executionMode: "sequential",
+    execute: async (_toolCallId, rawInput, signal) => {
+      try {
+        if (signal?.aborted) throw new Error("情景预案写入已中断");
+        const input = validateDailyPlanScenarioWriteInput(rawInput);
+        const { id: runId } = await associatedRunningJob(deps.pool, deps.sessionId, ["daily_plan_flow"]);
+        const outcome = await withAgentMutationLock(deps.pool, async (client) => {
+          const write = await replaceDraftScenarios(client, {
+            source_job_run_id: runId,
+            items: input.items,
+          });
+          await insertToolAudit(client, {
+            session_id: deps.sessionId,
+            tool_name: "daily_plan_scenario_write",
+            args: input,
+            result_sha256: sha256Json(write),
+            status: "ok",
+          });
+          return write;
+        });
+        return result(outcome);
+      } catch (error) {
+        await auditError(deps.pool, deps.sessionId, "daily_plan_scenario_write", rawInput);
         throw error;
       }
     },

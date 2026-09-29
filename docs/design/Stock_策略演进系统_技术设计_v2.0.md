@@ -39,7 +39,7 @@ E1–E38 全文见产品方案 §一，不再复制。技术层关键约束：Po
 | T14 | 批量动作与 UI 聚合 | `fetch_market_data.requests` 最多 200 项，服务端顺序执行并通过 tool_update 汇报进度；UI 对连续同名且无确认卡的调用分组折叠，单批结果优先展示汇总 | 减少模型调用轮次与工具卡噪声，确认内容仍完整可见 |
 | T15 | YOLO 与能力提示词（工具集合已由 T42 收敛） | `agent_setting` 持久化 `yolo_mode`；普通领域写入在确认制下写 pending，YOLO 直接事务执行，两条路径都经领域 service、状态指纹、写锁与审计。`finalize_backtest` 验证通过后始终直接事务执行；策略发布提案始终要求真人批准。系统提示词动态注入轻量表索引、轻量记忆索引与当前模式 | 保留 YOLO 安全语义，同时明确回测最终化和策略发布的独立门禁 |
 | T16 | 工具零信任与并发写协调 | pi loop 的 schema 校验不是信任边界；每个 execute/domain 入口再次严格校验并拒绝未知字段和语义歧义。所有 Agent 业务写工具共用按当前数据库区分的 PostgreSQL transaction advisory lock；确认批准锁定提案行并复核目标状态 SHA-256 | LLM 可输出错误参数；多会话与重复确认必须由数据库而非提示词保证一致性 |
-| T17 | M3 调度一致性与自动流程权限 | `croner` 只接受 5 段 cron并固定 Asia/Shanghai；`(job_id, scheduled_for)` 部分唯一索引去重，Runner 原子 claim；同一 `job_run` 最多两次尝试。当前只允许 datasource/analysis/agent_flow；agent_flow 与普通 Agent 共用权限工具注册表、按需工具目录及确认制/YOLO 设置，策略发布仍只能创建待真人审核提案；旧 script Runner 已退役 | 防重复 tick，并由领域 service、写锁、审计与真人发布门禁约束自动流程写入 |
+| T17 | M3 调度一致性与自动流程权限 | `croner` 只接受 5 段 cron并固定 Asia/Shanghai；`(job_id, scheduled_for)` 部分唯一索引去重，Runner 原子 claim；同一 `job_run` 最多两次尝试。`trading_day_only`（默认开）使 cron/missed 入队前校验目标日为交易所日历开市日，双休与法定节假日不入队，周维护任务显式豁免，手动触发不受限。当前只允许 datasource/analysis/agent_flow；agent_flow 与普通 Agent 共用权限工具注册表、按需工具目录及确认制/YOLO 设置，策略发布仍只能创建待真人审核提案；旧 script Runner 已退役 | 防重复 tick 与休市日误执行，并由领域 service、写锁、审计与真人发布门禁约束自动流程写入 |
 | T18 | 领域写工具（历史集合，现行以 T42 为准） | 删除通用 `database_change`。历史阶段曾注册自选与回测写工具；0029 后自选工具退役，0030 后由 `run_backtest` 产生工作运行、`finalize_backtest` 晋升最终结论，并新增记忆读写。策略调整只能使用 `strategy_publish_request` 创建待审核提案。领域参数不包含表、列或 SQL；确认与 YOLO 都经正式 service、审计、写锁和状态冲突检测 | 保留历史决策演进，同时以 T42 明确当前工具边界；策略发布始终排除在 YOLO 之外 |
 | T19 | 当前策略与冻结内容域 | `strategy_document` 保存现存策略稳定身份与当前正文（`content`/`sha256`），`strategy_state` 保存整体序号与集合哈希；历史修订正文不保存（0088 移除 `strategy_document_revision`）。“预期校对”和“数据获取规范”及其冻结内容副本均不存在。`content_*` 的其余旧策略/指引冻结，POST/PATCH 统一拒绝 | 页面和 Agent 只加载现存策略，同时保留并发一致性、恢复和审计能力 |
 | T20 | 作业提示词与结果 | `job_prompt` + `job_prompt_revision` 独立版本化；`job_definition.prompt_id` 引用稳定提示词，`job_run.prompt_revision_id` 固化实际版本。`job_write` 维护定义与提示词，`trigger_job` 只排队；Markdown 产物原子写 `job_run_output` 并关联运行/session，`job_run.result_md` 只兼容读取 | 计划与执行分离，历史运行和领域结果均可解释 |
@@ -633,6 +633,7 @@ interface Channel { name: string; supports(req: FetchRequest): boolean; fetch(re
 | 30 分钟线 | 新浪 `stock_zh_a_minute` 同源 HTTP（period=30、不复权、sh/sz 前缀） | 口径与 `fetch_30m_data.py` 一致：末价与日线收盘偏差 >3% 弃用 |
 | 期货主力连续日线 | 新浪 `futures_main_sina` 同源 HTTP | 合约拼接序列只表趋势，当年起窗口覆盖拉取 |
 | 个股资金流 | `https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get`（参数按规范 §2.3） | 主域 IP 风控，禁止走 push2his 主域；实测（2026-08-16）日级仅返回最近 1 个交易日，资金流暂只取数不落库，存储位置待后续明确 |
+| 交易日历 | 深交所 `onepersistenthour/monthList`（按月） | 整月逐日返回开休标志；目录同步写上月至下季共 5 个月，补齐 `market_trading_day` 的节假日休市行与未来覆盖；次年未发布返回空，不算缺口 |
 
 ### 5.4 每日更新链路（datasource 作业）
 
@@ -828,6 +829,7 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 ## 八、调度器（M3，`scheduler/`）
 
 - `service.ts`：每 30 秒用 `croner` 解析 enabled 作业；只接受传统 5 段 cron，固定时区 `Asia/Shanghai`。cron 扫描只负责幂等入队，不等待 Runner 完成；长任务运行期间仍持续扫描后续计划时刻。`job_run_scheduled_once` 保证多 tick/多进程对同一计划时刻只插入一次，Runner 以 `UPDATE ... WHERE status='queued'` 原子 claim。
+- 交易日门禁：入队前按 `job_definition.trading_day_only`（默认开）校验目标日——周末一律不入队，`market_trading_day` 显式休市行不入队，日历未覆盖的工作日按降级口径入队；固定周六执行的周维护任务显式豁免，手动触发不受限。
 - 启动补偿：从每个作业最后 `scheduled_for`（初次为定义创建/更新时间）扫描到启动时刻，插入 `missed` 记录；不补跑，页面提示可手动触发。暂停区间不追记。
 - `runner.ts`：`datasource` → 数据库动态解析真实/模拟持仓、待执行模拟信号、有效标的池、同花顺一、二级官方行业、八个核心指数和期货范围 → `dailyMarketUpdate`（含 MA）→ 执行目标日模拟信号 → scheduled 数据卷导出；`analysis` → 严格校验三类结构化请求并复用 `analysis/`；`agent_flow` → 固化 `job_prompt_revision`，按任务模型创建会话，构造与普通 Agent 同源的权限工具注册表并通过 `tool_catalog` 按需注入 schema；集合竞价任务使用 `auction_context_query`、`fetch_hithink_data` 和 `auction_assessment_write`，Markdown 写 `job_run_output`，结构化判断成功激活后发布仪表盘刷新事件。
 - 夜间板块机会筛选在工作日 23:00 运行，固定使用 DeepSeek V4 Pro。完成门禁要求目标日执行未传 `codes` 的完整 881 一级行业板块温度分析，再通过板块、行情、指标、策略筛选和标的研究只读工具形成 1–3 个板块、每板块最多 2 只标的；完整报告留在任务工作台，飞书只取不超过 600 个中文字符的 `结论摘要`。
@@ -997,7 +999,7 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 ### 4.34 `first_board_advance`（10:45涨停梯队盘中先手）
 
 - 稳定技术编码继续使用 `first_board_advance` 和 `first_board_intraday_scan`，展示名称为“涨停梯队盘中先手策略”和“涨停梯队盘中扫描”。盘中涨停、炸板、行情、最终竞价和题材梯队只写独立快照，收盘市场结构仍由收盘任务维护。
-- 扫描范围覆盖首板与高位连板。候选携带当前连板数、下一晋级阶段、题材最高板、梯队层数、高位核心状态和题材角色；被高位带动的跟风首板降级，高位核心断板后的低位切换单独识别。
+- 扫描范围覆盖执行时点当前涨停池中的首板与高位连板，一字板和10:30后封板不作资格排除。一字板记为高一致性、低盘中分歧，同时标记排队成交风险；晚封板只影响排序。候选携带当前连板数、下一晋级阶段、题材最高板、梯队层数、高位核心状态和题材角色；被高位带动的跟风首板降级，高位核心断板后的低位切换单独识别。
 - 每日最多4只正式候选；同时存在合格首板和高位连板时至少各保留1只，同一题材最多2只。收盘涨停接力扫描对盘中候选做二次复核，但不修改10:45原始快照。
 - 次日集合竞价按候选自身连板阶段使用晋级强、正常晋级、分歧持有、转弱退出、数据不足五类结论，并叠加连板高度PK。
 
@@ -1005,3 +1007,15 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 
 - 竞价上下文返回前一交易日最高连板、最高梯队股票及三进四/四进五候选；最高梯队代码一并进入最终竞价批量取数。
 - 最高梯队按最终竞价分为高度压制、高度释放和高度混合，只调整同日候选PK优先级，不覆盖原竞价硬门禁。
+
+### 4.36 `0154_定时任务仅交易日执行.sql`（调度排除双休与法定节假日）
+
+- 背景：法定节假日落在工作日时（如 2026-09-25 中秋）cron 的星期段无法排除，任务以休市日为目标日执行并覆盖上一开市日的信号。
+- `job_definition.trading_day_only` 默认 true：cron/missed 入队前按 `market_trading_day` 校验目标日，周末一律不入队，日历显式休市行不入队，日历未覆盖的工作日按降级口径入队；固定排在周六的 `value_candidate_sync`、`weekly_full_market_indicators` 显式豁免。手动触发不受门禁限制。
+- 交易日历覆盖由目录同步补齐：深交所月度日历写整月开休市行（上月至下季共 5 个月），当年缺月记任务缺口，次年未发布返回空不算缺口。
+
+### 4.37 `0156_波段信号每日总量收敛.sql`（簇发日信号预算）
+
+- 背景：指数大跌带动全市场普跌时，波段四条件簇发命中（2026-09-28 单日 26 个正式信号），指导意义低。
+- 波段正式信号、接近候选与复核候选每日合计不超过 10 个：正式信号按预期盈亏比降序优先占用预算，剩余名额依次给信号质量前 5 接近候选和存量复核候选；被挤出但条件仍满足的标的在 `capped_out` 单列。
+- 关注对账新增 `deferred` 通道：总预算挤出的存量关注保留至原有效期到期、不续期也不清退，与"复核后不再满足"的清退语义区分。

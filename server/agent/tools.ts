@@ -50,7 +50,9 @@ import { buildBusinessContextTools } from "./business-context-tools.js";
 import {
   buildJobAuctionAssessmentTool,
   buildJobDailyPlanTool,
+  buildJobDailyPlanScenarioTool,
   buildJobPoolAttentionTool,
+  buildPoolNewsWriteTool,
 } from "./job-tools.js";
 import { withAgentMutationLock } from "./mutation-lock.js";
 import { insertToolAudit } from "./repo.js";
@@ -223,20 +225,23 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "strategy_document_query",
     "job_context_query",
     "daily_plan_strategy_query",
+    "daily_plan_scenario_write",
   ],
-  swing_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
-  copper_left_launch_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
+  swing_signal_scan: ["strategy_document_query", "strategy_evaluation_query", "fetch_market_data"],
+  copper_left_launch_signal_scan: ["strategy_document_query", "strategy_evaluation_query", "fetch_market_data"],
   first_board_intraday_scan: ["strategy_document_query", "strategy_evaluation_query"],
   limit_up_close_scan: ["strategy_document_query", "strategy_evaluation_query"],
-  two_year_reversal_scan: ["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query"],
+  two_year_reversal_scan: ["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query", "fetch_market_data"],
   value_anchor_opportunity_scan: [
+    "fetch_market_data",
     "strategy_document_query",
     "strategy_evaluation_query",
     "value_anchor_signal_query",
-    "pool_attention_write",
   ],
   nightly_sector_opportunity_scan: [
-    "strategy_document_query",
+    "fetch_market_data",
+    "pool_context_query",
+    "fetch_hithink_data",    "strategy_document_query",
     "analysis_run",
     "board_query",
     "market_snapshot_query",
@@ -246,6 +251,7 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "market_event_query",
     "pool_attention_write",
   ],
+  pre_market_news_scan: ["pool_context_query", "pool_news_write"],
 };
 
 /** 展示任务明确授权的工具；未知任务不把交互工具回退目录伪装成专项授权。 */
@@ -260,6 +266,8 @@ const JOB_FLOW_ONLY_TOOLS = new Set([
   "auction_context_query",
   "pool_attention_write",
   "daily_plan_write",
+  "daily_plan_scenario_write",
+  "pool_news_write",
   "auction_assessment_write",
 ]);
 
@@ -496,6 +504,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     buildTwoYearReversalSignalTool({ pool, sessionId: deps.sessionId }),
     buildSwingSignalTool({ pool, sessionId: deps.sessionId }),
     buildLimitUpSignalTool({ pool, sessionId: deps.sessionId }),
+    buildPoolNewsWriteTool({ pool, sessionId: deps.sessionId }),
     {
       name: "memory_query",
       label: "查询 Agent 记忆",
@@ -560,6 +569,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     ...domainWriteTools,
     buildJobPoolAttentionTool({ pool, sessionId: deps.sessionId }),
     buildJobDailyPlanTool({ pool, sessionId: deps.sessionId }),
+    buildJobDailyPlanScenarioTool({ pool, sessionId: deps.sessionId }),
     buildJobAuctionAssessmentTool({ pool, sessionId: deps.sessionId }),
     {
       name: "analysis_run",

@@ -62,6 +62,20 @@ export async function dailyMarketGate(db: Db, targetDate: string, now: Date): Pr
   return { action: "run", mode: targetDate === today ? "snapshot" : "historical" };
 }
 
+/**
+ * cron 入队门禁：目标日是否为交易日。
+ * 周末一律休市；日历有行时以 is_open 为准（含显式休市行）；日历未覆盖的日期
+ * （次年未发布或目录同步长期缺数）按工作日推测，与 dailyMarketGate 的降级口径一致。
+ */
+export async function isScheduledTradingDay(db: Db, date: string): Promise<boolean> {
+  if (!isWeekdayDate(date)) return false;
+  const calendar = await db.query<{ is_open: boolean }>(
+    "SELECT is_open FROM market_trading_day WHERE trade_date = $1",
+    [date],
+  );
+  return calendar.rows[0]?.is_open ?? true;
+}
+
 /** 只接受传统 5 段 cron，所有匹配固定按 Asia/Shanghai。 */
 export function assertCron(expression: unknown): string {
   if (typeof expression !== "string" || expression.trim().split(/\s+/).length !== 5) {

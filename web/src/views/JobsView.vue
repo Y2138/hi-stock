@@ -161,6 +161,7 @@ function executionLabel(job: JobDefinition): string {
 
 function modelLabel(job: JobDefinition): string {
   if (job.job_type !== "agent_flow") return "不调用模型";
+  if (job.code === "pre_market_news_scan") return "跟随系统默认 Agent 模型；Web 搜索为内置 DeepSeek Web Search 能力";
   if (!job.model_id) return "跟随系统默认";
   for (const provider of llmCatalog.data.value?.providers ?? []) {
     const model = provider.models.find((item) => item.id === job.model_id);
@@ -402,7 +403,7 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
                       <span class="expand-mark" aria-hidden="true">{{ expandedJobCode === job.code ? "−" : "+" }}</span>
                       <span><strong>{{ job.name }}</strong><small class="code">{{ job.code }}</small></span>
                     </button>
-                    <div class="job-meta"><span class="badge accent">{{ TYPE_LABELS[job.job_type] }}</span><span v-if="job.phase" class="badge">{{ job.phase }}</span><span>{{ job.job_type === "agent_flow" ? runtimeRole(job) : executionLabel(job) }}</span></div>
+                    <div class="job-meta"><span class="badge accent">{{ TYPE_LABELS[job.job_type] }}</span><span v-if="job.phase" class="badge">{{ job.phase }}</span><span v-if="job.trading_day_only" class="badge">仅交易日</span><span>{{ job.job_type === "agent_flow" ? runtimeRole(job) : executionLabel(job) }}</span></div>
                     <p class="job-purpose-text">{{ responsibility(job) }}</p>
                   </td>
                   <td>

@@ -1,7 +1,9 @@
 // 关注池领域：当前成员、股性画像、板块投影、多来源近期关注与展示偏好。
 import type pg from "pg";
 import { inServiceTransaction, type TransactionDb } from "../../db/transaction.js";
+import { closeUnwatchedAutoMembers } from "./attention-lifecycle.js";
 import { STOCK_CHARACTER_CALCULATION_VERSION } from "../../indicators/formulas.js";
+import { getLatestMarketNews, instrumentNews } from "../market-news/repo.js";
 
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
 export type PoolKind = "watch";
@@ -33,8 +35,10 @@ export interface PoolAttentionEntry {
 
 export interface PoolMemberRow {
   id: string;
+  instrument_id: string;
   pool: PoolKind;
   role: string;
+  management_mode: "manual" | "strategy";
   tags: string[];
   stock_character: string | null;
   stock_character_profile: Record<string, unknown>;
@@ -47,6 +51,7 @@ export interface PoolMemberRow {
   effective_to: string | null;
   note: string | null;
   attention_entries: PoolAttentionEntry[];
+  news: ReturnType<typeof instrumentNews>;
   code: string;
   name: string;
   kind: string;
@@ -80,7 +85,33 @@ export interface PoolViewData {
   unclassified_count: number;
 }
 
-const MEMBER_SELECT = `SELECT membership.id::text, membership.pool, membership.role,
+/** 只读取当前关注所引用的标的评估快照，不以最新扫描替代来源记录。 */
+export async function listPoolResearch(db: Db, code: string, asOf = new Date().toISOString().slice(0, 10)) {
+  const result = await db.query(
+    `SELECT entry.id::text AS attention_id, entry.strategy_code, strategy.name AS strategy_name,
+            entry.reason, entry.status, entry.missing_signals, entry.stale_reason,
+            run.id::text AS run_id, run.target_date::text, run.data_date::text,
+            run.status AS run_status, run.strategy_runtime_version,
+            signal.evidence, signal.trigger_price_lower::float8, signal.trigger_price_upper::float8,
+            signal.invalidation
+       FROM pool_attention_entry entry
+       JOIN market_instrument instrument ON instrument.id=entry.instrument_id
+       LEFT JOIN strategy_definition strategy ON strategy.code=entry.strategy_code
+       LEFT JOIN strategy_entry_signal signal
+         ON signal.run_id=entry.source_evaluation_run_id AND signal.instrument_id=entry.instrument_id
+        AND signal.strategy_code=entry.strategy_code
+       LEFT JOIN strategy_evaluation_run run ON run.id=signal.run_id AND run.strategy_code=signal.strategy_code
+      WHERE instrument.code=$1 AND entry.valid_from <= $2::date
+        AND (entry.valid_until IS NULL OR entry.valid_until >= $2::date)
+        AND EXISTS (SELECT 1 FROM pool_membership membership
+                     WHERE membership.instrument_id=entry.instrument_id AND membership.effective_to IS NULL)
+      ORDER BY strategy.name NULLS LAST, entry.id`,
+    [code, asOf],
+  );
+  return result.rows;
+}
+
+const MEMBER_SELECT = `SELECT membership.id::text, instrument.id::text AS instrument_id, membership.pool, membership.role, membership.management_mode,
   membership.tags,
   membership.stock_character, membership.stock_character_profile, membership.stage, membership.evaluation_summary,
   membership.profile_as_of::text, membership.profile_calculation_version, membership.profile_input_sha256,
@@ -140,6 +171,10 @@ export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData>
   const members = await db.query<PoolMemberRow>(
     `${MEMBER_SELECT}
       WHERE membership.pool = $1 AND membership.effective_to IS NULL
+      AND (membership.management_mode='manual' OR EXISTS (
+        SELECT 1 FROM pool_attention_entry active WHERE active.instrument_id=membership.instrument_id
+          AND (active.source_type='manual' OR (active.valid_from<=$2::date
+            AND (active.valid_until IS NULL OR active.valid_until>=$2::date)))))
       ORDER BY instrument.code`,
     [WATCH_POOL, asOfDate],
   );
@@ -170,19 +205,33 @@ export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData>
           ORDER BY bar.bar_date DESC, bar.bar_time DESC LIMIT 1
        ) latest_close ON true
       WHERE membership.pool = $1 AND membership.effective_to IS NULL
+      AND (membership.management_mode='manual' OR EXISTS (
+        SELECT 1 FROM pool_attention_entry active WHERE active.instrument_id=membership.instrument_id
+          AND (active.source_type='manual' OR (active.valid_from<=$2::date
+            AND (active.valid_until IS NULL OR active.valid_until>=$2::date)))))
         AND board_instrument.code LIKE '881%.TI'
       GROUP BY board_instrument.id, board.instrument_id, preference.sort,
                latest_close.close, latest_close.prev_close, latest_close.bar_date
       ORDER BY preference.sort NULLS LAST, count(DISTINCT membership.id) DESC, board_instrument.name`,
-    [WATCH_POOL],
+    [WATCH_POOL, asOfDate],
   );
+  const news = await getLatestMarketNews(db, asOf);
+  const enrichedMembers = members.rows.map((row) => ({ ...row, news: instrumentNews(news, row.code) }));
   return {
     pool: WATCH_POOL,
-    members: members.rows,
+    members: enrichedMembers,
     boards: boards.rows,
-    attention_count: members.rows.filter((row) => row.attention_entries.length > 0).length,
-    unclassified_count: members.rows.filter((row) => row.kind === "stock" && row.boards.length === 0).length,
+    attention_count: enrichedMembers.filter((row) => row.attention_entries.length > 0).length,
+    unclassified_count: enrichedMembers.filter((row) => row.kind === "stock" && row.boards.length === 0).length,
   };
+}
+
+/** 策略复核包含过期存量，避免界面隐藏后 Agent 无法取全复核集合。 */
+export async function listStrategyAttentionReviewEntries(db: Db) {
+  return (await db.query(`SELECT instrument.code,instrument.name,entry.strategy_code,entry.status,entry.reason,
+      entry.data_date::text,entry.valid_from::text,entry.valid_until::text,entry.missing_signals,entry.stale_reason
+    FROM pool_attention_entry entry JOIN market_instrument instrument ON instrument.id=entry.instrument_id
+    WHERE entry.source_type='strategy' ORDER BY entry.strategy_code,instrument.code`)).rows;
 }
 
 export interface PoolChangeInput {
@@ -369,9 +418,9 @@ export async function ensureStrategyPoolMemberProfile(
     if (current.rows[0]) {
       if (current.rows[0].stock_character && current.rows[0].stage && current.rows[0].profile_as_of) return "existing";
       await client.query(
-        `UPDATE pool_membership SET tags=$2::jsonb,stock_character=$3,stock_character_profile=$4::jsonb,stage=$5,
+        `UPDATE pool_membership SET tags=CASE WHEN management_mode='strategy' THEN $2::jsonb ELSE $2::jsonb - '策略自动关注' END,stock_character=$3,stock_character_profile=$4::jsonb,stage=$5,
                 evaluation_summary=$6,profile_as_of=$7,profile_calculation_version=$8,profile_input_sha256=$9,
-                note='由策略信号自动入池并采用最新五维画像'
+                note=CASE WHEN management_mode='strategy' THEN '由策略信号自动入池并采用最新五维画像' ELSE note END
           WHERE id=$1`,
         [current.rows[0].id, JSON.stringify(tags), currentProfile.stock_character,
          JSON.stringify(currentProfile.stock_character_profile), currentProfile.stage, summary, currentProfile.as_of_date,
@@ -382,8 +431,13 @@ export async function ensureStrategyPoolMemberProfile(
     await client.query(
       `INSERT INTO pool_membership
          (instrument_id,pool,role,tags,stock_character,stock_character_profile,stage,evaluation_summary,
-          profile_as_of,profile_calculation_version,profile_input_sha256,effective_from,note)
-       VALUES ($1,'watch','关注',$2::jsonb,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,'由策略信号自动入池并采用最新五维画像')`,
+          profile_as_of,profile_calculation_version,profile_input_sha256,effective_from,note,management_mode)
+       VALUES ($1,'watch','关注',$2::jsonb,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,'由策略信号自动入池并采用最新五维画像','strategy')
+       ON CONFLICT (instrument_id,pool,effective_from) DO UPDATE SET
+         effective_to=NULL,exit_reason=NULL,tags=EXCLUDED.tags,stock_character=EXCLUDED.stock_character,
+         stock_character_profile=EXCLUDED.stock_character_profile,stage=EXCLUDED.stage,
+         evaluation_summary=EXCLUDED.evaluation_summary,profile_as_of=EXCLUDED.profile_as_of,
+         profile_calculation_version=EXCLUDED.profile_calculation_version,profile_input_sha256=EXCLUDED.profile_input_sha256`,
       [currentProfile.instrument_id, JSON.stringify(tags), currentProfile.stock_character,
        JSON.stringify(currentProfile.stock_character_profile), currentProfile.stage, summary, currentProfile.as_of_date,
        currentProfile.calculation_version, currentProfile.input_sha256, input.effective_from],
@@ -416,6 +470,7 @@ export async function clearPoolAttention(
     );
     if (!current.rows[0]) return null;
     await client.query("DELETE FROM pool_attention_entry WHERE id = $1", [current.rows[0].id]);
+    await closeUnwatchedAutoMembers(client, new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Shanghai" }), [input.code]);
     return { before: current.rows[0], after: null };
   });
 }
@@ -445,7 +500,8 @@ export async function applyPoolChange(
     if (input.action === "add" && before) throw new Error(`标的 ${input.code} 已在关注池中（角色 ${before.role}），请用 update`);
     if ((input.action === "update" || input.action === "remove") && !before) throw new Error(`标的 ${input.code} 没有当前策略角色`);
     if (input.action === "remove") {
-      await client.query("UPDATE pool_membership SET effective_to = $2 WHERE id = $1", [before!.id, input.effective_from]);
+      await client.query("UPDATE pool_membership SET effective_to = $2,exit_reason='人工移出关注池' WHERE id = $1", [before!.id, input.effective_from]);
+      await client.query("DELETE FROM pool_attention_entry WHERE instrument_id=$1", [instrumentId]);
       return { before, after: null };
     }
 
@@ -495,7 +551,7 @@ export async function applyPoolChange(
            pool=$2, role=$3, tags=$4, stock_character=$5,
            stock_character_profile=$6, stage=$7, evaluation_summary=$8, profile_as_of=$9,
            profile_calculation_version=$10, profile_input_sha256=$11, evaluation_session_id=$12,
-           note=$13
+           note=$13, management_mode='manual'
          WHERE id=$1`,
         // values 中的 effective_from 只用于新建历史行，同日刷新时不在 UPDATE 列中。
         [before.id, ...values.slice(0, 11), values[12]],

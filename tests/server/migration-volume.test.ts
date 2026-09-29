@@ -9,7 +9,7 @@ import pg from "pg";
 import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPool } from "../../server/db/client.js";
-import { runMigrations } from "../../server/db/migrate.js";
+import { loadMigrations, runMigrations } from "../../server/db/migrate.js";
 import { insertFetchRun, storeBars } from "../../server/datasource/service.js";
 import {
   findPgTool,
@@ -139,7 +139,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     const manifest = await readPortableManifest(exported.payloadPath);
     expect(manifest.version).toBe(7);
     expect(manifest.kind).toBe("portable_fixed_assets");
-    expect(manifest.migration_max).toBe(144);
+    expect(manifest.migration_max).toBe(Math.max(...(await loadMigrations(path.join(import.meta.dirname, "../../server/migrations"))).map((migration) => migration.version)));
     expect(manifest.tables.strategy_document).toBeGreaterThan(0);
     expect(manifest.tables.strategy_definition).toBeGreaterThan(0);
     expect(manifest.tables.strategy_score_benchmark).toBe(1);
@@ -335,19 +335,19 @@ describe.skipIf(toolBlockReason !== null)("数据卷（导出→恢复→校验�
     const u1 = new URL(sourceUrl);
     adminUrl = new URL(sourceUrl);
     adminUrl.pathname = "/postgres";
-    u1.pathname = "/stock_test_restore";
+    u1.pathname = `/stock_test_restore_${process.pid}`;
     restoreUrl1 = u1.toString();
     const u2 = new URL(sourceUrl);
-    u2.pathname = "/stock_test_restore2";
+    u2.pathname = `/stock_test_restore2_${process.pid}`;
     restoreUrl2 = u2.toString();
-    await dropDatabase(adminUrl.toString(), "stock_test_restore");
-    await dropDatabase(adminUrl.toString(), "stock_test_restore2");
+    await dropDatabase(adminUrl.toString(), `stock_test_restore_${process.pid}`);
+    await dropDatabase(adminUrl.toString(), `stock_test_restore2_${process.pid}`);
     outDir = await fs.mkdtemp(path.join(os.tmpdir(), "volume-test-"));
   });
 
   afterAll(async () => {
-    await dropDatabase(adminUrl.toString(), "stock_test_restore");
-    await dropDatabase(adminUrl.toString(), "stock_test_restore2");
+    await dropDatabase(adminUrl.toString(), `stock_test_restore_${process.pid}`);
+    await dropDatabase(adminUrl.toString(), `stock_test_restore2_${process.pid}`);
     await fs.rm(outDir, { recursive: true, force: true });
     await pool.end();
   });

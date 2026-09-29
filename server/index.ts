@@ -9,6 +9,7 @@ import { JobScheduler } from "./scheduler/service.js";
 import { IndicatorWorker } from "./indicators/worker.js";
 import { recoverInterruptedAgentSessions } from "./agent/session-runner.js";
 import { importLegacyHithinkApiKey } from "./system-settings.js";
+import { IntradayRiskWorker } from "./modules/intraday-risk/service.js";
 
 async function main(): Promise<void> {
   let config;
@@ -63,12 +64,17 @@ async function main(): Promise<void> {
   });
   const indicatorWorker = new IndicatorWorker(pool, config.indicatorIntervalMs);
   const notificationWorker = new NotificationWorker(pool);
+  const intradayRiskWorker = new IntradayRiskWorker(pool);
   const server = createApiServer({ pool });
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log("正在停止指标工作器和调度器，并等待当前任务安全退出…");
+    console.log("正在停止盘中风险观察器、指标工作器和调度器，并等待当前任务安全退出…");
+    await intradayRiskWorker.stop().catch((error) => {
+      console.error(`盘中风险观察器停止失败：${(error as Error).message}`);
+      process.exitCode = 1;
+    });
     await indicatorWorker.stop().catch((error) => {
       console.error(`指标工作器停止失败：${(error as Error).message}`);
       process.exitCode = 1;
@@ -98,9 +104,11 @@ async function main(): Promise<void> {
     await scheduler.start();
     indicatorWorker.start();
     notificationWorker.start();
+    intradayRiskWorker.start();
     console.log("作业调度器已启动：30 秒 tick，时区 Asia/Shanghai。");
     console.log("指标工作器已启动。");
     console.log("统一 Agent session 执行器已启用。");
+    console.log("盘中持仓风险观察器已启用：30 秒采样，非 Agent 会话模式。");
   } catch (error) {
     console.error(`作业调度器启动失败：${(error as Error).message}`);
     process.exitCode = 1;

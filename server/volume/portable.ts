@@ -56,7 +56,7 @@ export const PORTABLE_TABLES: readonly PortableTableSpec[] = [
   { table: "job_prompt_revision", where: "prompt_id NOT IN (SELECT id FROM job_prompt WHERE code IN ('copper_inventory_signal_review','lithium_warehouse_signal_review'))", columns: ["id", "prompt_id", "revision_no", "content", "sha256", "source", "base_revision_id", "change_summary", "created_at"], orderBy: ["id"], identity: true },
   { table: "strategy_document", where: "code NOT IN ('copper_inventory_strategy','lithium_warehouse_strategy')", columns: ["id", "code", "title", "role", "injection_order", "job_code", "content", "sha256", "created_at", "updated_at"], orderBy: ["id"], identity: true },
   { table: "strategy_definition", where: "code NOT IN ('copper_inventory','lithium_warehouse')", columns: ["code", "name", "strategy_type", "strategy_document_code", "status", "allow_new_entry", "entry_evaluator_code", "exit_evaluator_code", "context_evaluator_code", "fallback_strategy_code", "exit_policy_mode", "daily_plan_scope", "attention_policy", "runtime_version", "created_at", "updated_at"], orderBy: ["code"] },
-  { table: "job_definition", where: "code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review','commodity_lithium_warehouse_sync')", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "purpose", "phase", "priority", "strategy_code", "agent_role"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
+  { table: "job_definition", where: "code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review','commodity_lithium_warehouse_sync')", columns: ["id", "code", "name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "purpose", "phase", "priority", "strategy_code", "agent_role", "trading_day_only"], orderBy: ["id"], identity: true, jsonColumns: ["config"] },
   { table: "strategy_score_benchmark", where: "document_id NOT IN (SELECT id FROM strategy_document WHERE code IN ('copper_inventory_strategy','lithium_warehouse_strategy'))", columns: ["id", "document_id", "benchmark_code", "training_start", "training_end", "methodology", "distributions", "sample_counts", "source_summary", "sha256", "created_at"], orderBy: ["id"], identity: true, jsonColumns: ["distributions", "sample_counts", "source_summary"], dateColumns: ["training_start", "training_end"] },
   { table: "strategy_state", columns: ["singleton", "change_seq", "current_hash", "updated_at"], orderBy: ["singleton"] },
 ] as const;
@@ -241,6 +241,7 @@ export async function readPortableManifest(payloadPath: string): Promise<Portabl
 }
 
 const RESET_STATEMENTS = [
+  "DELETE FROM market_news_snapshot",
   "DELETE FROM auction_scope_assessment",
   "DELETE FROM daily_plan_auction_assessment",
   "DELETE FROM daily_plan_playbook",
@@ -310,7 +311,11 @@ async function resolvePortableJobModels(client: pg.PoolClient, rows: Record<stri
 
 async function insertBatch(client: pg.PoolClient, spec: PortableTableSpec, rows: Record<string, unknown>[]): Promise<void> {
   if (!rows.length) return;
-  if (spec.table === "job_definition") await resolvePortableJobModels(client, rows);
+  if (spec.table === "job_definition") {
+    await resolvePortableJobModels(client, rows);
+    // 0154 前导出的旧包没有 trading_day_only；按列默认值补 true，保持旧包可恢复。
+    for (const row of rows) if (row.trading_day_only === undefined) row.trading_day_only = true;
+  }
   const values: unknown[] = [];
   const jsonColumns = new Set(spec.jsonColumns ?? []);
   const tuples = rows.map((row) => {

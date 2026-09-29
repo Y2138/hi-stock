@@ -1,0 +1,27 @@
+-- 0147_盘前消息字段注释.sql：补齐结构化消息字段维护注释。
+COMMENT ON COLUMN market_news_snapshot.target_date IS '消息快照所属交易日。';
+COMMENT ON COLUMN market_news_snapshot.captured_at IS '服务端完成本次消息探查的时间。';
+COMMENT ON COLUMN market_news_snapshot.status IS 'success=完整，partial=有覆盖或实时性缺口，failed=失败。';
+COMMENT ON COLUMN market_news_snapshot.market_bias IS '市场底盘方向，仅为消息面上下文。';
+COMMENT ON COLUMN market_news_snapshot.summary IS '市场底盘简述。';
+COMMENT ON COLUMN market_news_snapshot.checked_codes IS '本次实际完成检索的关注池代码。';
+COMMENT ON COLUMN market_news_snapshot.gaps IS '搜索、覆盖或实时性缺口。';
+COMMENT ON COLUMN market_news_snapshot.run_id IS '生成本快照的盘前任务运行。';
+COMMENT ON COLUMN market_news_item.snapshot_id IS '所属盘前消息快照。';
+COMMENT ON COLUMN market_news_item.title IS '消息标题。';
+COMMENT ON COLUMN market_news_item.summary IS '卡片摘要。';
+COMMENT ON COLUMN market_news_item.category IS '宏观、政策、监管、产业、公司、海外或风险分类。';
+COMMENT ON COLUMN market_news_item.scope IS '市场、板块或标的影响范围。';
+COMMENT ON COLUMN market_news_item.direction IS '对关联范围的消息方向。';
+COMMENT ON COLUMN market_news_item.impact_level IS '规则型影响力等级，不是收益预测。';
+COMMENT ON COLUMN market_news_item.relation_type IS '市场、直接、产业链、板块或异常关联。';
+COMMENT ON COLUMN market_news_item.source_level IS '一级原始、专业财经、媒体或待核验来源等级。';
+COMMENT ON COLUMN market_news_item.source_name IS '来源名称。';
+COMMENT ON COLUMN market_news_item.source_url IS '来源链接。';
+COMMENT ON COLUMN market_news_item.published_at IS '来源发布时间，无法确认时为空。';
+COMMENT ON COLUMN market_news_item.fetched_at IS '服务端本次抓取时间。';
+COMMENT ON COLUMN market_news_item.facts IS '来源直接支持的事实。';
+COMMENT ON COLUMN market_news_item.impact_note IS '对关联范围的有限影响说明。';
+COMMENT ON COLUMN market_news_item.expires_at IS '消息卡片有效截止时间。';
+COMMENT ON COLUMN market_news_item_instrument.item_id IS '消息卡片。';
+COMMENT ON COLUMN market_news_item_instrument.instrument_id IS '关联标的。';

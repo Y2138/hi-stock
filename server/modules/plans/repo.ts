@@ -1,3 +1,4 @@
+import { positionGapReasons } from "./evaluation-gaps.js";
 // 每日计划盯防预案：任务会话写入 draft，运行成功后激活并绑定 plan_output_id。
 import type pg from "pg";
 import { apiErrors } from "../../http/router.js";
@@ -62,6 +63,7 @@ export interface PlaybookItemInput {
   missing_md?: string;
   invalidation_md?: string;
   risk_md?: string;
+  key_levels?: DailyPlanKeyLevel[];
   strategy_code?: string;
   strategy_runtime_version?: number;
   primary_evaluation_run_id?: string | null;
@@ -72,6 +74,58 @@ export interface PlaybookItemInput {
   evaluation_status?: "success" | "partial" | "failed" | "waiting";
   evaluation_data_date?: string | null;
   evaluation_missing?: string[];
+}
+
+/** 情景预案五类固定情景；与提示词、前端标签一一对应。 */
+export type DailyPlanScenarioKind =
+  | "surge_reversal"
+  | "open_plunge"
+  | "wide_swing"
+  | "strong_continuation"
+  | "weak_breakdown";
+
+export const DAILY_PLAN_SCENARIO_ORDER: Record<DailyPlanScenarioKind, number> = {
+  surge_reversal: 1,
+  open_plunge: 2,
+  wide_swing: 3,
+  strong_continuation: 4,
+  weak_breakdown: 5,
+};
+
+/** 关键点位事实：服务端机械计算写入，情景/做T预案只引用不转抄。 */
+export interface DailyPlanKeyLevel {
+  kind: "support" | "resistance" | "limit";
+  label: string;
+  price: number;
+}
+
+/** 做T预案：默认给出低吸/兑现区间；只有流动性极端才允许 skip_reason。 */
+export type DailyPlanTPlan =
+  | { buy_lower: number; buy_upper: number; sell_lower: number; sell_upper: number; confirm_md: string; cancel_md: string }
+  | { skip_reason: string };
+
+export interface DailyPlanScenarioInput {
+  scenario_kind: DailyPlanScenarioKind;
+  observable_md: string;
+  response_md: string;
+  invalidation_md: string;
+}
+
+export interface DailyPlanScenarioRow extends DailyPlanScenarioInput {
+  id: string;
+}
+
+export interface ReplaceScenariosInput {
+  source_job_run_id: string;
+  items: Array<{
+    code: string;
+    auction_md?: string;
+    intraday_md?: string;
+    invalidation_md?: string;
+    risk_md?: string;
+    t_plan: DailyPlanTPlan;
+    scenarios: DailyPlanScenarioInput[];
+  }>;
 }
 
 export interface ReplacePlaybookInput {
@@ -107,6 +161,9 @@ export interface PlaybookItemRow {
   evaluation_status: string | null;
   evaluation_data_date: string | null;
   evaluation_missing: string[];
+  key_levels: DailyPlanKeyLevel[];
+  t_plan: DailyPlanTPlan | null;
+  scenarios?: DailyPlanScenarioRow[];
   target_date: string;
   auction_assessment: AuctionAssessmentRow | null;
 }
@@ -192,10 +249,10 @@ export async function replaceDraftPlaybook(
         `INSERT INTO daily_plan_playbook
            (source_job_run_id, target_date, item_kind, instrument_id, code, name,
             grade, priority, action, trigger_kind, price_lower, price_upper,
-            headline, auction_md, intraday_md, evidence_md, missing_md, invalidation_md, risk_md,
+            headline, auction_md, intraday_md, evidence_md, missing_md, invalidation_md, risk_md, key_levels,
             strategy_code,strategy_runtime_version,primary_evaluation_run_id,fallback_evaluation_run_id,
             primary_action,fallback_action,effective_action,evaluation_status,evaluation_data_date,evaluation_missing)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$30::jsonb,
                  $20,$21,$22,$23,$24,$25,$26,$27,$28,$29::jsonb)`,
         [
           input.source_job_run_id,
@@ -227,10 +284,83 @@ export async function replaceDraftPlaybook(
           item.evaluation_status ?? "success",
           item.evaluation_data_date ?? null,
           JSON.stringify(item.evaluation_missing ?? []),
+          JSON.stringify(item.key_levels ?? []),
         ],
       );
     }
     return { replaced: input.items.length };
+  });
+}
+
+/** 全量替换本次运行草稿预案的情景矩阵与做T/盯防叙述；code 集合必须与草稿 position_action 完全一致。 */
+export async function replaceDraftScenarios(
+  db: TransactionDb,
+  input: ReplaceScenariosInput,
+): Promise<{ replaced_items: number; replaced_scenarios: number }> {
+  return inServiceTransaction(db, async (client) => {
+    const run = await client.query<{ code: string }>(
+      `SELECT definition.code
+         FROM job_run run
+         JOIN job_definition definition ON definition.id = run.job_id
+        WHERE run.id = $1 AND definition.code = 'daily_plan_flow'`,
+      [input.source_job_run_id],
+    );
+    if (!run.rows[0]) throw apiErrors.badRequest("情景预案只能由每日计划任务提交");
+    const drafts = await client.query<{ id: string; code: string }>(
+      `SELECT id::text, code FROM daily_plan_playbook
+        WHERE source_job_run_id = $1 AND item_kind = 'position_action' AND status = 'draft'`,
+      [input.source_job_run_id],
+    );
+    const draftByCode = new Map(drafts.rows.map((row) => [row.code, row.id]));
+    const inputCodes = new Set(input.items.map((item) => item.code));
+    const missing = [...draftByCode.keys()].filter((code) => !inputCodes.has(code));
+    const unknown = [...inputCodes].filter((code) => !draftByCode.has(code));
+    if (missing.length > 0 || unknown.length > 0) {
+      const parts: string[] = [];
+      if (missing.length > 0) parts.push(`缺少持仓：${missing.join("、")}`);
+      if (unknown.length > 0) parts.push(`不在本次结构化预案中：${unknown.join("、")}`);
+      throw apiErrors.badRequest(`情景预案覆盖不完整；${parts.join("；")}`);
+    }
+    let replacedScenarios = 0;
+    for (const item of input.items) {
+      const itemId = draftByCode.get(item.code)!;
+      await client.query(
+        `UPDATE daily_plan_playbook
+            SET auction_md = COALESCE($2, auction_md),
+                intraday_md = COALESCE($3, intraday_md),
+                invalidation_md = COALESCE($4, invalidation_md),
+                risk_md = COALESCE($5, risk_md),
+                t_plan = $6::jsonb,
+                updated_at = now()
+          WHERE id = $1`,
+        [
+          itemId,
+          item.auction_md ?? null,
+          item.intraday_md ?? null,
+          item.invalidation_md ?? null,
+          item.risk_md ?? null,
+          JSON.stringify(item.t_plan),
+        ],
+      );
+      await client.query("DELETE FROM daily_plan_scenario WHERE playbook_item_id = $1", [itemId]);
+      for (const scenario of item.scenarios) {
+        await client.query(
+          `INSERT INTO daily_plan_scenario
+             (playbook_item_id, source_job_run_id, scenario_kind, observable_md, response_md, invalidation_md)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            itemId,
+            input.source_job_run_id,
+            scenario.scenario_kind,
+            scenario.observable_md.trim(),
+            scenario.response_md.trim(),
+            scenario.invalidation_md.trim(),
+          ],
+        );
+        replacedScenarios += 1;
+      }
+    }
+    return { replaced_items: input.items.length, replaced_scenarios: replacedScenarios };
   });
 }
 
@@ -470,6 +600,41 @@ export async function discardDraftAuctionAssessmentsForRun(db: Db, sourceJobRunI
   return (result.rowCount ?? 0) + (scope.rowCount ?? 0);
 }
 
+function parseKeyLevels(value: unknown): DailyPlanKeyLevel[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): DailyPlanKeyLevel[] => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    const kind = record.kind === "support" || record.kind === "resistance" || record.kind === "limit"
+      ? record.kind : null;
+    const label = typeof record.label === "string" && record.label.trim() ? record.label.trim() : null;
+    const price = typeof record.price === "number" && Number.isFinite(record.price) && record.price > 0
+      ? record.price : null;
+    return kind && label && price !== null ? [{ kind, label, price }] : [];
+  });
+}
+
+function parseTPlan(value: unknown): DailyPlanTPlan | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.skip_reason === "string" && record.skip_reason.trim()) {
+    return { skip_reason: record.skip_reason.trim() };
+  }
+  const zones = [record.buy_lower, record.buy_upper, record.sell_lower, record.sell_upper];
+  if (zones.every((zone) => typeof zone === "number" && Number.isFinite(zone) && zone > 0)
+    && typeof record.confirm_md === "string" && typeof record.cancel_md === "string") {
+    return {
+      buy_lower: record.buy_lower as number,
+      buy_upper: record.buy_upper as number,
+      sell_lower: record.sell_lower as number,
+      sell_upper: record.sell_upper as number,
+      confirm_md: record.confirm_md,
+      cancel_md: record.cancel_md,
+    };
+  }
+  return null;
+}
+
 function toRow(row: Record<string, unknown>): PlaybookItemRow {
   return {
     id: String(row.id),
@@ -489,6 +654,8 @@ function toRow(row: Record<string, unknown>): PlaybookItemRow {
     missing_md: (row.missing_md as string | null) ?? null,
     invalidation_md: (row.invalidation_md as string | null) ?? null,
     risk_md: (row.risk_md as string | null) ?? null,
+    key_levels: parseKeyLevels(row.key_levels),
+    t_plan: parseTPlan(row.t_plan),
     strategy_code: (row.strategy_code as string | null) ?? null,
     strategy_runtime_version: row.strategy_runtime_version === null || row.strategy_runtime_version === undefined ? null : Number(row.strategy_runtime_version),
     primary_evaluation_run_id: row.primary_evaluation_run_id === null || row.primary_evaluation_run_id === undefined ? null : String(row.primary_evaluation_run_id),
@@ -498,7 +665,7 @@ function toRow(row: Record<string, unknown>): PlaybookItemRow {
     effective_action: (row.effective_action as string | null) ?? null,
     evaluation_status: (row.evaluation_status as string | null) ?? null,
     evaluation_data_date: row.evaluation_data_date === null || row.evaluation_data_date === undefined ? null : String(row.evaluation_data_date),
-    evaluation_missing: Array.isArray(row.evaluation_missing) ? row.evaluation_missing.map(String) : [],
+    evaluation_missing: positionGapReasons(Array.isArray(row.evaluation_missing) ? row.evaluation_missing : [], String(row.code)),
     target_date: String(row.target_date),
     auction_assessment: row.auction_assessment_id === null || row.auction_assessment_id === undefined
       ? null
@@ -529,7 +696,7 @@ export async function queryHistoricalPlanItems(db: Db, outputId: string, offset 
   const result = await db.query<Record<string, unknown>>(
     `SELECT id::text, item_kind, code, name, grade, priority, action, trigger_kind,
             price_lower, price_upper, headline, auction_md, intraday_md, evidence_md,
-            missing_md, invalidation_md, risk_md, strategy_code,strategy_runtime_version,
+            missing_md, invalidation_md, risk_md, key_levels, t_plan, strategy_code,strategy_runtime_version,
             primary_evaluation_run_id::text,fallback_evaluation_run_id::text,primary_action,fallback_action,
             effective_action,evaluation_status,evaluation_data_date::text,evaluation_missing,target_date::text
        FROM daily_plan_playbook
@@ -564,7 +731,8 @@ export async function getLatestDailyPlanBoard(pool: Db): Promise<DailyPlanBoard>
     `SELECT item.id, item.item_kind, item.code, item.name, item.grade, item.priority,
             item.action, item.trigger_kind, item.price_lower, item.price_upper,
             item.headline, item.auction_md, item.intraday_md, item.evidence_md,
-            item.missing_md, item.invalidation_md, item.risk_md, item.strategy_code,item.strategy_runtime_version,
+            item.missing_md, item.invalidation_md, item.risk_md, item.key_levels, item.t_plan,
+            item.strategy_code,item.strategy_runtime_version,
             item.primary_evaluation_run_id::text,item.fallback_evaluation_run_id::text,item.primary_action,item.fallback_action,
             item.effective_action,item.evaluation_status,item.evaluation_data_date::text,item.evaluation_missing,item.target_date::text,
             assessment.id::text AS auction_assessment_id,
@@ -585,6 +753,31 @@ export async function getLatestDailyPlanBoard(pool: Db): Promise<DailyPlanBoard>
     [output.id],
   );
   const rows = items.rows.map(toRow);
+  const scenarios = await pool.query<{
+    id: string;
+    playbook_item_id: string;
+    scenario_kind: DailyPlanScenarioKind;
+    observable_md: string;
+    response_md: string;
+    invalidation_md: string;
+  }>(
+    `SELECT scenario.id::text, scenario.playbook_item_id::text, scenario.scenario_kind,
+            scenario.observable_md, scenario.response_md, scenario.invalidation_md
+       FROM daily_plan_scenario scenario
+       JOIN daily_plan_playbook item ON item.id = scenario.playbook_item_id
+      WHERE item.plan_output_id = $1 AND item.status = 'active' AND item.item_kind = 'position_action'`,
+    [output.id],
+  );
+  const scenariosByItem = new Map<string, DailyPlanScenarioRow[]>();
+  for (const scenario of scenarios.rows) {
+    const { playbook_item_id, ...rest } = scenario;
+    scenariosByItem.set(playbook_item_id, [...(scenariosByItem.get(playbook_item_id) ?? []), rest]);
+  }
+  for (const row of rows) {
+    row.scenarios = (scenariosByItem.get(row.id) ?? []).sort(
+      (left, right) => DAILY_PLAN_SCENARIO_ORDER[left.scenario_kind] - DAILY_PLAN_SCENARIO_ORDER[right.scenario_kind],
+    );
+  }
   return {
     plan: {
       output_id: output.id,

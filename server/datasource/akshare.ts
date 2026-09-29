@@ -1,6 +1,6 @@
 // akshare 通道：直连底层公开 HTTP（不经 Python）
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §5.3
-// 覆盖扶摇缺失的能力：新浪 30 分钟线、新浪期货主力连续日线、东财个股资金流。
+// 覆盖扶摇缺失的能力：新浪 30 分钟线、新浪期货主力连续日线、东财个股资金流、深交所月度交易日历。
 // 响应格式以 2026-08-16 实测为准：
 //   - 新浪两个接口均为 jsonp 包裹（前缀含一段注释脚本 + "var="），主体是 JSON 数组；
 //   - 30m 元素字段 day/open/high/low/close/volume/amount（字符串）；
@@ -204,6 +204,43 @@ export async function fetchFundFlow(
       xlarge: toNumber(cols[5], "超大单"),
     };
   });
+}
+
+export interface ExchangeCalendarDay {
+  date: string;
+  isOpen: boolean;
+}
+
+const SZSE_CALENDAR_URL = "http://www.szse.cn/api/report/exchange/onepersistenthour/monthList";
+
+/**
+ * 深交所官方月度交易日历：返回整月每个自然日的开休市标志（jyrq=日期、jybz=1 开市）。
+ * 交易所次年日历约 12 月发布；未发布月份返回空 data，用 null 表示“未发布”而非失败。
+ * 响应格式以 2026-09-28 实测为准。
+ */
+export async function fetchSzseCalendarMonth(
+  month: string,
+  deps: AkshareDeps = {},
+): Promise<ExchangeCalendarDay[] | null> {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+    throw new UpstreamError(`日历月份必须是 YYYY-MM: ${month}`);
+  }
+  const url = new URL(SZSE_CALENDAR_URL);
+  url.searchParams.set("month", month);
+  url.searchParams.set("random", Math.random().toFixed(16).slice(2));
+  const raw = JSON.parse(await getWithRetry(url, deps)) as { data?: unknown };
+  if (!Array.isArray(raw.data)) throw new UpstreamError("深交所日历响应缺少 data 数组");
+  const days: ExchangeCalendarDay[] = [];
+  for (const item of raw.data as Record<string, unknown>[]) {
+    const date = String(item.jyrq ?? "");
+    const flag = String(item.jybz ?? "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !date.startsWith(`${month}-`)) {
+      throw new UpstreamError(`深交所日历行格式异常: ${date}`);
+    }
+    if (flag !== "0" && flag !== "1") throw new UpstreamError(`深交所日历开休标志异常: ${flag}`);
+    days.push({ date, isOpen: flag === "1" });
+  }
+  return days.length ? days : null;
 }
 
 /** sina 通道：承接 30m（A 股/指数/ETF）与 futures_day（主力连续）两类请求 */

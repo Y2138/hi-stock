@@ -523,6 +523,41 @@ export async function enqueueJobConclusion(
   );
 }
 
+/** 盘中风险只走个人通道，不关联 Agent 任务结果。 */
+export async function enqueueIntradayRiskAlert(
+  db: Db,
+  riskId: string,
+  content: string,
+): Promise<void> {
+  const settings = (await db.query<{
+    enabled: boolean;
+    personal_enabled: boolean;
+    personal_webhook: string | null;
+    personal_sign_secret: string | null;
+    webhook: string | null;
+    sign_secret: string | null;
+    personal_revision: number;
+  }>(
+    `SELECT enabled, personal_enabled, personal_webhook, personal_sign_secret,
+            webhook, sign_secret, personal_revision
+       FROM notification_setting WHERE singleton FOR SHARE`,
+  )).rows[0];
+  if (!settings) return;
+  const webhook = settings.personal_webhook ?? settings.webhook;
+  const secret = settings.personal_sign_secret ?? settings.sign_secret;
+  const enabled = settings.personal_webhook == null && settings.personal_sign_secret == null
+    ? settings.enabled
+    : settings.personal_enabled;
+  if (!enabled || !webhook || !secret) return;
+  await db.query(
+    `INSERT INTO notification_delivery
+      (intraday_risk_id, kind, channel, channel_revision, content)
+     VALUES ($1, 'intraday_risk', 'personal', $2, $3)
+     ON CONFLICT DO NOTHING`,
+    [riskId, settings.personal_revision, content],
+  );
+}
+
 export async function queueTestNotification(db: Db, channel: NotificationChannel = "personal") {
   const result = await db.query(
     `INSERT INTO notification_delivery (kind, channel, channel_revision, content)

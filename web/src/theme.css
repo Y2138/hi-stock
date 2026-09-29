@@ -279,6 +279,10 @@ code,
   margin-left: 0;
 }
 
+.nav-group + .nav-group { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.nav-group-label { padding: 0 9px 6px; color: var(--ink-soft); font-size: var(--fs-xs); letter-spacing: .08em; }
+.shell.nav-collapsed .nav-group-label { display: none; }
+
 .side-nav .nav-item {
   display: flex;
   align-items: center;
@@ -373,6 +377,10 @@ code,
 }
 
 .status-bar .palette-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+  white-space: nowrap;
   border: 1px solid var(--line);
   border-radius: 8px;
   min-width: 38px;
@@ -383,6 +391,10 @@ code,
   background: var(--paper);
   cursor: pointer;
   transition: border-color var(--dur) var(--ease);
+}
+
+@container status (max-width: 480px) {
+  .status-bar .search-label { display: none; }
 }
 
 @container status (max-width: 360px) {
@@ -436,7 +448,8 @@ code,
   }
 
   .shell:not(.nav-collapsed) .brand-full,
-  .shell:not(.nav-collapsed) .nav-label {
+  .shell:not(.nav-collapsed) .nav-label,
+  .shell .nav-group-label {
     display: none;
   }
 
@@ -645,6 +658,11 @@ code,
   font-size: 11px;
   color: var(--ink-faint);
 }
+
+.palette-feedback, .palette-help { margin: 0; padding: 10px 18px; color: var(--ink-soft); font-size: var(--fs-sm); }
+.palette-feedback { border-bottom: 1px solid var(--line); }
+.palette-help { border-top: 1px solid var(--line); background: var(--paper); }
+.palette-close { float: right; border: 0; background: transparent; color: var(--accent-ink); cursor: pointer; font: inherit; }
 
 .palette-enter-active,
 .palette-leave-active {
@@ -1034,4 +1052,21 @@ input[type="radio"] {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* 列表筛选只改变当前展示范围，汇总指标保持完整业务口径。 */
+.list-filter { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 0; }
+.pool-content .list-filter { padding-inline: 16px; border-bottom: 1px solid var(--line); }
+.list-filter input { width: min(320px, 100%); min-width: 0; min-height: var(--control-height); }
+.list-filter-count { color: var(--ink-soft); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+@container business (max-width: 480px) {
+  .list-filter input { width: 100%; }
+}
+
+.table-scroll-hint { display: none; color: var(--ink-soft); font-size: var(--fs-xs); }
+@container business (max-width: 920px) {
+  .table-scroll-hint { display: inline; }
+}
+@media (max-width: 720px) {
+  .shell .nav-collapse { display: none; }
 }

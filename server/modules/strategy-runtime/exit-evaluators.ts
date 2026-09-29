@@ -114,7 +114,7 @@ function fallbackEvaluation(item: CompatibilityItem): StrategyPositionEvaluation
   if (!triggers) return normalized(item, "portfolio_fallback_exit", "fallback", "observe", "兜底触发位尚未完成", {}, null);
   const close = number(item.current_close);
   const activeStop = number(triggers.active_stop);
-  const protection = number(triggers.post_first_take_profit_stop_candidate) ?? activeStop;
+  const protection = triggers.cooldown_active ? activeStop : number(triggers.post_first_take_profit_stop_candidate) ?? activeStop;
   if (close !== null && protection !== null && close <= protection) {
     return normalized(item, "portfolio_fallback_exit", "fallback", "exit", "收盘已跌破兜底保护位",
       { triggers, current_close: close }, protection, "open");
@@ -289,8 +289,8 @@ export function mergeExitEvaluations(
   };
 }
 
-async function compatibility(pool: pg.Pool, targetDate: string): Promise<CompatibilityContext> {
-  return queryPositionCompatibilityContext(pool, targetDate);
+async function compatibility(pool: pg.Pool, targetDate: string, strategyCode?: string): Promise<CompatibilityContext> {
+  return queryPositionCompatibilityContext(pool, targetDate, strategyCode);
 }
 
 export async function evaluateStrategyExit(context: StrategyExitEvaluationContext): Promise<StrategyExitEvaluationResult> {
@@ -302,13 +302,21 @@ export async function evaluateStrategyExit(context: StrategyExitEvaluationContex
       items: result.items, gaps: result.gaps,
     };
   }
-  const source = await compatibility(context.pool, context.targetDate);
+  const source = await compatibility(context.pool, context.targetDate, context.strategyCode);
   const selected = source.positions.items.filter((item) => context.strategyCode === "portfolio_fallback_exit"
     ? item.fallback_strategy_code === "portfolio_fallback_exit"
     : item.strategy_code === context.strategyCode);
-  const items = selected.map((item) => compatibilityEvaluation(item, context.strategyCode));
   const codes = new Set(selected.map((item) => item.code));
   const gaps = source.positions.gaps.filter((gap) => codes.has(gap.code));
+  const items = selected.map((item) => {
+    const evaluation = compatibilityEvaluation(item, context.strategyCode);
+    evaluation.missing_items = gaps.filter((gap) => gap.code === item.code).map((gap) => gap.reason);
+    if (evaluation.missing_items.length && evaluation.action === "hold") {
+      evaluation.action = "observe";
+      evaluation.reason = "绑定策略评估存在缺口，需补齐后复核";
+    }
+    return evaluation;
+  });
   return {
     status: gaps.length ? "partial" : "success",
     data_date: source.data_date,
@@ -320,26 +328,28 @@ export async function evaluateStrategyExit(context: StrategyExitEvaluationContex
 
 export async function queryPositionExitEvaluationBundle(pool: pg.Pool, targetDate: string) {
   const source = await compatibility(pool, targetDate);
-  const twoYear = await twoYearEvaluations(pool, targetDate);
-  const twoYearByCode = new Map(twoYear.items.map((item) => [item.code, item]));
-  const rows: EffectivePositionExitEvaluation[] = [];
+  const strategyCodes = new Set<string>();
   for (const item of source.positions.items) {
-    const primary = item.strategy_code === "two_year_reversal"
-      ? twoYearByCode.get(item.code) ?? null
-      : item.exit_policy_mode === "fallback_only" || !item.strategy_code
-        ? null
-        : compatibilityEvaluation(item, item.strategy_code);
-    const fallback = item.fallback_strategy_code === "portfolio_fallback_exit" ? fallbackEvaluation(item) : null;
-    rows.push(mergeExitEvaluations(item.strategy_code ?? "unassigned", item.exit_policy_mode ?? "none", primary, fallback));
+    if (item.strategy_code && item.exit_policy_mode !== "fallback_only") strategyCodes.add(item.strategy_code);
+    if (item.fallback_strategy_code && ["fallback_only", "dedicated_plus_fallback"].includes(item.exit_policy_mode ?? "")) strategyCodes.add(item.fallback_strategy_code);
   }
+  const evaluations = new Map(await Promise.all([...strategyCodes].map(async (strategyCode) =>
+    [strategyCode, await evaluateStrategyExit({ pool, targetDate, strategyCode })] as const)));
+  const rows = source.positions.items.map((item) => {
+    const primary = item.exit_policy_mode !== "fallback_only"
+      ? evaluations.get(item.strategy_code ?? "")?.items.find((row) => row.code === item.code) ?? null : null;
+    const fallback = evaluations.get(item.fallback_strategy_code ?? "")?.items.find((row) => row.code === item.code) ?? null;
+    return mergeExitEvaluations(item.strategy_code ?? "unassigned", item.exit_policy_mode ?? "none", primary, fallback);
+  });
+  const gaps = [...evaluations.values()].flatMap((evaluation) => evaluation.gaps);
   return {
-    status: source.positions.status === "success" && twoYear.gaps.length === 0 ? "success" as const : "partial" as const,
+    status: gaps.length === 0 ? "success" as const : "partial" as const,
     requested_date: targetDate,
     data_date: source.data_date,
     position_count: rows.length,
     primary_count: rows.filter((row) => row.primary !== null).length,
     fallback_count: rows.filter((row) => row.fallback !== null).length,
     items: rows,
-    gaps: [...source.positions.gaps, ...twoYear.gaps],
+    gaps,
   };
 }

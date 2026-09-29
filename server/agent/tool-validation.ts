@@ -349,6 +349,8 @@ const ScheduledPoolAttentionItemSchema = strictObject({
 });
 export const ScheduledPoolAttentionSchema = strictObject({
   reason: ReasonSchema,
+  reviewed_codes: Type.Optional(Type.Array(CodeSchema, { maxItems: 2000 })),
+  review_gaps: Type.Optional(Type.Array(strictObject({ code: CodeSchema, reason: ReasonSchema }), { maxItems: 2000 })),
   evaluation_status: Type.Optional(Type.Union([Type.Literal("success"), Type.Literal("partial"), Type.Literal("failed")])),
   data_date: Type.Optional(DateSchema),
   items: Type.Array(ScheduledPoolAttentionItemSchema, { maxItems: 100 }),
@@ -356,10 +358,39 @@ export const ScheduledPoolAttentionSchema = strictObject({
 export type ScheduledPoolAttentionItem = Static<typeof ScheduledPoolAttentionItemSchema>;
 export type ScheduledPoolAttentionInput = {
   reason: string;
+  reviewed_codes: string[];
+  review_gaps: Array<{ code: string; reason: string }>;
   evaluation_status: "success" | "partial" | "failed";
   data_date?: string;
   items: ScheduledPoolAttentionItem[];
 };
+
+const NewsItemSchema = strictObject({
+  title: Type.String({ minLength: 1, maxLength: 300 }),
+  summary: Type.String({ minLength: 1, maxLength: 2000 }),
+  category: Type.Union(["macro", "policy", "regulation", "industry", "company", "overseas", "risk", "other"].map((value) => Type.Literal(value))),
+  scope: Type.Union(["market", "sector", "instrument"].map((value) => Type.Literal(value))),
+  direction: Type.Union(["positive", "neutral", "negative", "mixed", "unknown"].map((value) => Type.Literal(value))),
+  impact_level: Type.Union(["high", "medium", "low"].map((value) => Type.Literal(value))),
+  relation_type: Type.Optional(Type.Union(["market", "direct", "supply_chain", "sector", "anomaly"].map((value) => Type.Literal(value)))),
+  source_level: Type.Union(["primary", "professional", "media", "unverified"].map((value) => Type.Literal(value))),
+  source_name: Type.String({ minLength: 1, maxLength: 120 }),
+  source_url: Type.String({ minLength: 8, maxLength: 2000, pattern: "^https?://" }),
+  published_at: Type.Optional(Type.Union([Type.String({ minLength: 10, maxLength: 40 }), Type.Null()])),
+  facts: Type.String({ minLength: 1, maxLength: 3000 }),
+  impact_note: Type.String({ minLength: 1, maxLength: 1200 }),
+  expires_at: Type.Optional(Type.Union([Type.String({ minLength: 10, maxLength: 40 }), Type.Null()])),
+  codes: Type.Optional(Type.Array(CodeSchema, { maxItems: 50 })),
+});
+export const PoolNewsWriteSchema = strictObject({
+  target_date: DateSchema,
+  checked_codes: Type.Array(CodeSchema, { maxItems: 2000, description: "本次已实际完成检索的池内标的；遗漏标的显示未覆盖，不能当成无消息。" }),
+  gaps: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 100 }),
+  market_bias: Type.Union(["positive", "neutral", "negative", "mixed", "unknown"].map((value) => Type.Literal(value))),
+  summary: Type.String({ minLength: 1, maxLength: 2000 }),
+  items: Type.Array(NewsItemSchema, { maxItems: 100 }),
+});
+export type PoolNewsWriteInput = Static<typeof PoolNewsWriteSchema>;
 
 /** 每日计划盯防预案行：持仓次日执行预案 + 打板机会，写入后由任务成功激活。 */
 const PlaybookTextSchema = Type.String({ minLength: 1, maxLength: 2_000 });
@@ -404,6 +435,44 @@ export const DailyPlanWriteSchema = strictObject({
   items: Type.Array(DailyPlanPlaybookItemSchema, { minItems: 1, maxItems: 60 }),
 });
 export type DailyPlanWriteRawInput = Static<typeof DailyPlanWriteSchema>;
+
+/** 每日计划情景预案：五情景矩阵 + 做T区间 + 盯防叙述；只引用服务端关键点位，不转抄策略结论。 */
+const DailyPlanScenarioItemSchema = strictObject({
+  scenario_kind: Type.Union([
+    Type.Literal("surge_reversal"),
+    Type.Literal("open_plunge"),
+    Type.Literal("wide_swing"),
+    Type.Literal("strong_continuation"),
+    Type.Literal("weak_breakdown"),
+  ]),
+  observable_md: Type.String({ minLength: 1, maxLength: 600 }),
+  response_md: Type.String({ minLength: 1, maxLength: 1_000 }),
+  invalidation_md: Type.String({ minLength: 1, maxLength: 600 }),
+});
+const DailyPlanTPlanSchema = Type.Union([
+  strictObject({
+    buy_lower: Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000 }),
+    buy_upper: Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000 }),
+    sell_lower: Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000 }),
+    sell_upper: Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000 }),
+    confirm_md: Type.String({ minLength: 1, maxLength: 1_000 }),
+    cancel_md: Type.String({ minLength: 1, maxLength: 1_000 }),
+  }),
+  strictObject({ skip_reason: Type.String({ minLength: 1, maxLength: 1_000 }) }),
+]);
+const DailyPlanScenarioWriteItemSchema = strictObject({
+  code: CodeSchema,
+  auction_md: Type.Optional(PlaybookTextSchema),
+  intraday_md: Type.Optional(PlaybookTextSchema),
+  invalidation_md: Type.Optional(PlaybookTextSchema),
+  risk_md: Type.Optional(PlaybookTextSchema),
+  t_plan: DailyPlanTPlanSchema,
+  scenarios: Type.Array(DailyPlanScenarioItemSchema, { minItems: 1, maxItems: 5 }),
+});
+export const DailyPlanScenarioWriteSchema = strictObject({
+  items: Type.Array(DailyPlanScenarioWriteItemSchema, { maxItems: 60 }),
+});
+export type DailyPlanScenarioWriteInput = Static<typeof DailyPlanScenarioWriteSchema>;
 
 const AuctionAssessmentItemSchema = strictObject({
   code: CodeSchema,
@@ -978,7 +1047,7 @@ export function validateScheduledPoolAttentionInput(input: unknown): ScheduledPo
     }
     return { ...item, code: item.code.trim() };
   });
-  return { reason: reason.trim(), evaluation_status: parsed.evaluation_status ?? "success", ...(parsed.data_date ? { data_date: parsed.data_date } : {}), items: normalized };
+  return { reason: reason.trim(), reviewed_codes: [...new Set(parsed.reviewed_codes ?? [])], review_gaps: parsed.review_gaps ?? [], evaluation_status: parsed.evaluation_status ?? "success", ...(parsed.data_date ? { data_date: parsed.data_date } : {}), items: normalized };
 }
 
 function validTimestamp(value: string): boolean {
@@ -1099,6 +1168,38 @@ export function validateDailyPlanWriteInput(input: unknown): DailyPlanWriteRawIn
   return parsed;
 }
 
+export function validateDailyPlanScenarioWriteInput(input: unknown): DailyPlanScenarioWriteInput {
+  const parsed = validateToolInput<DailyPlanScenarioWriteInput>(
+    "daily_plan_scenario_write",
+    DailyPlanScenarioWriteSchema,
+    input,
+  );
+  const codes = parsed.items.map((item) => item.code);
+  if (new Set(codes).size !== codes.length) throw new Error("daily_plan_scenario_write 存在重复标的");
+  for (const item of parsed.items) {
+    const kinds = new Set<string>();
+    for (const scenario of item.scenarios) {
+      if (kinds.has(scenario.scenario_kind)) {
+        throw new Error(`daily_plan_scenario_write ${item.code} 情景 ${scenario.scenario_kind} 重复；每个情景只允许一行`);
+      }
+      kinds.add(scenario.scenario_kind);
+    }
+    if ("buy_lower" in item.t_plan) {
+      const { buy_lower, buy_upper, sell_lower, sell_upper } = item.t_plan;
+      if (buy_lower > buy_upper) {
+        throw new Error(`daily_plan_scenario_write ${item.code} 做T低吸区间下沿高于上沿`);
+      }
+      if (sell_lower > sell_upper) {
+        throw new Error(`daily_plan_scenario_write ${item.code} 做T兑现区间下沿高于上沿`);
+      }
+      if (buy_upper >= sell_lower) {
+        throw new Error(`daily_plan_scenario_write ${item.code} 做T低吸区间上沿应低于兑现区间下沿`);
+      }
+    }
+  }
+  return parsed;
+}
+
 export function validateAuctionAssessmentWriteInput(input: unknown): AuctionAssessmentWriteInput {
   const parsed = validateToolInput<AuctionAssessmentWriteInput>(
     "auction_assessment_write",
@@ -1175,6 +1276,22 @@ export function validateFetchMarketDataInput(input: unknown): FetchMarketDataInp
   const financialCodes = parsed.financial_requests?.map((request) => request.code) ?? [];
   if (new Set(financialCodes).size !== financialCodes.length) {
     throw new Error("批量财务估值请求存在重复代码");
+  }
+  return parsed;
+}
+
+export function validatePoolNewsWriteInput(input: unknown): PoolNewsWriteInput {
+  const parsed = validateToolInput<PoolNewsWriteInput>("pool_news_write", PoolNewsWriteSchema, input);
+  const seen = new Set<string>();
+  for (const item of parsed.items) {
+    const key = `${item.source_url}#${item.title}#${item.direction}`;
+    if (seen.has(key)) throw new Error("相同消息及方向重复，请合并关联代码");
+    seen.add(key);
+    for (const value of [item.published_at, item.expires_at]) {
+      if (value !== undefined && value !== null && Number.isNaN(new Date(value).getTime())) {
+        throw new Error(`消息时间非法：${value}`);
+      }
+    }
   }
   return parsed;
 }

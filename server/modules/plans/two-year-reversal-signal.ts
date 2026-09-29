@@ -1,4 +1,5 @@
 import type pg from "pg";
+import { strategyAttentionCodes } from "../pools/attention-lifecycle.js";
 
 type Db = Pick<pg.Pool, "query">;
 type Bar = { code: string; date: string; close: number; low: number; low_raw?: number | null; board_name?: string; volume: number | null };
@@ -34,8 +35,9 @@ async function eligibleIndustryMembers(db: Db, asOf: string) {
   );
   const histories = new Map<string, Bar[]>();
   for (const bar of boardBars.rows) histories.set(bar.code, [...(histories.get(bar.code) ?? []), bar]);
-  const completeBoards = [...histories.values()].filter((history) => history.length >= 501
-    && history.at(-1)?.date === asOf && history.every((bar) => bar.close > 0)).length;
+  const completeBoardCodes = [...histories].filter(([, history]) => history.length >= 501
+    && history.at(-1)?.date === asOf && history.every((bar) => bar.close > 0)).map(([code]) => code);
+  const completeBoards = completeBoardCodes.length;
   const eligible = new Map<string, { name: string; return500: number; drawdown20: number; deviation500: number }>();
   for (const [code, history] of histories) {
     if (history.length < 501 || history.at(-1)?.date !== asOf || history.some((bar) => bar.close <= 0)) continue;
@@ -60,7 +62,7 @@ async function eligibleIndustryMembers(db: Db, asOf: string) {
         AND stock.kind='stock' AND stock.lifecycle_status='active' AND stock.name !~* '^\\*?ST'
       ORDER BY stock.id,industry.code`, [[...eligible.keys()], asOf],
   );
-  return { completeBoards, eligible, members: members.rows };
+  return { completeBoards, completeBoardCodes, eligible, members: members.rows };
 }
 
 export async function queryTwoYearReversalRawTargetCodes(db: Db, date: string): Promise<string[]> {
@@ -69,15 +71,27 @@ export async function queryTwoYearReversalRawTargetCodes(db: Db, date: string): 
 }
 
 export async function queryTwoYearReversalSignals(db: Db, date: string) {
+  const reviewCodes = await strategyAttentionCodes(db, "two_year_reversal");
   const selected = await queryTwoYearReversalCoverage(db, date);
   if (!selected) return { status: "unavailable" as const, date, qualified: [], near: [], gaps: ["近30个确认交易日无股票覆盖达近期峰值80%且881一级行业覆盖达80个的共同数据日"] };
   const asOf = selected.date;
   const gaps: string[] = [];
   if (asOf !== date) gaps.push(`目标日行情不完整，使用共同数据日 ${asOf}；滞后数据仅供观察，不形成目标日新开仓信号`);
-  const { completeBoards, eligible, members } = await eligibleIndustryMembers(db, asOf);
+  const { completeBoards, completeBoardCodes, eligible, members } = await eligibleIndustryMembers(db, asOf);
   if (completeBoards < 80) return { status: "unavailable" as const, date, data_date: asOf, qualified: [], near: [],
     gaps: [...gaps, `881一级行业两年日线不足80个（${completeBoards}个）`] };
-  if (!eligible.size) return { status: "success" as const, date, data_date: asOf, coverage: { stocks: selected.stocks, boards: selected.boards, complete_boards: completeBoards, qualified_boards: 0, members: 0, completed: 0 }, eligible_industries: [], qualified: [], qualified_count: 0, near: [], near_count: 0, historical: [], held: [], gaps, evidence: "research_only" };
+  // 旧信号所在行业已完成评估且不再满足行业条件，可以独立退出；行业缺数不能当作失效。
+  const outside = await db.query<{ code: string }>(
+    `SELECT stock.code FROM market_instrument stock
+       JOIN market_board_membership relation ON relation.member_instrument_id=stock.id
+       JOIN market_instrument board ON board.id=relation.board_instrument_id
+      WHERE stock.code=ANY($1::text[]) AND board.code LIKE '881%.TI'
+        AND relation.effective_from<=$2::date AND (relation.effective_to IS NULL OR relation.effective_to>$2::date)
+      GROUP BY stock.code HAVING bool_and(board.code=ANY($3::text[]))
+        AND NOT bool_or(board.code=ANY($4::text[]))`,
+    [reviewCodes, asOf, completeBoardCodes, [...eligible.keys()]]);
+  const reviewedCodes = outside.rows.map((row) => row.code);
+  if (!eligible.size) return { status: "success" as const, date, data_date: asOf, coverage: { stocks: selected.stocks, boards: selected.boards, complete_boards: completeBoards, qualified_boards: 0, members: 0, completed: 0 }, reviewed_codes: reviewedCodes, eligible_industries: [], qualified: [], qualified_count: 0, near: [], near_count: 0, historical: [], held: [], gaps, evidence: "research_only" };
   const bars = await db.query<Bar>(
     `SELECT stock.code,history.bar_date::text AS date,history.close::float8,history.low::float8,history.low_raw::float8,history.volume::float8
        FROM market_instrument stock JOIN LATERAL (
@@ -107,6 +121,7 @@ export async function queryTwoYearReversalSignals(db: Db, date: string) {
   for (const item of observations) {
     const group = peers.get(item.member.board_code) ?? [];
     if (group.length < 3) continue;
+    reviewedCodes.push(item.member.code);
     const relative5 = item.ret5 - mean(group);
     if (item.ret5 > -0.05 || relative5 > -0.03) continue;
     const board = eligible.get(item.member.board_code)!;
@@ -135,7 +150,10 @@ export async function queryTwoYearReversalSignals(db: Db, date: string) {
     status: "success" as const, date, data_date: asOf,
     coverage: { stocks: selected.stocks, boards: selected.boards, complete_boards: completeBoards, qualified_boards: eligible.size, members: members.length, completed: observations.length },
     eligible_industries: [...eligible].map(([code, item]) => ({ code, ...item })),
-    qualified: qualified.slice(0, 20), qualified_count: qualified.length, near: near.slice(0, 10), near_count: near.length,
+    qualified: qualified.filter((item, index) => index < 20 || reviewCodes.includes(String(item.code))), qualified_count: qualified.length,
+    near: near.filter((item, index) => index < 10 || reviewCodes.includes(String(item.code))), near_count: near.length,
+    reviewed_codes: reviewedCodes,
+    review_gaps: reviewCodes.filter((code) => !reviewedCodes.includes(code)).map((code) => ({ code, reason: "个股日线、行业历史或同业样本不足，无法完成复核" })),
     historical: historical.slice(0, 20), held: held.slice(0, 20),
     gaps, evidence: "research_only", writes_business_data: false,
   };

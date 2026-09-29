@@ -5,6 +5,7 @@ import { apiClient } from "../api/client";
 import type { AuctionScopeBoard, Instrument, PoolAttentionEntry, PoolMember, PoolViewData } from "../api/types";
 import InstrumentPicker from "../components/InstrumentPicker.vue";
 import StateBlock from "../components/StateBlock.vue";
+import PoolResearch from "../components/PoolResearch.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
 import { appMessage } from "../stores/message";
@@ -15,6 +16,7 @@ import { attentionSourceLabel, attentionStatusLabel, compareAttentionQuality } f
 const router = useRouter();
 const route = useRoute();
 const selected = ref("attention");
+const keyword = ref("");
 const detailMember = ref<PoolMember | null>(null);
 const removingAttention = ref<string | null>(null);
 const data = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools"));
@@ -33,7 +35,7 @@ const displayIndustries = (member: PoolMember) => {
   const secondary = member.boards.filter((board) => board.level === "secondary");
   return secondary.length ? secondary : member.boards.filter((board) => board.level === "primary");
 };
-const visibleMembers = computed(() => {
+const categoryMembers = computed(() => {
   const members = data.data.value?.members ?? [];
   if (selected.value === "all") {
     return focusedMemberCode.value
@@ -45,6 +47,25 @@ const visibleMembers = computed(() => {
   if (selected.value === "unclassified") return members.filter((member) => member.kind === "stock" && member.boards.length === 0);
   return members.filter((member) => member.boards.some((board) => board.code === selected.value));
 });
+const visibleMembers = computed(() => {
+  const query = keyword.value.trim().toLocaleLowerCase();
+  return categoryMembers.value.filter((member) =>
+    [member.name, member.code, member.role, ...member.tags, ...member.boards.map((board) => board.name)]
+      .some((value) => value.toLocaleLowerCase().includes(query)));
+});
+
+const visibleRows = computed(() => visibleMembers.value.map((member) => {
+  const entries = [...member.attention_entries].sort((left, right) => compareAttentionQuality(
+    { code: member.code, attention_entries: [left] },
+    { code: member.code, attention_entries: [right] },
+  ));
+  return {
+    member,
+    attention: entries[0],
+    sources: [...new Set(entries.map(attentionSourceLabel))],
+  };
+}));
+
 const selectedLabel = computed(() => {
   if (selected.value === "all") return "全部标的";
   if (selected.value === "attention") return "关注";
@@ -140,6 +161,12 @@ function pct(value: number | null): string {
   return `${value >= 0 ? "+" : ""}${(value * 100).toFixed(2)}%`;
 }
 
+const NEWS_DIRECTION_LABEL: Record<string, string> = { positive: "利好", neutral: "中性", negative: "利空", mixed: "多空并存", unknown: "—" };
+const NEWS_STATUS_LABEL: Record<string, string> = { pending: "尚未探查", stale: "已过期", uncovered: "未覆盖", empty: "无相关消息", unverified: "待核验", ready: "已更新" };
+function newsLabel(member: PoolMember): string { return NEWS_DIRECTION_LABEL[member.news.direction] ?? "—"; }
+function newsClass(member: PoolMember): string { return member.news.direction === "positive" ? "news-positive" : member.news.direction === "negative" ? "news-negative" : member.news.direction === "mixed" ? "news-mixed" : "news-neutral"; }
+function newsStatus(member: PoolMember): string { return NEWS_STATUS_LABEL[member.news.status] ?? "—"; }
+
 watch(() => route.query.member, (code) => {
   if (typeof code === "string") selected.value = "all";
 }, { immediate: true });
@@ -178,25 +205,25 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
             <InstrumentPicker class="market-search" placeholder="搜索全市场标的…" @select="openMarketInstrument" />
           </div>
           <nav class="pool-tabs" aria-label="标的池视图">
-            <button type="button" :class="{ active: selected === 'attention' }" @click="selected = 'attention'">
+            <button type="button" :aria-pressed="selected === 'attention'" :class="{ active: selected === 'attention' }" @click="selected = 'attention'">
               关注 <small>{{ data.data.value?.attention_count ?? 0 }}</small>
             </button>
-            <button type="button" :class="{ active: selected === 'all' }" @click="selected = 'all'">
+            <button type="button" :aria-pressed="selected === 'all'" :class="{ active: selected === 'all' }" @click="selected = 'all'">
               全部 <small>{{ data.data.value?.members.length ?? 0 }}</small>
             </button>
             <button
               v-for="board in data.data.value?.boards ?? []"
               :key="board.code"
               type="button"
-              :class="{ active: selected === board.code }"
+              :aria-pressed="selected === board.code" :class="{ active: selected === board.code }"
               @click="selected = board.code"
             >
               {{ board.name }} <small>{{ board.member_count }}</small>
             </button>
-            <button v-if="etfCount" type="button" :class="{ active: selected === 'etf' }" @click="selected = 'etf'">
+            <button v-if="etfCount" type="button" :aria-pressed="selected === 'etf'" :class="{ active: selected === 'etf' }" @click="selected = 'etf'">
               ETF <small>{{ etfCount }}</small>
             </button>
-            <button v-if="data.data.value?.unclassified_count" type="button" :class="{ active: selected === 'unclassified' }" @click="selected = 'unclassified'">
+            <button v-if="data.data.value?.unclassified_count" type="button" :aria-pressed="selected === 'unclassified'" :class="{ active: selected === 'unclassified' }" @click="selected = 'unclassified'">
               行业待同步 <small>{{ data.data.value.unclassified_count }}</small>
             </button>
           </nav>
@@ -206,22 +233,32 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           <div class="content-head">
             <div>
               <div class="card-title">{{ selectedLabel }}（{{ visibleMembers.length }}）</div>
-              <p class="card-desc">{{ selected === "attention" ? "按信号完整度排序：已成立 → 待补信号 → 人工关注；同档按代码排序。各任务来源的关注并列展示，互不清除。" : "当前有效池成员及其研究、阶段与关注状态。" }}</p>
+              <p class="card-desc">{{ selected === "attention" ? "按信号完整度排序：已成立 → 待补信号 → 人工关注；同档按代码排序。列表展示最完整信号摘要；点击标的查看各来源的完整条件与有效期。" : "当前有效池成员及其研究、阶段与关注状态。" }}</p>
             </div>
             <div v-if="selected !== 'all' && selected !== 'attention' && selected !== 'etf' && selected !== 'unclassified'" class="content-actions">
               <a class="btn compact" :href="`https://q.10jqka.com.cn/thshy/detail/code/${selected.split('.')[0]}/`" target="_blank" rel="noopener noreferrer">查看板块成分</a>
               <button class="btn compact" type="button" @click="goMarket(selected)">查看行业行情</button>
             </div>
           </div>
-          <p v-if="visibleMembers.length === 0" class="state-block empty">当前视图没有标的</p>
-          <div v-else class="table-wrap">
+          <div class="list-filter">
+            <input v-model="keyword" type="search" aria-label="筛选池内标的" placeholder="筛选池内名称、代码、行业或标签" />
+            <span class="list-filter-count" role="status">显示 {{ visibleMembers.length }} / {{ categoryMembers.length }} 只</span>
+            <span class="table-scroll-hint">左右滚动查看完整列</span>
+            <button v-if="keyword" class="btn compact" type="button" @click="keyword = ''">清空筛选</button>
+          </div>
+          <div v-if="visibleMembers.length === 0" class="state-block empty">
+            <strong>{{ keyword.trim() ? "没有匹配的池内标的" : "当前分类暂无标的" }}</strong>
+            <p>{{ keyword.trim() ? "可清空筛选，或切换「全部」扩大查找范围。" : "可切换其他分类查看，或通过 Agent 维护关注。" }}</p>
+            <button v-if="selected !== 'all'" class="btn" type="button" @click="selected = 'all'">查看全部分类</button>
+          </div>
+          <div v-else class="table-wrap" role="region" aria-label="池内标的，可左右滚动查看完整列" tabindex="0">
             <table class="data-table clickable" :class="{ 'attention-view': selected === 'attention' }">
               <colgroup>
-                <col class="col-instrument"><col class="col-role"><col class="col-stage"><col class="col-industry"><col class="col-attention"><col class="col-action">
+                <col class="col-instrument"><col class="col-role"><col class="col-stage"><col class="col-industry"><col class="col-news"><col class="col-attention"><col class="col-action">
               </colgroup>
-              <thead><tr><th>标的 / 行情</th><th>角色</th><th>阶段 / 股性</th><th>行业细分（官方）</th><th>近期关注</th><th>操作</th></tr></thead>
+              <thead><tr><th>标的 / 行情</th><th>角色</th><th>阶段 / 股性</th><th>行业细分（官方）</th><th>消息面</th><th>近期关注</th><th>操作</th></tr></thead>
               <tbody>
-                <tr v-for="member in visibleMembers" :key="member.id" :class="{ 'focused-row': member.code === focusedMemberCode }" tabindex="0" @click="openMemberDetail(member)" @keydown.enter="openMemberDetail(member)" @keydown.space.prevent="openMemberDetail(member)">
+                <tr v-for="{ member, attention, sources } in visibleRows" :key="member.id" :class="{ 'focused-row': member.code === focusedMemberCode }" tabindex="0" @click="openMemberDetail(member)" @keydown.enter="openMemberDetail(member)" @keydown.space.prevent="openMemberDetail(member)">
                   <td>
                     <strong>{{ member.name }}</strong><div class="num code-sub">{{ member.code }}</div>
                     <div class="quote"><span class="num">{{ member.last === null ? "—" : fmtNum(member.last) }}</span><span :class="{ up: (member.change_pct ?? 0) > 0, down: (member.change_pct ?? 0) < 0 }">{{ pct(member.change_pct) }}</span></div>
@@ -232,25 +269,19 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                     <button v-for="board in displayIndustries(member)" :key="board.code" class="market-link industry-text" type="button" @click.stop="goMarket(board.code)">{{ board.name }}</button>
                     <span v-if="member.boards.length === 0" class="muted">{{ member.kind === "etf" ? "不适用" : "待同步" }}</span>
                   </td>
+                  <td class="news-cell"><span class="badge news-badge" :class="newsClass(member)">{{ newsLabel(member) }}</span><span class="news-status">{{ newsStatus(member) }}</span></td>
                   <td class="attention-cell">
-                    <template v-if="isAttention(member)">
-                      <div v-for="entry in member.attention_entries" :key="entry.id" class="attention-entry">
-                        <div class="attention-entry-head">
-                          <span class="badge signal-status" :class="entry.status">{{ attentionStatusLabel(entry) }}</span>
-                          <RouterLink v-if="entry.strategy_code" class="source-tag" :to="{ path: '/strategies', query: { strategy: entry.strategy_code } }" @click.stop>{{ attentionSourceLabel(entry) }} ↗</RouterLink><span v-else class="muted source-tag">人工关注</span>
-                        <span v-if="entry.stale_reason" class="badge warn">待复核</span>
-                        </div>
-                        <ul v-if="entry.status === 'approaching'" class="signal-gaps">
-                          <li v-for="gap in entry.missing_signals" :key="gap">待确认：{{ gap }}</li>
-                          <li v-if="!entry.missing_signals.length">缺口待补充，请结合关注原因核实</li>
-                        </ul>
-                        <strong class="cell-clamp clamp-2">{{ entry.reason }}</strong>
-                        <div class="attention-footer">
-                          <span class="muted">{{ fmtDate(entry.valid_from) ?? "现在" }}–{{ fmtDate(entry.valid_until) ?? "持续" }}</span>
-                          <button class="detail-trigger remove-attention" type="button" :disabled="removingAttention === `${member.code}:${entry.source_job}`" @click.stop="removeAttention(member, entry)">{{ removingAttention === `${member.code}:${entry.source_job}` ? "移除中" : "移除" }}</button>
-                        </div>
+                    <div v-if="attention" class="attention-summary">
+                      <div class="attention-summary-head">
+                        <span class="badge signal-status" :class="attention.status">{{ attentionStatusLabel(attention) }}</span>
+                        <span v-if="attention.stale_reason" class="badge warn">待复核</span>
                       </div>
-                    </template>
+                      <div class="attention-sources" :title="sources.join('、')">
+                        <span v-for="source in sources.slice(0, 2)" :key="source" class="source-chip">{{ source }}</span>
+                        <span v-if="sources.length > 2" class="source-more">+{{ sources.length - 2 }}</span>
+                      </div>
+                      <span class="cell-clamp clamp-2 attention-reason">{{ attention.reason }}</span>
+                    </div>
                     <span v-else class="muted">未关注</span>
                     <div v-if="!isAttention(member)" class="attention-footer">
                       <span class="muted">—</span>
@@ -278,10 +309,23 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           <dl class="detail-overview">
             <div><dt>角色</dt><dd>{{ detailMember.role }}</dd></div>
             <div><dt>阶段</dt><dd>{{ memberStage(detailMember) }}</dd></div>
-            <div><dt>股性</dt><dd>{{ memberStockCharacter(detailMember) }}</dd></div>
-            <div><dt>行业细分</dt><dd>{{ displayIndustries(detailMember).map((board) => board.name).join(" · ") || (detailMember.kind === "etf" ? "不适用" : "待同步") }}</dd></div>
+            <div><dt>行业</dt><dd>{{ displayIndustries(detailMember).map((board) => board.name).join(" · ") || (detailMember.kind === "etf" ? "不适用" : "待同步") }}</dd></div>
+            <div class="overview-character"><dt>股性</dt><dd>{{ memberStockCharacter(detailMember) }}</dd></div>
           </dl>
-          <section class="detail-section"><h3>研究摘要</h3><p>{{ detailMember.evaluation_summary ?? "暂无研究摘要" }}</p></section>
+          <PoolResearch :key="[detailMember.code, ...detailMember.attention_entries.map(entry => `${entry.id}:${entry.source_evaluation_run_id}`)].join('|')" :code="detailMember.code" />
+          <details v-if="detailMember.evaluation_summary" class="detail-section entry-note"><summary>入池记录</summary><p>{{ detailMember.evaluation_summary }}</p></details>
+          <section class="detail-section news-section">
+            <div class="news-section-head"><h3>相关消息</h3><span class="badge news-badge" :class="newsClass(detailMember)">{{ newsLabel(detailMember) }}</span></div>
+            <p class="news-meta">{{ newsStatus(detailMember) }}<template v-if="detailMember.news.captured_at"> · 探查 {{ fmtDate(detailMember.news.captured_at) }}</template></p>
+            <template v-if="detailMember.news.items.length">
+              <article v-for="item in detailMember.news.items" :key="item.id" class="news-item">
+                <div class="news-item-head"><span class="badge news-badge" :class="item.direction === 'positive' ? 'news-positive' : item.direction === 'negative' ? 'news-negative' : item.direction === 'mixed' ? 'news-mixed' : 'news-neutral'">{{ NEWS_DIRECTION_LABEL[item.direction] }}</span><span class="muted">{{ item.impact_level === 'high' ? '高影响' : item.impact_level === 'medium' ? '中影响' : '低影响' }} · {{ item.relation_type === 'direct' ? '直接相关' : item.relation_type === 'supply_chain' ? '产业链关联' : item.relation_type === 'sector' ? '板块关联' : '市场关联' }}</span></div>
+                <a :href="item.source_url" target="_blank" rel="noopener noreferrer" class="news-title">{{ item.title }}</a>
+                <p>{{ item.facts }}</p><p class="news-impact">{{ item.impact_note }}</p>
+                <div class="muted">{{ item.source_name }} · {{ item.published_at ? fmtDate(item.published_at) : '发布时间待核验' }} · {{ item.source_level === 'primary' ? '原始披露' : '专业财经' }}</div>
+              </article>
+            </template>
+          </section>
           <section class="detail-section">
             <h3>近期关注</h3>
             <template v-if="isAttention(detailMember)">
@@ -289,6 +333,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                 <div class="attention-entry-head">
                   <span class="badge signal-status" :class="entry.status">{{ attentionStatusLabel(entry) }}</span>
                   <RouterLink v-if="entry.strategy_code" class="source-tag" :to="{ path: '/strategies', query: { strategy: entry.strategy_code } }" @click.stop>{{ attentionSourceLabel(entry) }} ↗</RouterLink><span v-else class="muted source-tag">人工关注</span>
+                  <button class="detail-trigger remove-attention" type="button" :disabled="removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}`" @click="removeAttention(detailMember, entry)">{{ removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}` ? "移除中" : "移除关注" }}</button>
                 </div>
                 <ul v-if="entry.status === 'approaching'" class="signal-gaps">
                   <li v-for="gap in entry.missing_signals" :key="gap">待确认：{{ gap }}</li>
@@ -298,9 +343,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                 <div class="muted">{{ fmtDate(entry.valid_from) ?? "现在" }}–{{ fmtDate(entry.valid_until) ?? "持续" }}<template v-if="entry.data_date"> · 数据 {{ fmtDate(entry.data_date) }}</template><template v-if="entry.source_evaluation_run_id"> · 结构化评估已记录</template></div>
                 <p v-if="entry.stale_reason" class="missing">{{ entry.stale_reason }}</p>
                 <div v-if="auctionForEntry(entry)" class="muted">竞价 {{ fmtDate(auctionScope.data.value?.target_date) }} · {{ AUCTION_CONCLUSION_LABELS[auctionForEntry(entry)?.conclusion ?? ''] ?? auctionForEntry(entry)?.conclusion }}：{{ auctionForEntry(entry)?.assessment_summary }}</div>
-                <div class="detail-attention-actions">
-                  <button class="btn compact remove-attention" type="button" :disabled="removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}`" @click="removeAttention(detailMember, entry)">{{ removingAttention === `${detailMember.code}:${entry.strategy_code ?? 'manual'}` ? "移除中" : "移除关注" }}</button>
-                </div>
+
               </div>
             </template>
             <p v-else class="muted">当前未关注</p>
@@ -316,6 +359,13 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 
 <style scoped>
 .signal-status{white-space:normal}.signal-status.qualified{color:var(--accent);border:1px solid currentColor}.signal-status.approaching{color:var(--warning, #9a6400);border:1px solid currentColor}.signal-status.manual{color:var(--ink-faint);border:1px solid currentColor}
+.attention-summary{display:grid;gap:5px}
+.attention-summary-head,.attention-sources{display:flex;align-items:center;gap:6px;min-width:0}
+.attention-summary-head .signal-status{white-space:nowrap}
+.attention-sources{overflow:hidden}
+.source-chip{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 5px;border-radius:4px;background:var(--paper-deep);color:var(--ink-soft);font-size:11px}
+.source-more{flex:none;color:var(--ink-soft);font-size:11px}
+.attention-reason{color:var(--ink-soft);line-height:1.5}
 .signal-gaps{margin:2px 0 8px;padding-left:16px;font-size:12px;line-height:1.6;overflow-wrap:anywhere}.signal-gaps li+li{margin-top:4px}
 .attention-entry{padding:8px 0;border-bottom:1px dashed var(--line)}.attention-entry:last-child{border-bottom:0}
 .attention-entry-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
@@ -339,16 +389,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .data-table{min-width:850px;table-layout:fixed}
 .data-table thead th{position:sticky;top:0;z-index:2;padding:9px 12px;background:var(--paper-deep);box-shadow:0 1px 0 var(--line);font-size:11px;letter-spacing:.02em}
 .data-table td{padding:12px;line-height:1.45}
-.data-table.attention-view{min-width:680px}.attention-view .col-attention{width:auto}
+.data-table.attention-view{min-width:920px}.attention-view .col-attention{width:350px}
 .data-table th:first-child,.data-table td:first-child{position:sticky;left:0;z-index:1;background:var(--card)}
 .data-table th:first-child{z-index:3;background:var(--paper-deep)}
 .data-table th:last-child,.data-table td:last-child{position:sticky;right:0;z-index:1;background:var(--card);box-shadow:-1px 0 var(--line)}
 .data-table th:last-child{z-index:3;background:var(--paper-deep)}
 .data-table tbody tr:hover td:first-child,.data-table tbody tr:hover td:last-child{background:var(--accent-soft)}
-.col-instrument{width:130px}.col-role{width:70px}.col-stage{width:130px}.col-industry{width:150px}.col-attention{width:280px}.col-action{width:86px}
+.col-instrument{width:130px}.col-role{width:70px}.col-stage{width:130px}.col-industry{width:150px}.col-news{width:98px}.col-attention{width:280px}.col-action{width:86px}
+.news-cell{vertical-align:top}.news-badge{display:inline-block;width:max-content;border:1px solid currentColor}.news-positive{color:var(--up)}.news-negative{color:var(--down)}.news-mixed{color:var(--warning,#9a6400)}.news-neutral{color:var(--ink-faint)}.news-status{display:block;margin-top:5px;font-size:11px;color:var(--ink-faint)}.news-section-head,.news-item-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.news-section-head h3{margin:0}.news-meta{margin:5px 0 10px!important;font-size:12px}.news-item{padding:10px 0;border-top:1px dashed var(--line)}.news-title{display:block;margin:6px 0;color:var(--accent-ink);font-weight:700;line-height:1.45}.news-title:hover{text-decoration:underline}.news-item p{margin:5px 0!important}.news-impact{color:var(--ink)!important}
 .attention-footer,.member-detail-head,.member-detail-actions{display:flex;align-items:center;justify-content:space-between;gap:8px}.attention-actions,.detail-attention-actions{display:flex;align-items:center;gap:8px}.detail-trigger{flex:none;border:0;background:transparent;padding:0;color:var(--accent-ink);font:600 11px var(--font-body);cursor:pointer}.detail-trigger:hover{text-decoration:underline}.remove-attention{color:var(--bad)}.remove-attention:disabled{cursor:wait;opacity:.55}.quote{display:flex;gap:8px;margin-top:5px}.cell-clamp{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.clamp-1{-webkit-line-clamp:1}.clamp-2{-webkit-line-clamp:2}.clamp-3{-webkit-line-clamp:3}.tag-preview{display:grid;gap:4px}.attention-cell{min-width:0}.attention-footer{margin-top:6px}.attention-footer>.muted{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-action-cell{vertical-align:middle!important}.row-action-cell .btn{white-space:nowrap}.data-table tbody tr:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}.market-link{display:block;border:0;background:transparent;padding:0;color:var(--accent-ink);text-align:left;cursor:pointer;font:inherit}.market-link:hover{text-decoration:underline}.industry-text{font-weight:600}.up{color:var(--up)}.down{color:var(--down)}
-.member-detail-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}.member-detail-panel{display:grid;width:min(620px,94vw);height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.member-detail-head{padding:14px 18px;border-bottom:1px solid var(--line);background:var(--card)}.member-detail-head>div:first-child{display:flex;align-items:center;min-width:0;gap:8px}.member-detail-head strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.detail-close{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:19px;line-height:1;cursor:pointer}.detail-close:hover{border-color:var(--accent);color:var(--accent-ink)}.member-detail-scroll{min-height:0;overflow:auto;padding:18px 20px 48px}.detail-overview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0;margin:0;border-block:1px solid var(--line)}.detail-overview>div{padding:12px 10px}.detail-overview>div:nth-child(odd){border-right:1px solid var(--line)}.detail-overview dt{margin-bottom:4px;color:var(--ink-faint);font-size:11px}.detail-overview dd{margin:0;overflow-wrap:anywhere;line-height:1.55}.detail-section{padding:18px 2px;border-bottom:1px solid var(--line)}.detail-section h3{margin:0 0 8px;font-size:var(--fs-md)}.detail-section p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);line-height:1.65}.detail-section .btn{margin-top:12px}.detail-tags{display:flex;align-items:flex-start;flex-wrap:wrap;gap:6px}.detail-tags .badge{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.member-detail-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}.member-detail-panel{display:grid;width:min(620px,94vw);height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.member-detail-head{padding:10px 14px;border-bottom:1px solid var(--line);background:var(--card)}.member-detail-head>div:first-child{display:flex;align-items:center;min-width:0;gap:8px}.member-detail-head strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.detail-close{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:19px;line-height:1;cursor:pointer}.detail-close:hover{border-color:var(--accent);color:var(--accent-ink)}.member-detail-scroll{min-height:0;overflow:auto;padding:10px 14px 20px}.detail-overview{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0;padding:0 0 10px;border-bottom:1px solid var(--line)}.detail-overview>div{display:flex;align-items:baseline;gap:8px;min-width:0}.detail-overview .overview-character{flex-basis:100%}.detail-overview dt{flex:none;color:var(--ink-soft);font-size:var(--fs-sm)}.detail-overview dd{margin:0;overflow-wrap:anywhere;line-height:1.5}.detail-section{padding:10px 0;border-bottom:1px solid var(--line)}.detail-section h3{margin:0 0 6px;font-size:var(--fs-md)}.detail-section p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);line-height:1.65}.detail-section .btn{margin-top:6px}.entry-note summary{cursor:pointer;color:var(--ink-soft);font-size:var(--fs-sm)}.entry-note p{margin-top:6px}.detail-section .attention-entry-head{justify-content:flex-start;flex-wrap:wrap}.detail-section .remove-attention{margin-left:auto}.detail-section .attention-entry-head .source-tag{flex:1;min-width:0;overflow-wrap:anywhere}.detail-section .attention-entry{padding:6px 0}.detail-tags{display:flex;align-items:flex-start;flex-wrap:wrap;gap:6px}.detail-tags .badge{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 .member-focus{display:flex;align-items:center;gap:10px;margin-bottom:12px;border-color:var(--accent);background:var(--accent-soft)}.focused-row{outline:2px solid var(--accent);outline-offset:-2px;background:var(--accent-soft)}
 @container business (max-width:720px){.pool-toolbar,.content-head{align-items:stretch;flex-direction:column}.market-search{width:100%}.content-actions{align-self:flex-start}}
-@media(max-width:720px){.pool-head{align-items:stretch;flex-direction:column}.member-detail-panel{width:100vw}.member-detail-head{align-items:flex-start}.member-detail-head>div:first-child{align-items:flex-start;flex-direction:column;gap:2px}.detail-overview{grid-template-columns:1fr}.detail-overview>div:nth-child(odd){border-right:0}.detail-overview>div+div{border-top:1px solid var(--line)}}
+@media(max-width:720px){.pool-head{align-items:stretch;flex-direction:column}.member-detail-panel{width:100vw}.member-detail-head{align-items:flex-start}.member-detail-head>div:first-child{flex-wrap:wrap;gap:4px 6px}}
 </style>

@@ -563,9 +563,10 @@ async function executeDatasource(
         ? await deps.catalogSync(run.id)
         : await syncMarketCatalog(deps.pool, { jobRunId: run.id });
       result = {
-        status: "success",
-        log: `市场目录同步完成：标的 ${summary.tickerCount}、板块 ${summary.boardCount}、交易日 ${summary.tradingDayCount}。`,
+        status: summary.calendarGaps.length > 0 ? "partial" : "success",
+        log: `市场目录同步完成：标的 ${summary.tickerCount}、板块 ${summary.boardCount}、交易日 ${summary.tradingDayCount}、交易所月度日历 ${summary.calendarMonthCount} 个月。`,
         artifacts: summary.fetchRunIds.map((id) => ({ kind: "market_fetch_run", id })),
+        dataGaps: summary.calendarGaps,
       };
     } else if (config.pipeline === "board_membership_sync") {
       const summary = deps.boardMembershipSync
@@ -667,6 +668,11 @@ async function executeAgentFlow(
     const result = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, definition.code, run.target_date);
     markdown = result.markdown;
     unavailableGaps = result.unavailableGaps;
+  }
+  if (definition.code === "pre_market_news_scan") {
+    const snapshot = (await deps.pool.query<{ gaps: unknown[] }>("SELECT gaps FROM market_news_snapshot WHERE run_id=$1", [run.id])).rows[0];
+    if (!snapshot) throw new Error("盘前消息未完成结构化快照写入");
+    unavailableGaps.push(...snapshot.gaps);
   }
   return {
     status: unavailableGaps.length ? "partial" : "success",

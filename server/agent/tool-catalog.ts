@@ -48,7 +48,7 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
   },
   {
     title: "任务流程",
-    tools: ["auction_context_query", "auction_assessment_write", "pool_attention_write", "daily_plan_write"],
+    tools: ["auction_context_query", "auction_assessment_write", "pool_attention_write", "daily_plan_write", "pool_news_write"],
   },
   {
     title: "研究与资料",

@@ -10,6 +10,7 @@ type Raw = Record<string, unknown>;
 export type IntradayLadderRole = "theme_leader" | "ladder_middle" | "theme_initiator"
   | "high_board_follower" | "ladder_replenishment" | "leadership_switch";
 export type IntradayHighBoardState = "none" | "active" | "mixed" | "leader_broken";
+export type IntradayExecutionRisk = "queue_fill_uncertain" | "late_seal" | "normal";
 
 interface ThemeContext {
   width: number;
@@ -56,6 +57,16 @@ export function classifyIntradayLadderRole(input: {
   if (input.themeMaxStreak <= 1) return { role: "theme_initiator", highBoardState };
   if (input.themeTierCount >= 3 || input.themeMaxStreak >= 3) return { role: "ladder_replenishment", highBoardState };
   return { role: "high_board_follower", highBoardState };
+}
+
+export function classifyIntradayBoardForm(input: { hasTheme: boolean; oneWord: boolean; limitMinute: number | null }): {
+  eligible: boolean; consistency: "high" | "normal"; executionRisk: IntradayExecutionRisk;
+} {
+  return {
+    eligible: input.hasTheme,
+    consistency: input.oneWord ? "high" : "normal",
+    executionRisk: input.oneWord ? "queue_fill_uncertain" : input.limitMinute !== null && input.limitMinute > 630 ? "late_seal" : "normal",
+  };
 }
 
 export interface IntradayLimitLadderResult {
@@ -155,13 +166,14 @@ export async function queryIntradayLimitLadder(db: Db, date: string): Promise<In
     });
     const seal = number(item.seal_money); const maxSeal = number(item.max_seal_money); const floatCap = number(auction?.float_market_cap);
     const oneWord = Boolean(quote && quote.open === quote.high && quote.high === quote.low && quote.close === quote.high);
-    const eligible = minute !== null && minute >= 570 && minute <= 630 && !oneWord && Boolean(mainTheme);
+    // 当前涨停池就是点时梯队事实；一字板和10:30后封板只影响排序、成交风险，不应被硬排除。
+    const boardForm = classifyIntradayBoardForm({ hasTheme: Boolean(mainTheme), oneWord, limitMinute: minute });
     const auctionVolume = number(auction?.auction_volume); const unmatched = number(auction?.auction_unmatched);
     const themeWidth = context?.width ?? 0;
     const sealRetention = seal !== null && maxSeal && maxSeal > 0 ? seal / maxSeal : null;
     const sealFloatRatio = seal !== null && floatCap && floatCap > 0 ? seal / floatCap : null;
     const selectionScore = rolePriority[role] * 100 + Math.min(streakCount, 5) * 10 + Math.min(themeWidth, 10)
-      + (sealRetention ?? 0) * 3 + Math.min((sealFloatRatio ?? 0) * 500, 5);
+      + (sealRetention ?? 0) * 3 + Math.min((sealFloatRatio ?? 0) * 500, 5) + (oneWord ? 3 : 0);
     return {
       code, name: String(item.name ?? code), streak_count: streakCount, next_stage: `${streakCount}进${streakCount + 1}`,
       main_theme: mainTheme, themes, ladder_role: role, high_board_state: highBoardState,
@@ -174,7 +186,10 @@ export async function queryIntradayLimitLadder(db: Db, date: string): Promise<In
       seal_float_ratio: sealFloatRatio === null ? null : Number(sealFloatRatio.toFixed(6)),
       auction_pct: number(auction?.auction_pct), auction_yesterday_ratio_pct: number(auction?.auction_yesterday_ratio_pct),
       auction_unmatched_ratio: unmatched !== null && auctionVolume && auctionVolume > 0 ? Number((unmatched / auctionVolume).toFixed(4)) : null,
-      one_word: oneWord, eligible, selection_score: Number(selectionScore.toFixed(4)),
+      one_word: oneWord,
+      intraday_consistency: boardForm.consistency,
+      execution_risk: boardForm.executionRisk,
+      eligible: boardForm.eligible, selection_score: Number(selectionScore.toFixed(4)),
       evidence: { captured_at: new Date(sourceTimestamp).toISOString(), current_turnover: quote?.turnover ?? null, current_low: quote?.low ?? null },
       invalidation: "11点前已炸板、收盘未封住，题材高位核心转弱，或次日竞价出现明确卖方未匹配与题材共振转弱",
     };

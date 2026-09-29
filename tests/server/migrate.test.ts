@@ -49,9 +49,11 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "company_commodity_profile",
       "daily_plan_auction_assessment",
       "daily_plan_playbook",
-      "first_board_intraday_snapshot",
+      "daily_plan_scenario",      "first_board_intraday_snapshot",
       "fundamental_snapshot",
       "hithink_dataset_snapshot",
+      "intraday_market_sample",
+      "intraday_position_risk",
       "job_definition",
       "job_prompt",
       "job_prompt_revision",
@@ -79,6 +81,9 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "market_instrument_alias",
       "market_limit_event",
       "market_limit_ladder_snapshot",
+      "market_news_item",
+      "market_news_item_instrument",
+      "market_news_snapshot",
       "market_special_sync_run",
       "market_stock_character_metric",
       "market_trading_day",
@@ -132,6 +137,12 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     );
     expect(undocumented.rows).toEqual([]);
 
+    const ladder = await pool.query<{ content: string }>(
+      "SELECT content FROM strategy_document WHERE code='first_board_advance_strategy'",
+    );
+    expect(ladder.rows[0]?.content).toContain("一字板、10:30后至扫描时间封板的标的均不作硬排除");
+    expect(ladder.rows[0]?.content).not.toContain("排除09:25后仍未打开的一字板");
+
     const session = await pool.query<{
       session_type: string;
       session_status: string;
@@ -169,14 +180,26 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(dailyPlan).toContain("只负责持仓");
     expect(dailyPlan).toContain("playbook_write.replaced");
     expect(dailyPlan).toContain("不得调用 `daily_plan_write`");
-    expect(dailyPlan).toContain("不得扫描打板");
-    expect(dailyPlan).toContain("专属退出评估器与已固化的兜底退出评估器");
+    expect(dailyPlan).toContain("不扫描或推荐新的策略机会");
+    expect(dailyPlan).toContain("专属与兜底退出评估");
+    expect(dailyPlan).toContain("daily_plan_scenario_write");
+    expect(dailyPlan).toContain("不以冷却期、止盈核对期等为由拒绝给点位");
+    expect(dailyPlan).toContain("板块当日排行");
+    // 0155：任务移至盘前消息面之后，情景与开盘预案结合当日快照。
+    expect(dailyPlan).toContain("盘前消息面");
+    expect(dailyPlan).toContain("当日开盘预案");
+    expect((await pool.query<{ cron: string }>(
+      "SELECT cron FROM job_definition WHERE code='daily_plan_flow'",
+    )).rows[0]!.cron).toBe("5 9 * * 1-5");
     const dailyStrategy = (await pool.query<{ content: string }>(
       "SELECT content FROM strategy_document WHERE code='daily_plan_strategy'",
     )).rows[0]!.content;
     expect(dailyStrategy).toContain("MACD柱由正转负且收盘跌破MA10");
     expect(dailyStrategy).toContain("初始止损取");
     expect(dailyStrategy).not.toContain("## 五、打板观察");
+    expect(dailyStrategy).toContain("不依赖持仓的初始策略归因");
+    expect(dailyStrategy).toContain("不免除点位输出");
+    expect(dailyStrategy).toContain("当日盘前消息面");
     expect(dailyPlan).toContain("个人消息");
     expect(dailyPlan).not.toContain("daily_plan_context_query(date=目标日)");
     expect(dailyPlan).not.toContain("pool_attention_write");
@@ -431,18 +454,21 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       for (const file of files.filter((file) => Number(file.slice(0, 4)) >= 120)) {
         await fs.copyFile(path.join(sourceDir, file), path.join(tmpDir, file));
       }
-      expect((await runMigrations(pool, tmpDir)).applied).toEqual([120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144]);
+      expect((await runMigrations(pool, tmpDir)).applied).toEqual(migrationVersions.filter((version) => version >= 120));
       expect((await pool.query<{ action: string; effective_action: string; strategy_code: string | null }>(
         "SELECT action,effective_action,strategy_code FROM daily_plan_playbook WHERE code='990099.SZ'",
       )).rows).toEqual([{ action: "buy", effective_action: "buy", strategy_code: null }]);
       expect((await pool.query<{ content: string }>(
         "SELECT content FROM strategy_document WHERE code='swing_strategy'",
-      )).rows[0]!.content).toContain("按分数降序、代码升序只保留前5只");
+      )).rows[0]!.content).toContain("3. RSI14 < 30；");
+      expect((await pool.query<{ content: string }>(
+        "SELECT content FROM strategy_document WHERE code='swing_strategy'",
+      )).rows[0]!.content).toContain("深度评分 0-5 分");
       expect((await pool.query<{ content: string }>(
         `SELECT revision.content FROM job_prompt prompt
            JOIN job_prompt_revision revision ON revision.id=prompt.current_revision_id
           WHERE prompt.code='swing_signal_scan'`,
-      )).rows[0]!.content).toContain("同时报告筛选前接近候选总数");
+      )).rows[0]!.content).toContain("深度评分构成（MA250 偏离、60 日跌幅、行业 20 日动量）");
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }

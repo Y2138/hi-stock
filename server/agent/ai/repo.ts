@@ -106,6 +106,23 @@ export async function getLlmConfigByModelId(
   return getLlmConfig(db, modelId);
 }
 
+/** 受控后台能力按固定模型键解析，不跟随用户当前对话模型。 */
+export async function getLlmConfigByModelKey(
+  db: Db,
+  modelKey: string,
+): Promise<ActiveLlmConfig | null> {
+  const result = await db.query<{ id: string }>(
+    `SELECT m.id::text AS id
+       FROM llm_model m
+       JOIN llm_provider p ON p.id = m.provider_id
+      WHERE m.model_key = $1 AND p.enabled = true AND m.enabled = true
+      ORDER BY m.updated_at DESC, m.id DESC
+      LIMIT 1`,
+    [modelKey],
+  );
+  return result.rows[0] ? getLlmConfig(db, result.rows[0].id) : null;
+}
+
 export async function getProviderApiKey(
   db: Db,
   providerKey: string,

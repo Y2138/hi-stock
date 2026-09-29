@@ -140,6 +140,8 @@ export interface JobDefinition {
   priority: number | null;
   strategy_code: string | null;
   agent_role: string | null;
+  /** 仅交易日执行：非交易所开市日的 cron 触发不入队；周维护任务为 false。 */
+  trading_day_only: boolean;
   available_tools: string[];
   enabled: boolean;
   created_at: string;
@@ -376,6 +378,34 @@ export interface Position {
 
 // ---- 每日计划盯防预案（server/modules/plans） ----
 
+/** 情景预案五类固定情景；kind 与服务端 daily_plan_scenario 一致。 */
+export type DailyPlanScenarioKind =
+  | "surge_reversal"
+  | "open_plunge"
+  | "wide_swing"
+  | "strong_continuation"
+  | "weak_breakdown";
+
+export interface DailyPlanScenario {
+  id: string;
+  scenario_kind: DailyPlanScenarioKind;
+  observable_md: string;
+  response_md: string;
+  invalidation_md: string;
+}
+
+/** 关键点位事实：服务端机械计算（均线/近10、20日高低/前日高低/次日涨跌停）。 */
+export interface DailyPlanKeyLevel {
+  kind: "support" | "resistance" | "limit";
+  label: string;
+  price: number;
+}
+
+/** 做T预案：默认低吸/兑现区间；仅流动性极端允许 skip_reason。 */
+export type DailyPlanTPlan =
+  | { buy_lower: number; buy_upper: number; sell_lower: number; sell_upper: number; confirm_md: string; cancel_md: string }
+  | { skip_reason: string };
+
 export interface DailyPlanPlaybookItem {
   id: string;
   item_kind: "position_action" | "off_pool_opportunity";
@@ -394,6 +424,9 @@ export interface DailyPlanPlaybookItem {
   missing_md: string | null;
   invalidation_md: string | null;
   risk_md: string | null;
+  key_levels: DailyPlanKeyLevel[];
+  t_plan: DailyPlanTPlan | null;
+  scenarios?: DailyPlanScenario[];
   strategy_code: string | null;
   strategy_runtime_version: number | null;
   primary_evaluation_run_id: string | null;
@@ -530,6 +563,25 @@ export interface PoolAttentionEntry {
   valid_until: string | null;
 }
 
+export interface PoolResearch {
+  attention_id: string;
+  strategy_code: string | null;
+  strategy_name: string | null;
+  reason: string;
+  status: PoolAttentionEntry["status"];
+  missing_signals: string[];
+  stale_reason: string | null;
+  run_id: string | null;
+  target_date: string | null;
+  data_date: string | null;
+  run_status: string | null;
+  strategy_runtime_version: number | null;
+  evidence: Record<string, unknown> | null;
+  trigger_price_lower: number | null;
+  trigger_price_upper: number | null;
+  invalidation: string | null;
+}
+
 export interface PoolMember {
   id: string;
   pool: "watch";
@@ -555,6 +607,46 @@ export interface PoolMember {
   quote_time: string | null;
   price_source: "close" | null;
   boards: Array<{ code: string; name: string; board_type: string; level: "primary" | "secondary" }>;
+  news: {
+    direction: "positive" | "neutral" | "negative" | "mixed" | "unknown";
+    status: "pending" | "stale" | "uncovered" | "empty" | "unverified" | "ready";
+    captured_at: string | null;
+    target_date: string | null;
+    items: Array<MarketNewsItem>;
+  };
+}
+
+export interface MarketNewsItem {
+  id: string;
+  title: string;
+  summary: string;
+  category: string;
+  scope: string;
+  direction: "positive" | "neutral" | "negative" | "mixed" | "unknown";
+  impact_level: "high" | "medium" | "low";
+  relation_type: string;
+  source_level: string;
+  source_name: string;
+  source_url: string;
+  published_at: string | null;
+  fetched_at: string;
+  facts: string;
+  impact_note: string;
+  expires_at: string | null;
+  codes: string[];
+}
+
+export interface MarketNewsSnapshot {
+  id: string;
+  target_date: string;
+  captured_at: string;
+  status: "success" | "partial" | "failed";
+  market_bias: "positive" | "neutral" | "negative" | "mixed" | "unknown";
+  summary: string;
+  checked_codes: string[];
+  gaps: string[];
+  items: MarketNewsItem[];
+  stale: boolean;
 }
 
 export interface PoolBoard {
@@ -926,7 +1018,7 @@ export interface NotificationSettings {
 export interface NotificationDelivery {
   id: string;
   output_id: string | null;
-  kind: "daily_plan" | "agent_result" | "test";
+  kind: "daily_plan" | "agent_result" | "intraday_risk" | "test";
   channel: "personal" | "strategy";
   job_code: string | null;
   job_name: string | null;
@@ -942,4 +1034,24 @@ export interface NotificationDelivery {
 export interface NotificationPage {
   items: Omit<NotificationDelivery, "content">[];
   next_cursor: string | null;
+}
+
+export type IntradayRiskLevel = "normal" | "watch" | "high";
+export interface IntradayRiskRow {
+  code: string;
+  name: string;
+  risk: IntradayRiskLevel;
+  key_level: string | null;
+  reason: string;
+  sample_at: string | null;
+  data_time: string | null;
+  model_key: string;
+  updated_at: string;
+}
+export interface IntradayRiskSnapshot {
+  trade_date: string;
+  running: boolean;
+  sample_at: string | null;
+  data_status: "ready" | "partial" | "stale" | "unavailable";
+  positions: IntradayRiskRow[];
 }

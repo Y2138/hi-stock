@@ -7,7 +7,7 @@ import {
   listPositionChanges,
   listPositions,
 } from "../modules/positions/repo.js";
-import { listPoolView } from "../modules/pools/repo.js";
+import { listPoolView, listStrategyAttentionReviewEntries } from "../modules/pools/repo.js";
 import { getCurrentStrategy } from "../modules/strategy/repo.js";
 import { findJobPrompt, listJobPrompts } from "../modules/job-prompts/repo.js";
 import { listJobDefinitions, listJobOutputs, listJobRuns } from "../scheduler/repo.js";
@@ -142,7 +142,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "pool_context_query",
       label: "查询标的池业务上下文",
       description:
-        "返回关注池成员全集。未传 codes 时每只成员只返回角色、阶段、关注、行情和一级行业摘要；传 codes 时才返回对应标的完整研究属性。date 指定关注有效性的判定日（缺省为今天）。只有需要板块总览时才开启 include_boards。",
+        "返回关注池成员全集。未传 codes 时每只成员只返回角色、阶段、关注、行情和一级行业摘要；传 codes 时才返回对应标的完整研究属性。date 指定关注有效性的判定日（缺省为今天）。strategy_attentions 返回全部策略存量关注（含过期条目），策略任务必须按 strategy_code 取全复核；当前展示成员与复核集合分开。只有需要板块总览时才开启 include_boards。",
       parameters: PoolContextQuerySchema,
       execute: async (_id, raw) => audited<PoolContextQueryInput>(
         deps, "pool_context_query", raw, validatePoolContextQueryInput, async (input) => {
@@ -170,6 +170,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
               }));
           return {
             pool: view.pool,
+            strategy_attentions: await listStrategyAttentionReviewEntries(deps.pool),
             member_count: members.length,
             attention_count: members.filter((member) => member.attention_entries.length > 0).length,
             detail_level: input.codes?.length ? "full" : "summary",

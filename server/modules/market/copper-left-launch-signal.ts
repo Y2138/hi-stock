@@ -168,6 +168,7 @@ export async function queryCopperLeftLaunchEntry(db: Db, targetDate: string) {
   const qualified = failed.length === 0 && current.quantity <= 0;
   return {
     status: "success", data_date: current.dataDate,
+    reviewed_codes: [TARGET],
     coverage: { target_count: 1, completed_count: 1, peer_count: PEERS.length },
     signals: qualified ? [item] : [],
     near_candidates: !qualified && current.quantity <= 0 && failed.length === 1 ? [item] : [],

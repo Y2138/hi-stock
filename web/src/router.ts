@@ -12,6 +12,7 @@ import DataSyncView from "./views/DataSyncView.vue";
 import NotificationHistoryView from "./views/NotificationHistoryView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import MemoryView from "./views/MemoryView.vue";
+import MarketNewsView from "./views/MarketNewsView.vue";
 
 export const router = createRouter({
   history: createWebHistory("/"),
@@ -28,6 +29,7 @@ export const router = createRouter({
     { path: "/positions", name: "positions", component: PositionsView, meta: { title: "持仓" } },
     { path: "/market", name: "market", component: MarketView, meta: { title: "行情" } },
     { path: "/market-structure", name: "market-structure", component: MarketStructureView, meta: { title: "市场结构" } },
+    { path: "/market-news", name: "market-news", component: MarketNewsView, meta: { title: "市场消息" } },
     { path: "/memories", name: "memories", component: MemoryView, meta: { title: "Agent 记忆" } },
     { path: "/jobs", name: "jobs", component: JobsView, meta: { title: "任务中心" } },
     {

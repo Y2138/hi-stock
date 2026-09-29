@@ -3,13 +3,14 @@ import type { AgentCoreFrame } from "./core/loop.js";
 
 const REQUIRED_READS: Record<string, readonly string[]> = {
   daily_plan_flow: ["strategy_document_query", "daily_plan_strategy_query"],
-  value_anchor_opportunity_scan: ["strategy_document_query", "value_anchor_signal_query"],
+  value_anchor_opportunity_scan: ["strategy_document_query", "strategy_evaluation_query"],
   swing_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
   copper_left_launch_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
   first_board_intraday_scan: ["strategy_document_query", "strategy_evaluation_query"],
   limit_up_close_scan: ["strategy_document_query", "strategy_evaluation_query"],
-  two_year_reversal_scan: ["strategy_document_query", "two_year_reversal_signal_query"],
+  two_year_reversal_scan: ["strategy_document_query", "strategy_evaluation_query"],
   nightly_sector_opportunity_scan: [
+    "pool_context_query",
     "strategy_document_query",
     "analysis_run",
     "board_query",
@@ -18,6 +19,7 @@ const REQUIRED_READS: Record<string, readonly string[]> = {
     "strategy_screen_query",
     "stock_research_query",
   ],
+  pre_market_news_scan: ["pool_context_query", "web_search", "pool_news_write"],
 };
 const TARGET_DATE_TOOLS = new Set([
   "daily_plan_strategy_query", "daily_plan_context_query", "swing_signal_query", "auction_context_query",
@@ -99,7 +101,7 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
     },
     missing(): string[] {
       const required = [...(Object.hasOwn(REQUIRED_READS, jobCode) ? REQUIRED_READS[jobCode]! : [])];
-      if (jobCode === "nightly_sector_opportunity_scan" || jobCode === "value_anchor_opportunity_scan") {
+      if (jobCode === "nightly_sector_opportunity_scan") {
         required.push("pool_attention_write");
       }
       if (jobCode === "auction_opportunity_assessment") {
@@ -183,6 +185,12 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
         const write = object(results.get("daily_plan_strategy_query")?.playbook_write);
         if (!Array.isArray(items) || write.replaced !== items.length) {
           missing.push("daily_plan_strategy_query（服务端未完成结构化预案写入）");
+        } else if (items.length > 0) {
+          // 情景/做T预案是持仓预案的必备输出：有持仓而未完成结构化情景写入不得收尾。
+          const scenarioWrite = object(results.get("daily_plan_scenario_write"));
+          if (scenarioWrite.replaced_items !== items.length) {
+            missing.push("daily_plan_scenario_write（情景与做T预案未完成结构化写入）");
+          }
         }
       }
       if (jobCode === "auction_opportunity_assessment" && results.has("auction_context_query")

@@ -240,6 +240,9 @@ export function calculateStockCharacterProfile(input: StockCharacterBar[]): Stoc
   const defenseLabel = strengthLabel(defenseScore);
   const volatilityLabel = riskLabel(volatilityScore);
   const stockCharacter = `洗盘恢复${washoutLabel}·拉升${markupLabel}·假突破风险${falseBreakoutLabel}·护盘${defenseLabel}·波动${volatilityLabel}`;
+  const stopLossTag = defense.recoveryRate === null
+    ? null
+    : defense.recoveryRate >= 0.5 ? "止损：买入价×0.90" : "止损：买入价×0.93";
 
   return {
     dimensions: {
@@ -278,6 +281,7 @@ export function calculateStockCharacterProfile(input: StockCharacterBar[]): Stoc
       `假突破风险：${falseBreakoutLabel}`,
       `护盘：${defenseLabel}`,
       `波动：${volatilityLabel}`,
+      ...(stopLossTag ? [stopLossTag] : []),
     ],
     key_levels: {
       close: latest?.close ?? null,

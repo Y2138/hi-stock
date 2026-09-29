@@ -1,6 +1,8 @@
 import type pg from "pg";
+import { positionGapReasons } from "../plans/evaluation-gaps.js";
 import { queryDailyPlanContext } from "../plans/daily-context.js";
-import { replaceDraftPlaybook, type PlaybookItemInput } from "../plans/repo.js";
+import { getLatestMarketNews, instrumentNews } from "../market-news/repo.js";
+import { replaceDraftPlaybook, type DailyPlanKeyLevel, type PlaybookItemInput } from "../plans/repo.js";
 import { listPositions } from "../positions/repo.js";
 import { mergeExitEvaluations } from "./exit-evaluators.js";
 import { reconcileStrategyAttention, type StrategyAttentionChange } from "./attention.js";
@@ -23,10 +25,8 @@ function positionItems(evaluation: EvaluationRecord | undefined): StrategyPositi
   return Array.isArray(items) ? items as StrategyPositionEvaluation[] : [];
 }
 
-function gapsForPosition(evaluation: EvaluationRecord | undefined, code: string): unknown[] {
-  return (evaluation?.ensured.run.gaps ?? []).filter((gap) =>
-    !gap || typeof gap !== "object" || Array.isArray(gap)
-      || !("code" in gap) || (gap as { code?: unknown }).code === code);
+function gapsForPosition(evaluation: EvaluationRecord | undefined, code: string): string[] {
+  return positionGapReasons(evaluation?.ensured.run.gaps ?? [], code);
 }
 
 function evaluationGap(evaluation: EvaluationRecord): Record<string, unknown> | null {
@@ -40,12 +40,53 @@ function evaluationGap(evaluation: EvaluationRecord): Record<string, unknown> | 
   return null;
 }
 
+interface PositionTechnicalLevels {
+  close: number | null;
+  ma5: number | null;
+  ma10: number | null;
+  ma20: number | null;
+  high_10d: number | null;
+  low_10d: number | null;
+  high_20d: number | null;
+  low_20d: number | null;
+  prev_high: number | null;
+  prev_low: number | null;
+  limit_up_price?: number;
+  limit_down_price?: number;
+}
+
+/** 情景/做T预案的关键点位：全部为技术面机械事实，不引入任何策略判断；同价位只保留首个标签。 */
+export function buildKeyLevels(levels: PositionTechnicalLevels | undefined): DailyPlanKeyLevel[] {
+  if (!levels) return [];
+  const items: DailyPlanKeyLevel[] = [];
+  const seen = new Set<string>();
+  const push = (kind: DailyPlanKeyLevel["kind"], label: string, price: number | null | undefined) => {
+    if (price === null || price === undefined || !Number.isFinite(price) || price <= 0) return;
+    const key = price.toFixed(2);
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push({ kind, label, price: Math.round(price * 100) / 100 });
+  };
+  for (const [label, value] of [["MA5", levels.ma5], ["MA10", levels.ma10], ["MA20", levels.ma20]] as const) {
+    push(value !== null && levels.close !== null && value >= levels.close ? "resistance" : "support", label, value);
+  }
+  push("resistance", "近10日高点", levels.high_10d);
+  push("resistance", "近20日高点", levels.high_20d);
+  push("support", "近10日低点", levels.low_10d);
+  push("support", "近20日低点", levels.low_20d);
+  push("resistance", "前日高点", levels.prev_high);
+  push("support", "前日低点", levels.prev_low);
+  push("limit", "预案日涨停价", levels.limit_up_price ?? null);
+  push("limit", "预案日跌停价", levels.limit_down_price ?? null);
+  return items;
+}
+
 
 export async function queryDailyPlanStrategyContext(
   pool: pg.Pool,
   input: { date: string; requested_by_job_run_id?: string | null },
 ) {
-  const [definitions, positions, legacyContext, activeAttentions] = await Promise.all([
+  const [definitions, positions, legacyContext, activeAttentions, newsSnapshot] = await Promise.all([
     listStrategyRuntimeDefinitions(pool),
     listPositions(pool),
     queryDailyPlanContext(pool, input.date),
@@ -63,6 +104,7 @@ export async function queryDailyPlanStrategyContext(
         ORDER BY strategy.name,instrument.code`,
       [input.date],
     ),
+    getLatestMarketNews(pool, input.date),
   ]);
   const byCode = new Map(definitions.map((definition) => [definition.code, definition]));
   const requests = new Map<string, { strategy: StrategyRuntimeDefinition; phase: "entry" | "exit" | "context" }>();
@@ -80,8 +122,9 @@ export async function queryDailyPlanStrategyContext(
       gaps.push({ code: position.code, scope: "position", reason: `持仓策略不存在：${position.strategy_code}` });
       continue;
     }
-    if (strategy.exit_evaluator_code) add(strategy, "exit");
-    if (position.fallback_strategy_code) {
+    const mode = position.exit_policy_mode ?? strategy.exit_policy_mode;
+    if (mode !== "fallback_only" && strategy.exit_evaluator_code) add(strategy, "exit");
+    if (["fallback_only", "dedicated_plus_fallback"].includes(mode) && position.fallback_strategy_code) {
       const fallback = byCode.get(position.fallback_strategy_code);
       if (fallback?.exit_evaluator_code) add(fallback, "exit");
       else gaps.push({ code: position.code, scope: "fallback", reason: `兜底策略不可用：${position.fallback_strategy_code}` });
@@ -121,6 +164,8 @@ export async function queryDailyPlanStrategyContext(
     }
   }
 
+  const technicalByCode = new Map(legacyContext.positions.items.map((item) => [item.code, item.technical_levels]));
+  const boardsByCode = new Map(legacyContext.position_boards.items.map((item) => [item.code, item]));
   const positionEvaluations = positions.map((position) => {
     if (!position.strategy_code || !byCode.has(position.strategy_code)) return {
       code: position.code, name: position.name, strategy_code: position.strategy_code, strategy_name: null,
@@ -130,22 +175,27 @@ export async function queryDailyPlanStrategyContext(
       primary_evaluation_run_id: null, fallback_evaluation_run_id: null,
       evaluation_status: "partial" as const, data_date: legacyContext.market.data_date,
       missing_items: ["持仓策略未归因或不可用"], strategy_runtime_version: null,
+      key_levels: buildKeyLevels(technicalByCode.get(position.code)),
+      boards: boardsByCode.get(position.code) ?? null,
     };
     const strategy = byCode.get(position.strategy_code)!;
-    const primaryRun = strategy.exit_evaluator_code ? evaluationByKey.get(`${strategy.code}:exit`) : undefined;
-    const fallbackRun = position.fallback_strategy_code
+    const mode = position.exit_policy_mode ?? strategy.exit_policy_mode;
+    const primaryRequired = mode !== "fallback_only" && Boolean(strategy.exit_evaluator_code);
+    const fallbackRequired = ["fallback_only", "dedicated_plus_fallback"].includes(mode);
+    const primaryRun = primaryRequired ? evaluationByKey.get(`${strategy.code}:exit`) : undefined;
+    const fallbackRun = fallbackRequired && position.fallback_strategy_code
       ? evaluationByKey.get(`${position.fallback_strategy_code}:exit`) : undefined;
     const primary = positionItems(primaryRun).find((item) => item.code === position.code) ?? null;
     const fallback = positionItems(fallbackRun).find((item) => item.code === position.code) ?? null;
     const merged = mergeExitEvaluations(position.strategy_code, position.exit_policy_mode ?? strategy.exit_policy_mode, primary, fallback);
-    const missingItems = [
-      ...(strategy.exit_evaluator_code && !primaryRun ? ["主策略退出评估不可用"] : []),
-      ...(position.fallback_strategy_code && !fallbackRun ? ["兜底退出评估不可用"] : []),
-      ...(strategy.exit_evaluator_code && primaryRun && !primary ? ["主策略未返回该持仓评估"] : []),
-      ...(position.fallback_strategy_code && fallbackRun && !fallback ? ["兜底策略未返回该持仓评估"] : []),
+    const missingItems = positionGapReasons([
+      ...(primaryRequired && !primaryRun ? ["主策略退出评估不可用"] : []),
+      ...(fallbackRequired && !fallbackRun ? ["兜底退出评估不可用"] : []),
+      ...(primaryRequired && primaryRun && !primary ? ["主策略未返回该持仓评估"] : []),
+      ...(fallbackRequired && fallbackRun && !fallback ? ["兜底策略未返回该持仓评估"] : []),
       ...(primary?.missing_items ?? []), ...(fallback?.missing_items ?? []),
       ...gapsForPosition(primaryRun, position.code), ...gapsForPosition(fallbackRun, position.code),
-    ];
+    ], position.code);
     const incomplete = Boolean(missingItems.length) || [primaryRun, fallbackRun]
       .some((run) => run && ["failed", "running", "queued"].includes(run.ensured.run.status));
     const evaluationStatus = primaryRun?.ensured.execution === "waiting" || fallbackRun?.ensured.execution === "waiting"
@@ -167,6 +217,9 @@ export async function queryDailyPlanStrategyContext(
       evaluation_status: evaluationStatus,
       data_date: primaryRun?.ensured.run.data_date ?? fallbackRun?.ensured.run.data_date ?? legacyContext.market.data_date,
       missing_items: missingItems,
+      // 情景/做T预案输入：技术面关键点位与板块归属，与策略评估解耦。
+      key_levels: buildKeyLevels(technicalByCode.get(position.code)),
+      boards: boardsByCode.get(position.code) ?? null,
     };
   });
 
@@ -187,6 +240,7 @@ export async function queryDailyPlanStrategyContext(
           ? { price_upper: effective.trigger_price_upper } : {}),
         headline: `${item.strategy_name ?? "待归因"}｜${item.effective_reason}`,
         evidence_md: `主策略：${item.primary?.reason ?? "无"}；兜底：${item.fallback?.reason ?? "无"}`,
+        key_levels: item.key_levels,
         ...(item.missing_items.length ? { missing_md: item.missing_items.map((value) => typeof value === "string" ? value : JSON.stringify(value)).join("；") } : {}),
         ...(item.strategy_code ? { strategy_code: item.strategy_code } : {}),
         ...(item.strategy_runtime_version ? { strategy_runtime_version: item.strategy_runtime_version } : {}),
@@ -206,6 +260,35 @@ export async function queryDailyPlanStrategyContext(
     ? await replaceDraftPlaybook(pool, { source_job_run_id: input.requested_by_job_run_id, items: playbookItems })
     : null;
 
+  // 盘前消息面：任务已移至盘前运行，情景/开盘预案结合当日快照；缺失或过期必须列为缺口。
+  const marketNews = newsSnapshot ? {
+    target_date: newsSnapshot.target_date,
+    captured_at: newsSnapshot.captured_at,
+    market_bias: newsSnapshot.market_bias,
+    summary: newsSnapshot.summary,
+    stale: newsSnapshot.stale,
+    positions: positionEvaluations.map((item) => {
+      const news = instrumentNews(newsSnapshot, item.code);
+      return {
+        code: item.code,
+        direction: news.direction,
+        status: news.status,
+        items: news.items.map((entry) => ({
+          title: entry.title,
+          direction: entry.direction,
+          impact_level: entry.impact_level,
+          published_at: entry.published_at,
+          source_name: entry.source_name,
+        })),
+      };
+    }),
+  } : null;
+  const newsGaps: Record<string, unknown>[] = newsSnapshot
+    ? (newsSnapshot.stale
+      ? [{ scope: "market_news", reason: `盘前消息快照已过期（采集于 ${newsSnapshot.captured_at}）` }]
+      : [])
+    : [{ scope: "market_news", reason: "当日盘前消息快照缺失，开盘情景缺少消息面输入" }];
+
   const requiredDocuments = new Set<string>(["daily_plan_strategy"]);
   const portfolioDocuments = await pool.query<{ code: string }>(
     "SELECT code FROM strategy_document WHERE role='portfolio' ORDER BY injection_order,id",
@@ -213,7 +296,8 @@ export async function queryDailyPlanStrategyContext(
   for (const document of portfolioDocuments.rows) requiredDocuments.add(document.code);
   for (const evaluation of evaluations) requiredDocuments.add(evaluation.strategy.strategy_document_code);
   const waitingCount = evaluations.filter((item) => item.ensured.execution === "waiting").length;
-  const status = gaps.length || legacyContext.status !== "success" || waitingCount ? "partial" as const : "success" as const;
+  const status = gaps.length || newsGaps.length || legacyContext.status !== "success" || waitingCount
+    ? "partial" as const : "success" as const;
   return {
     requested_date: input.date,
     status,
@@ -241,10 +325,13 @@ export async function queryDailyPlanStrategyContext(
       execution: item.ensured.execution, run: item.ensured.run, result: item.ensured.result,
     })),
     position_evaluations: positionEvaluations,
+    position_boards: legacyContext.position_boards,
+    board_day_ranking: legacyContext.board_day_ranking,
+    market_news: marketNews,
     active_attentions: activeAttentions.rows,
     attention_changes: attentionChanges,
     playbook_items: playbookItems,
     playbook_write: playbookWrite,
-    gaps: [...legacyContext.gaps, ...gaps],
+    gaps: [...legacyContext.gaps, ...gaps, ...newsGaps],
   };
 }

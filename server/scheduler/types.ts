@@ -32,6 +32,8 @@ export interface JobDefinitionRow {
   strategy_code: string | null;
   /** 任务在策略运行时中的受控角色。 */
   agent_role: string | null;
+  /** 仅交易日执行：目标日非交易所日历开市日时 cron/missed 触发不入队；周维护任务为 false。 */
+  trading_day_only: boolean;
   enabled: boolean;
   created_at: string;
   updated_at: string;

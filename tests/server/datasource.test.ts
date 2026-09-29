@@ -26,7 +26,7 @@ import {
   normalizeHithinkDatasetRequest,
 } from "../../server/datasource/hithink-datasets.js";
 import { executeHithinkCapability, HITHINK_CAPABILITIES } from "../../server/datasource/hithink-capabilities.js";
-import { syncAllBoardMemberships, syncBoardMembership, upsertTickerIdentities } from "../../server/datasource/catalog-service.js";
+import { syncAllBoardMemberships, syncBoardMembership, syncMarketCatalog, upsertTickerIdentities } from "../../server/datasource/catalog-service.js";
 import { syncLimitDataset, syncLimitLadder } from "../../server/datasource/special-service.js";
 import {
   calculateDefenseRecovery,
@@ -47,7 +47,7 @@ import {
   type LimitUpBenchmark,
 } from "../../server/modules/market/limit-up-signals.js";
 import indicatorFixture from "../fixtures/指标金样本.json";
-import { fetchFundFlow } from "../../server/datasource/akshare.js";
+import { fetchFundFlow, fetchSzseCalendarMonth } from "../../server/datasource/akshare.js";
 import {
   dailyMarketUpdate,
   ensureInstrument,
@@ -663,6 +663,41 @@ describe("datasource 限流与重试", () => {
     }, noWait)).rejects.toThrow("to 不能早于 from");
     expect(await fetchLimitPoolPage("up", { tradeDate: "2026-08-18", page: 1 }, noWait)).toMatchObject({ page: 1, pages: 1, total: 1 });
     expect(await fetchDragonTiger("all", "2026-08-18", noWait)).toMatchObject({ boardType: "all", tradeDate: "2026-08-18" });
+    vi.unstubAllGlobals();
+  });
+
+  it("深交所月度日历按 jyrq/jybz 解析整月开休市，未发布月份返回 null", async () => {
+    const mock = vi.fn(async (url: unknown) => {
+      const parsed = new URL(String(url));
+      expect(parsed.host).toBe("www.szse.cn");
+      if (parsed.searchParams.get("month") === "2026-10") {
+        return jsonResponse({ data: [
+          { jyrq: "2026-10-01", jybz: "0" },
+          { jyrq: "2026-10-02", jybz: "0" },
+          { jyrq: "2026-10-08", jybz: "1" },
+          { jyrq: "2026-10-09", jybz: "1" },
+          { jyrq: "2026-10-10", jybz: "0" },
+        ] });
+      }
+      if (parsed.searchParams.get("month") === "2027-01") return jsonResponse({ data: [], nowdate: "2026-09-28" });
+      throw new Error(`未预期的 URL: ${String(url)}`);
+    });
+    vi.stubGlobal("fetch", mock);
+    const october = await fetchSzseCalendarMonth("2026-10", { sleep: noopSleep });
+    expect(october).toEqual([
+      { date: "2026-10-01", isOpen: false },
+      { date: "2026-10-02", isOpen: false },
+      { date: "2026-10-08", isOpen: true },
+      { date: "2026-10-09", isOpen: true },
+      { date: "2026-10-10", isOpen: false },
+    ]);
+    // 次年日历未发布：空 data 视为 null 而非失败。
+    expect(await fetchSzseCalendarMonth("2027-01", { sleep: noopSleep })).toBeNull();
+    await expect(fetchSzseCalendarMonth("2026-13", { sleep: noopSleep })).rejects.toThrow("日历月份");
+    vi.unstubAllGlobals();
+    const badMonth = vi.fn(async () => jsonResponse({ data: [{ jyrq: "2026-11-01", jybz: "0" }, { jyrq: "2026-12-01", jybz: "1" }] }));
+    vi.stubGlobal("fetch", badMonth);
+    await expect(fetchSzseCalendarMonth("2026-11", { sleep: noopSleep })).rejects.toThrow("日历行格式异常");
     vi.unstubAllGlobals();
   });
 
@@ -1730,6 +1765,63 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       "SELECT count(*)::int AS n FROM market_board_membership WHERE effective_to IS NULL",
     );
     expect(current.rows[0]!.n).toBe(1);
+  });
+
+  it("market_catalog_sync 同步交易所月度日历：写入整月开休市，当年缺月记缺口", async () => {
+    const timestamp = Date.parse("2026-09-28T07:10:00+08:00");
+    vi.stubGlobal("fetch", vi.fn(async (url: unknown) => {
+      const parsed = new URL(String(url));
+      const envelope = (data: unknown) => jsonResponse({ code: 0, message: "success", data });
+      if (parsed.pathname === "/api/a-share-index/catalog/ths-index-list") {
+        return envelope({ timestamp, item: [] });
+      }
+      if (parsed.pathname === "/api/meta/tickers/list") {
+        return envelope({ timestamp, item: [
+          { thscode: "600990.SH", ticker: "600990", name: "日历测试股", asset_type: "a-share", exchange: "SH", currency: "CNY" },
+        ] });
+      }
+      if (parsed.pathname === "/api/a-share/calendar/trading-days") {
+        return envelope({ timestamp, item: [{ date: "20260928" }] });
+      }
+      throw new Error(`未预期的 URL: ${String(url)}`);
+    }));
+    // 同步窗口固定为 2026-08..2027-01（now=2026-09-28）：9 月模拟失败、11 月未返回、次年 1 月未发布。
+    const exchangeCalendar = async (month: string) => {
+      if (month === "2026-09") throw new Error("模拟当年月份失败");
+      if (month === "2026-11" || month === "2027-01") return null;
+      if (month === "2026-08") {
+        return [
+          { date: "2026-08-28", isOpen: true },
+          { date: "2026-08-29", isOpen: false },
+        ];
+      }
+      if (month === "2026-10") {
+        return [
+          { date: "2026-10-01", isOpen: false },
+          { date: "2026-10-08", isOpen: true },
+        ];
+      }
+      return [{ date: "2026-12-31", isOpen: false }];
+    };
+    try {
+      const summary = await syncMarketCatalog(pool, {
+        ...noWait,
+        exchangeCalendar,
+        now: () => new Date("2026-09-28T02:00:00Z"),
+      });
+      expect(summary.calendarMonthCount).toBe(3);
+      expect(summary.calendarGaps.map((gap) => gap.code).sort())
+        .toEqual(["szse_calendar.2026-09", "szse_calendar.2026-11"]);
+      expect(summary.fetchRunIds).toHaveLength(2);
+      const rows = await pool.query<{ is_open: boolean }>(
+        "SELECT is_open FROM market_trading_day WHERE trade_date = ANY($1::date[]) ORDER BY trade_date",
+        [["2026-09-28", "2026-10-01", "2026-10-08", "2026-12-31"]],
+      );
+      // 扶摇开市行保留，交易所日历补齐节假日休市行（国庆 10-01 休、10-08 开、12-31 周四休）。
+      expect(rows.rows.map((row) => row.is_open)).toEqual([true, false, true, false]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("涨停分页中途失败保留成功页并记 partial，补跑保持幂等", async () => {

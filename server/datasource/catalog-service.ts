@@ -10,9 +10,29 @@ import {
   type TickerIdentity,
 } from "./hithink-meta.js";
 import type { HithinkDeps } from "./hithink.js";
+import { fetchSzseCalendarMonth, type ExchangeCalendarDay } from "./akshare.js";
 import { insertFetchRun } from "./service.js";
 
 type Db = Pick<pg.Pool, "query">;
+
+const shanghaiMonthFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+});
+
+/** 当前上海月份（YYYY-MM），不依赖服务器本地时区。 */
+function shanghaiYearMonth(now: Date): string {
+  return shanghaiMonthFormatter.format(now);
+}
+
+function shiftMonth(month: string, delta: number): string {
+  const [year, mon] = month.split("-").map(Number) as [number, number];
+  const total = year * 12 + (mon - 1) + delta;
+  const y = Math.floor(total / 12);
+  const m = total - y * 12 + 1;
+  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}`;
+}
 
 export type InstrumentKind = "stock" | "etf" | "index" | "board" | "fund" | "futures";
 
@@ -136,12 +156,47 @@ export interface CatalogSyncSummary {
   tickerCount: number;
   boardCount: number;
   tradingDayCount: number;
+  /** 交易所月度日历成功覆盖的月份数。 */
+  calendarMonthCount: number;
+  /** 交易所日历缺数（当年/已过月份未取到）；次年未发布不算缺口。 */
+  calendarGaps: Array<{ code: string; reason: string }>;
   fetchRunIds: string[];
+}
+
+/** 同步窗口：上月至下季（共 5 个月），保证当天与近期节假日在调度门禁可见。 */
+function calendarMonthWindow(now: Date): string[] {
+  const current = shanghaiYearMonth(now);
+  return [-1, 0, 1, 2, 3].map((delta) => shiftMonth(current, delta));
+}
+
+async function fetchExchangeCalendar(
+  months: readonly string[],
+  deps: { exchangeCalendar?: (month: string) => Promise<ExchangeCalendarDay[] | null>; now?: () => Date },
+): Promise<{ fetched: Array<{ month: string; days: ExchangeCalendarDay[] }>; gaps: Array<{ code: string; reason: string }> }> {
+  const currentYear = shanghaiYearMonth(deps.now?.() ?? new Date()).slice(0, 4);
+  const fetched: Array<{ month: string; days: ExchangeCalendarDay[] }> = [];
+  const gaps: Array<{ code: string; reason: string }> = [];
+  for (const month of months) {
+    try {
+      const days = deps.exchangeCalendar
+        ? await deps.exchangeCalendar(month)
+        : await fetchSzseCalendarMonth(month);
+      if (days) {
+        fetched.push({ month, days });
+      } else if (month.slice(0, 4) <= currentYear) {
+        gaps.push({ code: `szse_calendar.${month}`, reason: "当年或已过月份的交易所日历未返回数据" });
+      }
+      // 次年日历未发布属预期降级：门禁对未覆盖日期按工作日推测。
+    } catch (error) {
+      gaps.push({ code: `szse_calendar.${month}`, reason: (error as Error).message });
+    }
+  }
+  return { fetched, gaps };
 }
 
 export async function syncMarketCatalog(
   db: TransactionDb,
-  deps: HithinkDeps & { jobRunId?: string } = {},
+  deps: HithinkDeps & { jobRunId?: string; exchangeCalendar?: (month: string) => Promise<ExchangeCalendarDay[] | null>; now?: () => Date } = {},
 ): Promise<CatalogSyncSummary> {
   deps = { ...deps, db: deps.db ?? db };
   const boards = [] as Awaited<ReturnType<typeof fetchBoardCatalog>>;
@@ -149,6 +204,7 @@ export async function syncMarketCatalog(
   const boardCodes = new Set(boards.map((board) => board.code));
   const tickers = await fetchAllTickers({ assetTypes: [...TICKER_ASSET_TYPES] }, deps);
   const tradingDays = await fetchTradingDays(deps);
+  const calendar = await fetchExchangeCalendar(calendarMonthWindow(deps.now?.() ?? new Date()), deps);
   return inServiceTransaction(db, async (client) => {
     await upsertBoardCatalog(client, boards);
     await upsertTickerIdentities(client, tickers, boardCodes);
@@ -168,17 +224,43 @@ export async function syncMarketCatalog(
        ON CONFLICT (trade_date) DO UPDATE SET is_open = true, source = EXCLUDED.source, fetched_at = now()`,
       [JSON.stringify(tradingDays.map((day) => ({ trade_date: day.date, source: "hithink" })))],
     );
+    // 交易所月度日历含休市日，覆盖调度门禁所需的开休标志；先写开市行再整月覆盖。
+    const calendarRows = calendar.fetched.flatMap(({ month, days }) =>
+      days.map((day) => ({ trade_date: day.date, is_open: day.isOpen, source: `szse:${month}` })));
+    if (calendarRows.length) {
+      await client.query(
+        `WITH incoming AS (
+           SELECT * FROM jsonb_to_recordset($1::jsonb) AS item(trade_date date, is_open boolean, source text)
+         )
+         INSERT INTO market_trading_day (trade_date, is_open, source, fetched_at)
+         SELECT trade_date, is_open, source, now() FROM incoming
+         ON CONFLICT (trade_date) DO UPDATE SET is_open = EXCLUDED.is_open, source = EXCLUDED.source, fetched_at = now()`,
+        [JSON.stringify(calendarRows)],
+      );
+    }
     const fetchRunId = await insertFetchRun(client, {
       jobRunId: deps.jobRunId,
       channel: "hithink",
       scope: { pipeline: "market_catalog_sync", boards: boards.length, tickers: tickers.length },
       rowsWritten: boards.length + tickers.length + tradingDays.length,
     });
+    let calendarFetchRunId: string | null = null;
+    if (calendar.fetched.length) {
+      calendarFetchRunId = await insertFetchRun(client, {
+        jobRunId: deps.jobRunId,
+        channel: "szse",
+        scope: { pipeline: "market_catalog_sync", months: calendar.fetched.map((item) => item.month) },
+        rowsWritten: calendarRows.length,
+        gaps: calendar.gaps,
+      });
+    }
     return {
       tickerCount: tickers.length,
       boardCount: boards.length,
       tradingDayCount: tradingDays.length,
-      fetchRunIds: [fetchRunId],
+      calendarMonthCount: calendar.fetched.length,
+      calendarGaps: calendar.gaps,
+      fetchRunIds: calendarFetchRunId ? [fetchRunId, calendarFetchRunId] : [fetchRunId],
     };
   });
 }

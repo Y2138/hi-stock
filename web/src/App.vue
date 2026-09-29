@@ -12,6 +12,7 @@ import type { UiRefreshRequest } from "./api/types";
 import { dispatchUiRefresh } from "./composables/useUiRefresh";
 import { appMessage } from "./stores/message";
 import { ASK_AI_EVENT, type AskAiRequest } from "./utils/askAi";
+import { NAV_GROUPS } from "./navigation";
 import {
   isPreviewResult,
   parseResultRef,
@@ -20,18 +21,6 @@ import {
   serializeResultRef,
   type ResultRef,
 } from "./utils/results";
-
-const NAV_ITEMS = [
-  { to: "/", icon: "📊", label: "仪表盘" },
-  { to: "/positions", icon: "💼", label: "持仓" },
-  { to: "/pools", icon: "🌱", label: "关注池" },
-  { to: "/market-structure", icon: "▦", label: "市场结构" },
-  { to: "/jobs", icon: "⏱", label: "任务中心" },
-  { to: "/strategies", icon: "📜", label: "当前策略" },
-  { to: "/memories", icon: "🧠", label: "Agent 记忆" },
-  { to: "/datasync", icon: "💾", label: "数据与备份" },
-  { to: "/settings", icon: "⚙️", label: "设置" },
-];
 
 const paletteOpen = ref(false);
 const navCollapsed = ref(localStorage.getItem("stock-nav-collapsed") === "1");
@@ -142,7 +131,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="shell" :class="{ 'nav-collapsed': navCollapsed, 'agent-open': workspaceOpen }">
-    <nav class="side-nav">
+    <nav class="side-nav" aria-label="主导航">
       <div class="brand-row">
         <span class="brand-full">Stock 策略演进</span>
         <span class="brand-mark">S</span>
@@ -154,18 +143,22 @@ onBeforeUnmount(() => {
           @click="toggleNav"
         >{{ navCollapsed ? "›" : "‹" }}</button>
       </div>
-      <RouterLink
-        v-for="item in NAV_ITEMS"
-        :key="item.to"
-        :to="item.to"
-        class="nav-item"
-        :exact-active-class="item.to === '/' ? 'active' : undefined"
-        :active-class="item.to === '/' ? undefined : 'active'"
-        :title="navCollapsed ? item.label : undefined"
-      >
-        <span class="icon">{{ item.icon }}</span>
-        <span class="nav-label">{{ item.label }}</span>
-      </RouterLink>
+      <div v-for="group in NAV_GROUPS" :key="group.label" class="nav-group">
+        <div class="nav-group-label">{{ group.label }}</div>
+        <RouterLink
+          v-for="item in group.items"
+          :key="item.to"
+          :to="item.to"
+          class="nav-item"
+          :exact-active-class="item.to === '/' ? 'active' : undefined"
+          :active-class="item.to === '/' ? undefined : 'active'"
+          :title="item.label"
+          :aria-label="item.label"
+        >
+          <span class="icon" aria-hidden="true">{{ item.icon }}</span>
+          <span class="nav-label">{{ item.label }}</span>
+        </RouterLink>
+      </div>
     </nav>
 
     <StatusBar :key="statusKey" @open-palette="paletteOpen = true" @refresh="viewKey++" />

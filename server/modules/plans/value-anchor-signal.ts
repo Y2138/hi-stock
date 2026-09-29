@@ -1,4 +1,5 @@
 import type pg from "pg";
+import { strategyAttentionCodes } from "../pools/attention-lifecycle.js";
 import { queryValueRank } from "../value-ranking/service.js";
 
 type Db = Pick<pg.Pool, "query">;
@@ -13,6 +14,7 @@ export async function queryValueAnchorSignals(db: Db, date: string) {
       gaps: [{ domain: "rank", reason: "月度排名已过期，拒绝使用旧Top" }] };
   }
   const rankItems = rank.items as Array<Record<string, unknown>>;
+  const reviewCodes = await strategyAttentionCodes(db, "value_anchor");
   const codes = rankItems.map((item) => String(item.code));
   const bars = await db.query<{
     code: string; name: string; industry_name: string | null; bar_date: string;
@@ -128,6 +130,9 @@ export async function queryValueAnchorSignals(db: Db, date: string) {
     status: gaps.length ? "partial" : "success", date, rank_date: rank.rank_date,
     scanned_count: rankItems.length, completed_count: completedCount, skipped_count: skipped.length, skipped,
     qualified, near, rejected: rejected.slice(0, 20),
+    reviewed_codes: [...codes.filter((code) => !skipped.some((item) => item.code === code)),
+      ...reviewCodes.filter((code) => !codes.includes(code))],
+    review_gaps: skipped,
     rejected_count: rejected.length, gaps,
     evidence: "research_only", writes_business_data: false,
   };

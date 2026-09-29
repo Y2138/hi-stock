@@ -8,7 +8,7 @@ import pg from "pg";
 import { marketRoutes } from "../modules/market/routes.js";
 import { positionRoutes } from "../modules/positions/routes.js";
 import { plansRoutes } from "../modules/plans/routes.js";
-import { clearPoolAttention, listPoolView } from "../modules/pools/repo.js";
+import { clearPoolAttention, listPoolResearch, listPoolView } from "../modules/pools/repo.js";
 import { volumeRoutes } from "../volume/routes.js";
 import { chatRoutes } from "../agent/routes.js";
 import { llmConfigRoutes } from "../agent/ai/routes.js";
@@ -22,7 +22,9 @@ import { strategyRuntimeRoutes } from "../modules/strategy-runtime/routes.js";
 import { boardRoutes } from "../modules/boards/routes.js";
 import { memoryRoutes } from "../modules/memory/routes.js";
 import { notificationRoutes } from "../modules/notifications/routes.js";
+import { getLatestMarketNews } from "../modules/market-news/repo.js";
 import { systemSettingsRoutes } from "../system-settings-routes.js";
+import { intradayRiskRoutes } from "../modules/intraday-risk/routes.js";
 
 /** 统一 API 错误：携带 HTTP 状态码与稳定错误码 */
 export class ApiError extends Error {
@@ -285,6 +287,7 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/positions", positionRoutes.list),
     route("GET", "/api/positions/changes", positionRoutes.changes),
     route("GET", "/api/positions/realized-pnl", positionRoutes.realizedPnl),
+    route("GET", "/api/intraday-risk", intradayRiskRoutes.latest),
     route("GET", "/api/plans/latest", plansRoutes.latest),
     route("GET", "/api/plans/limit-up/latest", plansRoutes.latestLimitUp),
     route("GET", "/api/auction/latest", plansRoutes.latestAuction),
@@ -292,6 +295,16 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
       const asOf = query.get("date") ?? undefined;
       if (asOf && !/^\d{4}-\d{2}-\d{2}$/u.test(asOf)) throw apiErrors.badRequest("date 必须是 YYYY-MM-DD");
       return { data: await listPoolView(pool, asOf) };
+    }),
+    route("GET", "/api/market-news", async ({ query }) => {
+      const date = query.get("date") ?? undefined;
+      if (date && !/^\d{4}-\d{2}-\d{2}$/u.test(date)) throw apiErrors.badRequest("date 必须是 YYYY-MM-DD");
+      return { data: await getLatestMarketNews(pool, date) };
+    }),
+    route("GET", "/api/pools/:code/research", async ({ params }) => {
+      const code = params.code?.trim().toUpperCase() ?? "";
+      if (!/^[A-Z0-9._-]{1,32}$/u.test(code)) throw apiErrors.badRequest("标的代码无效");
+      return { data: await listPoolResearch(pool, code) };
     }),
     route("DELETE", "/api/pools/:code/attention", async ({ params, query }) => {
       const code = params.code?.trim().toUpperCase() ?? "";

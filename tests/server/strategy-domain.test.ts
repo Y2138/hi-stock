@@ -215,8 +215,8 @@ describe.skipIf(!prepared)("当前策略、演进摘要与真人发布门禁", (
   it("评估器注册表覆盖全部策略绑定并拒绝未接入执行链路的评估器", async () => {
     const evaluators = listStrategyEvaluatorDefinitions();
     expect(new Set(evaluators.map((item) => item.code)).size).toBe(evaluators.length);
-    expect(getStrategyEvaluatorDefinition("swing_entry_v1")).toMatchObject({ phase: "entry", status: "ready", version: 1 });
-    expect(getStrategyEvaluatorDefinition("fallback_exit_v1")).toMatchObject({ phase: "exit", status: "ready", version: 1 });
+    expect(getStrategyEvaluatorDefinition("swing_entry_v1")).toMatchObject({ phase: "entry", status: "ready", version: 2 });
+    expect(getStrategyEvaluatorDefinition("fallback_exit_v1")).toMatchObject({ phase: "exit", status: "ready", version: 2 });
     expect(await findStrategyEvaluatorBindingGaps(pool)).toEqual([]);
     await pool.query("BEGIN");
     try {

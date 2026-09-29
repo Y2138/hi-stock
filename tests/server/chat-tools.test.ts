@@ -15,6 +15,8 @@ import { processHithinkResult } from "../../server/agent/hithink-result-processo
 import { queryLimitUpSignals } from "../../server/modules/market/limit-up-signals.js";
 import { createDeepSeekWebResearchProvider } from "../../server/agent/web-research-provider.js";
 import { createSafeWebFetchProvider, WEB_FETCH_CONTRACT_LIMITS } from "../../server/agent/web-fetch-provider.js";
+import zlib from "node:zlib";
+import { readFileSync } from "node:fs";
 import { storeBars } from "../../server/datasource/service.js";
 import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
 import {
@@ -23,7 +25,7 @@ import {
   findTrialStartMatch,
   inferStopLossMode,
 } from "../../server/modules/plans/daily-context.js";
-import { evaluateSwingSignal, selectTopSwingNearCandidates } from "../../server/modules/plans/swing-signals.js";
+import { applySwingDailyDepthLimit, evaluateSwingSignal, swingDepthScore, SWING_DAILY_SIGNAL_LIMIT, SWING_RSI_OVERSOLD_LIMIT } from "../../server/modules/plans/swing-signals.js";
 import { mergeExitEvaluations, queryPositionExitEvaluationBundle } from "../../server/modules/strategy-runtime/exit-evaluators.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
 
@@ -183,6 +185,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     });
     expect(inferStopLossMode("凶狠·快拉·护盘中", [])).toBe("ma5");
     expect(inferStopLossMode(null, ["股性：温和·慢拉·波动小"])).toBe("ma10");
+    expect(inferStopLossMode(null, ["止损：买入价×0.93"])).toBe("fixed_93");
     expect(inferStopLossMode("快拉·慢拉", [])).toBeNull();
   });
 
@@ -198,7 +201,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
           low: index === 39 ? 10.7 : close - 0.2,
           close,
           volume: index === 39 ? 50 : 100,
-          rsi14: index === 39 ? 30 : null,
+          rsi14: index === 39 ? 25 : null,
           indicator_status: "ready" as const,
         };
       });
@@ -214,19 +217,22 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         evidence: { confirmation_window_available: true },
       });
 
-      const rankedNearCandidates = selectTopSwingNearCandidates(
-        [45, 41, 40.5, 44, 43, 42].map((rsi14, index) => ({
-          code: `60099${index}.SH`,
-          ...evaluateSwingSignal(
-            rows.map((row, rowIndex) => rowIndex === 39 ? { ...row, rsi14 } : row),
-            "stock",
-            0.4,
-          )!,
-        })),
-      );
-      expect(rankedNearCandidates).toHaveLength(5);
-      expect(rankedNearCandidates.map((item) => item.evidence.rsi14)).toEqual([40.5, 41, 42, 43, 44]);
-      expect(rankedNearCandidates[0]!.signal_quality_score).toBeGreaterThan(rankedNearCandidates[4]!.signal_quality_score);
+    // RSI 阈值收紧至 30：浅跌（35）只差一个条件，深超卖（25）构成正式信号。
+    const shallow = evaluateSwingSignal(
+      rows.map((row, rowIndex) => rowIndex === 39 ? { ...row, rsi14: 35 } : row),
+      "stock",
+      0.4,
+    )!;
+    expect(shallow.passed_count).toBe(3);
+    expect(shallow.failed_conditions).toEqual(["rsi_oversold"]);
+    const deep = evaluateSwingSignal(
+      rows.map((row, rowIndex) => rowIndex === 39 ? { ...row, rsi14: 25 } : row),
+      "stock",
+      0.4,
+    )!;
+    expect(deep.price_signal).toBe(true);
+    expect(SWING_RSI_OVERSOLD_LIMIT).toBe(30);
+
 
       const instrument = await pool.query<{ id: string }>(
         `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
@@ -337,6 +343,50 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       );
       await pool.query("DELETE FROM market_instrument WHERE code = '881105.TI'");
     }
+  });
+
+  it("波段深度评分：合并池按评分降序每日保留前5，挤出标的不进信号清单", () => {
+    expect(SWING_DAILY_SIGNAL_LIMIT).toBe(5);
+    // 深度评分：MA250 两档、60 日跌幅两档、行业动量为负一档；缺数计 0 分。
+    expect(swingDepthScore({ ma250_dev: -0.4, ret60: -0.3, industry_mom20: -0.08 })).toBe(5);
+    expect(swingDepthScore({ ma250_dev: -0.2, ret60: -0.15, industry_mom20: 0.02 })).toBe(2);
+    expect(swingDepthScore({ ma250_dev: null, ret60: null, industry_mom20: null })).toBe(0);
+    const member = (code: string, score: number, ma250Dev: number | null, rr = 2.5) => ({
+      code,
+      name: `股${code}`,
+      evidence: { expected_reward_risk: rr },
+      depth: {
+        ma250_dev: ma250Dev,
+        ret60: ma250Dev === null ? null : -0.3,
+        industry_mom20: ma250Dev === null ? null : -0.1,
+      },
+      depth_score: score,
+    });
+    // 预算内：2 正式 + 2 接近全部保留，无挤出。
+    const within = applySwingDailyDepthLimit(
+      [member("600100.SH", 5, -0.4), member("600101.SH", 2, -0.2)],
+      [member("000001.SZ", 4, -0.38), member("000002.SZ", 3, -0.3)],
+    );
+    expect(within.signals.map((item) => item.code)).toEqual(["600100.SH", "600101.SH"]);
+    expect(within.nearCandidates.map((item) => item.code)).toEqual(["000001.SZ", "000002.SZ"]);
+    expect(within.cappedOut).toEqual([]);
+    // 合并池排名：接近候选评分更高可排在正式信号之前；每日只保留前 5。
+    const cluster = applySwingDailyDepthLimit(
+      Array.from({ length: 6 }, (_, index) => member(`600${200 + index}.SH`, 1, -0.1)),
+      [member("000009.SZ", 5, -0.5), member("000008.SZ", 4, -0.4)],
+    );
+    expect(cluster.nearCandidates.map((item) => item.code)).toEqual(["000009.SZ", "000008.SZ"]);
+    expect(cluster.signals.map((item) => item.code)).toEqual(["600200.SH", "600201.SH", "600202.SH"]);
+    expect(cluster.cappedOut.map((item) => item.code)).toEqual([
+      "600203.SH", "600204.SH", "600205.SH",
+    ]);
+    expect(cluster.cappedOut.every((item) => item.signal_status === "qualified")).toBe(true);
+    // 同分平手：MA250 更深者优先，再按代码升序。
+    const tie = applySwingDailyDepthLimit(
+      [member("600300.SH", 3, -0.2), member("600301.SH", 3, -0.36)],
+      [],
+    );
+    expect(tie.signals.map((item) => item.code)).toEqual(["600301.SH", "600300.SH"]);
   });
 
   it("工具集以纵向业务能力为先、数据库排障能力置后", () => {
@@ -455,9 +505,10 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "daily_plan_strategy_query",
       "web_search",
       "web_fetch",
+      "daily_plan_scenario_write",
     ]);
     expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "swing_signal_scan" }).map((tool) => tool.name)).toEqual([
-      "strategy_document_query", "strategy_evaluation_query", "web_search", "web_fetch",
+      "strategy_document_query", "strategy_evaluation_query", "web_search", "web_fetch", "fetch_market_data",
     ]);
     // 每周评分与周中检查已随评分机制退役：不再有专属工具子集，与未知任务一样回退到完整交互目录。
     for (const retired of ["midweek_check", "weekly_review"]) {
@@ -472,7 +523,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     const leftReversal = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "left_reversal_opportunity_scan" });
     expect(leftReversal.map((tool) => tool.name)).not.toContain("left_reversal_opportunity_query");
     expect(buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "two_year_reversal_scan" }).map((tool) => tool.name).sort())
-      .toEqual(["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query", "web_search", "web_fetch"].sort());
+      .toEqual(["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query", "fetch_market_data", "web_search", "web_fetch"].sort());
     const scopedEvaluation = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "two_year_reversal_scan" })
       .find((tool) => tool.name === "strategy_evaluation_query")!;
     expect(scopedEvaluation).toBeDefined();
@@ -484,11 +535,14 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     })).rejects.toThrow("只能执行 entry 评估");
     const valueAnchor = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "value_anchor_opportunity_scan" });
     expect(valueAnchor.map((tool) => tool.name).sort()).toEqual([
-      "pool_attention_write", "strategy_document_query", "strategy_evaluation_query", "value_anchor_signal_query", "web_fetch", "web_search",
+      "strategy_document_query", "strategy_evaluation_query", "value_anchor_signal_query", "fetch_market_data", "web_fetch", "web_search",
     ].sort());
     const nightly = buildChatTools({ pool, sessionId }, { kind: "job", jobCode: "nightly_sector_opportunity_scan" });
     const nightlyNames = nightly.map((tool) => tool.name);
     expect([...nightlyNames].sort()).toEqual([
+      "pool_context_query",
+      "fetch_hithink_data",
+      "fetch_market_data",
       "strategy_document_query",
       "stock_research_query",
       "market_snapshot_query",
@@ -1060,6 +1114,110 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       url: "https://example.com/text",
       max_chars: 999,
     })).rejects.toThrow("参数校验失败");
+  });
+
+  it("web_fetch 兼容缺失 Content-Type 的正文嗅探与服务端压缩响应", async () => {
+    const provider = createSafeWebFetchProvider({
+      now: () => new Date("2026-09-10T08:30:00Z"),
+      lookupHost: async () => [{ address: "93.184.216.34", family: 4 }],
+      requestImpl: async (url) => {
+        if (url.pathname === "/no-type") {
+          return {
+            status: 200, headers: {},
+            body: Buffer.from(`<!doctype html><html><head><title>无类型页</title></head><body><p>${"公开正文。".repeat(300)}</p></body></html>`),
+          };
+        }
+        if (url.pathname === "/no-type-json") {
+          return { status: 200, headers: {}, body: Buffer.from(JSON.stringify({ items: ["甲", "乙", "丙"] })) };
+        }
+        if (url.pathname === "/gzipped") {
+          return {
+            status: 200,
+            headers: { "content-type": "text/html; charset=utf-8", "content-encoding": "gzip" },
+            body: zlib.gzipSync(Buffer.from(`<!doctype html><body><p>${"压缩正文。".repeat(300)}</p></body>`)),
+          };
+        }
+        if (url.pathname === "/inflate-over-cap") {
+          return {
+            status: 200,
+            headers: { "content-type": "text/plain", "content-encoding": "gzip" },
+            body: zlib.gzipSync(Buffer.alloc(WEB_FETCH_CONTRACT_LIMITS.maxResponseBytes + 1024, 97)),
+          };
+        }
+        if (url.pathname === "/unknown-encoding") {
+          return { status: 200, headers: { "content-type": "text/plain", "content-encoding": "zstd" }, body: Buffer.from("x") };
+        }
+        return { status: 200, headers: { "content-type": "text/plain" }, body: Buffer.from("ok") };
+      },
+    });
+    const tool = buildChatTools({ pool, sessionId, webFetch: provider }).find((item) => item.name === "web_fetch")!;
+
+    // 财联社 detail 页等站点不回 Content-Type：按正文首字节判定 HTML / JSON。
+    const sniffedHtml = textOf(await tool.execute("tc-web-fetch-no-type", {
+      url: "https://example.com/no-type",
+    })) as { contentType: string; title: string | null; text: string };
+    expect(sniffedHtml.contentType).toBe("text/html");
+    expect(sniffedHtml.title).toBe("无类型页");
+    expect(sniffedHtml.text).toContain("公开正文");
+    const sniffedJson = textOf(await tool.execute("tc-web-fetch-no-type-json", {
+      url: "https://example.com/no-type-json",
+    })) as { contentType: string; text: string };
+    expect(sniffedJson.contentType).toBe("application/json");
+    expect(sniffedJson.text).toContain("甲");
+
+    // 部分站点忽略 identity 强制压缩：gzip 透明解压，未知编码仍显式失败，解压超限按大小限制拒绝。
+    const gzipped = textOf(await tool.execute("tc-web-fetch-gzip", {
+      url: "https://example.com/gzipped",
+    })) as { text: string };
+    expect(gzipped.text).toContain("压缩正文");
+    await expect(tool.execute("tc-web-fetch-unknown-encoding", {
+      url: "https://example.com/unknown-encoding",
+    })).rejects.toThrow("不支持的压缩内容");
+    await expect(tool.execute("tc-web-fetch-inflate-over-cap", {
+      url: "https://example.com/inflate-over-cap",
+    })).rejects.toThrow("解压结果超过大小限制");
+  });
+
+  it("web_fetch 服务端漏发中间证书时按 AIA 补链重试，自签证书不得成为信任锚", async () => {
+    const leafDer = readFileSync(new URL("./fixtures/tls-chain/leaf.der", import.meta.url));
+    const intermediatePem = readFileSync(new URL("./fixtures/tls-chain/intermediate.pem", import.meta.url), "utf8");
+    const rootPem = readFileSync(new URL("./fixtures/tls-chain/root.pem", import.meta.url), "utf8");
+    const build = (issuer: string, attempts: Array<{ extraCa?: readonly string[] }>) =>
+      buildChatTools({
+        pool, sessionId,
+        webFetch: createSafeWebFetchProvider({
+          lookupHost: async () => [{ address: "93.184.216.34", family: 4 }],
+          requestImpl: async (_url, _address, _signal, extraCa) => {
+            attempts.push({ extraCa });
+            if (!extraCa?.length) {
+              throw Object.assign(new Error("unable to verify the first certificate"), { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" });
+            }
+            return {
+              status: 200,
+              headers: { "content-type": "text/html; charset=utf-8" },
+              body: Buffer.from(`<!doctype html><body><p>${"补链正文。".repeat(300)}</p></body>`),
+            };
+          },
+          probePeerCertificate: async () => leafDer,
+          fetchIssuerCertificate: async () => issuer,
+        }),
+      }).find((item) => item.name === "web_fetch")!;
+
+    // 自签证书无法补全链：原始 TLS 校验失败保留，不做降级重试。
+    const selfSignedAttempts: Array<{ extraCa?: readonly string[] }> = [];
+    await expect(build(rootPem, selfSignedAttempts).execute("tc-web-fetch-selfsigned", {
+      url: "https://www.chain-news.test/morning",
+    })).rejects.toThrow("unable to verify the first certificate");
+    expect(selfSignedAttempts).toHaveLength(1);
+
+    // 叶子证书 AIA 指向的中间证书（CA、非自签、可验签）追加后重试成功。
+    const chainAttempts: Array<{ extraCa?: readonly string[] }> = [];
+    const completed = textOf(await build(intermediatePem, chainAttempts).execute("tc-web-fetch-chain", {
+      url: "https://www.chain-news.test/morning",
+    })) as { text: string };
+    expect(completed.text).toContain("补链正文");
+    expect(chainAttempts).toHaveLength(2);
+    expect(chainAttempts[1]!.extraCa?.[0]?.trim()).toBe(intermediatePem.trim());
   });
 
   it("市场领域工具始终注册并按严格参数约束执行", async () => {

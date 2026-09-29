@@ -3,7 +3,7 @@ import { createSession } from "../agent/repo.js";
 import { inServiceTransaction, type TransactionDb } from "../db/transaction.js";
 import { sameTimestampVersion } from "../db/timestamp.js";
 import { assertJobType, validateJobConfig } from "./config.js";
-import { assertCron, dailyMarketGate, nextCronRun, shanghaiDate } from "./time.js";
+import { assertCron, dailyMarketGate, isScheduledTradingDay, nextCronRun, shanghaiDate } from "./time.js";
 import type {
   DatasourceJobConfig,
   Db,
@@ -61,10 +61,16 @@ function assertPriority(value: unknown): number | null {
   return value;
 }
 
+function assertTradingDayOnly(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== "boolean") throw apiErrors.badRequest("trading_day_only 必须是布尔值");
+  return value;
+}
+
 export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLatest[]> {
   const result = await db.query<JobDefinitionRow & { latest_run: Partial<JobRunRow> | null }>(
     `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text, to_jsonb(d)->>'model_id' AS model_id,
-            d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role, d.enabled,
+            d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role, d.trading_day_only, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
             (SELECT json_build_object(
@@ -90,7 +96,8 @@ export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLates
 export async function findJobByCode(db: Db, code: string): Promise<JobDefinitionRow | null> {
   const result = await db.query<JobDefinitionRow>(
     `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text,
-            to_jsonb(d)->>'model_id' AS model_id, d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role, d.enabled,
+            to_jsonb(d)->>'model_id' AS model_id, d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role,
+            d.trading_day_only, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
        FROM job_definition d WHERE d.code = $1
@@ -105,7 +112,7 @@ export async function createJobDefinition(
   input: {
     code: unknown; name: unknown; cron: unknown; job_type: unknown; config: unknown;
     prompt_id?: unknown; model_id?: unknown; enabled?: unknown;
-    purpose?: unknown; phase?: unknown; priority?: unknown;
+    purpose?: unknown; phase?: unknown; priority?: unknown; trading_day_only?: unknown;
   },
 ): Promise<JobDefinitionRow> {
   const code = assertCode(input.code);
@@ -126,15 +133,17 @@ export async function createJobDefinition(
   const purpose = assertPurpose(input.purpose);
   const phase = assertPhase(input.phase);
   const priority = assertPriority(input.priority);
+  const tradingDayOnly = assertTradingDayOnly(input.trading_day_only);
   const promptId = await validatePromptBinding(db, jobType, input.prompt_id);
   const modelId = await validateModelBinding(db, jobType, input.model_id);
   const result = await db.query<JobDefinitionRow>(
-    `INSERT INTO job_definition (code, name, cron, job_type, config, prompt_id, model_id, purpose, phase, priority, enabled)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority, strategy_code, agent_role, enabled,
+    `INSERT INTO job_definition (code, name, cron, job_type, config, prompt_id, model_id, purpose, phase, priority, trading_day_only, enabled)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+     RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority,
+               strategy_code, agent_role, trading_day_only, enabled,
                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
-    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, purpose, phase, priority, input.enabled ?? true],
+    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, purpose, phase, priority, tradingDayOnly, input.enabled ?? true],
   );
   return result.rows[0]!;
 }
@@ -144,7 +153,7 @@ export async function updateJobDefinition(
   code: string,
   patch: Record<string, unknown>,
 ): Promise<JobDefinitionRow> {
-  const allowed = ["name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "purpose", "phase", "priority", "base_updated_at"];
+  const allowed = ["name", "cron", "job_type", "config", "prompt_id", "model_id", "enabled", "purpose", "phase", "priority", "trading_day_only", "base_updated_at"];
   const unknown = Object.keys(patch).filter((key) => !allowed.includes(key));
   if (unknown.length > 0) throw apiErrors.badRequest(`包含未知字段：${unknown.join(", ")}`);
   if (Object.keys(patch).length === 0) throw apiErrors.badRequest("缺少可更新字段");
@@ -177,6 +186,7 @@ export async function updateJobDefinition(
   const purpose = patch.purpose === undefined ? current.purpose : assertPurpose(patch.purpose);
   const phase = patch.phase === undefined ? current.phase : assertPhase(patch.phase);
   const priority = patch.priority === undefined ? current.priority : assertPriority(patch.priority);
+  const tradingDayOnly = patch.trading_day_only === undefined ? current.trading_day_only : assertTradingDayOnly(patch.trading_day_only);
   const promptId = await validatePromptBinding(
     db,
     jobType,
@@ -191,13 +201,14 @@ export async function updateJobDefinition(
     `UPDATE job_definition
         SET name = $2, cron = $3, job_type = $4, config = $5,
             prompt_id = $6, model_id = $7, enabled = $8,
-            purpose = $9, phase = $10, priority = $11, updated_at = now()
+            purpose = $9, phase = $10, priority = $11, trading_day_only = $12, updated_at = now()
       WHERE code = $1
-        AND ($12::timestamptz IS NULL OR updated_at = $12::timestamptz)
-      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority, strategy_code, agent_role, enabled,
+        AND ($13::timestamptz IS NULL OR updated_at = $13::timestamptz)
+      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority,
+                strategy_code, agent_role, trading_day_only, enabled,
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
-    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, patch.enabled ?? current.enabled, purpose, phase, priority, baseUpdatedAt],
+    [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, patch.enabled ?? current.enabled, purpose, phase, priority, tradingDayOnly, baseUpdatedAt],
   );
   if (!result.rows[0]) throw apiErrors.conflict("作业定义已被其他会话更新，请刷新后重试");
   return result.rows[0];
@@ -258,7 +269,7 @@ export async function findJobRunById(db: Db, id: string): Promise<(JobRunRow & {
             json_build_object('id', d.id::text, 'code', d.code, 'name', d.name,
               'cron', d.cron, 'job_type', d.job_type, 'config', d.config, 'prompt_id', d.prompt_id::text,
               'model_id', to_jsonb(d)->>'model_id',
-              'enabled', d.enabled,
+              'trading_day_only', d.trading_day_only, 'enabled', d.enabled,
               'created_at', to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
               'updated_at', to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')) AS job
        FROM job_run r JOIN job_definition d ON d.id = r.job_id WHERE r.id = $1`,
@@ -379,13 +390,16 @@ export async function insertScheduledJobRun(
   status: "queued" | "missed",
 ): Promise<JobRunRow | null> {
   return inServiceTransaction(db, async (client) => {
-    const definition = await client.query<{ name: string; job_type: JobType; model_id: string | null }>(
-      "SELECT name, job_type, model_id::text FROM job_definition WHERE id = $1",
+    const definition = await client.query<{ name: string; job_type: JobType; model_id: string | null; trading_day_only: boolean }>(
+      "SELECT name, job_type, model_id::text, trading_day_only FROM job_definition WHERE id = $1",
       [jobId],
     );
     const def = definition.rows[0];
     if (!def) throw apiErrors.notFound(`作业不存在：${jobId}`);
     const targetDate = shanghaiDate(scheduledFor);
+    // 双休与法定节假日不入队（含 missed 追记）：避免休市日执行并覆盖上一开市日的信号。
+    // 手动触发不经此门禁，保留假日补跑历史目标日的入口。
+    if (def.trading_day_only && !(await isScheduledTradingDay(client, targetDate))) return null;
     const result = await client.query<JobRunRow>(
       `INSERT INTO job_run
          (job_id, target_date, trigger_kind, scheduled_for, status, finished_at, log)

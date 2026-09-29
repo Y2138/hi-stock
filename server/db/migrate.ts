@@ -19,6 +19,11 @@ const DEFAULT_MIGRATIONS_DIR = path.join(here, "..", "migrations");
 // 仅允许这一条已知哈希继续向前迁移，0128 会将两种旧库收敛到同一约束。
 const LEGACY_APPLIED_HASHES: Readonly<Record<number, readonly string[]>> = {
   120: ["4c7908240f0703146397288035526fea7ff82657da1d971248be9894d8a9e0e4"],
+  // 0146 在本机已先应用过包含结构化覆盖字段的等价版本；0149 固化提示词增量，允许该存量库继续前滚。
+  146: ["f5789e936f1b6d77e55fab0d91fdc2146c69f51f4254dc15129655e793441b4c"],
+  // 0150 开发库先应用过包含 management_mode/exit_reason 结构与存量关注复核提示词的等价版本；
+  // 文件随后微调措辞，结构效果一致，允许该存量库继续前滚。
+  150: ["e21940d9c7a03c442d56126f28e7bdb032f813417b355e7ae57604ee820ea8fb"],
 };
 
 export interface MigrationFile {
