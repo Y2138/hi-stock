@@ -380,6 +380,9 @@ describe.skipIf(!prepared)("每日计划盯防预案", () => {
     )).rows[0]!.id;
     expect(await activateAuctionAssessmentsForRun(pool, run, output)).toBe(3);
     expect((await getLatestAuctionScopeAssessments(pool)).items).toHaveLength(3);
+    const shared = await getLatestAuctionScopeAssessments(pool,null);
+    expect(shared.items).toHaveLength(2);
+    expect(shared.items.every(item => item.scope_kind !== "position")).toBe(true);
   });
 
   it("策略关注清除后历史竞价评估保留且来源外键置空", async () => {

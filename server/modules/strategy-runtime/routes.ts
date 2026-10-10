@@ -32,13 +32,13 @@ function withEvaluatorMetadata<T extends { entry_evaluator_code: string | null; 
 }
 
 export const strategyRuntimeRoutes = {
-  async list({ pool }: Ctx) {
-    return { data: (await listStrategyRuntimeDefinitions(pool)).map(withEvaluatorMetadata) };
+  async list({ pool, query }: Ctx) {
+    return { data: (await listStrategyRuntimeDefinitions(pool, query.get("account_id") ?? undefined)).map(withEvaluatorMetadata) };
   },
-  async get({ pool, params }: Ctx) {
-    return { data: withEvaluatorMetadata(await getStrategyRuntimeDefinition(pool, params.code!)) };
+  async get({ pool, params, query }: Ctx) {
+    return { data: withEvaluatorMetadata(await getStrategyRuntimeDefinition(pool, params.code!, query.get("account_id") ?? undefined)) };
   },
   async evaluations({ pool, params, query }: Ctx) {
-    return { data: await listStrategyEvaluationRuns(pool, params.code!, limitOf(query)) };
+    return { data: await listStrategyEvaluationRuns(pool, params.code!, limitOf(query), query.get("account_id") ?? undefined) };
   },
 };

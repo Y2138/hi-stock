@@ -8,7 +8,7 @@ import { positionGapReasons } from "../../server/modules/plans/evaluation-gaps.j
 import { runMigrations } from "../../server/db/migrate.js";
 import { reconcileStrategyAttention } from "../../server/modules/strategy-runtime/attention.js";
 import { describeEntryMissingSignals, ensureStrategyEvaluation } from "../../server/modules/strategy-runtime/service.js";
-import { ensureStrategyPoolMemberProfile, listStrategyAttentionReviewEntries, listPoolView, listPoolResearch, setPoolAttentionEntry } from "../../server/modules/pools/repo.js";
+import { ensureStrategyPoolMemberProfile, listStrategyAttentionReviewEntries, listPoolView, listPoolResearch, setPoolAttentionEntry, setPoolSpecialAttention } from "../../server/modules/pools/repo.js";
 import type { StrategyEvaluationRunSummary } from "../../server/modules/strategy-runtime/types.js";
 import { prepareTestDb, resetSchema } from "./helpers.js";
 
@@ -274,7 +274,7 @@ describe.skipIf(!prepared)("策略评估运行幂等复用", () => {
     const changes = await reconcileStrategyAttention(pool, { run: first, source_job: "swing_signal_scan" });
     expect(changes).toContainEqual(expect.objectContaining({ code: "990130.SZ", action: "clear", pool_removed: true }));
     expect(changes).toContainEqual(expect.objectContaining({ code: "990131.SZ", action: "retain", stale_reason: "缺目标日RSI14" }));
-    expect(changes).toContainEqual(expect.objectContaining({ code: "990135.SZ", action: "clear", pool_removed: true }));
+    expect(changes).toContainEqual(expect.objectContaining({ code: "990135.SZ", action: "retain" }));
     const memberships = await pool.query(`SELECT instrument.code,membership.effective_to::text FROM pool_membership membership
       JOIN market_instrument instrument ON instrument.id=membership.instrument_id WHERE instrument.code=ANY($1)`, [codes]);
     for (const code of ["990132.SZ", "990133.SZ", "990134.SZ"]) expect(memberships.rows.find((row) => row.code === code)?.effective_to).toBeNull();
@@ -345,7 +345,55 @@ describe.skipIf(!prepared)("策略评估运行幂等复用", () => {
     });
   });
 
-  it("存量波段标的缺日线时仍进入复核，过期条目可从研究上下文取全", async () => {    const stock = (await pool.query<{ id: string }>("INSERT INTO market_instrument(code,name,kind,lifecycle_status) VALUES ('000136.SZ','存量缺数样本','stock','active') RETURNING id::text")).rows[0]!.id;
+  it("特别关注不随每日计划对账清退，取消后恢复常规清退", async () => {
+    const instrument = await pool.query<{ id: string }>(
+      "INSERT INTO market_instrument(code,name,kind) VALUES ('990141.SZ','特别关注样本','stock') RETURNING id::text",
+    );
+    await pool.query(`INSERT INTO pool_membership(instrument_id,pool,role,effective_from,management_mode)
+      VALUES ($1,'watch','关注','2026-09-22','strategy')`, [instrument.rows[0]!.id]);
+    await pool.query("INSERT INTO market_trading_day(trade_date,is_open,source) VALUES ('2026-09-30',true,'test')");
+    await setPoolSpecialAttention(pool, { code: "990141.SZ", special: true });
+    await setPoolAttentionEntry(pool, { code: "990141.SZ", source_job: "swing_signal_scan", strategy_code: "swing",
+      status: "qualified", reason: "旧信号", valid_from: "2026-09-22", valid_until: "2026-09-25", data_date: "2026-09-22" });
+    const result = { reviewed_codes: ["990141.SZ"], review_gaps: [] };
+    let sequence = 0;
+    const run = async (date: string) => {
+      const { rows } = await pool.query<{ id: string }>(`INSERT INTO strategy_evaluation_run
+        (strategy_code,phase,target_date,data_date,evaluator_code,evaluator_version,strategy_runtime_version,strategy_snapshot_hash,input_fingerprint,status,result)
+        VALUES ('swing','entry',$1,$1,'swing_entry_v1',2,1,$2,$3,'success',$4::jsonb) RETURNING id::text`,
+        [date, "a".repeat(64), ((++sequence)).toString(16).padStart(64, "0"), JSON.stringify(result)]);
+      return {
+        id: rows[0]!.id, strategy_code: "swing", phase: "entry", target_date: date, data_date: date,
+        evaluator_code: "swing_entry_v1", evaluator_version: 2, strategy_runtime_version: 1,
+        strategy_snapshot_hash: "a".repeat(64), input_fingerprint: "a".repeat(64), status: "success",
+        requested_by_job_run_id: null, reused_from_run_id: null, coverage: {}, gaps: [],
+        started_at: null, finished_at: null, created_at: date, result, attempt_count: 1,
+        last_requested_at: date,
+      } satisfies StrategyEvaluationRunSummary;
+    };
+    // 复核已不再满足且已过期：普通标的会清退，特别关注必须保留并按交易日续期。
+    const retained = await reconcileStrategyAttention(pool, { run: await run("2026-09-29"), source_job: "swing_signal_scan" });
+    expect(retained).toContainEqual(expect.objectContaining({
+      code: "990141.SZ", action: "retain",
+      stale_reason: "特别关注保留：策略信号到期或不再满足，仅用户手动取消特别关注后才会清退",
+    }));
+    expect((await pool.query(`SELECT entry.valid_until::text,membership.effective_to::text
+        FROM pool_attention_entry entry JOIN pool_membership membership ON membership.instrument_id=entry.instrument_id
+       WHERE entry.instrument_id=$1 AND membership.effective_to IS NULL`, [instrument.rows[0]!.id])).rows[0])
+      .toEqual({ valid_until: "2026-09-30", effective_to: null });
+    expect((await listPoolView(pool, "2026-09-29")).members.find((row) => row.code === "990141.SZ"))
+      .toMatchObject({ special_attention: true });
+    expect((await listPoolView(pool, "2026-09-29")).special_count).toBe(1);
+    // 取消特别关注后，同一复核结论按常规清退。
+    await setPoolSpecialAttention(pool, { code: "990141.SZ", special: false });
+    const cleared = await reconcileStrategyAttention(pool, { run: await run("2026-09-30"), source_job: "swing_signal_scan" });
+    expect(cleared).toContainEqual(expect.objectContaining({
+      code: "990141.SZ", action: "clear", reason: "复核后不再满足本策略关注条件", pool_removed: true,
+    }));
+  });
+
+  it("存量波段标的缺日线时仍进入复核，过期条目可从研究上下文取全", async () => {
+    const stock = (await pool.query<{ id: string }>("INSERT INTO market_instrument(code,name,kind,lifecycle_status) VALUES ('000136.SZ','存量缺数样本','stock','active') RETURNING id::text")).rows[0]!.id;
     const board = (await pool.query<{ id: string }>("INSERT INTO market_instrument(code,name,kind) VALUES ('881105.TI','周期行业样本','board') RETURNING id::text")).rows[0]!.id;
     await pool.query("INSERT INTO market_board(instrument_id,board_type,source,active) VALUES ($1,'industry','hithink',true)", [board]);
     await pool.query("INSERT INTO market_board_membership(board_instrument_id,member_instrument_id,effective_from) VALUES ($1,$2,'2026-09-01')", [board, stock]);

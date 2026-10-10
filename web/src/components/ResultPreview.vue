@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
+import { portfolioAccounts } from "../stores/account";
 import { apiClient, type ApiFail } from "../api/client";
 import type { AgentMemory, JobRunOutput } from "../api/types";
 import { openAgentSession } from "../utils/askAi";
@@ -17,6 +18,9 @@ const data = ref<JobRunOutput | AgentMemory | null>(null);
 let loadVersion = 0;
 
 const jobOutput = computed(() => props.result.type === "job-output" ? data.value as JobRunOutput | null : null);
+const outputScope = computed(() => jobOutput.value?.account_id
+  ? `账户：${portfolioAccounts.value.find(account => account.id === jobOutput.value?.account_id)?.name ?? jobOutput.value.account_id}`
+  : "全局任务");
 const memory = computed(() => props.result.type === "memory" ? data.value as AgentMemory | null : null);
 const title = computed(() => jobOutput.value
   ? `${jobOutput.value.output_type} · ${jobOutput.value.target_date}`
@@ -47,6 +51,8 @@ function goToPage(): void {
   if (jobOutput.value) {
     void router.push({ path: "/jobs", query: {
       job: jobOutput.value.job_id,
+      scope: jobOutput.value.account_id ? "account" : "global",
+      ...(jobOutput.value.account_id ? { account:jobOutput.value.account_id } : {}),
       ...(jobOutput.value.run_id ? { run: jobOutput.value.run_id } : {}),
     } });
   } else if (memory.value) {
@@ -80,7 +86,7 @@ watch(() => `${props.result.type}:${props.result.id}`, () => void load(), { imme
       <article v-else-if="data" class="result-document">
         <div class="result-meta">
           <template v-if="jobOutput">
-            <span class="badge accent">{{ jobOutput.status }}</span><span>目标日 {{ jobOutput.target_date }}</span><span>{{ fmtTime(jobOutput.created_at) }}</span>
+            <span class="badge">{{ outputScope }}</span><span class="badge accent">{{ jobOutput.status }}</span><span>目标日 {{ jobOutput.target_date }}</span><span>{{ fmtTime(jobOutput.created_at) }}</span>
           </template>
           <template v-else-if="memory">
             <span class="badge accent">{{ memory.category }}</span><span>{{ memory.status }}</span><span>最后验证 {{ fmtTime(memory.last_verified_at) }}</span>

@@ -25,6 +25,7 @@ interface RuntimeBinding {
 }
 
 export interface EnsureStrategyEvaluationInput {
+  account_id?: string | null;
   strategy_code: string;
   phase: StrategyEvaluationPhase;
   target_date: string;
@@ -118,20 +119,20 @@ async function inputFacts(db: Db, input: EnsureStrategyEvaluationInput, binding:
                          position.opened_at::text, position.strategy_code, position.strategy_runtime_version,
                          position.fallback_strategy_code, position.exit_policy_mode, position.updated_at::text
                     FROM portfolio_position position JOIN market_instrument instrument ON instrument.id=position.instrument_id
-                   WHERE position.quantity>0 AND (position.strategy_code=$1 OR position.fallback_strategy_code=$1)
-                   ORDER BY instrument.code`, [input.strategy_code])
+                   WHERE position.account_id=$2 AND position.quantity>0 AND (position.strategy_code=$1 OR position.fallback_strategy_code=$1)
+                   ORDER BY instrument.code`, [input.strategy_code, input.account_id ?? "1"])
       : Promise.resolve({ rows: [] }),
     input.phase === "entry"
       ? db.query(`SELECT instrument.code, membership.effective_from::text, membership.effective_to::text,
-                         membership.profile_input_sha256, position.quantity::text
+                         membership.profile_input_sha256
                     FROM pool_membership membership JOIN market_instrument instrument ON instrument.id=membership.instrument_id
-                    LEFT JOIN portfolio_position position ON position.instrument_id=membership.instrument_id AND position.quantity>0
                    WHERE membership.pool='watch' AND membership.effective_to IS NULL ORDER BY instrument.code`)
       : Promise.resolve({ rows: [] }),
     db.query(`SELECT count(*)::int AS count, max(created_at)::text AS created_at
                 FROM value_rank_snapshot WHERE rank_date <= $1::date`, [input.target_date]),
   ]);
   return {
+    account_id: input.phase === "entry" ? null : input.account_id ?? "1",
     strategy_code: binding.code,
     runtime_version: binding.runtime_version,
     document_sha256: binding.document_sha256,
@@ -226,7 +227,7 @@ export function describeEntryMissingSignals(
     if (strategyCode === "swing") {
       if (condition === "volume_contracted") {
         const current = decimal(evidence.volume_ratio_5, 3);
-        if (current) return `5日量比：当前 ${current}，目标 < 0.850`;
+        if (current) return `5日量比：当前 ${current}，目标 < 0.700，或 MA250 偏离 ≤ -35.0% 豁免`;
       }
       if (condition === "rsi_oversold") {
         const current = decimal(evidence.rsi14);
@@ -339,7 +340,8 @@ async function persistPositionEvaluations(
   const instruments = await client.query<{ id: string; code: string; opened_at: string | null }>(
     `SELECT instrument.id::text,instrument.code,position.opened_at::text
        FROM market_instrument instrument LEFT JOIN portfolio_position position ON position.instrument_id=instrument.id
-      WHERE instrument.code=ANY($1::text[])`, [codes],
+        AND position.account_id=(SELECT account_id FROM strategy_evaluation_run WHERE id=$2)
+      WHERE instrument.code=ANY($1::text[])`, [codes,runId],
   );
   const byCode = new Map(instruments.rows.map((row) => [row.code, row]));
   for (const item of normalized) {
@@ -382,24 +384,29 @@ export async function ensureStrategyEvaluation(
   db: Db,
   input: EnsureStrategyEvaluationInput,
 ): Promise<EnsureStrategyEvaluationResult> {
+  if (input.requested_by_job_run_id) {
+    const source=(await db.query<{account_id:string|null}>("SELECT account_id::text FROM job_run WHERE id=$1",[input.requested_by_job_run_id])).rows[0];
+    if (source?.account_id && input.phase === "entry") throw apiErrors.badRequest("账户任务不能执行全局入场扫描");
+    if (source?.account_id && source.account_id !== (input.account_id ?? "1")) throw apiErrors.badRequest("评估账户与任务账户不一致");
+  }
   const binding = await loadBinding(db, input);
   const fingerprint = sha256(await inputFacts(db, input, binding));
   const claim = await inServiceTransaction(db, async (client) => {
     const inserted = await client.query<JsonRecord>(
       `INSERT INTO strategy_evaluation_run
-         (strategy_code,phase,target_date,evaluator_code,evaluator_version,strategy_runtime_version,
+         (account_id,strategy_code,phase,target_date,evaluator_code,evaluator_version,strategy_runtime_version,
           strategy_snapshot_hash,input_fingerprint,status,requested_by_job_run_id,started_at,last_requested_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'running',$9,now(),now())
+       VALUES ($10,$1,$2,$3,$4,$5,$6,$7,$8,'running',$9,now(),now())
        ON CONFLICT DO NOTHING RETURNING ${RUN_RETURNING}`,
       [binding.code, input.phase, input.target_date, binding.evaluator_code, binding.evaluator_version,
-       binding.runtime_version, binding.strategy_snapshot_hash, fingerprint, input.requested_by_job_run_id ?? null],
+       binding.runtime_version, binding.strategy_snapshot_hash, fingerprint, input.requested_by_job_run_id ?? null, input.phase === "entry" ? null : input.account_id ?? "1"],
     );
     if (inserted.rows[0]) return { mode: "execute" as const, row: inserted.rows[0] };
     const existing = await client.query<JsonRecord>(
       `SELECT ${RUN_RETURNING} FROM strategy_evaluation_run
         WHERE strategy_code=$1 AND phase=$2 AND target_date=$3 AND evaluator_code=$4
-          AND evaluator_version=$5 AND input_fingerprint=$6 FOR UPDATE`,
-      [binding.code, input.phase, input.target_date, binding.evaluator_code, binding.evaluator_version, fingerprint],
+          AND evaluator_version=$5 AND input_fingerprint=$6 AND account_id IS NOT DISTINCT FROM $7::bigint FOR UPDATE`,
+      [binding.code, input.phase, input.target_date, binding.evaluator_code, binding.evaluator_version, fingerprint,input.phase === "entry" ? null : input.account_id ?? "1"],
     );
     const row = existing.rows[0]!;
     if (row.status === "success") {
@@ -433,7 +440,7 @@ export async function ensureStrategyEvaluation(
   const runId = String(claim.row.id);
   try {
     const result = await executeStrategyEvaluator(binding.evaluator_code, {
-      pool: db, targetDate: input.target_date, strategyDocumentId: binding.document_id,
+      pool: db, targetDate: input.target_date, strategyDocumentId: binding.document_id, accountId: input.phase === "entry" ? null : input.account_id ?? "1",
     });
     const status = normalizedStatus(result);
     const persisted = await inServiceTransaction(db, async (client) => {

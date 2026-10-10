@@ -414,9 +414,10 @@ async function main(): Promise<void> {
           rsi14: index === 39 ? rsi : 0, // 评估器只校验最后一行的 RSI
           indicator_status: "ready",
         }));
-        const evaluation = evaluateSwingSignal(rows, "stock", DEFENSE);
-        if (!evaluation?.price_signal || !evaluation.evidence.confirmation_window_available) continue;
         const ma250 = i >= 249 ? sma(closes.slice(i - 249, i + 1), 250) : null;
+        const ma250Dev = ma250 !== null && ma250 > 0 ? bar.close / ma250 - 1 : null;
+        const evaluation = evaluateSwingSignal(rows, "stock", DEFENSE, ma250Dev);
+        if (!evaluation?.price_signal || !evaluation.evidence.confirmation_window_available) continue;
         facts.push({
           code: member.code,
           name: member.name,
@@ -427,7 +428,7 @@ async function main(): Promise<void> {
             shadow_type: bar.close > bar.open ? "阳线" : "下影假阴",
             box_height: (evaluation.evidence.box_top_40d - evaluation.evidence.box_floor_20d) / evaluation.evidence.close,
             ret60: i >= 60 ? bar.close / closes[i - 60]! - 1 : null,
-            ma250_dev: ma250 !== null && ma250 > 0 ? bar.close / ma250 - 1 : null,
+            ma250_dev: ma250Dev,
             atr_pct: atrSeries[i] != null ? atrSeries[i]! / bar.close : null,
             industry_code: member.industry_code,
           },

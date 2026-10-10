@@ -24,7 +24,7 @@ const DEFINITION_SELECT = `
     LEFT JOIN strategy_definition fallback ON fallback.code = definition.fallback_strategy_code
     LEFT JOIN LATERAL (
       SELECT count(*)::int AS count FROM portfolio_position position
-       WHERE position.strategy_code=definition.code AND position.quantity>0
+       WHERE position.strategy_code=definition.code AND position.quantity>0 AND ($1::bigint IS NULL OR position.account_id=$1)
     ) position_count ON true
     LEFT JOIN LATERAL (
       SELECT count(*)::int AS count FROM pool_attention_entry attention
@@ -38,7 +38,7 @@ const DEFINITION_SELECT = `
         'started_at',run.started_at::text,'finished_at',run.finished_at::text,'created_at',run.created_at::text,
         'last_requested_at',run.last_requested_at::text
       ) AS item
-      FROM strategy_evaluation_run run WHERE run.strategy_code=definition.code
+      FROM strategy_evaluation_run run WHERE run.strategy_code=definition.code AND ($1::bigint IS NULL OR run.account_id=$1 OR run.account_id IS NULL)
       ORDER BY run.target_date DESC,run.created_at DESC LIMIT 1
     ) latest_evaluation ON true
     LEFT JOIN LATERAL (
@@ -55,18 +55,19 @@ const DEFINITION_SELECT = `
        WHERE job.strategy_code = definition.code
     ) tasks ON true`;
 
-export async function listStrategyRuntimeDefinitions(db: Db): Promise<StrategyRuntimeDefinition[]> {
+export async function listStrategyRuntimeDefinitions(db: Db, accountId?: string): Promise<StrategyRuntimeDefinition[]> {
   const result = await db.query<StrategyRuntimeDefinition>(
     `${DEFINITION_SELECT}
       WHERE definition.code NOT IN ('copper_inventory','lithium_warehouse')
       ORDER BY CASE definition.status WHEN 'active' THEN 1 WHEN 'exit_only' THEN 2 WHEN 'paused' THEN 3 ELSE 4 END,
                definition.name, definition.code`,
+    [accountId ?? null],
   );
   return result.rows;
 }
 
-export async function getStrategyRuntimeDefinition(db: Db, code: string): Promise<StrategyRuntimeDefinition> {
-  const result = await db.query<StrategyRuntimeDefinition>(`${DEFINITION_SELECT} WHERE definition.code = $1 AND definition.code NOT IN ('copper_inventory','lithium_warehouse')`, [code]);
+export async function getStrategyRuntimeDefinition(db: Db, code: string, accountId?: string): Promise<StrategyRuntimeDefinition> {
+  const result = await db.query<StrategyRuntimeDefinition>(`${DEFINITION_SELECT} WHERE definition.code = $2 AND definition.code NOT IN ('copper_inventory','lithium_warehouse')`, [accountId ?? null, code]);
   if (!result.rows[0]) throw apiErrors.notFound(`策略运行时不存在：${code}`);
   return result.rows[0];
 }
@@ -75,6 +76,7 @@ export async function listStrategyEvaluationRuns(
   db: Db,
   strategyCode: string,
   limit = 50,
+  accountId?: string,
 ): Promise<StrategyEvaluationRunSummary[]> {
   await getStrategyRuntimeDefinition(db, strategyCode);
   const result = await db.query<StrategyEvaluationRunSummary>(
@@ -88,10 +90,10 @@ export async function listStrategyEvaluationRuns(
        FROM strategy_evaluation_run run
        LEFT JOIN job_run requested_run ON requested_run.id=run.requested_by_job_run_id
        LEFT JOIN job_definition requested_job ON requested_job.id=requested_run.job_id
-      WHERE run.strategy_code = $1
+      WHERE run.strategy_code = $1 AND ($3::bigint IS NULL OR run.account_id=$3 OR run.account_id IS NULL)
       ORDER BY run.target_date DESC, run.created_at DESC
       LIMIT $2`,
-    [strategyCode, limit],
+    [strategyCode, limit, accountId ?? null],
   );
   return result.rows;
 }

@@ -148,6 +148,8 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     expect(manifest.tables.pool_membership).toBeUndefined();
     expect(manifest.tables.backtest_run).toBeUndefined();
     expect(manifest.tables.portfolio_position).toBeUndefined();
+    expect(manifest.tables.portfolio_account).toBeUndefined();
+    expect(manifest.tables.daily_plan_market_context).toBeUndefined();
     expect(manifest.tables.daily_plan_auction_assessment).toBeUndefined();
     expect(manifest.strategy_hashes.length).toBe(manifest.tables.strategy_document);
     for (const code of ["copper_inventory_strategy", "lithium_warehouse_strategy"]) {
@@ -180,6 +182,8 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
       "agent_confirmation",
       "agent_tool_audit",
       "agent_run_metric",
+      "portfolio_account",
+      "daily_plan_market_context",
       "portfolio_position",
       "portfolio_position_change",
       "portfolio_realized_pnl_baseline",

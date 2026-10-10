@@ -34,6 +34,7 @@ export interface JobDefinitionRow {
   agent_role: string | null;
   /** 仅交易日执行：目标日非交易所日历开市日时 cron/missed 触发不入队；周维护任务为 false。 */
   trading_day_only: boolean;
+  execution_scope: "global" | "account";
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -47,6 +48,7 @@ export interface JobRunRow {
   job_id: string;
   prompt_revision_id: string | null;
   session_id: string | null;
+  account_id: string | null;
   strategy_change_seq: string | null;
   strategy_snapshot_hash: string | null;
   target_date: string;
@@ -65,6 +67,7 @@ export interface JobRunRow {
 }
 
 export interface JobRunOutputRow {
+  account_id: string | null;
   id: string;
   job_id: string;
   run_id: string | null;

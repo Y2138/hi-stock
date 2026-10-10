@@ -39,6 +39,7 @@ export interface PoolMemberRow {
   pool: PoolKind;
   role: string;
   management_mode: "manual" | "strategy";
+  special_attention: boolean;
   tags: string[];
   stock_character: string | null;
   stock_character_profile: Record<string, unknown>;
@@ -82,6 +83,7 @@ export interface PoolViewData {
   members: PoolMemberRow[];
   boards: PoolBoardRow[];
   attention_count: number;
+  special_count: number;
   unclassified_count: number;
 }
 
@@ -112,6 +114,7 @@ export async function listPoolResearch(db: Db, code: string, asOf = new Date().t
 }
 
 const MEMBER_SELECT = `SELECT membership.id::text, instrument.id::text AS instrument_id, membership.pool, membership.role, membership.management_mode,
+  membership.special_attention,
   membership.tags,
   membership.stock_character, membership.stock_character_profile, membership.stage, membership.evaluation_summary,
   membership.profile_as_of::text, membership.profile_calculation_version, membership.profile_input_sha256,
@@ -171,7 +174,7 @@ export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData>
   const members = await db.query<PoolMemberRow>(
     `${MEMBER_SELECT}
       WHERE membership.pool = $1 AND membership.effective_to IS NULL
-      AND (membership.management_mode='manual' OR EXISTS (
+      AND (membership.management_mode='manual' OR membership.special_attention OR EXISTS (
         SELECT 1 FROM pool_attention_entry active WHERE active.instrument_id=membership.instrument_id
           AND (active.source_type='manual' OR (active.valid_from<=$2::date
             AND (active.valid_until IS NULL OR active.valid_until>=$2::date)))))
@@ -205,7 +208,7 @@ export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData>
           ORDER BY bar.bar_date DESC, bar.bar_time DESC LIMIT 1
        ) latest_close ON true
       WHERE membership.pool = $1 AND membership.effective_to IS NULL
-      AND (membership.management_mode='manual' OR EXISTS (
+      AND (membership.management_mode='manual' OR membership.special_attention OR EXISTS (
         SELECT 1 FROM pool_attention_entry active WHERE active.instrument_id=membership.instrument_id
           AND (active.source_type='manual' OR (active.valid_from<=$2::date
             AND (active.valid_until IS NULL OR active.valid_until>=$2::date)))))
@@ -222,8 +225,34 @@ export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData>
     members: enrichedMembers,
     boards: boards.rows,
     attention_count: enrichedMembers.filter((row) => row.attention_entries.length > 0).length,
+    special_count: enrichedMembers.filter((row) => row.special_attention).length,
     unclassified_count: enrichedMembers.filter((row) => row.kind === "stock" && row.boards.length === 0).length,
   };
+}
+
+/** 特别关注由用户在池页面逐只标记：不随每日计划对账清退，仅用户手动取消。 */
+export async function setPoolSpecialAttention(
+  db: TransactionDb,
+  input: { code: string; special: boolean },
+): Promise<{ code: string; special_attention: boolean }> {
+  return inServiceTransaction(db, async (client) => {
+    const instrument = await client.query<{ id: string }>(
+      "SELECT id::text FROM market_instrument WHERE code = $1",
+      [input.code],
+    );
+    if (!instrument.rows[0]) throw new Error(`未知标的代码：${input.code}`);
+    const membership = await client.query<{ id: string }>(
+      `SELECT id::text FROM pool_membership
+        WHERE instrument_id = $1 AND pool = $2 AND effective_to IS NULL FOR UPDATE`,
+      [instrument.rows[0].id, WATCH_POOL],
+    );
+    if (!membership.rows[0]) throw new Error(`标的 ${input.code} 不在关注池中`);
+    await client.query(
+      "UPDATE pool_membership SET special_attention=$2 WHERE id=$1",
+      [membership.rows[0].id, input.special],
+    );
+    return { code: input.code, special_attention: input.special };
+  });
 }
 
 /** 策略复核包含过期存量，避免界面隐藏后 Agent 无法取全复核集合。 */
@@ -565,10 +594,10 @@ export async function applyPoolChange(
       `INSERT INTO pool_membership
          (instrument_id, pool, role, tags, stock_character, stock_character_profile, stage,
           evaluation_summary, profile_as_of, profile_calculation_version, profile_input_sha256,
-          evaluation_session_id, effective_from, note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          evaluation_session_id, effective_from, note, special_attention)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING id::text`,
-      [instrumentId, ...values],
+      [...[instrumentId, ...values], before?.special_attention ?? false],
     );
     const afterRows = await client.query<PoolMemberRow>(
       `${MEMBER_SELECT} WHERE membership.id = $1`,

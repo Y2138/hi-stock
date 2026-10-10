@@ -36,9 +36,10 @@ export interface RiskGate {
 }
 
 /** 物化当日净值快照（幂等）：现金台账 + 持仓最新收盘市值；台账缺行或无持仓行情时跳过并返回 false。 */
-export async function recordDailyEquity(db: Db, date: string): Promise<boolean> {
+export async function recordDailyEquity(db: Db, date: string, accountId = "1"): Promise<boolean> {
   const ledger = await db.query<{ cash: string }>(
-    `SELECT cash FROM portfolio_account_state WHERE id = true`,
+    `SELECT cash FROM portfolio_account_state WHERE account_id = $1`,
+    [accountId],
   );
   const cashValue = Number(ledger.rows[0]?.cash);
   if (!ledger.rows[0] || !Number.isFinite(cashValue)) return false;
@@ -51,7 +52,8 @@ export async function recordDailyEquity(db: Db, date: string): Promise<boolean> 
        WHERE bar.instrument_id = p.instrument_id AND bar.freq = 'day'
        ORDER BY bar.bar_date DESC LIMIT 1
      ) b ON true
-     WHERE p.quantity > 0`,
+     WHERE p.account_id = $1 AND p.quantity > 0`,
+    [accountId],
   );
   let marketValue = 0;
   for (const row of holdings.rows) {
@@ -61,17 +63,19 @@ export async function recordDailyEquity(db: Db, date: string): Promise<boolean> 
   const equity = cashValue + marketValue;
   if (!Number.isFinite(marketValue) || !Number.isFinite(equity)) return false;
   await db.query(
-    `INSERT INTO portfolio_equity_daily (snap_date, cash, market_value, equity)
-     VALUES ($1::date, $2, $3, $4)
-     ON CONFLICT (snap_date) DO UPDATE
+    `INSERT INTO portfolio_equity_daily (account_id, snap_date, cash, market_value, equity)
+     VALUES ($1, $2::date, $3, $4, $5)
+     ON CONFLICT (account_id, snap_date) DO UPDATE
        SET cash = EXCLUDED.cash, market_value = EXCLUDED.market_value, equity = EXCLUDED.equity, updated_at = now()`,
-    [date, cashValue, marketValue, equity],
+    [accountId, date, cashValue, marketValue, equity],
   );
   return true;
 }
 
 /** 风控三件套判定（只读；调用方通常先 recordDailyEquity 物化当日快照）。 */
-export async function queryRiskGate(db: Db, date: string): Promise<RiskGate> {
+export type MarketRiskGate = Pick<RiskGate, "data_date" | "industry_rising_ratio" | "breadth_open" | "composite_return_60d" | "composite_return_120d" | "absolute_momentum_open">;
+
+export async function queryMarketRiskGate(db: Db, date: string): Promise<MarketRiskGate> {
   // 1) 宽度：881 一级行业最近截面的上涨占比（每板块最后一根 vs 前一根；DESC 排序下前一日是 lead）。
   const breadth = await db.query<{ data_date: string; rising_ratio: number | null }>(
     `WITH ranked AS (
@@ -121,11 +125,18 @@ export async function queryRiskGate(db: Db, date: string): Promise<RiskGate> {
   composite120 = cumulative(120);
   const absoluteMomentumOpen = composite60 === null ? null : composite60 >= 0;
 
+  return { data_date:dataDate, industry_rising_ratio:risingRatio, breadth_open:breadthOpen,
+    composite_return_60d:composite60,composite_return_120d:composite120,absolute_momentum_open:absoluteMomentumOpen };
+}
+
+export async function queryRiskGate(db: Db, date: string, accountId = "1", sharedMarket?: MarketRiskGate): Promise<RiskGate> {
+  const market = sharedMarket ?? await queryMarketRiskGate(db,date);
   // 3) 连损：最近 10 笔平仓（realized_pnl<0 的卖出）里的连续亏损笔数。
   const streak = await db.query<{ pnl: string }>(
     `SELECT realized_pnl::text AS pnl FROM portfolio_position_change
-     WHERE kind = 'sell' AND realized_pnl IS NOT NULL
+     WHERE account_id = $1 AND kind = 'sell' AND realized_pnl IS NOT NULL
      ORDER BY change_date DESC, id DESC LIMIT 10`,
+    [accountId],
   );
   let stopStreak = 0;
   for (const row of streak.rows) {
@@ -135,7 +146,8 @@ export async function queryRiskGate(db: Db, date: string): Promise<RiskGate> {
 
   // 4) 回撤：净值快照最近 20 个交易日的峰值回撤。
   const equities = await db.query<{ equity: string }>(
-    `SELECT equity::text FROM portfolio_equity_daily ORDER BY snap_date DESC LIMIT 20`,
+    `SELECT equity::text FROM portfolio_equity_daily WHERE account_id = $1 ORDER BY snap_date DESC LIMIT 20`,
+    [accountId],
   );
   let drawdown: number | null = null;
   if (equities.rows.length >= 20) {
@@ -151,12 +163,7 @@ export async function queryRiskGate(db: Db, date: string): Promise<RiskGate> {
   const circuitOpen = drawdown === null ? (stopStreak >= 3 ? true : null) : drawdown >= 0.05 || stopStreak >= 3;
 
   return {
-    data_date: dataDate,
-    industry_rising_ratio: risingRatio,
-    breadth_open: breadthOpen,
-    composite_return_60d: composite60,
-    composite_return_120d: composite120,
-    absolute_momentum_open: absoluteMomentumOpen,
+    ...market,
     stop_loss_streak: stopStreak,
     drawdown_20d: drawdown,
     equity_circuit_open: circuitOpen,

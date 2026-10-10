@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // 任务中心只负责查看、启停、立即运行和失败处理；任务定义与提示词只能由 Agent 维护。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
+import { selectedAccount, selectedAccountId, taskScope } from "../stores/account";
 import { apiClient, type ApiFail } from "../api/client";
 import { TOOL_LABELS, type JobDefinition, type JobPrompt, type JobRun, type JobRunDetail, type JobRunOutput, type LlmConfigCatalog } from "../api/types";
 import MarkdownView from "../components/MarkdownView.vue";
@@ -72,7 +73,7 @@ const DATASOURCE_ORDER = [
   "commodity_copper_sync", "commodity_copper_inventory_sync", "commodity_copper_macro_sync",
   "daily_market_structure", "full_market_indicator_refresh",
 ];
-const jobs = useResource<JobDefinition[]>(() => apiClient.get<JobDefinition[]>("/api/jobs"));
+const jobs = useResource<JobDefinition[]>(() => apiClient.get<JobDefinition[]>(`/api/jobs?account_id=${selectedAccountId.value}`));
 const prompts = useResource<JobPrompt[]>(() => apiClient.get<JobPrompt[]>("/api/job-prompts"));
 const llmCatalog = useResource<LlmConfigCatalog>(() => apiClient.get<LlmConfigCatalog>("/api/llm/providers"));
 type JobTab = "agent" | "data";
@@ -94,9 +95,11 @@ const promptDetail = ref<JobPrompt | null>(null);
 const promptLoading = ref(false);
 const promptError = ref<ApiFail | null>(null);
 const route = useRoute();
+const router = useRouter();
 const resultOpen = computed(() => Boolean(parseResultRef(route.query.result)));
 
-const tabJobs = computed(() => (jobs.data.value ?? [])
+const scopedJobs = computed(() => (jobs.data.value ?? []).filter(job => job.execution_scope === taskScope.value));
+const tabJobs = computed(() => scopedJobs.value
   .filter((job) => activeTab.value === "agent" ? job.job_type === "agent_flow" : job.job_type !== "agent_flow")
   .sort((left, right) => {
     if (left.job_type !== right.job_type) return left.job_type === "datasource" ? -1 : 1;
@@ -112,7 +115,7 @@ const visibleJobs = computed(() => {
   });
 });
 const tabCounts = computed(() => {
-  const rows = jobs.data.value ?? [];
+  const rows = scopedJobs.value;
   return {
     agent: rows.filter((row) => row.job_type === "agent_flow").length,
     data: rows.filter((row) => row.job_type !== "agent_flow").length,
@@ -123,7 +126,9 @@ const counts = computed(() => ({
   enabled: tabJobs.value.filter((row) => row.enabled).length,
   paused: tabJobs.value.filter((row) => !row.enabled).length,
 }));
-const tabDescription = computed(() => activeTab.value === "agent"
+const tabDescription = computed(() => taskScope.value === "account"
+  ? `仅查看「${selectedAccount.value?.name ?? "当前账户"}」的执行记录与结果；任务定义和定时开关由所有账户共用。`
+  : activeTab.value === "agent"
   ? "按版本化提示词执行的 Agent 任务，可查看对话、提示词与 Markdown 结果。"
   : "固定数据同步与服务内分析，直接写入数据库，不经过 Agent 对话。");
 const detachedOutputs = computed(() => outputs.value.filter((output) =>
@@ -176,11 +181,11 @@ const AGENT_ROLE_LABELS: Record<string, string> = {
 };
 function runtimeRole(job: JobDefinition): string {
   const role = job.agent_role ? AGENT_ROLE_LABELS[job.agent_role] ?? job.agent_role : "未纳入策略运行时";
-  return job.strategy_code ? `${role} · ${job.strategy_code}` : role;
+  return `${job.execution_scope === "account" ? selectedAccount.value?.name ?? "当前账户" : "全局"} · ${job.strategy_code ? `${role} · ${job.strategy_code}` : role}`;
 }
 
 function roleScope(job: JobDefinition): string {
-  if (job.agent_role === "portfolio_aggregator") return "跨策略统筹：按策略运行时发现入场、持仓出场与兜底，不绑定单一策略";
+  if (job.agent_role === "portfolio_aggregator") return "当前账户持仓统筹：复用共享市场事实，独立评估持仓出场与兜底";
   if (job.agent_role === "auction_cross_scope") return "跨域竞价：持仓、逐条关注来源、打板机会分别评价，不绑定单一策略";
   return job.strategy_code ? `单策略专项：${job.strategy_code}` : "不绑定单一策略";
 }
@@ -236,13 +241,18 @@ async function toggle(job: JobDefinition): Promise<void> {
 }
 
 async function trigger(job: JobDefinition, retry = false): Promise<void> {
+  if (job.execution_scope === "account" && selectedAccount.value?.status === "archived") { appMessage.info("已归档账户只能查看历史任务"); return; }
+  const sourceAccountId = job.execution_scope === "account" ? selectedAccountId.value : null;
+  const sourceAccountName = selectedAccount.value?.name;
   const key = `trigger:${job.code}`;
   actionKey.value = key;
-  const result = await apiClient.post<JobRun>(`/api/jobs/${job.code}/trigger`, {});
+  const result = await apiClient.post<JobRun>(`/api/jobs/${job.code}/trigger`, sourceAccountId ? { account_id: sourceAccountId } : {});
   actionKey.value = null;
   if (!result.ok) return;
   appMessage.success(retry ? `已重新排队 ${job.name}` : `已排队 ${job.name}`);
-  if (result.data.session_id) openAgentSession(result.data.session_id);
+  const sameContext = sourceAccountId ? sourceAccountId === selectedAccountId.value && taskScope.value === "account" : taskScope.value === "global";
+  if (result.data.session_id && sameContext) openAgentSession(result.data.session_id);
+  else if (!sameContext) appMessage.info(`运行已保留在${sourceAccountId ? `「${sourceAccountName ?? sourceAccountId}」账户任务` : "全局任务"}中`);
   await jobs.reload();
 }
 
@@ -275,10 +285,13 @@ async function openHistory(job: JobDefinition, requestedRunId?: string | null): 
   outputs.value = [];
   historyLoading.value = true;
   historyError.value = null;
+  const accountId = job.execution_scope === "account" ? selectedAccountId.value : "0";
+  const requestedScope = taskScope.value;
   const [runResult, outputResult] = await Promise.all([
-    apiClient.get<JobRun[]>(`/api/jobs/${job.code}/runs?limit=80`),
-    apiClient.get<JobRunOutput[]>(`/api/jobs/${job.code}/outputs?limit=80`),
+    apiClient.get<JobRun[]>(`/api/jobs/${job.code}/runs?limit=80&account_id=${accountId}`),
+    apiClient.get<JobRunOutput[]>(`/api/jobs/${job.code}/outputs?limit=80&account_id=${accountId}`),
   ]);
+  if (historyJob.value?.id !== job.id || taskScope.value !== requestedScope || (job.execution_scope === "account" && accountId !== selectedAccountId.value)) return;
   historyLoading.value = false;
   if (!runResult.ok) historyError.value = runResult;
   else runs.value = runResult.data;
@@ -316,6 +329,10 @@ async function openRequestedJob(): Promise<void> {
   if (!requested) return;
   const job = (jobs.data.value ?? []).find((item) => item.id === requested || item.code === requested);
   const requestedRun = typeof route.query.run === "string" ? route.query.run : null;
+  if (job && taskScope.value !== job.execution_scope) {
+    taskScope.value = job.execution_scope;
+    await jobs.reload();
+  }
   if (job) activeTab.value = job.job_type === "agent_flow" ? "agent" : "data";
   if (job && historyJob.value?.id !== job.id) {
     await openHistory(job, requestedRun);
@@ -344,13 +361,30 @@ function onKeydown(event: KeyboardEvent): void {
   if (event.key === "Escape" && historyJob.value && !resultOpen.value) closeHistory();
 }
 
+function switchScope(scope: "account" | "global") {
+  const query: typeof route.query = { ...route.query, scope };
+  for (const key of ["job", "run", "result", "output"]) delete query[key];
+  if (scope === "global") delete query.account;
+  taskScope.value = scope;
+  void router.replace({ query });
+}
+
+watch(() => [taskScope.value, taskScope.value === "account" ? selectedAccountId.value : null], () => {
+  closeHistory(); closePrompt(); expandedJobCode.value = null;
+  if (taskScope.value === "account") activeTab.value = "agent";
+  void jobs.reload();
+});
+watch(() => route.query.scope, scope => {
+  if (scope === "global" || scope === "account") taskScope.value = scope;
+}, { immediate:true });
+
 useUiRefresh("jobs", refresh);
 onMounted(async () => {
   window.addEventListener("keydown", onKeydown);
   await refresh();
   await openRequestedJob();
 });
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+onBeforeUnmount(() => { closeHistory(); window.removeEventListener("keydown", onKeydown); });
 watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
 </script>
 
@@ -364,7 +398,12 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
       <button class="btn primary agent-entry" type="button" @click="createWithAgent">让 Agent 维护任务</button>
     </div>
 
-    <nav class="job-tabs" role="tablist" aria-label="任务类型">
+    <nav class="job-tabs job-scope-tabs" role="tablist" aria-label="任务归属">
+      <button class="job-tab" :class="{ active: taskScope === 'account' }" type="button" role="tab" :aria-selected="taskScope === 'account'" @click="switchScope('account')"><span>账户任务</span><small>每个账户分别执行</small></button>
+      <button class="job-tab" :class="{ active: taskScope === 'global' }" type="button" role="tab" :aria-selected="taskScope === 'global'" @click="switchScope('global')"><span>全局任务</span><small>行情、扫描与共享研究</small></button>
+    </nav>
+    <div class="task-scope-note"><strong>{{ taskScope === 'account' ? `账户：${selectedAccount?.name ?? '当前账户'}` : '全局共享 · 与账户选择无关' }}</strong><span>{{ taskScope === 'account' ? '每日计划、竞价等任务按账户独立执行。' : '此处任务只执行一次，结果供所有账户使用。' }}</span></div>
+    <nav v-if="taskScope === 'global'" class="job-tabs" role="tablist" aria-label="任务类型">
       <button class="job-tab" :class="{ active: activeTab === 'agent' }" type="button" role="tab" :aria-selected="activeTab === 'agent'" @click="activeTab = 'agent'">
         <span>Agent 任务</span><span class="tab-count num">{{ tabCounts.agent }}</span>
       </button>
@@ -376,7 +415,7 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
     <section class="card job-panel">
       <header class="job-toolbar">
         <div class="toolbar-copy">
-          <strong>{{ activeTab === "agent" ? "Agent 任务" : "数据获取" }}</strong>
+          <strong>{{ taskScope === "account" ? "当前账户任务" : activeTab === "agent" ? "全局 Agent 任务" : "全局数据获取" }}</strong>
           <span>{{ tabDescription }}</span>
         </div>
         <div class="toolbar-controls">
@@ -574,4 +613,11 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
 .empty-output,.detail-state{display:grid;place-items:center;min-height:120px;margin:0;color:var(--ink-faint);text-align:center;background:var(--paper-deep);border:1px dashed var(--line);border-radius:var(--radius-sm)}.detail-json,.run-log{margin:0;padding:11px 12px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);background:var(--paper-deep);border-radius:var(--radius-sm);font:11.5px/1.55 var(--font-mono)}.mobile-back{display:none}
 @media(max-width:900px){.job-toolbar{align-items:stretch;flex-direction:column}.toolbar-controls{justify-content:space-between;min-width:0}.job-search{flex:1}.run-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:700px){.page-head-actions{align-items:flex-start;flex-direction:column}.job-tabs{overflow-x:auto}.job-toolbar{padding:12px}.toolbar-controls{align-items:stretch;flex-direction:column}.job-search{width:100%}.status-filter{align-self:flex-start}.job-detail-grid{grid-template-columns:1fr}.job-detail-side{padding:14px 0 0;border-top:1px solid var(--line);border-left:0}.history-panel,.prompt-panel{width:100vw}.prompt-body{padding:16px 16px 40px}.history-body{grid-template-columns:1fr}.history-body.detail-open .history-list-pane{display:none}.history-body:not(.detail-open) .run-detail-pane{display:none}.history-list-pane,.run-detail-pane{border-right:0}.mobile-back{display:inline-flex;margin-bottom:12px;border:0;background:transparent;color:var(--accent-ink);padding:0;cursor:pointer}.section-title{align-items:flex-start}.inline-output{padding:13px}}
+</style>
+
+<style scoped>
+.job-scope-tabs .job-tab { display:flex; flex-direction:column; align-items:flex-start; gap:4px; min-width:180px; }
+.job-scope-tabs small { font-size:11px; font-weight:400; color:var(--ink-faint); }
+.task-scope-note { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin:0 0 18px; color:var(--ink-soft); font-size:12px; }
+.task-scope-note strong { color:var(--ink); }
 </style>

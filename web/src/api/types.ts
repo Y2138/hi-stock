@@ -109,6 +109,7 @@ export type JobType = "datasource" | "analysis" | "agent_flow";
 export type JobStatus = "queued" | "running" | "success" | "failed" | "partial" | "missed" | "cancelled";
 
 export interface JobRunSummary {
+  account_id: string | null;
   id: string;
   session_id: string | null;
   strategy_change_seq: string | null;
@@ -123,6 +124,7 @@ export interface JobRunSummary {
 }
 
 export interface JobDefinition {
+  execution_scope: "global" | "account";
   id: string;
   code: string;
   name: string;
@@ -165,6 +167,7 @@ export interface JobRun extends JobRunSummary {
 }
 
 export interface JobRunOutput {
+  account_id: string | null;
   id: string;
   job_id: string;
   run_id: string | null;
@@ -350,6 +353,7 @@ export const ENTRY_SIGNAL_TYPE_LABELS: Record<string, string> = {
 };
 
 export interface Position {
+  account_id: string;
   instrument_id: string;
   code: string;
   name: string;
@@ -482,6 +486,7 @@ export interface AuctionScopeBoard {
 
 
 export interface PositionChange {
+  account_id: string;
   id: string;
   instrument_id: string;
   code: string;
@@ -586,6 +591,7 @@ export interface PoolMember {
   id: string;
   pool: "watch";
   role: string;
+  special_attention: boolean;
   tags: string[];
   stock_character: string | null;
   stock_character_profile: Record<string, unknown>;
@@ -668,6 +674,7 @@ export interface PoolViewData {
   members: PoolMember[];
   boards: PoolBoard[];
   attention_count: number;
+  special_count: number;
   unclassified_count: number;
 }
 
@@ -834,6 +841,7 @@ export interface LlmConfigCatalog {
 }
 
 export interface ChatSession {
+  account_id: string | null;
   id: string;
   title: string;
   archived: boolean;
@@ -1016,6 +1024,8 @@ export interface NotificationSettings {
   updated_at: string;
 }
 export interface NotificationDelivery {
+  account_id: string | null;
+  account_name: string | null;
   id: string;
   output_id: string | null;
   kind: "daily_plan" | "agent_result" | "intraday_risk" | "test";

@@ -12,6 +12,7 @@ import path from "node:path";
 import busboy from "busboy";
 import type http from "node:http";
 import type pg from "pg";
+import { requireAccount } from "../modules/accounts/repo.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { ApiError, apiErrors } from "../http/router.js";
 import { PROJECT_ROOT } from "../config.js";
@@ -19,7 +20,7 @@ import { getLlmConfigByModelId } from "./ai/repo.js";
 import { resolveActiveChatModel } from "./ai/runtime.js";
 import { persistAndPublishSessionEvent } from "./events.js";
 import { controlAgentRun, type AgentControlAction } from "./run-control.js";
-import { runAgentSessionTurn } from "./session-runner.js";
+import { runAgentSessionTurn, serializeSession } from "./session-runner.js";
 import { streamChatSessionEvents, streamCursor } from "./session-routes.js";
 import { getAgentSettings } from "./settings.js";
 import {
@@ -29,6 +30,7 @@ import {
 } from "./confirmations.js";
 import {
   createSession,
+  bindSessionAccount,
   getAttachment,
   getSession,
   insertAttachment,
@@ -117,7 +119,7 @@ export const chatRoutes = {
 
   /** GET /api/chat/sessions（默认未归档；?archived=1 查已归档） */
   async listSessions({ pool, query }: Ctx) {
-    return { data: await listSessions(pool, { archivedOnly: query.get("archived") === "1" }) };
+    return { data: await listSessions(pool, { archivedOnly: query.get("archived") === "1", accountId: query.get("account_id") ?? undefined, includeInteractive: query.get("include_interactive") === "1" }) };
   },
 
   /** POST /api/chat/sessions {title?} */
@@ -140,14 +142,29 @@ export const chatRoutes = {
     if (typeof b.parent_session_id === "string" && !(await getSession(pool, b.parent_session_id))) {
       throw apiErrors.notFound(`父会话不存在：${b.parent_session_id}`);
     }
+    const accountId = b.account_id === null ? null : b.account_id ?? "1";
+    if (accountId !== null) {
+      if (typeof accountId !== "string") throw apiErrors.badRequest("account_id 必须是数字字符串或 null");
+      const account = await requireAccount(pool, accountId);
+      if (account.status !== "active") throw apiErrors.conflict("账户已归档，不能新建会话");
+    }
     return {
       status: 201,
       data: await createSession(pool, {
         title: b.title as string | undefined,
         session_type: "interactive",
+        account_id: accountId,
         parent_session_id: b.parent_session_id as string | null | undefined,
       }),
     };
+  },
+
+  async bindAccount({ pool, params, body }: Ctx) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw apiErrors.badRequest("请求体必须是对象");
+    const value=body as Record<string,unknown>;
+    if (Object.keys(value).some(key=>key!=="account_id") || typeof value.account_id!=="string" || !/^[1-9]\d*$/.test(value.account_id)) throw apiErrors.badRequest("account_id 必须是正整数编号");
+    const accountId = value.account_id;
+    return { data: await serializeSession(params.id!, () => bindSessionAccount(pool, params.id!, accountId)) };
   },
 
   /** PATCH /api/chat/sessions/:id {title? / archived? / model_id?} */

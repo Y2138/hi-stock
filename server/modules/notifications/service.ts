@@ -442,11 +442,12 @@ export async function previewJobConclusion(
 } | null> {
   const result = await db.query(
     `SELECT o.id::text, o.job_id::text, o.target_date::text, o.created_at, o.markdown,
-      r.data_gaps, r.session_id::text AS session_id, j.code AS job_code, j.name AS job_name,
+      r.status AS run_status, r.data_gaps, r.account_id::text, account.name AS account_name, r.session_id::text AS session_id, j.code AS job_code, j.name AS job_name,
       EXISTS (SELECT 1 FROM job_run_output older WHERE older.job_id=o.job_id
-        AND older.target_date=o.target_date AND older.id < o.id) AS revised
+        AND older.account_id IS NOT DISTINCT FROM o.account_id AND older.target_date=o.target_date AND older.id < o.id) AS revised
     FROM job_run_output o JOIN job_run r ON r.id=o.run_id JOIN job_definition j ON j.id=o.job_id
-    WHERE j.job_type='agent_flow' AND r.status='success' AND o.source='agent_flow'
+    LEFT JOIN portfolio_account account ON account.id=r.account_id
+    WHERE j.job_type='agent_flow' AND (r.status='success' OR (r.status='partial' AND j.code='pre_market_news_scan')) AND o.source='agent_flow'
       AND o.status IN ('generated','approved') AND length(btrim(o.markdown))>0
       AND ($1::bigint IS NULL OR o.id=$1) AND ($2::text IS NULL OR j.code=$2)
     ORDER BY o.id DESC LIMIT 1`,
@@ -455,7 +456,7 @@ export async function previewJobConclusion(
   const output = result.rows[0];
   if (!output) return null;
   const conclusion = extractConclusion(output.markdown);
-  const header = `Stock ${field(output.job_name, 60)}${output.revised ? "（更新版）" : ""}｜任务日期 ${output.target_date}`;
+  const header = `Stock ${output.account_name ? `【${field(output.account_name,100)}】` : ""}${field(output.job_name, 60)}${output.revised ? "（更新版）" : ""}${output.run_status === "partial" ? "（部分成功）" : ""}｜任务日期 ${output.target_date}`;
   const footer = `结果 #${output.id}｜完整内容请在 Stock 工作台查看。`;
   const wrap = (content: string) => ({
     output_id: output.id,
@@ -517,8 +518,8 @@ export async function enqueueJobConclusion(
   if (!enabled || !webhook || !secret) return;
   if (!personal && settings.job_codes !== null && !settings.job_codes.includes(summary.job_code)) return;
   await db.query(
-    `INSERT INTO notification_delivery (output_id, kind, channel, channel_revision, content)
-    VALUES ($1, $2, $3, $4, $5) ON CONFLICT (output_id) DO NOTHING`,
+    `INSERT INTO notification_delivery (output_id, kind, channel, channel_revision, content,account_id)
+    VALUES ($1, $2, $3, $4, $5,(SELECT account_id FROM job_run_output WHERE id=$1)) ON CONFLICT (output_id) DO NOTHING`,
     [outputId, personal ? "daily_plan" : "agent_result", personal ? "personal" : "strategy", personal ? settings.personal_revision : settings.strategy_revision, summary.content],
   );
 }
@@ -551,8 +552,8 @@ export async function enqueueIntradayRiskAlert(
   if (!enabled || !webhook || !secret) return;
   await db.query(
     `INSERT INTO notification_delivery
-      (intraday_risk_id, kind, channel, channel_revision, content)
-     VALUES ($1, 'intraday_risk', 'personal', $2, $3)
+      (intraday_risk_id, kind, channel, channel_revision, content,account_id)
+     VALUES ($1, 'intraday_risk', 'personal', $2, $3,(SELECT account_id FROM intraday_position_risk WHERE id=$1))
      ON CONFLICT DO NOTHING`,
     [riskId, settings.personal_revision, content],
   );
@@ -576,17 +577,19 @@ export interface NotificationQuery {
   before?: string;
   status?: string;
   jobCode?: string;
+  accountId?: string;
 }
 const DELIVERY_JOIN = `FROM notification_delivery d LEFT JOIN job_run_output o ON o.id=d.output_id
-  LEFT JOIN job_definition j ON j.id=o.job_id`;
+  LEFT JOIN job_definition j ON j.id=o.job_id LEFT JOIN portfolio_account account ON account.id=d.account_id`;
 export async function listNotifications(db: Db, query: NotificationQuery = {}) {
   const result = await db.query(
     `SELECT d.id::text, d.output_id::text, d.kind, d.channel, d.status, d.attempts, d.error,
-      d.created_at, d.sent_at, d.next_attempt_at, j.code AS job_code, j.name AS job_name
+      d.created_at, d.sent_at, d.next_attempt_at, d.account_id::text, account.name AS account_name, j.code AS job_code, j.name AS job_name
     ${DELIVERY_JOIN} WHERE ($1::bigint IS NULL OR d.id<$1) AND ($2::text IS NULL OR d.status=$2)
       AND ($3::text IS NULL OR j.code=$3)
+      AND ($4::bigint IS NULL OR d.account_id=$4 OR ($4=0 AND d.account_id IS NULL))
     ORDER BY d.id DESC LIMIT 21`,
-    [query.before ?? null, query.status ?? null, query.jobCode ?? null],
+    [query.before ?? null, query.status ?? null, query.jobCode ?? null, query.accountId ?? null],
   );
   const items = result.rows.slice(0, 20);
   return {
@@ -597,7 +600,7 @@ export async function listNotifications(db: Db, query: NotificationQuery = {}) {
 export async function getNotification(db: Db, id: string) {
   const result = await db.query(
     `SELECT d.id::text, d.output_id::text, d.kind, d.channel, d.content, d.status, d.attempts, d.error,
-      d.created_at, d.sent_at, d.next_attempt_at, j.code AS job_code, j.name AS job_name ${DELIVERY_JOIN} WHERE d.id=$1`,
+      d.created_at, d.sent_at, d.next_attempt_at, d.account_id::text, account.name AS account_name, j.code AS job_code, j.name AS job_name ${DELIVERY_JOIN} WHERE d.id=$1`,
     [id],
   );
   if (!result.rows[0]) throw apiErrors.notFound("通知不存在");
@@ -611,8 +614,10 @@ const SUBSCRIBED = `(d.kind='test' OR (CASE WHEN d.channel='personal' THEN CASE 
   WHERE source.id=d.output_id AND job.code=ANY(s.job_codes)))))`;
 const SUPERSEDED = `EXISTS (SELECT 1 FROM job_run_output newer JOIN job_run_output original ON original.id=d.output_id
   JOIN job_run newer_run ON newer_run.id=newer.run_id
-  WHERE newer.job_id=original.job_id AND newer.target_date=original.target_date AND newer.id>original.id
-    AND newer.source='agent_flow' AND newer.status IN ('generated','approved') AND newer_run.status='success')`;
+  WHERE newer.job_id=original.job_id AND newer.account_id IS NOT DISTINCT FROM original.account_id AND newer.target_date=original.target_date AND newer.id>original.id
+    AND newer.source='agent_flow' AND newer.status IN ('generated','approved')
+    AND (newer_run.status='success' OR (newer_run.status='partial' AND EXISTS (
+      SELECT 1 FROM job_definition job WHERE job.id=newer.job_id AND job.code='pre_market_news_scan'))))`;
 
 export async function retryNotification(db: Db, id: string) {
   const result = await db.query(

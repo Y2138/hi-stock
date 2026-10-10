@@ -10,10 +10,16 @@ interface Ctx {
   query: URLSearchParams;
 }
 
+function accountId(query: URLSearchParams): string {
+  const value = query.get("account_id") ?? "1";
+  if (!/^\d+$/.test(value) || value === "0") throw apiErrors.badRequest("account_id 必须是正整数");
+  return value;
+}
+
 export const positionRoutes = {
   /** GET /api/positions：持仓 join 最新收盘/市值/盈亏（pnl_amount = 数量×(收盘−成本)） */
-  async list({ pool }: Ctx) {
-    return { data: await listPositions(pool) };
+  async list({ pool, query }: Ctx) {
+    return { data: await listPositions(pool, accountId(query)) };
   },
 
   /** GET /api/positions/changes?limit=100：变更事件流 */
@@ -23,11 +29,11 @@ export const positionRoutes = {
     if (!Number.isInteger(limit) || limit <= 0 || limit > 1000) {
       throw apiErrors.badRequest(`limit 非法：${limitRaw}`);
     }
-    return { data: await listPositionChanges(pool, limit) };
+    return { data: await listPositionChanges(pool, limit, undefined, accountId(query)) };
   },
 
   /** GET /api/positions/realized-pnl：历史基线 + 后续卖出事件的累计已实现盈亏。 */
-  async realizedPnl({ pool }: Ctx) {
-    return { data: await getRealizedPnlSummary(pool) };
+  async realizedPnl({ pool, query }: Ctx) {
+    return { data: await getRealizedPnlSummary(pool, accountId(query)) };
   },
 };

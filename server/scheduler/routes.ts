@@ -44,8 +44,8 @@ function parseLimit(query: URLSearchParams): number {
 }
 
 export const jobRoutes = {
-  async list({ pool }: Ctx) {
-    return { data: (await listJobDefinitions(pool)).map((job) => ({ ...job, available_tools: job.job_type === "agent_flow" ? jobFlowAvailableTools(job.code) : [] })) };
+  async list({ pool, query }: Ctx) {
+    return { data: (await listJobDefinitions(pool, query.get("account_id") ?? undefined)).map((job) => ({ ...job, available_tools: job.job_type === "agent_flow" ? jobFlowAvailableTools(job.code) : [] })) };
   },
 
   async create({ pool, body }: Ctx) {
@@ -80,11 +80,16 @@ export const jobRoutes = {
 
   async trigger({ pool, params, body }: Ctx) {
     const value = bodyObject(body);
-    assertOnly(value, ["target_date"]);
+    assertOnly(value, ["target_date", "account_id"]);
     if (value.target_date !== undefined && typeof value.target_date !== "string") {
       throw apiErrors.badRequest("target_date 必须是 YYYY-MM-DD");
     }
-    const run = await queueManualJob(pool, params.code!, value.target_date as string | undefined);
+    if (value.account_id !== undefined && (typeof value.account_id !== "string" || !/^\d+$/.test(value.account_id))) {
+      throw apiErrors.badRequest("account_id 必须是数字字符串");
+    }
+    const definition = await findJobByCode(pool,params.code!);
+    if (definition?.execution_scope === "account" && !value.account_id) throw apiErrors.badRequest("账户任务必须指定 account_id");
+    const run = await queueManualJob(pool, params.code!, value.target_date as string | undefined, new Date(), value.account_id as string | undefined);
     wakeScheduler(pool);
     return { status: 202, data: run };
   },
@@ -92,13 +97,13 @@ export const jobRoutes = {
   async runs({ pool, params, query }: Ctx) {
     const job = await findJobByCode(pool, params.code!);
     if (!job) throw apiErrors.notFound(`未知作业 code：${params.code}`);
-    return { data: await listJobRuns(pool, job.id, parseLimit(query)) };
+    return { data: await listJobRuns(pool, job.id, parseLimit(query), undefined, query.get("account_id") ?? undefined) };
   },
 
   async outputs({ pool, params, query }: Ctx) {
     const job = await findJobByCode(pool, params.code!);
     if (!job) throw apiErrors.notFound(`未知作业 code：${params.code}`);
-    return { data: await listJobOutputs(pool, job.id, parseLimit(query)) };
+    return { data: await listJobOutputs(pool, job.id, parseLimit(query), undefined, query.get("account_id") ?? undefined) };
   },
 
   async runDetail({ pool, params }: Ctx) {

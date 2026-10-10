@@ -14,7 +14,7 @@ import {
   type HithinkDatasetRequest,
   type HithinkDatasetStoreOutcome,
 } from "../datasource/hithink-datasets.js";
-import { queueManualJob } from "../scheduler/repo.js";
+import { findJobByCode, queueManualJob } from "../scheduler/repo.js";
 import { wakeScheduler } from "../scheduler/service.js";
 import { executeAnalysis } from "../analysis/service.js";
 import { queryStrategyScreen } from "../modules/plans/strategy-screen.js";
@@ -114,6 +114,7 @@ import {
 export interface ChatToolDeps {
   pool: pg.Pool;
   sessionId: string | null;
+  accountId?: string | null;
   /** 永久测试注入；生产缺省走 datasource service。 */
   fetchMarket?: (
     request: { code: string; freq: "day" | "30m" | "futures_day"; start: string; end: string },
@@ -311,7 +312,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     {
       name: "portfolio_write",
       label: "批量维护持仓",
-      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。买入事件必须声明 strategy_code（swing/two_year_reversal/limit_up/discretionary 等）；服务端校验策略状态并双写兼容 entry_signal_type，已有持仓只允许同策略加仓。持仓与近期关注独立，买入不会创建关注，只会消费同标的已有的每日计划自动关注并保留人工关注。服务端统一经过持仓 service；不能直接指定表或字段。",
+      description: "一次提交一批买入、卖出、调整或备注事件并在同一事务执行；逐事件固化决策来源、执行符合度、策略快照、可选计划与偏离原因。买入事件必须声明 strategy_code（swing/two_year_reversal/limit_up/discretionary 等）；服务端校验策略状态并双写兼容 entry_signal_type，已有持仓只允许同策略加仓。持仓与近期关注独立，买入不会创建或消费共享关注。服务端统一经过持仓 service；不能直接指定表或字段。",
       parameters: PortfolioWriteSchema,
       validate: validatePortfolioWriteInput,
     },
@@ -353,13 +354,14 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     executionMode: "sequential",
     execute: guard(deps, spec.name, spec.validate, async (params) => {
       const response = await withAgentMutationLock(pool, async (client) => {
-        const preview = await previewDomainWrite(client, spec.name, params, { sessionId: deps.sessionId });
+        const preview = await previewDomainWrite(client, spec.name, params, { sessionId: deps.sessionId, accountId: deps.accountId });
         const publicPreview = publicDomainWritePreview(preview);
         const settings = await getAgentSettings(client);
         if (settings.yolo_mode) {
           const result = await executeDomainWriteInTransaction(client, spec.name, params, {
             expectedStateHash: preview._state_hash,
             sessionId: deps.sessionId,
+            accountId: deps.accountId,
           });
           await insertToolAudit(client, {
             session_id: deps.sessionId,
@@ -493,16 +495,16 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
   };
 
   const tools: AgentTool[] = [
-    ...buildBusinessContextTools({ pool, sessionId: deps.sessionId }),
+    ...buildBusinessContextTools({ pool, sessionId: deps.sessionId, accountId: deps.accountId, jobCode: scope.kind === "job" ? scope.jobCode : undefined }),
     ...buildHithinkTools({ pool, sessionId: deps.sessionId, query: deps.queryHithink }),
     ...buildMarketDomainTools({ pool, sessionId: deps.sessionId }),
-    buildDailyPlanContextTool({ pool, sessionId: deps.sessionId }),
-    buildDailyPlanStrategyTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined }),
-    buildStrategyEvaluationTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined }),
+    buildDailyPlanContextTool({ pool, sessionId: deps.sessionId, accountId: deps.accountId }),
+    buildDailyPlanStrategyTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined, accountId: deps.accountId }),
+    buildStrategyEvaluationTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined, accountId: deps.accountId }),
     buildValueRankTool({ pool, sessionId: deps.sessionId }),
     buildValueAnchorSignalTool({ pool, sessionId: deps.sessionId }),
-    buildTwoYearReversalSignalTool({ pool, sessionId: deps.sessionId }),
-    buildSwingSignalTool({ pool, sessionId: deps.sessionId }),
+    buildTwoYearReversalSignalTool({ pool, sessionId: deps.sessionId, accountId: deps.accountId }),
+    buildSwingSignalTool({ pool, sessionId: deps.sessionId, accountId: deps.accountId }),
     buildLimitUpSignalTool({ pool, sessionId: deps.sessionId }),
     buildPoolNewsWriteTool({ pool, sessionId: deps.sessionId }),
     {
@@ -574,7 +576,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     {
       name: "analysis_run",
       label: "运行复合分析",
-      description: "批量运行板块温度、关键位、长线估值或月度价值排名分析。全部能力由服务读取数据库执行，结果和缺口写入 analysis_run；不调用外部 Python。板块温度的正式口径仅覆盖 881/884 本地日更的行业板块；概念/地域/特色板块走势用 hithink index_history 原始 K 线解读，不包装为温度结论。",
+      description: "批量运行板块温度、板块趋势结构、关键位、长线估值或月度价值排名分析。全部能力由服务读取数据库执行，结果和缺口写入 analysis_run；不调用外部 Python。板块温度与趋势结构的正式口径仅覆盖 881/884 本地日更的行业板块；sector_trend_structure 返回 881 板块左侧趋势信号（三触发线按优先级：中期脱离=脱离60日中期下降趋势、新低回升=触及60日新低后创10日新高、急跌反转=13日急跌反跳；前两级优先，前两线要求止跌形态与量比<1.5，新低回升线为纯口径）、trigger 标签、观察窗口、失效位与板块内补涨候选，口径冻结自回测结论文档；概念/地域/特色板块走势用 hithink index_history 原始 K 线解读，不包装为温度或趋势结构结论。",
       parameters: AnalysisRunSchema,
       executionMode: "sequential",
       execute: guard<AnalysisRunInput>(deps, "analysis_run", validateAnalysisRunInput, async (params, context) => {
@@ -767,7 +769,9 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
         const client = await pool.connect();
         try {
           await client.query("BEGIN");
-          const run = await queueManualJob(client, params.code, params.target_date);
+          const definition = await findJobByCode(client,params.code);
+          if (definition?.execution_scope === "account" && deps.accountId === null) throw new Error("账户任务必须从账户会话触发");
+          const run = await queueManualJob(client, params.code, params.target_date, new Date(), deps.accountId ?? undefined);
           const summary = {
             message: `作业 ${params.code} 已排队，等待调度器执行`,
             job_run_id: run.id,
@@ -817,7 +821,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
         "优先使用纵向业务工具；仅在其尚未覆盖的内部统计、跨领域探索或排障时使用，并与 database_schema 成对加载。只能查询服务端正面清单中的只读表；服务端按当前表结构实时校验字段，普通行查询必须显式选择 columns。最多 5 项、每项 100 行，不接受原始 SQL。",
       parameters: DatabaseQuerySchema,
       execute: guard<DatabaseQueryInput>(deps, "database_query", validateDatabaseQueryInput, async (params) => {
-        const result = textResult(await queryDatabase(pool, params));
+        const result = textResult(await queryDatabase(pool, params, deps.accountId === undefined ? "1" : deps.accountId));
         return withAudit(deps, "database_query", params, "ok", result);
       }),
     },

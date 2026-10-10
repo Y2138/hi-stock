@@ -72,6 +72,7 @@ async function portfolioState(
   code: string,
   changeDates: string[],
   lock: boolean,
+  accountId = "1",
 ): Promise<unknown> {
   const instrument = await oneRow(
     client,
@@ -83,15 +84,15 @@ async function portfolioState(
     client,
     `SELECT instrument_id::text, quantity::text, cost_price::text, cost_basis,
             opened_at::text, updated_at
-       FROM portfolio_position WHERE instrument_id = $1${lock ? " FOR UPDATE" : ""}`,
-    [instrument.id],
+       FROM portfolio_position WHERE account_id = $1 AND instrument_id = $2${lock ? " FOR UPDATE" : ""}`,
+    [accountId, instrument.id],
   );
   const latestChange = await oneRow(
     client,
     `SELECT id::text, change_date::text, kind, quantity::text, price::text, reason, created_at
-       FROM portfolio_position_change WHERE instrument_id = $1
+       FROM portfolio_position_change WHERE account_id = $1 AND instrument_id = $2
       ORDER BY id DESC LIMIT 1${lock ? " FOR UPDATE" : ""}`,
-    [instrument.id],
+    [accountId, instrument.id],
   );
   const passedSignals = await client.query(
     `SELECT assessment.id::text, assessment.conclusion, assessment.review_type,
@@ -100,20 +101,23 @@ async function portfolioState(
        FROM daily_plan_auction_assessment assessment
        JOIN daily_plan_playbook item ON item.id = assessment.playbook_item_id
        JOIN job_run auction_run ON auction_run.id = assessment.source_job_run_id
-      WHERE assessment.code = $1
+      WHERE assessment.account_id=$3 AND assessment.code = $1
         AND auction_run.target_date = ANY($2::date[])
         AND assessment.conclusion = 'signal_passed'
         AND assessment.status IN ('active','superseded')
       ORDER BY auction_run.target_date, assessment.id`,
-    [code, changeDates],
+    [code, changeDates, accountId],
   );
-  return { instrument, position, latest_change: latestChange, passed_signals: passedSignals.rows };
+  const account = await oneRow(client, `SELECT id::text,name,status FROM portfolio_account WHERE id=$1${lock ? " FOR UPDATE" : ""}`,[accountId]);
+  if (!account || account.status !== "active") throw new Error("账户不存在或已归档");
+  return { account, instrument, position, latest_change: latestChange, passed_signals: passedSignals.rows };
 }
 
 async function positionEntrySignalState(
   client: pg.PoolClient,
   input: PositionEntrySignalWriteInput,
   lock: boolean,
+  accountId = "1",
 ): Promise<unknown> {
   const instrument = await oneRow(
     client,
@@ -124,8 +128,8 @@ async function positionEntrySignalState(
   const position = await oneRow(
     client,
     `SELECT instrument_id::text, quantity::text, opened_at::text, entry_signal_type
-       FROM portfolio_position WHERE instrument_id = $1 AND quantity > 0${lock ? " FOR UPDATE" : ""}`,
-    [instrument.id],
+       FROM portfolio_position WHERE account_id = $1 AND instrument_id = $2 AND quantity > 0${lock ? " FOR UPDATE" : ""}`,
+    [accountId, instrument.id],
   );
   if (!position) throw new Error(`标的 ${input.code} 当前无持仓，不能修正买入信号类型`);
   return { instrument, position };
@@ -247,6 +251,7 @@ async function targetState(
   toolName: DomainWriteToolName,
   input: DomainWriteInput,
   lock: boolean,
+  accountId = "1",
 ): Promise<unknown> {
   switch (toolName) {
     case "portfolio_write": {
@@ -256,12 +261,12 @@ async function targetState(
         const changeDates = value.changes
           .filter((change) => change.code === code)
           .map((change) => change.change_date);
-        states.push(await portfolioState(client, code, changeDates, lock));
+        states.push(await portfolioState(client, code, changeDates, lock, accountId));
       }
       return states;
     }
     case "position_entry_signal_write":
-      return positionEntrySignalState(client, input as PositionEntrySignalWriteInput, lock);
+      return positionEntrySignalState(client, input as PositionEntrySignalWriteInput, lock, accountId);
     case "pool_onboard": return resolvePoolOnboarding(client, input as PoolOnboardCommitInput, lock);
     case "pool_write": {
       const value = input as PoolWriteInput;
@@ -357,14 +362,24 @@ function targetSummary(toolName: DomainWriteToolName, input: DomainWriteInput, s
   return {};
 }
 
+async function writeAccount(client: pg.PoolClient, toolName: DomainWriteToolName, options: { sessionId?: string | null; accountId?: string | null }) {
+  if (!["portfolio_write", "position_entry_signal_write"].includes(toolName)) return undefined;
+  const session = options.sessionId ? (await client.query<{ account_id: string | null }>(
+    "SELECT account_id::text FROM chat_session WHERE id=$1", [options.sessionId])).rows[0] : null;
+  const id = session ? session.account_id : options.accountId === undefined ? "1" : options.accountId;
+  if (!id) throw new Error("持仓写入必须绑定账户会话");
+  if (options.accountId && session && options.accountId !== session.account_id) throw new Error("写入账户与会话账户不一致");
+  return id;
+}
+
 export async function previewDomainWrite(
   client: pg.PoolClient,
   toolName: DomainWriteToolName,
   rawInput: unknown,
-  options: { lock?: boolean; sessionId?: string | null } = {},
+  options: { lock?: boolean; sessionId?: string | null; accountId?: string | null } = {},
 ): Promise<DomainWritePreview> {
   const input = validateDomainInput(toolName, rawInput);
-  return buildDomainWritePreview(client, toolName, input, options.lock === true);
+  return buildDomainWritePreview(client, toolName, input, options.lock === true, await writeAccount(client, toolName, options));
 }
 
 async function buildDomainWritePreview(
@@ -372,8 +387,9 @@ async function buildDomainWritePreview(
   toolName: DomainWriteToolName,
   input: DomainWriteInput,
   lock: boolean,
+  accountId?: string | null,
 ): Promise<DomainWritePreview> {
-  const state = await targetState(client, toolName, input, lock);
+  const state = await targetState(client, toolName, input, lock, accountId ?? undefined);
   const action = toolName === "portfolio_write" || toolName === "pool_write"
     ? "batch"
     : "action" in input ? String(input.action) : toolName;
@@ -382,8 +398,8 @@ async function buildDomainWritePreview(
     domain: DOMAIN_LABELS[toolName],
     action,
     reason: input.reason,
-    target: targetSummary(toolName, input, state),
-    _state_hash: sha256Json({ tool_name: toolName, input, state }),
+    target: { ...targetSummary(toolName, input, state), ...(accountId ? { account_id: accountId } : {}) },
+    _state_hash: sha256Json({ tool_name: toolName, input, state, account_id: accountId ?? null }),
   };
 }
 
@@ -405,10 +421,11 @@ export async function executeDomainWriteInTransaction(
   client: pg.PoolClient,
   toolName: DomainWriteToolName,
   rawInput: unknown,
-  options: { expectedStateHash?: string | null; sessionId?: string | null } = {},
+  options: { expectedStateHash?: string | null; sessionId?: string | null; accountId?: string | null } = {},
 ): Promise<unknown> {
   const input = validateDomainInput(toolName, rawInput);
-  const preview = await buildDomainWritePreview(client, toolName, input, true);
+  const accountId = await writeAccount(client, toolName, options);
+  const preview = await buildDomainWritePreview(client, toolName, input, true, accountId);
   if (options.expectedStateHash && options.expectedStateHash !== preview._state_hash) {
     throw new DomainWriteConflictError();
   }
@@ -420,6 +437,7 @@ export async function executeDomainWriteInTransaction(
       for (const change of value.changes) {
         items.push(await recordPositionChange(client, {
           code: change.code,
+          account_id: accountId,
           kind: change.kind,
           quantity: change.quantity,
           price: change.price,
@@ -443,6 +461,7 @@ export async function executeDomainWriteInTransaction(
       const value = input as PositionEntrySignalWriteInput;
       return updatePositionEntrySignalType(client, {
         code: value.code,
+        account_id: accountId,
         entry_signal_type: value.entry_signal_type,
         reason: value.reason,
         source: "chat",

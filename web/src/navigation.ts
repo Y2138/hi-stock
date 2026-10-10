@@ -1,12 +1,14 @@
 // 导航与全局搜索共用页面名称，避免入口缺失或命名不一致。
 export const NAV_GROUPS = [
-  { label: "日常工作", items: [
+  { label: "全部账户总览", items: [
     { to: "/", icon: "📊", label: "仪表盘" },
-    { to: "/positions", icon: "💼", label: "持仓" },
-    { to: "/pools", icon: "🌱", label: "关注池" },
   ] },
-  { label: "研究与执行", items: [
+  { label: "账户工作", items: [
+    { to: "/positions", icon: "💼", label: "持仓" },
     { to: "/jobs", icon: "⏱", label: "任务中心" },
+  ] },
+  { label: "全局研究", items: [
+    { to: "/pools", icon: "🌱", label: "关注池" },
     { to: "/market-structure", icon: "▦", label: "市场结构" },
     { to: "/market-news", icon: "📰", label: "市场消息" },
     { to: "/strategies", icon: "📜", label: "当前策略" },

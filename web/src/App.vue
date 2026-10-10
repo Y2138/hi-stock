@@ -3,6 +3,9 @@
 // 产品方案 §5.2 / §七；视图切换淡入位移为纯 CSS transition。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import { apiClient } from "./api/client";
+import AccountSelector from "./components/AccountSelector.vue";
+import { portfolioAccounts, selectedAccountId, selectAccount, taskScope, type PortfolioAccount } from "./stores/account";
 import StatusBar from "./components/StatusBar.vue";
 import CommandPalette from "./components/CommandPalette.vue";
 import AppMessageCenter from "./components/AppMessageCenter.vue";
@@ -34,10 +37,30 @@ const router = useRouter();
 const settingsAgentOpen = ref(false);
 const isSettingsPage = computed(() => route.path === "/settings" || route.path.startsWith("/settings/"));
 const workspaceOpen = computed(() => isSettingsPage.value ? settingsAgentOpen.value : agentOpen.value);
+const accountPage = computed(() => route.path === "/positions" || (route.path === "/jobs" && taskScope.value === "account"));
+const globalResearchPage = computed(() => ["/pools", "/strategies", "/market", "/market-structure", "/market-news"].includes(route.path));
+const accountViewKey = computed(() => route.path === "/positions" ? selectedAccountId.value : "global");
+const agentAccountId = computed(() => accountPage.value ? selectedAccountId.value : null);
+watch(() => [route.path, route.query.account], () => {
+  if (!["/positions", "/jobs"].includes(route.path)) return;
+  const id = route.query.account;
+  if (typeof id === "string" && /^[1-9]\d*$/.test(id)) selectAccount(id);
+}, { immediate: true, flush: "sync" });
+watch(agentAccountId, () => { aiRequest.value = null; }, { flush: "sync" });
 const activeResult = computed(() => {
   const result = parseResultRef(route.query.result);
   return result && isPreviewResult(result) ? result : null;
 });
+
+watch(selectedAccountId, () => {
+  if (!accountPage.value) return;
+  aiRequest.value = null;
+  const query = { ...route.query };
+  for (const key of ["run", "change", "output", "session", "chat"]) delete query[key];
+  if (query.account) query.account = selectedAccountId.value;
+  if (activeResult.value?.type === "job-output") delete query.result;
+  if (JSON.stringify(query) !== JSON.stringify(route.query)) void router.replace({ query });
+}, { flush: "sync" });
 
 function onGlobalKeydown(e: KeyboardEvent): void {
   if (e.key === "Escape" && activeResult.value) {
@@ -110,6 +133,7 @@ function onUiRefresh(request: UiRefreshRequest): void {
 }
 
 onMounted(() => {
+  void apiClient.get<PortfolioAccount[]>("/api/accounts").then(response => { if (response.ok) portfolioAccounts.value = response.data; });
   window.addEventListener("keydown", onGlobalKeydown);
   window.addEventListener(ASK_AI_EVENT, onAskAi);
   window.addEventListener(RESULT_OPEN_EVENT, onOpenResult);
@@ -164,10 +188,15 @@ onBeforeUnmount(() => {
     <StatusBar :key="statusKey" @open-palette="paletteOpen = true" @refresh="viewKey++" />
 
     <main class="main-area" :class="{ 'result-open': activeResult }">
+      <div v-if="accountPage && !activeResult" class="page-account-context">
+        <div><span class="badge accent">账户工作</span><small>切换仅影响本页和账户 Agent</small></div>
+        <AccountSelector />
+      </div>
+      <div v-if="globalResearchPage && !activeResult" class="page-global-context"><span class="badge">全局共享</span><small>所有账户共用，账户切换不改变本页内容</small></div>
       <div v-show="!activeResult" class="business-view">
         <RouterView v-slot="{ Component }">
           <Transition name="view-fade" mode="out-in">
-            <component :is="Component" :key="`${route.path}#${viewKey}`" />
+            <component :is="Component" :key="`${route.path}#${viewKey}#${accountViewKey}`" />
           </Transition>
         </RouterView>
       </div>
@@ -177,12 +206,23 @@ onBeforeUnmount(() => {
     <CommandPalette :open="paletteOpen" @close="paletteOpen = false" />
     <AppMessageCenter />
     <AgentWorkspace
+      :key="agentAccountId ?? 'global'"
       :open="workspaceOpen"
+      :account-id="agentAccountId"
       :request="aiRequest"
       @open="setAgentOpen(true)"
       @close="setAgentOpen(false)"
-      @request-consumed="aiRequest = null"
+      @request-consumed="(id) => { if (aiRequest?.id === id) aiRequest = null; }"
       @ui-refresh="onUiRefresh"
     />
   </div>
 </template>
+
+<style scoped>
+.page-global-context { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:16px; color:var(--ink-faint); font-size:11px; }
+.page-account-context { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:0 0 18px; padding-bottom:14px; border-bottom:1px solid var(--line); }
+.page-account-context > div { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+.page-account-context small { color:var(--ink-faint); font-size:11px; }
+.page-account-context :deep(.account-selector) { width:220px; padding:0; margin:0; border:0; flex-shrink:0; }
+@media(max-width:720px) { .page-account-context { align-items:flex-start; flex-direction:column; gap:10px; } .page-account-context :deep(.account-selector) { width:100%; } }
+</style>

@@ -3,6 +3,7 @@
 // 业务事实只能由 Agent 通过领域工具写入；估值由当前持仓与最新行情派生。
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute } from "vue-router";
+import { selectedAccount, selectedAccountId } from "../stores/account";
 import { apiClient } from "../api/client";
 import type {
   BarsResponse,
@@ -26,17 +27,17 @@ import { fmtDate, fmtNum, fmtPrice, fmtTime } from "../utils/format";
 import { askAi } from "../utils/askAi";
 
 
-const positions = useResource<Position[]>(() => apiClient.get<Position[]>("/api/positions"));
+const positions = useResource<Position[]>(() => apiClient.get<Position[]>(`/api/positions?account_id=${selectedAccountId.value}`));
 const changes = useResource<PositionChange[]>(() =>
-  apiClient.get<PositionChange[]>("/api/positions/changes?limit=100"),
+  apiClient.get<PositionChange[]>(`/api/positions/changes?limit=100&account_id=${selectedAccountId.value}`),
 );
 const realizedPnl = useResource<RealizedPnlSummary>(() =>
-  apiClient.get<RealizedPnlSummary>("/api/positions/realized-pnl"),
+  apiClient.get<RealizedPnlSummary>(`/api/positions/realized-pnl?account_id=${selectedAccountId.value}`),
 );
 // 次日执行预案：来自最新每日计划的结构化盯防数据；404 = 尚无预案，不算错误。
-const dailyPlan = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>("/api/plans/latest"));
-const auctionScope = useResource<AuctionScopeBoard>(() => apiClient.get<AuctionScopeBoard>("/api/auction/latest"));
-const intradayRisk = useResource<IntradayRiskSnapshot>(() => apiClient.get<IntradayRiskSnapshot>("/api/intraday-risk"));
+const dailyPlan = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>(`/api/plans/latest?account_id=${selectedAccountId.value}`));
+const auctionScope = useResource<AuctionScopeBoard>(() => apiClient.get<AuctionScopeBoard>(`/api/auction/latest?account_id=${selectedAccountId.value}`));
+const intradayRisk = useResource<IntradayRiskSnapshot>(() => apiClient.get<IntradayRiskSnapshot>(`/api/intraday-risk?account_id=${selectedAccountId.value}`));
 const intradayRiskByCode = computed(() => new Map((intradayRisk.data.value?.positions ?? []).map((item) => [item.code, item])));
 const riskLabel: Record<IntradayRiskRow["risk"], string> = { normal: "正常", watch: "关注", high: "风险" };
 const riskClass: Record<IntradayRiskRow["risk"], string> = { normal: "", watch: "warn", high: "down" };
@@ -260,7 +261,7 @@ onUnmounted(() => {
 <template>
   <section>
     <div class="page-head position-head">
-      <h1>持仓</h1>
+      <div><h1>持仓</h1><div class="sub">{{ selectedAccount?.name ?? "当前账户" }} · 持仓、成交、计划与盘中风险独立维护</div></div>
       <button class="btn primary agent-entry" type="button" @click="recordWithAgent">记录持仓变化</button>
     </div>
 

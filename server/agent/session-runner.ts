@@ -58,7 +58,7 @@ function persistedFrameData(frame: AgentCoreFrame): Record<string, unknown> {
   };
 }
 
-async function serializeSession<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+export async function serializeSession<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
   const previous = sessionQueues.get(sessionId) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -164,7 +164,7 @@ export async function runAgentSessionTurn(
     const manageStatus = input.manageSessionStatus ?? true;
     const historyRows = input.historyMode === "empty" ? [] : await listMessages(input.pool, session.id);
     const runtime = await resolveActiveChatModel(input.pool, session.model_id);
-    const basePrompt = input.systemPrompt ?? (await buildSystemPrompt(input.pool));
+    const basePrompt = input.systemPrompt ?? (await buildSystemPrompt(input.pool, undefined, session.account_id));
     const fullPrompt = input.systemPromptSuffix
       ? `${basePrompt}\n\n${input.systemPromptSuffix}`
       : basePrompt;
@@ -219,6 +219,7 @@ export async function runAgentSessionTurn(
     const availableTools = input.tools ?? buildChatTools({
       pool: input.pool,
       sessionId: session.id,
+      accountId: session.account_id,
     }, input.toolScope);
     const preload = input.toolScope?.kind === "job" && !input.tools && Object.hasOwn(JOB_FLOW_TOOL_BUNDLES, input.toolScope.jobCode)
       ? JOB_FLOW_TOOL_BUNDLES[input.toolScope.jobCode] ?? [] : [];

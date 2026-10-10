@@ -37,7 +37,7 @@ function averageAt(values: number[], end: number, window = 3) {
   return end + 1 < window ? null : mean(values.slice(end - window + 1, end + 1));
 }
 
-async function state(db: Db, targetDate: string) {
+async function state(db: Db, targetDate: string, accountId: string | null = "1") {
   const [barsResult, cuResult, macroResult, inventoryResult, calendarResult, positionResult] = await Promise.all([
     db.query<Bar>(
       `WITH ranked AS (
@@ -76,8 +76,8 @@ async function state(db: Db, targetDate: string) {
     db.query<{ date: string }>("SELECT max(trade_date)::text date FROM market_trading_day WHERE is_open=true AND trade_date <= $1::date", [targetDate]),
     db.query<{ quantity: number }>(
       `SELECT COALESCE(position.quantity,0)::float8 quantity FROM market_instrument instrument
-       LEFT JOIN portfolio_position position ON position.instrument_id=instrument.id
-       WHERE instrument.code=$1`, [TARGET],
+       LEFT JOIN portfolio_position position ON position.instrument_id=instrument.id AND position.account_id=$2
+       WHERE instrument.code=$1`, [TARGET, accountId],
     ),
   ]);
   const gaps: Array<{ code?: string; reason: string }> = [];
@@ -145,8 +145,8 @@ async function state(db: Db, targetDate: string) {
   return { status: "success" as const, dataDate, gaps, target, byCode, cu, macro, inventory: inventoryResult.rows, quantity: positionResult.rows[0]?.quantity ?? 0, feature };
 }
 
-export async function queryCopperLeftLaunchEntry(db: Db, targetDate: string) {
-  const current = await state(db, targetDate);
+export async function queryCopperLeftLaunchEntry(db: Db, targetDate: string, accountId: string | null = "1") {
+  const current = await state(db, targetDate, accountId);
   if (!current.feature) return { status: "partial", data_date: current.dataDate, coverage: { target_count: 1, completed_count: 0 }, signals: [], near_candidates: [], gaps: current.gaps };
   const f = current.feature;
   const conditions = {
@@ -177,14 +177,15 @@ export async function queryCopperLeftLaunchEntry(db: Db, targetDate: string) {
   };
 }
 
-export async function queryCopperLeftLaunchExit(db: Db, targetDate: string) {
+export async function queryCopperLeftLaunchExit(db: Db, targetDate: string, accountId = "1") {
   const positions = await db.query<{ code: string; name: string }>(
     `SELECT instrument.code,instrument.name FROM portfolio_position position
      JOIN market_instrument instrument ON instrument.id=position.instrument_id
-     WHERE position.quantity>0 AND position.strategy_code='copper_left_launch' ORDER BY instrument.code`,
+     WHERE position.account_id=$1 AND position.quantity>0 AND position.strategy_code='copper_left_launch' ORDER BY instrument.code`,
+    [accountId],
   );
   if (!positions.rows.length) return { status: "success", data_date: targetDate, coverage: { strategy_code: "copper_left_launch", position_count: 0, completed_count: 0 }, items: [], gaps: [] };
-  const current = await state(db, targetDate);
+  const current = await state(db, targetDate, accountId);
   if (!current.feature) return { status: "partial", data_date: current.dataDate, coverage: { strategy_code: "copper_left_launch", position_count: positions.rows.length, completed_count: 0 }, items: [], gaps: current.gaps };
   const targetRows = current.target;
   const dates = targetRows.map((row) => row.date);

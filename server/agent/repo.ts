@@ -2,6 +2,9 @@
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §4.2、§6.1
 // chat_message.content 存 pi AgentMessage 纯 JSON；role 列只做检索映射（toolResult→tool）。
 import type pg from "pg";
+import { inServiceTransaction, type TransactionDb } from "../db/transaction.js";
+import { requireAccount } from "../modules/accounts/repo.js";
+import { apiErrors } from "../http/router.js";
 import { redactAgentMessage, redactEphemeralCode } from "./redaction.js";
 
 export type Db = Pick<pg.Pool, "query">;
@@ -23,6 +26,7 @@ export interface ChatSessionRow {
   title: string;
   archived: boolean;
   model_id: string | null;
+  account_id: string | null;
   session_type: ChatSessionType;
   session_status: ChatSessionStatus;
   source: ChatSessionSource;
@@ -67,14 +71,14 @@ export interface ToolAuditRow {
   created_at: string;
 }
 
-const SESSION_COLS = `id::text, title, archived, model_id::text,
+const SESSION_COLS = `id::text, title, archived, model_id::text, to_jsonb(chat_session)->>'account_id' AS account_id,
   session_type, session_status, source, parent_session_id::text,
   started_at, finished_at, last_error_summary,
   context_summary, context_summary_through_seq,
   context_summary_estimated_tokens, context_compacted_at,
   created_at, updated_at`;
 // 0017 分段迁移测试仍需创建会话；压缩列在 0018 前以空检查点返回。
-const SESSION_CREATE_COLS = `id::text, title, archived, model_id::text,
+const SESSION_CREATE_COLS = `id::text, title, archived, model_id::text, to_jsonb(chat_session)->>'account_id' AS account_id,
   session_type, session_status, source, parent_session_id::text,
   started_at, finished_at, last_error_summary,
   NULL::text AS context_summary, 0::int AS context_summary_through_seq,
@@ -95,13 +99,13 @@ export function toDbRole(role: string): "user" | "assistant" | "tool" {
 /** 会话列表：任务与普通对话共用列表；类型只作为来源和展示元数据。 */
 export async function listSessions(
   db: Db,
-  opts: { archivedOnly?: boolean } = {},
+  opts: { archivedOnly?: boolean; accountId?: string; includeInteractive?: boolean } = {},
 ): Promise<ChatSessionRow[]> {
   const r = await db.query<ChatSessionRow>(
     `SELECT ${SESSION_COLS} FROM chat_session
-      WHERE archived = $1
+      WHERE archived = $1 AND ($2::bigint IS NULL OR account_id=$2 OR account_id IS NULL OR ($3::boolean AND session_type='interactive'))
       ORDER BY updated_at DESC`,
-    [opts.archivedOnly ?? false],
+    [opts.archivedOnly ?? false, opts.accountId ?? null, opts.includeInteractive ?? false],
   );
   return r.rows;
 }
@@ -138,6 +142,28 @@ export async function getSession(db: Db, id: string): Promise<ChatSessionRow | n
   return r.rows[0] ?? null;
 }
 
+/** 普通会话只允许首次关联账户，不改变已关联历史或任务会话的归属。 */
+export async function bindSessionAccount(db: TransactionDb, sessionId: string, accountId: string): Promise<ChatSessionRow> {
+  return inServiceTransaction(db, async client => {
+    const session=(await client.query<ChatSessionRow>(`SELECT ${SESSION_COLS} FROM chat_session WHERE id=$1 FOR UPDATE`,[sessionId])).rows[0];
+    if (!session) throw apiErrors.notFound(`会话不存在：${sessionId}`);
+    const task=(await client.query("SELECT id FROM job_run WHERE session_id=$1 LIMIT 1",[sessionId])).rows[0];
+    if (session.session_type !== "interactive" || task) throw apiErrors.forbidden("任务会话的账户归属不可修改");
+    if (session.account_id && session.account_id !== accountId) throw apiErrors.conflict("会话已经关联其他账户，请新建会话维护该账户");
+    if (session.account_id === accountId) return session;
+    if (session.archived || ["queued","running","waiting_confirmation"].includes(session.session_status)) throw apiErrors.conflict("请等待会话空闲且取消归档后再关联账户");
+    const pending=(await client.query("SELECT id FROM agent_confirmation WHERE session_id=$1 AND status='pending' LIMIT 1",[sessionId])).rows[0];
+    if (pending) throw apiErrors.conflict("会话仍有待确认提案，请先处理后再关联账户");
+    await client.query("SELECT id FROM portfolio_account WHERE id=$1 FOR UPDATE",[accountId]);
+    const account=await requireAccount(client,accountId);
+    if (account.status !== "active") throw apiErrors.conflict("已归档账户不能关联新的维护会话");
+    const updated=await client.query<ChatSessionRow>(`UPDATE chat_session SET account_id=$2,updated_at=now(),
+      context_summary=NULL,context_summary_through_seq=0,context_summary_estimated_tokens=0,context_compacted_at=NULL
+      WHERE id=$1 RETURNING ${SESSION_COLS}`,[sessionId,accountId]);
+    return updated.rows[0]!;
+  });
+}
+
 export interface CreateSessionInput {
   title?: string;
   model_id?: string | null;
@@ -145,6 +171,7 @@ export interface CreateSessionInput {
   session_status?: ChatSessionStatus;
   source?: ChatSessionSource;
   parent_session_id?: string | null;
+  account_id?: string | null;
 }
 
 export async function createSession(
@@ -154,9 +181,9 @@ export async function createSession(
   const input = typeof value === "string" ? { title: value } : value ?? {};
   const r = await db.query<ChatSessionRow>(
     `INSERT INTO chat_session
-       (title, model_id, session_type, session_status, source, parent_session_id)
+       (title, model_id, session_type, session_status, source, parent_session_id${input.account_id !== undefined ? ", account_id" : ""})
      VALUES ($1, COALESCE($2::bigint, (SELECT active_model_id FROM llm_setting WHERE singleton = true)),
-             $3, $4, $5, $6)
+             $3, $4, $5, $6${input.account_id !== undefined ? ", $7" : ""})
      RETURNING ${SESSION_CREATE_COLS}`,
     [
       input.title?.trim() || "新会话",
@@ -165,6 +192,7 @@ export async function createSession(
       input.session_status ?? "idle",
       input.source ?? "user",
       input.parent_session_id ?? null,
+      ...(input.account_id !== undefined ? [input.account_id] : []),
     ],
   );
   return r.rows[0]!;

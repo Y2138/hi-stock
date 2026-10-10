@@ -67,25 +67,26 @@ function assertTradingDayOnly(value: unknown): boolean {
   return value;
 }
 
-export async function listJobDefinitions(db: Db): Promise<JobDefinitionWithLatest[]> {
+export async function listJobDefinitions(db: Db, accountId?: string): Promise<JobDefinitionWithLatest[]> {
   const result = await db.query<JobDefinitionRow & { latest_run: Partial<JobRunRow> | null }>(
     `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text, to_jsonb(d)->>'model_id' AS model_id,
-            d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role, d.trading_day_only, d.enabled,
+            d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role, d.trading_day_only, d.execution_scope, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
             (SELECT json_build_object(
                       'id', r.id::text, 'target_date', r.target_date,
                       'trigger_kind', r.trigger_kind, 'status', r.status,
-                      'session_id', r.session_id::text,
+                      'session_id', r.session_id::text, 'account_id',r.account_id::text,
                       'strategy_change_seq', r.strategy_change_seq::text,
                       'strategy_snapshot_hash', r.strategy_snapshot_hash,
                       'attempt_count', r.attempt_count, 'scheduled_for', r.scheduled_for,
                       'started_at', r.started_at, 'finished_at', r.finished_at)
-               FROM job_run r WHERE r.job_id = d.id
+               FROM job_run r WHERE r.job_id = d.id AND ($1::bigint IS NULL OR COALESCE(r.account_id,CASE WHEN d.execution_scope='account' THEN 1 ELSE 0 END) IN ($1,0))
               ORDER BY r.id DESC LIMIT 1) AS latest_run
        FROM job_definition d
       WHERE d.code NOT IN ('copper_inventory_signal_review','lithium_warehouse_signal_review','commodity_lithium_warehouse_sync')
       ORDER BY d.priority NULLS LAST, d.code`,
+    [accountId ?? null],
   );
   return result.rows.map((row) => ({
     ...row,
@@ -97,7 +98,7 @@ export async function findJobByCode(db: Db, code: string): Promise<JobDefinition
   const result = await db.query<JobDefinitionRow>(
     `SELECT d.id::text, d.code, d.name, d.cron, d.job_type, d.config, d.prompt_id::text,
             to_jsonb(d)->>'model_id' AS model_id, d.purpose, d.phase, d.priority, d.strategy_code, d.agent_role,
-            d.trading_day_only, d.enabled,
+            d.trading_day_only, d.execution_scope, d.enabled,
             to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
             to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
        FROM job_definition d WHERE d.code = $1
@@ -140,7 +141,7 @@ export async function createJobDefinition(
     `INSERT INTO job_definition (code, name, cron, job_type, config, prompt_id, model_id, purpose, phase, priority, trading_day_only, enabled)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority,
-               strategy_code, agent_role, trading_day_only, enabled,
+               strategy_code, agent_role, trading_day_only, execution_scope, enabled,
                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
     [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, purpose, phase, priority, tradingDayOnly, input.enabled ?? true],
@@ -205,7 +206,7 @@ export async function updateJobDefinition(
       WHERE code = $1
         AND ($13::timestamptz IS NULL OR updated_at = $13::timestamptz)
       RETURNING id::text, code, name, cron, job_type, config, prompt_id::text, model_id::text, purpose, phase, priority,
-                strategy_code, agent_role, trading_day_only, enabled,
+                strategy_code, agent_role, trading_day_only, execution_scope, enabled,
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at`,
     [code, name, cron, jobType, JSON.stringify(config), promptId, modelId, patch.enabled ?? current.enabled, purpose, phase, priority, tradingDayOnly, baseUpdatedAt],
@@ -245,16 +246,17 @@ async function validatePromptBinding(db: Db, jobType: JobType, value: unknown): 
   return prompt.rows[0].id;
 }
 
-export async function listJobRuns(db: Db, jobId: string, limit: number, targetDate?: string): Promise<JobRunRow[]> {
+export async function listJobRuns(db: Db, jobId: string, limit: number, targetDate?: string, accountId?: string): Promise<JobRunRow[]> {
   const result = await db.query<JobRunRow>(
     `SELECT id::text, job_id::text, prompt_revision_id::text,
-            session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
+            session_id::text, account_id::text, strategy_change_seq::text, strategy_snapshot_hash,
             target_date::text, trigger_kind,
             scheduled_for, status, attempt_count, next_retry_at, log, artifacts, data_gaps,
             result_md, started_at, finished_at, created_at
        FROM job_run WHERE job_id = $1 AND ($3::date IS NULL OR target_date = $3::date)
+        AND ($4::bigint IS NULL OR COALESCE(account_id,CASE WHEN (SELECT execution_scope FROM job_definition WHERE id=$1)='account' THEN 1 ELSE 0 END) IN ($4,0))
       ORDER BY job_run.created_at DESC, job_run.id DESC LIMIT $2`,
-    [jobId, limit, targetDate ?? null],
+    [jobId, limit, targetDate ?? null, accountId ?? null],
   );
   return result.rows;
 }
@@ -262,14 +264,14 @@ export async function listJobRuns(db: Db, jobId: string, limit: number, targetDa
 export async function findJobRunById(db: Db, id: string): Promise<(JobRunRow & { job: JobDefinitionRow }) | null> {
   const result = await db.query<JobRunRow & { job: JobDefinitionRow }>(
     `SELECT r.id::text, r.job_id::text, r.prompt_revision_id::text,
-            r.session_id::text, r.strategy_change_seq::text, r.strategy_snapshot_hash,
+            r.session_id::text, r.account_id::text, r.strategy_change_seq::text, r.strategy_snapshot_hash,
             r.target_date::text,
             r.trigger_kind, r.scheduled_for, r.status, r.attempt_count, r.next_retry_at,
             r.log, r.artifacts, r.data_gaps, r.result_md, r.started_at, r.finished_at, r.created_at,
             json_build_object('id', d.id::text, 'code', d.code, 'name', d.name,
               'cron', d.cron, 'job_type', d.job_type, 'config', d.config, 'prompt_id', d.prompt_id::text,
               'model_id', to_jsonb(d)->>'model_id',
-              'trading_day_only', d.trading_day_only, 'enabled', d.enabled,
+              'trading_day_only', d.trading_day_only, 'execution_scope', d.execution_scope, 'enabled', d.enabled,
               'created_at', to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
               'updated_at', to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')) AS job
        FROM job_run r JOIN job_definition d ON d.id = r.job_id WHERE r.id = $1`,
@@ -278,7 +280,7 @@ export async function findJobRunById(db: Db, id: string): Promise<(JobRunRow & {
   return result.rows[0] ?? null;
 }
 
-const OUTPUT_SELECT = `SELECT id::text, job_id::text, run_id::text, session_id::text,
+const OUTPUT_SELECT = `SELECT account_id::text,id::text, job_id::text, run_id::text, session_id::text,
   output_type, target_date::text, markdown, sha256, status, source,
   supersedes_output_id::text, strategy_change_seq::text, strategy_snapshot_hash,
   created_at FROM job_run_output`;
@@ -288,11 +290,13 @@ export async function listJobOutputs(
   jobId: string,
   limit: number,
   targetDate?: string,
+  accountId?: string,
 ): Promise<JobRunOutputRow[]> {
   const result = await db.query<JobRunOutputRow>(
     `${OUTPUT_SELECT} WHERE job_id = $1 AND ($3::date IS NULL OR target_date = $3::date)
+      AND ($4::bigint IS NULL OR COALESCE(account_id,CASE WHEN (SELECT execution_scope FROM job_definition WHERE id=$1)='account' THEN 1 ELSE 0 END) IN ($4,0))
       ORDER BY target_date DESC, id DESC LIMIT $2`,
-    [jobId, limit, targetDate ?? null],
+    [jobId, limit, targetDate ?? null, accountId ?? null],
   );
   return result.rows;
 }
@@ -310,7 +314,7 @@ export async function findJobOutputById(
   id: string,
 ): Promise<(JobRunOutputRow & { job: JobDefinitionRow }) | null> {
   const result = await db.query<JobRunOutputRow & { job: JobDefinitionRow }>(
-    `SELECT o.id::text, o.job_id::text, o.run_id::text, o.session_id::text,
+    `SELECT o.id::text, o.job_id::text, o.run_id::text, o.session_id::text, o.account_id::text,
             o.output_type, o.target_date::text, o.markdown, o.sha256, o.status, o.source,
             o.supersedes_output_id::text, o.strategy_change_seq::text, o.strategy_snapshot_hash,
             o.created_at,
@@ -331,6 +335,7 @@ export async function queueManualJob(
   code: string,
   requestedTargetDate?: string,
   now = new Date(),
+  requestedAccountId?: string,
 ): Promise<JobRunRow> {
   const targetDate = requestedTargetDate ?? shanghaiDate(now);
   const parsedDate = new Date(`${targetDate}T00:00:00Z`);
@@ -344,6 +349,16 @@ export async function queueManualJob(
   return inServiceTransaction(db, async (client) => {
     const def = await findJobByCode(client, code);
     if (!def) throw apiErrors.notFound(`未知作业 code：${code}`);
+    const accountId = def.execution_scope === "account" ? (requestedAccountId ?? "1") : undefined;
+    if (def.execution_scope === "account" && (!/^\d+$/.test(accountId!) || accountId === "0")) {
+      throw apiErrors.badRequest("账户级任务必须指定有效 account_id");
+    }
+    let accountName = "";
+    if (accountId) {
+      const account = await client.query<{name:string}>("SELECT id,name FROM portfolio_account WHERE id = $1 AND status = 'active' FOR UPDATE", [accountId]);
+      if (!account.rows[0]) throw apiErrors.badRequest(`账户不存在或已归档：${accountId}`);
+      accountName = account.rows[0].name;
+    }
     let config;
     try {
       config = validateJobConfig(def.job_type, def.config);
@@ -358,23 +373,24 @@ export async function queueManualJob(
       await validatePromptBinding(client, def.job_type, def.prompt_id);
     }
     const result = await client.query<JobRunRow>(
-      `INSERT INTO job_run (job_id, target_date, trigger_kind)
-       VALUES ($1, $2, 'manual')
+      `INSERT INTO job_run (job_id, account_id, target_date, trigger_kind)
+       VALUES ($1, $2, $3, 'manual')
        RETURNING id::text, job_id::text, prompt_revision_id::text,
-                 session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
+                 session_id::text, account_id::text, strategy_change_seq::text, strategy_snapshot_hash,
                  target_date::text, trigger_kind,
                  scheduled_for, status, attempt_count, next_retry_at, log, artifacts, data_gaps,
                  result_md, started_at, finished_at, created_at`,
-      [def.id, targetDate],
+      [def.id, accountId, targetDate],
     );
     const run = result.rows[0]!;
     if (def.job_type !== "agent_flow") return run;
     const session = await createSession(client, {
-      title: `${def.name} · ${targetDate}`,
+      title: `${accountName ? `${accountName} · ` : ""}${def.name} · ${targetDate}`,
       model_id: def.model_id,
       session_type: "job",
       session_status: "queued",
       source: "manual_job",
+      account_id: accountId ?? null,
     });
     await client.query("UPDATE job_run SET session_id = $2 WHERE id = $1", [run.id, session.id]);
     run.session_id = session.id;
@@ -390,8 +406,8 @@ export async function insertScheduledJobRun(
   status: "queued" | "missed",
 ): Promise<JobRunRow | null> {
   return inServiceTransaction(db, async (client) => {
-    const definition = await client.query<{ name: string; job_type: JobType; model_id: string | null; trading_day_only: boolean }>(
-      "SELECT name, job_type, model_id::text, trading_day_only FROM job_definition WHERE id = $1",
+    const definition = await client.query<{ name: string; job_type: JobType; model_id: string | null; trading_day_only: boolean; execution_scope: "global" | "account" }>(
+      "SELECT name, job_type, model_id::text, trading_day_only, execution_scope FROM job_definition WHERE id = $1",
       [jobId],
     );
     const def = definition.rows[0];
@@ -400,32 +416,41 @@ export async function insertScheduledJobRun(
     // 双休与法定节假日不入队（含 missed 追记）：避免休市日执行并覆盖上一开市日的信号。
     // 手动触发不经此门禁，保留假日补跑历史目标日的入口。
     if (def.trading_day_only && !(await isScheduledTradingDay(client, targetDate))) return null;
-    const result = await client.query<JobRunRow>(
+    const accountRows: Array<{id:string|null;name:string}> = def.execution_scope === "account"
+      ? (await client.query<{ id: string; name: string }>("SELECT id::text,name FROM portfolio_account WHERE status = 'active' AND ($1::text <> 'missed' OR id=1 OR created_at <= $2::timestamptz) ORDER BY id FOR UPDATE",[status,scheduledFor])).rows
+      : [{ id: null, name: "" }];
+    let created: JobRunRow | null = null;
+    for (const account of accountRows) {
+      const result = await client.query<JobRunRow>(
       `INSERT INTO job_run
-         (job_id, target_date, trigger_kind, scheduled_for, status, finished_at, log)
-       VALUES ($1, $2, 'cron', $3, $4,
-               CASE WHEN $4 = 'missed' THEN now() ELSE NULL END,
-               CASE WHEN $4 = 'missed' THEN '服务停机期间错过计划时刻；未自动补跑。' ELSE '' END)
-       ON CONFLICT (job_id, scheduled_for) WHERE scheduled_for IS NOT NULL DO NOTHING
+         (job_id, account_id, target_date, trigger_kind, scheduled_for, status, finished_at, log)
+       VALUES ($1, $2, $3, 'cron', $4, $5,
+               CASE WHEN $5 = 'missed' THEN now() ELSE NULL END,
+               CASE WHEN $5 = 'missed' THEN '服务停机期间错过计划时刻；未自动补跑。' ELSE '' END)
+       ON CONFLICT (job_id, COALESCE(account_id, 0), scheduled_for) WHERE scheduled_for IS NOT NULL DO NOTHING
        RETURNING id::text, job_id::text, prompt_revision_id::text,
-                 session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
+                 session_id::text, account_id::text, strategy_change_seq::text, strategy_snapshot_hash,
                  target_date::text, trigger_kind,
                  scheduled_for, status, attempt_count, next_retry_at, log, artifacts, data_gaps,
                  result_md, started_at, finished_at, created_at`,
-      [jobId, targetDate, scheduledFor.toISOString(), status],
-    );
-    const run = result.rows[0];
-    if (!run || status === "missed" || def.job_type !== "agent_flow") return run ?? null;
-    const session = await createSession(client, {
-      title: `${def.name} · ${targetDate}`,
-      model_id: def.model_id,
-      session_type: "job",
-      session_status: "queued",
-      source: "cron",
-    });
-    await client.query("UPDATE job_run SET session_id = $2 WHERE id = $1", [run.id, session.id]);
-    run.session_id = session.id;
-    return run;
+      [jobId, account.id, targetDate, scheduledFor.toISOString(), status],
+      );
+      const run = result.rows[0];
+      if (!run) continue;
+      created = run;
+      if (status === "missed" || def.job_type !== "agent_flow") continue;
+      const session = await createSession(client, {
+        title: `${account.name ? `${account.name} · ` : ""}${def.name} · ${targetDate}`,
+        model_id: def.model_id,
+        session_type: "job",
+        session_status: "queued",
+        source: "cron",
+        account_id: account.id,
+      });
+      await client.query("UPDATE job_run SET session_id = $2 WHERE id = $1", [run.id, session.id]);
+      run.session_id = session.id;
+    }
+    return created;
   });
 }
 

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
+import { portfolioAccounts } from "../stores/account";
 import { apiClient } from "../api/client";
 import type { NotificationPage, NotificationDelivery, NotificationSettings } from "../api/types";
 import { appMessage } from "../stores/message";
@@ -8,6 +9,7 @@ const page = ref<NotificationPage>({ items: [], next_cursor: null });
 const cursors = ref<Array<string | null>>([null]);
 const status = ref("");
 const job = ref("");
+const account = ref("");
 const jobs = ref<NotificationSettings["jobs"]>([]);
 const loading = ref(false);
 const error = ref("");
@@ -22,6 +24,7 @@ async function load() {
   const ticket = ++request;
   loading.value = true; error.value = "";
   const query = new URLSearchParams();
+  if (account.value) query.set("account_id", account.value);
   if (status.value) query.set("status", status.value);
   if (job.value) query.set("job_code", job.value);
   const before = cursors.value.at(-1);
@@ -68,6 +71,7 @@ onUnmounted(() => { disposed = true; request++; detailRequest++; if (timer) clea
     <div class="page-head"><h1>通知记录</h1><RouterLink to="/settings?section=notifications">← 消息推送设置</RouterLink></div>
     <p class="sub">每页 20 条，按需查看正文。“飞书已接收”不代表用户已读。</p>
     <div class="filters">
+      <label>账户 <select v-model="account" :disabled="loading" @change="reset"><option value="">全部账户与全局通知</option><option value="0">仅全局通知</option><option v-for="item in portfolioAccounts" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
       <label>任务 <select v-model="job" :disabled="loading" @change="reset"><option value="">全部任务及测试</option><option v-for="item in jobs" :key="item.code" :value="item.code">{{ item.name }}</option></select></label>
       <label>状态 <select v-model="status" :disabled="loading" @change="reset"><option value="">全部状态</option><option v-for="(label, key) in labels" :key="key" :value="key">{{ label }}</option></select></label>
       <button class="btn" :disabled="loading" @click="load">刷新</button>
@@ -77,7 +81,7 @@ onUnmounted(() => { disposed = true; request++; detailRequest++; if (timer) clea
       <p v-if="!page.items.length" class="empty">{{ loading ? '正在读取通知…' : '没有符合条件的通知' }}</p>
       <article v-for="item in page.items" :key="item.id" class="history-row">
         <div class="row-main">
-          <div><strong>{{ item.kind === 'test' ? '连接测试' : item.job_name || '任务结果' }}</strong><span class="meta">{{ channelLabels[item.channel] }}</span><span v-if="item.output_id" class="meta">结果 #{{ item.output_id }}</span><p class="meta">{{ time(item.created_at) }} · 本轮尝试 {{ item.attempts }} 次</p></div>
+          <div><strong>{{ item.kind === 'test' ? '连接测试' : item.job_name || '任务结果' }}</strong><span class="meta">{{ item.account_name ?? "全局" }}</span><span class="meta">{{ channelLabels[item.channel] }}</span><span v-if="item.output_id" class="meta">结果 #{{ item.output_id }}</span><p class="meta">{{ time(item.created_at) }} · 本轮尝试 {{ item.attempts }} 次</p></div>
           <span class="badge" :class="{ ok: item.status === 'sent', bad: item.status === 'failed' }">{{ labels[item.status] }}</span>
         </div>
         <p v-if="item.error" class="hint">{{ item.error }}</p>

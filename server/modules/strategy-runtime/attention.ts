@@ -51,11 +51,6 @@ export async function reconcileStrategyAttention(
     const kept = new Set<string>();
     const changes: StrategyAttentionChange[] = [];
     for (const signal of allowed) {
-      const held = await client.query("SELECT 1 FROM portfolio_position WHERE instrument_id=$1 AND quantity>0", [signal.instrument_id]);
-      if (held.rows[0]) {
-        changes.push({ code: signal.code, strategy_code: input.run.strategy_code, action: "skip", reason: "已有持仓" });
-        continue;
-      }
       await ensureStrategyPoolMemberProfile(client, {
         code: signal.code,
         effective_from: signal.valid_from,

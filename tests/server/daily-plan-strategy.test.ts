@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type pg from "pg";
+import { createAccount } from "../../server/modules/accounts/repo.js";
 import { runMigrations } from "../../server/db/migrate.js";
 import { queryDailyPlanStrategyContext } from "../../server/modules/strategy-runtime/daily-plan.js";
 import { limitUpOpportunityItems } from "../../server/modules/strategy-runtime/limit-up-opportunities.js";
@@ -344,4 +345,36 @@ describe.skipIf(!prepared)("每日计划策略统一编排", () => {
     await pool.query("DELETE FROM market_bar WHERE instrument_id=$1", [instrumentId]);
     await pool.query("DELETE FROM market_instrument WHERE id=$1", [instrumentId]);
   });
+  it("两账户共享市场事实但拥有不同退出评估与激活预案", async () => {
+    const accounts = await Promise.all([createAccount(pool,"计划账户甲"),createAccount(pool,"计划账户乙")]);
+    const instrument = (await pool.query<{id:string}>(`INSERT INTO market_instrument(code,name,kind)
+      VALUES('990999.SZ','跨账户样本','stock') RETURNING id::text`)).rows[0]!.id;
+    for (const [index,account] of accounts.entries()) {
+      await pool.query(`INSERT INTO portfolio_position(account_id,instrument_id,quantity,cost_price,opened_at,
+        strategy_code,strategy_runtime_version,fallback_strategy_code,exit_policy_mode)
+        VALUES($1,$2,100,$3,'2026-09-28','discretionary',1,'portfolio_fallback_exit','fallback_only')`,[account.id,instrument,10+index*10]);
+    }
+    const runs: string[] = [];
+    for (const account of accounts) {
+      runs.push((await pool.query<{id:string}>(`INSERT INTO job_run(job_id,account_id,target_date,trigger_kind,status)
+        SELECT id,$1,'2026-09-29','manual','running' FROM job_definition WHERE code='daily_plan_flow' RETURNING id::text`,[account.id])).rows[0]!.id);
+    }
+    const results = await Promise.all(accounts.map((account,index) => queryDailyPlanStrategyContext(pool,{
+      date:"2026-09-29",account_id:account.id,requested_by_job_run_id:runs[index]})));
+    expect(results[0]!.market).toEqual(results[1]!.market);
+    expect(results.map(result=>result.position_evaluations.map(item=>item.code))).toEqual([["990999.SZ"],["990999.SZ"]]);
+    expect(results[0]!.evaluations[0]!.run.id).not.toBe(results[1]!.evaluations[0]!.run.id);
+    expect((await pool.query("SELECT count(*)::int AS count FROM daily_plan_market_context WHERE target_date='2026-09-29'")).rows[0].count).toBe(1);
+    const outputIds: string[]=[];
+    for (const [index,account] of accounts.entries()) {
+      const output=(await pool.query<{id:string}>(`INSERT INTO job_run_output(job_id,run_id,account_id,output_type,target_date,markdown,sha256,source)
+        SELECT job_id,id,account_id,'daily_plan',target_date,'账户计划',repeat('a',64),'agent_flow' FROM job_run WHERE id=$1 RETURNING id::text`,[runs[index]])).rows[0]!.id;
+      outputIds.push(output);
+      await activatePlaybookForRun(pool,runs[index]!,output);
+      expect((await getLatestDailyPlanBoard(pool,account.id)).plan.output_id).toBe(output);
+    }
+    expect((await getLatestDailyPlanBoard(pool,accounts[0]!.id)).plan.output_id).toBe(outputIds[0]);
+    expect((await pool.query("SELECT count(*)::int AS count FROM daily_plan_playbook WHERE source_job_run_id=ANY($1::bigint[]) AND status='active'",[runs])).rows[0].count).toBe(2);
+  });
+
 });

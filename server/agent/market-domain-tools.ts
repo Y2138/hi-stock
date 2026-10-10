@@ -159,6 +159,7 @@ export function buildStrategyEvaluationTool(deps: {
   pool: pg.Pool;
   sessionId: string | null;
   jobCode?: string;
+  accountId?: string | null;
 }): AgentTool {
   return {
     name: "strategy_evaluation_query",
@@ -200,10 +201,12 @@ export function buildStrategyEvaluationTool(deps: {
         }
       }
       if (!strategyCode) throw new Error("strategy_evaluation_query 必须提供 strategy_code");
+      if (deps.accountId === null && input.phase !== "entry") throw new Error("全局研究不评估个人持仓，请进入账户页面");
       return audited(deps, "strategy_evaluation_query", { ...input, strategy_code: strategyCode }, async () => {
         const ensured = await ensureStrategyEvaluation(deps.pool, {
           strategy_code: strategyCode!, phase: input.phase, target_date: input.date,
           requested_by_job_run_id: requestedByJobRunId,
+          account_id: deps.accountId,
         });
         let opportunityWrite: { replaced: number } | null = null;
         if (deps.jobCode === "limit_up_close_scan" && input.phase === "entry"
@@ -228,11 +231,12 @@ export function buildDailyPlanStrategyTool(deps: {
   pool: pg.Pool;
   sessionId: string | null;
   jobCode?: string;
+  accountId?: string | null;
 }): AgentTool {
   return {
     name: "daily_plan_strategy_query",
     label: "查询每日计划策略统筹",
-    description: "按目标日自动发现入场、观察、组合叠加、持仓主策略和兜底策略，执行或复用结构化评估运行，按策略维护关注集合，并由服务端直接写入合并后的结构化预案；同时返回持仓动作、覆盖门禁、playbook_items 与 playbook_write。不得再调用 daily_plan_write 或逐工具手工拼装每日计划。",
+    description: "按目标日复用共享市场上下文，只评估绑定账户持仓的主策略与兜底策略，由服务端写入该账户的结构化预案；返回账户持仓动作、覆盖门禁、playbook_items 与 playbook_write。不得再调用 daily_plan_write 或逐工具手工拼装每日计划。",
     parameters: DailyPlanStrategySchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof DailyPlanStrategySchema>>(
@@ -248,14 +252,14 @@ export function buildDailyPlanStrategyTool(deps: {
         )).rows[0]?.id ?? null;
       }
       return audited(deps, "daily_plan_strategy_query", input, () => queryDailyPlanStrategyContext(deps.pool, {
-        date: input.date, requested_by_job_run_id: runId,
+        date: input.date, requested_by_job_run_id: runId, account_id: deps.accountId ?? undefined,
       }));
     },
   };
 }
 
 /** 旧每日计划兼容上下文：保留交互排障和结果对比，正式每日计划使用 daily_plan_strategy_query。 */
-export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: string | null; accountId?: string | null }): AgentTool {
   return {
     name: "daily_plan_context_query",
     label: "查询旧每日计划兼容上下文",
@@ -263,13 +267,14 @@ export function buildDailyPlanContextTool(deps: { pool: pg.Pool; sessionId: stri
     parameters: DailyPlanContextSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof DailyPlanContextSchema>>("daily_plan_context_query", DailyPlanContextSchema, raw);
-      return audited(deps, "daily_plan_context_query", input, () => queryDailyPlanContext(deps.pool, input.date));
+      if (deps.accountId === null) throw new Error("持仓上下文需要选择账户，请进入持仓页面");
+      return audited(deps, "daily_plan_context_query", input, () => queryDailyPlanContext(deps.pool, input.date, deps.accountId ?? "1"));
     },
   };
 }
 
 /** 波段四条件扫描兼容查询；正式运行由独立策略任务调用结构化评估。 */
-export function buildSwingSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+export function buildSwingSignalTool(deps: { pool: pg.Pool; sessionId: string | null; accountId?: string | null }): AgentTool {
   return {
     name: "swing_signal_query",
     label: "查询波段确定性信号",
@@ -278,7 +283,7 @@ export function buildSwingSignalTool(deps: { pool: pg.Pool; sessionId: string | 
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof SwingSignalSchema>>("swing_signal_query", SwingSignalSchema, raw);
       return audited(deps, "swing_signal_query", input, () => executeStrategyEvaluator("swing_entry_v1", {
-        pool: deps.pool, targetDate: input.date,
+        pool: deps.pool, targetDate: input.date, accountId: deps.accountId === undefined ? "1" : deps.accountId,
       }));
     },
   };
@@ -310,7 +315,7 @@ export function buildValueAnchorSignalTool(deps: { pool: pg.Pool; sessionId: str
   };
 }
 
-export function buildTwoYearReversalSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
+export function buildTwoYearReversalSignalTool(deps: { pool: pg.Pool; sessionId: string | null; accountId?: string | null }): AgentTool {
   return {
     name: "two_year_reversal_signal_query", label: "查询两年结构反转新开仓信号",
     description: "按目标日由服务端固定规则扫描881一级行业与所属股票，返回覆盖、正式新开仓信号、接近候选和缺口；只读，供人工决策。",
@@ -318,7 +323,7 @@ export function buildTwoYearReversalSignalTool(deps: { pool: pg.Pool; sessionId:
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof TwoYearReversalSignalSchema>>("two_year_reversal_signal_query", TwoYearReversalSignalSchema, raw);
       return audited(deps, "two_year_reversal_signal_query", input, () => executeStrategyEvaluator("two_year_reversal_entry_v1", {
-        pool: deps.pool, targetDate: input.date,
+        pool: deps.pool, targetDate: input.date, accountId: deps.accountId === undefined ? "1" : deps.accountId,
       }));
     },
   };

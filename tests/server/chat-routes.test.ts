@@ -16,6 +16,7 @@ import {
 import fs from "node:fs/promises";
 import path from "node:path";
 import type pg from "pg";
+import { archiveAccount, createAccount } from "../../server/modules/accounts/repo.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../server/db/migrate.js";
 import { setAiRuntimeForTests } from "../../server/agent/ai/runtime.js";
@@ -1325,4 +1326,63 @@ describe.skipIf(!prepared)("对话 HTTP/SSE 路由（stock_test 真实库 + faux
       await readLoop;
     }
   }, 20_000);
+  it("全局研究会话不绑定账户，账户会话保持独立列表", async () => {
+    const global=await api(server.baseUrl,"POST","/api/chat/sessions",{title:"全局研究验收",account_id:null});
+    expect(global.status).toBe(201);
+    expect(global.json.account_id).toBeNull();
+    const personal=await api(server.baseUrl,"POST","/api/chat/sessions",{title:"账户维护验收",account_id:"1"});
+    expect(personal.status).toBe(201);
+    expect(personal.json.account_id).toBe("1");
+    const listed=await api(server.baseUrl,"GET","/api/chat/sessions?account_id=0");
+    const rows=listed.json as unknown as Array<{id:string;account_id:string|null}>;
+    expect(rows.some(row=>row.id===global.json.id)).toBe(true);
+    expect(rows.some(row=>row.id===personal.json.id)).toBe(false);
+    const manualListed = await api(server.baseUrl,"GET","/api/chat/sessions?account_id=0&include_interactive=1");
+    expect((manualListed.json as unknown as Array<{id:string}>).some(row=>row.id===personal.json.id)).toBe(true);
+    const task = await createSession(pool,{ title:"账户任务", session_type:"job", account_id:"1" });
+    const withTasks = await api(server.baseUrl,"GET","/api/chat/sessions?account_id=0&include_interactive=1");
+    expect((withTasks.json as unknown as Array<{id:string}>).some(row=>row.id===task.id)).toBe(false);
+  });
+
+  it("普通会话可首次关联账户并清除旧摘要，消息保留且不能换绑", async () => {
+    const session = await createSession(pool, { title: "历史未关联会话", account_id: null });
+    await appendMessage(pool, { session_id: session.id, seq: 1, role: "user", json: { role: "user", content: "登记持仓", timestamp: Date.now() } });
+    await pool.query("UPDATE chat_session SET context_summary='旧全局摘要',context_summary_through_seq=1,context_summary_estimated_tokens=100,context_compacted_at=now() WHERE id=$1", [session.id]);
+    const messages = (await pool.query("SELECT * FROM chat_message WHERE session_id=$1", [session.id])).rows;
+    const bind = await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: "1" });
+    expect(bind.status).toBe(200);
+    expect(await getSession(pool, session.id)).toMatchObject({ account_id: "1", context_summary: null, context_summary_through_seq: 0, context_summary_estimated_tokens: 0 });
+    expect((await pool.query("SELECT * FROM chat_message WHERE session_id=$1", [session.id])).rows).toEqual(messages);
+    expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: "1" })).status).toBe(200);
+    const other = await createAccount(pool, "禁止换绑测试");
+    expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: other.id })).status).toBe(409);
+  });
+
+  it("关联账户拒绝任务、忙碌、归档及待确认会话和无效账户", async () => {
+    const cases = [
+      { session_type: "job" as const, account_id: null, expected: 403 },
+      { session_status: "running" as const, account_id: null, expected: 409 },
+      { session_status: "queued" as const, account_id: null, expected: 409 },
+      { session_status: "waiting_confirmation" as const, account_id: null, expected: 409 },
+    ];
+    for (const { expected, ...input } of cases) {
+      const session = await createSession(pool, input);
+      expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: "1" })).status).toBe(expected);
+      expect((await getSession(pool, session.id))?.account_id).toBeNull();
+    }
+    const session = await createSession(pool, { account_id: null });
+    await pool.query("UPDATE chat_session SET archived=true WHERE id=$1", [session.id]);
+    expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: "1" })).status).toBe(409);
+    await pool.query("UPDATE chat_session SET archived=false WHERE id=$1", [session.id]);
+    const pending = await createConfirmation(pool, { session_id: session.id, tool_name: "portfolio_write", payload: { reason: "待确认保护" } });
+    expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: "1" })).status).toBe(409);
+    await pool.query("UPDATE agent_confirmation SET status='rejected' WHERE id=$1", [pending.id]);
+    const archived = await createAccount(pool, "归档关联测试");
+    await archiveAccount(pool, archived.id);
+    expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: archived.id })).status).toBe(409);
+    expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: "999999999" })).status).toBe(404);
+    expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: null })).status).toBe(400);
+    expect((await api(server.baseUrl, "POST", `/api/chat/sessions/${session.id}/account`, { account_id: "1", title: "越界字段" })).status).toBe(400);
+  });
+
 });

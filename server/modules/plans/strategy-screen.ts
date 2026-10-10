@@ -185,7 +185,14 @@ function evaluateRule(
         reason: "缺少可信的股性护盘收回率（该标的未入池生成画像或画像未成功）；正式口径经 pool_onboard 入池后获得",
       };
     }
-    const evaluation = evaluateSwingSignal(windowed as SwingSignalBar[], kind, defenseRecovery.defense_recovery_ma10);
+    // 缩量或门与扫描任务同口径：MA250 偏离 ≤ -35% 的深度标的豁免缩量；日线不足 250 根时按严格缩量执行。
+    const closes = rows.map((row) => row.close);
+    const ma250 = closes.length >= 250
+      ? closes.slice(-250).reduce((sum, value) => sum + value, 0) / 250 : null;
+    const lastClose = closes.at(-1)!;
+    const ma250Deviation = ma250 !== null && ma250 > 0 ? lastClose / ma250 - 1 : null;
+    const evaluation = evaluateSwingSignal(
+      windowed as SwingSignalBar[], kind, defenseRecovery.defense_recovery_ma10, ma250Deviation);
     if (!evaluation) {
       return { rule, status: "gap", reason: "波段四条件缺少可信RSI14/OHLCV输入" };
     }
@@ -227,7 +234,8 @@ export async function queryStrategyScreen(
   }
 
   const indicatorFailures = await recomputeDirtyIndicators(pool, stockRows.map((row) => row.id), deps);
-  const window = Math.max(...rules.map((rule) => RULE_MIN_BARS[rule]));
+  // 波段规则的缩量或门需要 MA250（250 根 + 当日），其余规则按各自最小窗口取数。
+  const window = Math.max(...rules.map((rule) => RULE_MIN_BARS[rule]), rules.includes("swing") ? 260 : 0);
   const barsByCode = await loadBars({ query: pool.query.bind(pool) }, stockRows.map((row) => row.id), request.date, window);
   const defenseByInstrument = rules.includes("swing")
     ? await loadDefenseRecovery({ query: pool.query.bind(pool) }, stockRows.map((row) => row.id), request.date)

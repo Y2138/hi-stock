@@ -127,12 +127,6 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
             if (input.review_gaps.some((gap) => gap.code === item.code)) throw new Error(`${item.code} 缺数据时不能续期或判定失效`);
             if (item.action === "mark") {
               if (!input.data_date || item.attention_from !== date) throw new Error("更新关注必须提供目标日 data_date，attention_from 必须与任务日期一致");
-              const held = await client.query(`SELECT 1 FROM portfolio_position position JOIN market_instrument instrument
-                ON instrument.id=position.instrument_id WHERE instrument.code=$1 AND position.quantity>0`, [item.code]);
-              if (held.rows.length) {
-                items.push({ code: item.code, action: "skip", suppressed_by: "existing_position" });
-                continue;
-              }
               const membership = await client.query(`SELECT 1 FROM pool_membership membership JOIN market_instrument instrument
                 ON instrument.id=membership.instrument_id WHERE instrument.code=$1 AND membership.pool=$2 AND membership.effective_to IS NULL`, [item.code, WATCH_POOL]);
               if (!membership.rows.length) await ensureStrategyPoolMemberProfile(client, {

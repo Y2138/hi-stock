@@ -16,6 +16,10 @@ export const SWING_UNIVERSE_MAX_MEMBERS = 388;
 export const SWING_SUBINDUSTRY_REPRESENTATIVE_LIMIT = 10;
 /** RSI14 超卖硬阈值：2020-2026 事件研究显示越深越可靠（<25 档七年方向不变），<30 直接削减浅跌弱势信号。 */
 export const SWING_RSI_OVERSOLD_LIMIT = 30;
+/** 缩量硬阈值：事件研究显示缩量不足且深度不够的信号质量最差；深度标的按或门豁免。 */
+export const SWING_VOLUME_DRYNESS_LIMIT = 0.7;
+/** 深度豁免与深度评分共用的 MA250 偏离深阈值。 */
+export const SWING_DEEP_MA250_DEVIATION = -0.35;
 /** 正式信号与接近候选合并按深度评分排序后，每日保留的标的总数。 */
 export const SWING_DAILY_SIGNAL_LIMIT = 5;
 
@@ -156,11 +160,13 @@ function roundPrice(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
-/** 使用 T 日收盘价评估四条件；T+1 突破与价格上限作为执行窗口单独返回。 */
+/** 使用 T 日收盘价评估四条件；T+1 突破与价格上限作为执行窗口单独返回。
+ * ma250Deviation 供缩量或门豁免：深度标的（≤−35%）不满足缩量也算通过；缺数时按严格缩量执行。 */
 export function evaluateSwingSignal(
   rows: SwingSignalBar[],
   kind: string,
   defenseRecoveryMa10: number | null,
+  ma250Deviation?: number | null,
 ): SwingSignalEvaluation | null {
   if (rows.length < 40 || !["stock", "etf"].includes(kind)) return null;
   const current = rows.at(-1)!;
@@ -185,7 +191,8 @@ export function evaluateSwingSignal(
   const risk = current.close - initialStop;
   const expectedRewardRisk = risk > 0 ? (targetPrice - current.close) / risk : null;
   const conditions = {
-    volume_contracted: current.volume! < volumeMa5 * 0.85,
+    volume_contracted: current.volume! < volumeMa5 * SWING_VOLUME_DRYNESS_LIMIT
+      || (ma250Deviation != null && ma250Deviation <= SWING_DEEP_MA250_DEVIATION),
     reversal_candle: current.close > current.open || lowerShadowRatio > 0.005,
     rsi_oversold: current.rsi14! < SWING_RSI_OVERSOLD_LIMIT,
     reward_risk_acceptable: expectedRewardRisk !== null && expectedRewardRisk >= 1.8,
@@ -237,7 +244,9 @@ export interface SwingDepthFeatures {
  */
 export function swingDepthScore(features: SwingDepthFeatures): number {
   let score = 0;
-  if (features.ma250_dev != null) score += features.ma250_dev <= -0.35 ? 2 : features.ma250_dev <= -0.15 ? 1 : 0;
+  if (features.ma250_dev != null) {
+    score += features.ma250_dev <= SWING_DEEP_MA250_DEVIATION ? 2 : features.ma250_dev <= -0.15 ? 1 : 0;
+  }
   if (features.ret60 != null) score += features.ret60 <= -0.25 ? 2 : features.ret60 <= -0.12 ? 1 : 0;
   if (features.industry_mom20 != null && features.industry_mom20 < 0) score += 1;
   return score;
@@ -299,7 +308,7 @@ export function applySwingDailyDepthLimit<S extends SwingDailyPoolMember, N exte
   };
 }
 
-export async function querySwingSignals(db: Db, date: string) {
+export async function querySwingSignals(db: Db, date: string, accountId: string | null = "1") {
   const reviewCodes = await strategyAttentionCodes(db, "swing");
   const universe = await querySwingUniverse(db, date, reviewCodes);
   const universeCodes = universe.map((item) => item.code);
@@ -311,7 +320,7 @@ export async function querySwingSignals(db: Db, date: string) {
             COALESCE(position.quantity,0)::float8 AS quantity,
             metric.as_of_date::text AS metric_date,metric_run.status AS metric_status,metric.defense_recovery_ma10
        FROM market_instrument instrument
-       LEFT JOIN portfolio_position position ON position.instrument_id=instrument.id
+       LEFT JOIN portfolio_position position ON position.instrument_id=instrument.id AND position.account_id=$3
        LEFT JOIN LATERAL (
          SELECT current.* FROM market_stock_character_metric current
           WHERE current.instrument_id=instrument.id AND current.as_of_date <= $1::date
@@ -319,7 +328,7 @@ export async function querySwingSignals(db: Db, date: string) {
        ) metric ON true
        LEFT JOIN market_indicator_run metric_run ON metric_run.id=metric.indicator_run_id
       WHERE instrument.code=ANY($2::text[]) ORDER BY instrument.code`,
-    [date, universeCodes],
+    [date, universeCodes, accountId],
   );
   const latest = await db.query<{ data_date: string | null }>(
     `SELECT max(bar.bar_date)::text AS data_date FROM market_bar bar
@@ -345,9 +354,13 @@ export async function querySwingSignals(db: Db, date: string) {
     near_candidate_total_count: 0,
     daily_signal_limit: SWING_DAILY_SIGNAL_LIMIT,
     rsi_oversold_limit: SWING_RSI_OVERSOLD_LIMIT,
+    volume_dryness_limit: SWING_VOLUME_DRYNESS_LIMIT,
+    deep_ma250_deviation: SWING_DEEP_MA250_DEVIATION,
     qualified_total_count: 0,
     capped_out_count: 0,
     capped_out: [],
+    industry_headwind_count: 0,
+    industry_headwind: [],
     signals: [],
     near_candidates: [],
     suppressed_matches: [],
@@ -433,18 +446,19 @@ export async function querySwingSignals(db: Db, date: string) {
       excluded.push({ code: member.code, reason: "缺少数据日一致的可信护盘收回率" });
       continue;
     }
-    // 四条件只看最近 40 根；MA250 与 60 日跌幅用 260 根窗口计算。
-    const evaluation = evaluateSwingSignal(rows.slice(-40), member.kind, member.defense_recovery_ma10);
+    // 四条件只看最近 40 根；MA250 与 60 日跌幅用 260 根窗口计算，MA250 偏离同时供缩量或门豁免。
+    const closes = rows.map((row) => row.close);
+    const ma250 = closes.length >= 250 ? closes.slice(-250).reduce((sum, value) => sum + value, 0) / 250 : null;
+    const ma250Dev = ma250 !== null && ma250 > 0 ? rows.at(-1)!.close / ma250 - 1 : null;
+    const evaluation = evaluateSwingSignal(rows.slice(-40), member.kind, member.defense_recovery_ma10, ma250Dev);
     if (!evaluation) {
       excluded.push({ code: member.code, reason: "波段扫描缺少可信RSI14/OHLCV或止损输入" });
       continue;
     }
     const held = member.quantity > 0;
     const priceCapBlocked = evaluation.price_signal && !evaluation.evidence.confirmation_window_available;
-    const closes = rows.map((row) => row.close);
-    const ma250 = closes.length >= 250 ? closes.slice(-250).reduce((sum, value) => sum + value, 0) / 250 : null;
     const depth: SwingDepthFeatures = {
-      ma250_dev: ma250 !== null && ma250 > 0 ? evaluation.evidence.close / ma250 - 1 : null,
+      ma250_dev: ma250Dev,
       ret60: closes.length >= 61 ? evaluation.evidence.close / closes.at(-61)! - 1 : null,
       industry_mom20: industryMomentum.get(industryOf.get(member.code) ?? "") ?? null,
     };
@@ -462,10 +476,27 @@ export async function querySwingSignals(db: Db, date: string) {
       depth_score: swingDepthScore(depth),
     });
   }
-  const allSignals = items.filter((item) => item.signal);
+  // 行业逆风降级：行业 20 日动量非负的候选不进入正式/接近（RSI<30 池内胜率 32.4%、平均 R 为负），
+  // 仅列为行业逆风复核；行业动量缺数时不降级，与深度评分缺数口径一致。
+  const industryHeadwindOf = (item: (typeof items)[number]) =>
+    item.depth.industry_mom20 != null && item.depth.industry_mom20 >= 0;
+  const eligibleCandidate = (item: (typeof items)[number]) => item.signal
+    || (!item.held && !item.price_signal && item.passed_count === 3 && item.evidence.confirmation_window_available);
+  const industryHeadwind = items
+    .filter((item) => eligibleCandidate(item) && industryHeadwindOf(item))
+    .map((item) => ({
+      code: item.code,
+      name: item.name,
+      signal_status: item.signal ? ("qualified" as const) : ("approaching" as const),
+      industry_mom20: item.depth.industry_mom20,
+      depth_score: item.depth_score,
+      reason: "所属行业20日动量非负，降级为行业逆风复核，不占用每日信号名额",
+    }));
+  const headwindCodes = new Set(industryHeadwind.map((item) => item.code));
+  const allSignals = items.filter((item) => item.signal && !headwindCodes.has(item.code));
   const allNearCandidates = items.filter((item) =>
-    !item.held && !item.price_signal && item.passed_count === 3 && item.evidence.confirmation_window_available,
-  );
+    !item.held && !item.price_signal && item.passed_count === 3 && item.evidence.confirmation_window_available
+    && !headwindCodes.has(item.code));
   // 深度池：正式与接近合并按深度评分排序，每日只保留前 N；挤出者单列供关注对账保留。
   const { signals, nearCandidates, cappedOut } = applySwingDailyDepthLimit(allSignals, allNearCandidates);
   const suppressedMatches = items.filter((item) => item.price_signal && !item.signal);
@@ -487,9 +518,13 @@ export async function querySwingSignals(db: Db, date: string) {
     near_candidate_total_count: allNearCandidates.length,
     daily_signal_limit: SWING_DAILY_SIGNAL_LIMIT,
     rsi_oversold_limit: SWING_RSI_OVERSOLD_LIMIT,
+    volume_dryness_limit: SWING_VOLUME_DRYNESS_LIMIT,
+    deep_ma250_deviation: SWING_DEEP_MA250_DEVIATION,
     qualified_total_count: allSignals.length,
     capped_out_count: cappedOut.length,
     capped_out: cappedOut,
+    industry_headwind_count: industryHeadwind.length,
+    industry_headwind: industryHeadwind,
     signals,
     near_candidates: nearCandidates,
     suppressed_matches: suppressedMatches,

@@ -23,7 +23,7 @@ export async function queryTwoYearReversalCoverage(db: Db, date: string) {
 }
 
 /** 与正式扫描共享行业与成员筛选口径，供日更只补相关股票的未复权价。 */
-async function eligibleIndustryMembers(db: Db, asOf: string) {
+async function eligibleIndustryMembers(db: Db, asOf: string, accountId: string | null = "1") {
   const boardBars = await db.query<Bar>(
     `SELECT board.code,board.name AS board_name,history.bar_date::text AS date,history.close::float8,history.low::float8,history.volume::float8
        FROM market_board catalog JOIN market_instrument board ON board.id=catalog.instrument_id
@@ -55,12 +55,12 @@ async function eligibleIndustryMembers(db: Db, asOf: string) {
        FROM market_board_membership membership
        JOIN market_instrument industry ON industry.id=membership.board_instrument_id
        JOIN market_instrument stock ON stock.id=membership.member_instrument_id
-       LEFT JOIN portfolio_position position ON position.instrument_id=stock.id
+       LEFT JOIN portfolio_position position ON position.instrument_id=stock.id AND position.account_id=$3
        LEFT JOIN pool_membership membership_pool ON membership_pool.instrument_id=stock.id AND membership_pool.effective_to IS NULL
       WHERE industry.code=ANY($1::text[]) AND membership.effective_from <= $2::date
         AND (membership.effective_to IS NULL OR membership.effective_to > $2::date)
         AND stock.kind='stock' AND stock.lifecycle_status='active' AND stock.name !~* '^\\*?ST'
-      ORDER BY stock.id,industry.code`, [[...eligible.keys()], asOf],
+      ORDER BY stock.id,industry.code`, [[...eligible.keys()], asOf, accountId],
   );
   return { completeBoards, completeBoardCodes, eligible, members: members.rows };
 }
@@ -70,14 +70,14 @@ export async function queryTwoYearReversalRawTargetCodes(db: Db, date: string): 
   return selection.completeBoards >= 80 ? selection.members.map((member) => member.code) : [];
 }
 
-export async function queryTwoYearReversalSignals(db: Db, date: string) {
+export async function queryTwoYearReversalSignals(db: Db, date: string, accountId: string | null = "1") {
   const reviewCodes = await strategyAttentionCodes(db, "two_year_reversal");
   const selected = await queryTwoYearReversalCoverage(db, date);
   if (!selected) return { status: "unavailable" as const, date, qualified: [], near: [], gaps: ["近30个确认交易日无股票覆盖达近期峰值80%且881一级行业覆盖达80个的共同数据日"] };
   const asOf = selected.date;
   const gaps: string[] = [];
   if (asOf !== date) gaps.push(`目标日行情不完整，使用共同数据日 ${asOf}；滞后数据仅供观察，不形成目标日新开仓信号`);
-  const { completeBoards, completeBoardCodes, eligible, members } = await eligibleIndustryMembers(db, asOf);
+  const { completeBoards, completeBoardCodes, eligible, members } = await eligibleIndustryMembers(db, asOf, accountId);
   if (completeBoards < 80) return { status: "unavailable" as const, date, data_date: asOf, qualified: [], near: [],
     gaps: [...gaps, `881一级行业两年日线不足80个（${completeBoards}个）`] };
   // 旧信号所在行业已完成评估且不再满足行业条件，可以独立退出；行业缺数不能当作失效。

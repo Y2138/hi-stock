@@ -5,7 +5,8 @@ import { runMigrations } from "../../server/db/migrate.js";
 import { createPool } from "../../server/db/client.js";
 import { applyPoolChange, setPoolAttentionEntry, setPoolBoardOrder } from "../../server/modules/pools/repo.js";
 import { attentionSourceLabel, attentionStatusLabel, compareAttentionQuality } from "../../web/src/utils/poolAttention.js";
-import { recordPositionChange, updatePositionEntrySignalType } from "../../server/modules/positions/repo.js";
+import { createAccount, archiveAccount } from "../../server/modules/accounts/repo.js";
+import { getRealizedPnlSummary, listPositions, recordPositionChange, updatePositionEntrySignalType } from "../../server/modules/positions/repo.js";
 import { marketRoutes } from "../../server/modules/market/routes.js";
 import { api, prepareTestDb, resetSchema, seedTestStrategy, startTestServer, type TestServer } from "./helpers.js";
 
@@ -427,7 +428,7 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     expect(cleared.after).toBeNull();
   });
 
-  it("买入成交只消费对应策略关注并保留其他策略与人工关注", async () => {
+  it("账户买入保留共享策略关注与人工关注", async () => {
     await setPoolAttentionEntry(pool, {
       code: "600487.SH", source_job: "daily_plan_flow", status: "qualified",
       reason: "已符合：等待买入", valid_from: "2026-08-18", valid_until: "2026-08-19",
@@ -451,11 +452,41 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
          JOIN market_instrument instrument ON instrument.id = entry.instrument_id
         WHERE instrument.code = '600487.SH'`,
     )).rows.map((row) => row.source_job);
-    expect(entries.sort()).toEqual(["daily_plan_flow", "manual"]);
+    expect(entries.sort()).toEqual(["daily_plan_flow", "daily_plan_flow", "manual"]);
   });
 
   it("旧账户快照和资金摘要 API 已退役", async () => {
     expect((await api(server!.baseUrl, "GET", "/api/account/snapshots")).status).toBe(404);
     expect((await api(server!.baseUrl, "GET", "/api/account/summary")).status).toBe(404);
   });
+  it("命名账户的同标的成交、成本、收益和归档彼此隔离", async () => {
+    const first = await createAccount(pool, "隔离账户甲");
+    const second = await createAccount(pool, "隔离账户乙");
+    const buy = { code: "000021.SZ",kind: "buy" as const,quantity: 100,price: 10,change_date: "2026-09-28",
+      source: "ingest" as const,decision_origin: "planned_discretionary" as const,
+      execution_compliance: "matched" as const,strategy_code: "discretionary" };
+    await recordPositionChange(pool, { ...buy, account_id:first.id });
+    await recordPositionChange(pool, { ...buy, account_id:second.id, quantity:200, price:20 });
+    const overview = await api(server!.baseUrl,"GET","/api/accounts/overview");
+    expect(overview.status).toBe(200);
+    const portfolios=(overview.json as unknown as {accounts:Array<{account:{id:string};positions:Array<{quantity:number;cost_price:number}>;jobs:Array<{execution_scope:string}>}>;global_jobs:Array<{execution_scope:string}>}).accounts;
+    expect(portfolios.find(item=>item.account.id===first.id)?.positions).toMatchObject([{quantity:100,cost_price:10}]);
+    expect(portfolios.find(item=>item.account.id===second.id)?.positions).toMatchObject([{quantity:200,cost_price:20}]);
+    expect(portfolios.every(item=>item.jobs.every(job=>job.execution_scope==="account"))).toBe(true);
+    expect((overview.json as unknown as {global_jobs:Array<{execution_scope:string}>}).global_jobs.every(job=>job.execution_scope==="global")).toBe(true);
+    expect(await listPositions(pool,first.id)).toMatchObject([{quantity:100,cost_price:10,account_id:first.id}]);
+    expect(await listPositions(pool,second.id)).toMatchObject([{quantity:200,cost_price:20,account_id:second.id}]);
+    await expect(archiveAccount(pool,first.id)).rejects.toThrow("仍有持仓");
+    await expect(recordPositionChange(pool, {account_id:first.id,code:buy.code,kind:"sell",quantity:101,price:12,
+      change_date:"2026-09-29",source:"ingest",decision_origin:"planned_discretionary",execution_compliance:"matched"})).rejects.toThrow("超过");
+    await recordPositionChange(pool, {account_id:first.id,code:buy.code,kind:"sell",quantity:100,price:12,
+      change_date:"2026-09-29",source:"ingest",decision_origin:"planned_discretionary",execution_compliance:"matched"});
+    expect((await getRealizedPnlSummary(pool,first.id)).realized_pnl).toBe(200);
+    expect((await getRealizedPnlSummary(pool,second.id)).realized_pnl).toBe(0);
+    expect(await listPositions(pool,second.id)).toMatchObject([{quantity:200,cost_price:20}]);
+    expect((await api(server!.baseUrl,"GET",`/api/positions?account_id=${second.id}`)).json).toMatchObject([{quantity:200,cost_price:20}]);
+    expect((await archiveAccount(pool,first.id)).status).toBe("archived");
+    await expect(recordPositionChange(pool,{...buy,account_id:first.id})).rejects.toThrow("已归档");
+  });
+
 });

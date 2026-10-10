@@ -95,16 +95,16 @@ describe.skipIf(!prepared)("风控三件套每日判定（stock_test 真实库�
     const endDate = "2026-03-31";
     for (let index = 0; index < 3; index += 1) {
       await pool.query(
-        `INSERT INTO portfolio_position_change (instrument_id, change_date, kind, quantity, price, amount, reason, source, realized_pnl)
-         VALUES ((SELECT id FROM market_instrument WHERE code='881400.TI' LIMIT 1), $1::date, 'sell', 100, 9, 900, '止损', 'form', -120)`,
+        `INSERT INTO portfolio_position_change (account_id, instrument_id, change_date, kind, quantity, price, amount, reason, source, realized_pnl)
+         VALUES (1, (SELECT id FROM market_instrument WHERE code='881400.TI' LIMIT 1), $1::date, 'sell', 100, 9, 900, '止损', 'form', -120)`,
         [addDays(endDate, -index * 3)]);
     }
     // 净值快照：25 个交易日，前段 100000 后段跌破 94000（回撤 6%）
     for (let day = 24; day >= 0; day -= 1) {
       const equity = day >= 10 ? 100_000 : 94_000;
       await pool.query(
-        `INSERT INTO portfolio_equity_daily (snap_date, cash, market_value, equity) VALUES ($1::date, $2, $3, $4)
-         ON CONFLICT (snap_date) DO UPDATE SET equity = EXCLUDED.equity`,
+        `INSERT INTO portfolio_equity_daily (account_id, snap_date, cash, market_value, equity) VALUES (1, $1::date, $2, $3, $4)
+         ON CONFLICT (account_id, snap_date) DO UPDATE SET equity = EXCLUDED.equity`,
         [addDays(endDate, -day), equity, 0, equity]);
     }
     const gate = await queryRiskGate(pool, endDate);
@@ -124,8 +124,8 @@ describe.skipIf(!prepared)("风控三件套每日判定（stock_test 真实库�
       `INSERT INTO market_instrument (code, name, kind) VALUES ('600001.SH', '测试股', 'stock')
        ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name RETURNING id`);
     await pool.query(
-      `INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at) VALUES ($1, 1000, 10, '2026-01-05')
-       ON CONFLICT (instrument_id) DO UPDATE SET quantity = EXCLUDED.quantity`,
+      `INSERT INTO portfolio_position (account_id, instrument_id, quantity, cost_price, opened_at) VALUES (1, $1, 1000, 10, '2026-01-05')
+       ON CONFLICT (account_id, instrument_id) DO UPDATE SET quantity = EXCLUDED.quantity`,
       [stock.rows[0]!.id]);
     await pool.query(
       `INSERT INTO market_bar (instrument_id, bar_date, bar_time, open, high, low, close, freq, adjustment, channel, volume)

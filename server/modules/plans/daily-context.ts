@@ -2,10 +2,12 @@
 // 开仓信号只来自独立的波段扫描（swing_signal_query）；本文件的右侧/试盘扫描是评估性输出：
 // 右侧条件存活复核用于持有判断，试盘形态推进用于关注标的上涨概率评估。
 import type pg from "pg";
+import { inServiceTransaction, type TransactionDb } from "../../db/transaction.js";
+import { sha256Json } from "../../agent/hash.js";
 import { evaluateRightSideSignal, type RightSideSignalBar, type RightSideSignalEvaluation } from "./right-side-rule.js";
 export { evaluateRightSideSignal, type RightSideSignalBar, type RightSideSignalEvaluation } from "./right-side-rule.js";
 import { querySectorTemperature } from "../../analysis/service.js";
-import { queryRiskGate, recordDailyEquity } from "./risk-gate.js";
+import { queryRiskGate, recordDailyEquity, queryMarketRiskGate } from "./risk-gate.js";
 import { MARKET_STRUCTURE_DATASETS, type MarketStructureDataset } from "../market/structure.js";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
@@ -660,6 +662,7 @@ async function queryPositionContext(
   expectedDataDate: string | null,
   rightSideByCode: Map<string, RightSideSignalEvaluation>,
   strategyCode?: string,
+  accountId = "1",
 ) {
   const rows = await db.query<PositionContextRow>(
     `SELECT instrument.code, instrument.name, instrument.kind,
@@ -735,7 +738,7 @@ async function queryPositionContext(
        LEFT JOIN LATERAL (
          SELECT change.change_date
            FROM portfolio_position_change change
-          WHERE change.instrument_id = position.instrument_id AND change.kind = 'buy'
+          WHERE change.account_id = position.account_id AND change.instrument_id = position.instrument_id AND change.kind = 'buy'
             AND position.opened_at IS NOT NULL
             AND change.change_date >= position.opened_at
           ORDER BY change.change_date DESC, change.id DESC LIMIT 1
@@ -764,9 +767,9 @@ async function queryPositionContext(
             AND position.opened_at IS NOT NULL
             AND bar.bar_date BETWEEN position.opened_at AND $1::date
        ) holding ON true
-      WHERE position.quantity > 0
+      WHERE position.account_id = $2 AND position.quantity > 0
       ORDER BY instrument.code`,
-    [date],
+    [date, accountId],
   );
   const selectedRows = rows.rows.filter((row) => !strategyCode || (strategyCode === "portfolio_fallback_exit"
     ? row.fallback_strategy_code === strategyCode && ["fallback_only", "dedicated_plus_fallback"].includes(row.exit_policy_mode ?? "")
@@ -969,7 +972,7 @@ async function queryPositionContext(
   };
 }
 
-export async function queryPositionCompatibilityContext(db: Db, date: string, strategyCode?: string) {
+export async function queryPositionCompatibilityContext(db: Db, date: string, strategyCode?: string, accountId = "1") {
   const latest = await db.query<{ data_date: string | null }>(
     `SELECT max(bar.bar_date)::text AS data_date FROM market_bar bar
       JOIN market_instrument instrument ON instrument.id=bar.instrument_id
@@ -986,6 +989,7 @@ export async function queryPositionCompatibilityContext(db: Db, date: string, st
     dataDate,
     new Map(rightSide.items.map((item) => [item.code, item])),
     strategyCode,
+    accountId,
   );
   return { requested_date: date, data_date: dataDate, right_side: rightSide, positions };
 }
@@ -1042,14 +1046,42 @@ async function queryPositionBoards(
   return { items, gaps };
 }
 
-export async function queryDailyPlanContext(db: Db, date: string) {
+async function computeSharedMarketContext(db: Db, date: string) {
   const sector = await querySectorTemperature(db, { analysis_type: "sector_temperature", as_of: date });
   const dataDate = sector.input.latest_date;
   const [structure, trial, rightSide] = await Promise.all([
-    queryStructureSync(db, date),
-    scanTrialSignals(db, date, dataDate),
-    scanRightSideSignals(db, date, dataDate),
+    queryStructureSync(db, date), scanTrialSignals(db, date, dataDate), scanRightSideSignals(db, date, dataDate),
   ]);
+  return { sector, dataDate, structure, trial, rightSide, marketRisk: await queryMarketRiskGate(db,date) };
+}
+
+/** 全局市场层：数据库锁保证多个账户同时请求只计算一次，行情或关注输入变化时重算。 */
+export async function querySharedDailyPlanMarketContext(db: Db, date: string) {
+  return inServiceTransaction(db as TransactionDb, async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('daily-plan-market-context'), hashtext($1))", [date]);
+    const facts = await client.query(`SELECT
+      (SELECT jsonb_build_array(count(*),max(fetched_at)) FROM market_bar WHERE bar_date<=$1::date) AS bars,
+      (SELECT jsonb_build_array(count(*),max(computed_at)) FROM market_indicator_value WHERE bar_date<=$1::date) AS indicators,
+      (SELECT jsonb_build_array(count(*),max(computed_at)) FROM market_stock_character_metric WHERE as_of_date<=$1::date) AS profiles,
+      (SELECT max(finished_at) FROM market_special_sync_run WHERE target_date<=$1::date) AS structure,
+      (SELECT jsonb_agg(to_jsonb(m) ORDER BY m.id) FROM pool_membership m WHERE effective_to IS NULL) AS members,
+      (SELECT jsonb_agg(DISTINCT instrument_id) FROM portfolio_position WHERE quantity>0) AS held_codes,
+      (SELECT jsonb_agg(to_jsonb(b) ORDER BY b.instrument_id) FROM market_board b) AS boards` , [date]);
+    const fingerprint = sha256Json({ version: 2, date, facts: facts.rows[0] });
+    const cached = await client.query<{ result: Awaited<ReturnType<typeof computeSharedMarketContext>> }>(
+      "SELECT result FROM daily_plan_market_context WHERE target_date=$1 AND input_sha256=$2", [date, fingerprint]);
+    if (cached.rows[0]) return cached.rows[0].result;
+    const result = await computeSharedMarketContext(client, date);
+    await client.query(`INSERT INTO daily_plan_market_context(target_date,input_sha256,result)
+      VALUES($1,$2,$3::jsonb) ON CONFLICT(target_date) DO UPDATE
+      SET input_sha256=EXCLUDED.input_sha256,result=EXCLUDED.result,updated_at=now()`, [date,fingerprint,JSON.stringify(result)]);
+    return result;
+  });
+}
+
+/** 账户层：复用共享市场事实，只计算本账户持仓、所属板块与风险门禁。 */
+export async function queryDailyPlanContext(db: Db, date: string, accountId = "1") {
+  const { sector, dataDate, structure, trial, rightSide, marketRisk } = await querySharedDailyPlanMarketContext(db, date);
   // 试盘是评估性输出：stage/price_signal 描述形态推进程度，用于关注标的上涨概率评估，不产生开仓信号。
   const finalizedTrialItems = trial.items.map((item) => ({
     ...item,
@@ -1060,6 +1092,7 @@ export async function queryDailyPlanContext(db: Db, date: string) {
     date,
     dataDate,
     new Map(rightSide.items.map((item) => [item.code, item])),
+    undefined, accountId,
   );
   const positionBoards = await queryPositionBoards(
     db,
@@ -1168,8 +1201,8 @@ export async function queryDailyPlanContext(db: Db, date: string) {
     ? (sector.input.available_codes > 0 ? "partial" : "unavailable")
     : "success";
   // 风控三件套（采纳层）：生成当日计划时物化净值快照并输出开仓闸门判定。
-  await recordDailyEquity(db, date).catch(() => false);
-  const riskGate = await queryRiskGate(db, date);
+  await recordDailyEquity(db, date, accountId).catch(() => false);
+  const riskGate = await queryRiskGate(db, date, accountId, marketRisk);
   const gaps = [
     ...sector.gaps.map((gap) => ({ scope: "market", detail: gap })),
     ...structure.datasets.filter((item) => item.status !== "success").map((item) => ({

@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from "vue";
+import { portfolioAccounts } from "../../stores/account";
 import ChatView from "../../views/ChatView.vue";
 import type { UiRefreshRequest } from "../../api/types";
 import type { AskAiRequest } from "../../utils/askAi";
 
-const props = defineProps<{ open: boolean; request?: AskAiRequest | null }>();
+const props = defineProps<{ open: boolean; request?: AskAiRequest | null; accountId: string | null }>();
+const conversationLabel = ref("");
+const selectedAccount = computed(() => portfolioAccounts.value.find(account => account.id === props.accountId));
 const emit = defineEmits<{
   open: [];
   close: [];
@@ -98,7 +101,7 @@ onBeforeUnmount(stopResize);
         <div class="workspace-title">
           <span>✦</span>
           <strong>Agent</strong>
-          <small>与当前业务页面并排</small>
+          <small :title="conversationLabel || selectedAccount?.name">{{ conversationLabel || selectedAccount?.name || "自由对话" }}</small>
         </div>
         <button class="workspace-collapse" type="button" aria-label="收起 Agent 工作区" title="收起 Agent 工作区" @click="emit('close')">›</button>
       </header>
@@ -106,8 +109,10 @@ onBeforeUnmount(stopResize);
         <ChatView
           embedded
           :request="request"
+          :account-id="accountId"
           @request-close="emit('close')"
           @request-consumed="(id) => emit('request-consumed', id)"
+          @context-label="(label) => conversationLabel = label"
           @ui-refresh="(request) => emit('ui-refresh', request)"
         />
       </div>

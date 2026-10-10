@@ -53,7 +53,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
   if (!res.ok) {
     const env = payload as ErrorEnvelope | null;
-    return reportFailure({
+    const failure: ApiFail = {
       ok: false,
       code: env?.error?.code ?? "HTTP_" + res.status,
       message: env?.error?.message ?? `请求失败（HTTP ${res.status}）`,
@@ -61,7 +61,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       details: env?.error
         ? Object.fromEntries(Object.entries(env.error).filter(([key]) => !["code", "message"].includes(key)))
         : undefined,
-    });
+    };
+    // 空账户尚无计划或竞价结果是正常空状态，由页面展示，不弹请求失败提示。
+    if (res.status === 404 && /^\/api\/(plans\/latest|auction\/latest)(?:$|\?)/.test(path)) return failure;
+    return reportFailure(failure);
   }
   return { ok: true, data: payload as T };
 }

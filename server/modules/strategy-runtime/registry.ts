@@ -11,6 +11,7 @@ import type { StrategyEvaluationPhase } from "./types.js";
 export interface StrategyEvaluatorContext {
   pool: pg.Pool;
   targetDate: string;
+  accountId?: string | null;
   strategyDocumentId?: string | null;
 }
 
@@ -41,21 +42,21 @@ const pending = (code: string, phase: StrategyEvaluationPhase): StrategyEvaluato
  * 入场、出场和组合评估均通过稳定编码复用领域服务；尚未接入的能力显式标记 pending。
  */
 const DEFINITIONS: readonly StrategyEvaluatorDefinition[] = [
-  ready("swing_entry_v1", "entry", ({ pool, targetDate }) => querySwingSignals(pool, targetDate), 2),
-  ready("two_year_reversal_entry_v1", "entry", ({ pool, targetDate }) => queryTwoYearReversalSignals(pool, targetDate), 2),
+  ready("swing_entry_v1", "entry", ({ pool, targetDate, accountId }) => querySwingSignals(pool, targetDate, accountId ?? null), 2),
+  ready("two_year_reversal_entry_v1", "entry", ({ pool, targetDate, accountId }) => queryTwoYearReversalSignals(pool, targetDate, accountId ?? null), 2),
   ready("limit_up_observation_v1", "entry", ({ pool, targetDate, strategyDocumentId }) =>
     queryLimitUpSignals(pool, targetDate, strategyDocumentId), 2),
   ready("first_board_advance_entry_v1", "entry", ({ pool, targetDate }) => queryIntradayLimitLadder(pool, targetDate), 2),
   ready("value_anchor_entry_v1", "entry", ({ pool, targetDate }) => queryValueAnchorSignals(pool, targetDate), 3),
-  ready("copper_left_launch_entry_v1", "entry", ({ pool, targetDate }) => queryCopperLeftLaunchEntry(pool, targetDate), 2),
-  ready("copper_left_launch_exit_v1", "exit", ({ pool, targetDate }) => queryCopperLeftLaunchExit(pool, targetDate)),
+  ready("copper_left_launch_entry_v1", "entry", ({ pool, targetDate, accountId }) => queryCopperLeftLaunchEntry(pool, targetDate, accountId ?? null), 2),
+  ready("copper_left_launch_exit_v1", "exit", ({ pool, targetDate, accountId }) => queryCopperLeftLaunchExit(pool, targetDate, accountId ?? undefined)),
   pending("nightly_sector_attention_v1", "entry"),
   pending("manual_entry_v1", "entry"),
-  ready("swing_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "swing" }), 2),
-  ready("two_year_reversal_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "two_year_reversal" })),
-  ready("legacy_right_side_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "legacy_right_side" }), 2),
-  ready("legacy_left_reversal_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "legacy_left_reversal" }), 2),
-  ready("fallback_exit_v1", "exit", ({ pool, targetDate }) => evaluateStrategyExit({ pool, targetDate, strategyCode: "portfolio_fallback_exit" }), 2),
+  ready("swing_exit_v1", "exit", ({ pool, targetDate, accountId }) => evaluateStrategyExit({ pool, targetDate, accountId: accountId ?? undefined, strategyCode: "swing" }), 2),
+  ready("two_year_reversal_exit_v1", "exit", ({ pool, targetDate, accountId }) => evaluateStrategyExit({ pool, targetDate, accountId: accountId ?? undefined, strategyCode: "two_year_reversal" })),
+  ready("legacy_right_side_exit_v1", "exit", ({ pool, targetDate, accountId }) => evaluateStrategyExit({ pool, targetDate, accountId: accountId ?? undefined, strategyCode: "legacy_right_side" }), 2),
+  ready("legacy_left_reversal_exit_v1", "exit", ({ pool, targetDate, accountId }) => evaluateStrategyExit({ pool, targetDate, accountId: accountId ?? undefined, strategyCode: "legacy_left_reversal" }), 2),
+  ready("fallback_exit_v1", "exit", ({ pool, targetDate, accountId }) => evaluateStrategyExit({ pool, targetDate, accountId: accountId ?? undefined, strategyCode: "portfolio_fallback_exit" }), 2),
 ];
 
 const REGISTRY = new Map(DEFINITIONS.map((definition) => [definition.code, definition]));

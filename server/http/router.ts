@@ -8,7 +8,7 @@ import pg from "pg";
 import { marketRoutes } from "../modules/market/routes.js";
 import { positionRoutes } from "../modules/positions/routes.js";
 import { plansRoutes } from "../modules/plans/routes.js";
-import { clearPoolAttention, listPoolResearch, listPoolView } from "../modules/pools/repo.js";
+import { clearPoolAttention, listPoolResearch, listPoolView, setPoolSpecialAttention } from "../modules/pools/repo.js";
 import { volumeRoutes } from "../volume/routes.js";
 import { chatRoutes } from "../agent/routes.js";
 import { llmConfigRoutes } from "../agent/ai/routes.js";
@@ -25,6 +25,8 @@ import { notificationRoutes } from "../modules/notifications/routes.js";
 import { getLatestMarketNews } from "../modules/market-news/repo.js";
 import { systemSettingsRoutes } from "../system-settings-routes.js";
 import { intradayRiskRoutes } from "../modules/intraday-risk/routes.js";
+import { getAccountOverview } from "../modules/accounts/overview.js";
+import { accountRoutes } from "../modules/accounts/routes.js";
 
 /** 统一 API 错误：携带 HTTP 状态码与稳定错误码 */
 export class ApiError extends Error {
@@ -254,6 +256,12 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
       await pool.query("SELECT 1");
       return { data: { status: "ok" } };
     }),
+    route("GET", "/api/accounts", accountRoutes.list),
+    route("POST", "/api/accounts", accountRoutes.create),
+    route("GET", "/api/accounts/overview", async ({ pool }) => ({ data: await getAccountOverview(pool) })),
+    route("GET", "/api/accounts/:id", accountRoutes.get),
+    route("PATCH", "/api/accounts/:id", accountRoutes.update),
+    route("POST", "/api/accounts/:id/archive", accountRoutes.archive),
     // 系统调度作业；一期 task_* 表仅作迁移历史，不再暴露写入口。
     route("GET", "/api/jobs", jobRoutes.list),
     route("PATCH", "/api/jobs/:code/control", jobRoutes.control),
@@ -315,6 +323,13 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
       // 返回被移除的条目快照；移除后该来源已不存在。
       return { data: { code, removed: result.before } };
     }),
+    route("POST", "/api/pools/:code/special", async ({ params, body }) => {
+      const code = params.code?.trim().toUpperCase() ?? "";
+      if (!/^[A-Z0-9._-]{1,32}$/u.test(code)) throw apiErrors.badRequest("标的代码无效");
+      const special = (body as { special?: unknown } | null)?.special;
+      if (typeof special !== "boolean") throw apiErrors.badRequest("special 必须是布尔值");
+      return { data: await setPoolSpecialAttention(pool, { code, special }) };
+    }),
     // 二期 M1 收尾：数据卷 HTTP 路由（技术设计 v2.0 §九，只追加；恢复的前端二次确认在 web 侧）
     route("GET", "/api/volume/snapshots", volumeRoutes.listSnapshots),
     route("GET", "/api/volume/portable", volumeRoutes.listPortable),
@@ -347,6 +362,7 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/chat/sessions", chatRoutes.listSessions),
     route("POST", "/api/chat/sessions", chatRoutes.createSession),
     route("PATCH", "/api/chat/sessions/:id", chatRoutes.updateSession),
+    route("POST", "/api/chat/sessions/:id/account", chatRoutes.bindAccount),
     route("GET", "/api/chat/sessions/:id/messages", chatRoutes.listMessages),
     route("GET", "/api/chat/sessions/:id/attachments", chatRoutes.listAttachments),
     route("POST", "/api/chat/:sessionId/messages", chatRoutes.postMessage),

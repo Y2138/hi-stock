@@ -4,7 +4,7 @@ import { apiErrors } from "../http/router.js";
 import { generateValueMonthlyRank } from "../modules/value-ranking/service.js";
 
 export const ANALYSIS_SERVICE_VERSION = "analysis-v3";
-export const ANALYSIS_TYPES = ["sector_temperature", "key_levels", "long_valuation", "value_monthly_rank"] as const;
+export const ANALYSIS_TYPES = ["sector_temperature", "key_levels", "long_valuation", "value_monthly_rank", "sector_trend_structure"] as const;
 export type AnalysisType = (typeof ANALYSIS_TYPES)[number];
 type Db = Pick<pg.Pool, "query">;
 
@@ -285,6 +285,472 @@ export async function querySectorTemperature(db: Db, request: AnalysisRequest): 
   };
 }
 
+/** 夜间板块左侧趋势结构：板块信号（主线 60 日中期脱离 + 补充线 13 日急跌反转）与补涨候选口径冻结自
+ *  docs/回测结论/夜间板块左侧趋势结构研究结论.md（含窗口矩阵章节）与 夜间板块内个股选择原则与验证.md；阈值变更必须先有新的冻结回测证据。 */
+const SECTOR_TREND_RULES = {
+  mediumWindow: 60,
+  mediumSlopeThreshold: -0.08,
+  shortWindow: 10,
+  /** 补充触发线（急跌反转）：13 日斜率背景 + 5 日斜率确认，口径冻结自窗口研究结论。 */
+  supplementaryWindow: 13,
+  supplementarySlopeThreshold: -0.08,
+  supplementaryShortWindow: 5,
+  /** 第三触发线（新低回升，纯 Donchian 口径）：近 13 日触及 60 日最低收盘×1.001 且收盘创近 10 日最高收盘；
+   *  不附加止跌形态与量比条件（消融证明冗余），口径冻结自 Donchian 补充研究结论。 */
+  donchianTouchWindow: 13,
+  donchianLowBase: 60,
+  donchianBreakoutWindow: 10,
+  donchianTolerance: 1.001,
+  mildVolumeMax: 1.5,
+  bottomingLookback: 15,
+  priorLowWindow: 20,
+  secondBottomTolerance: 0.97,
+  secondBottomMinGap: 5,
+  secondBottomMaxGap: 20,
+  contractionRatioMax: 0.85,
+  observationDays: 20,
+  minStockBars: 121,
+  minTurnover20Yuan: 20_000_000,
+} as const;
+
+export type SectorBottomingPattern = "阳包阴" | "双日止跌" | "金针探底";
+
+interface TrendBarRow {
+  bar_date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+function trendBarRows(bars: Bar[]): TrendBarRow[] | null {
+  const rows: TrendBarRow[] = [];
+  for (const bar of bars) {
+    const open = number(bar.open);
+    const high = number(bar.high);
+    const low = number(bar.low);
+    const close = number(bar.close);
+    const volume = number(bar.volume);
+    if (open === null || high === null || low === null || close === null || close <= 0) return null;
+    rows.push({ bar_date: bar.bar_date, open, high, low, close, volume: volume ?? 0 });
+  }
+  return rows;
+}
+
+function olsFit(values: number[]): { slope: number; intercept: number } {
+  const n = values.length;
+  const xMean = (n - 1) / 2;
+  const yMean = mean(values)!;
+  let covariance = 0;
+  let variance = 0;
+  for (let x = 0; x < n; x += 1) {
+    covariance += (x - xMean) * (values[x]! - yMean);
+    variance += (x - xMean) ** 2;
+  }
+  const slope = variance > 0 ? covariance / variance : 0;
+  return { slope, intercept: yMean - slope * xMean };
+}
+
+/** 归一化斜率：窗口内拟合总幅度（小数），与 scripts/lib/sector-trend-rules.ts 同式。 */
+function normalizedSlope(values: number[]): number | null {
+  if (values.length < 5) return null;
+  const average = mean(values);
+  if (average === null || average <= 0) return null;
+  return (olsFit(values).slope * (values.length - 1)) / average;
+}
+
+/** 回归趋势线在最后一个点的取值。 */
+function trendLineAtLast(values: number[]): number | null {
+  if (values.length < 5) return null;
+  const { slope, intercept } = olsFit(values);
+  return intercept + slope * (values.length - 1);
+}
+
+/** 二元 OLS：y = a + b·x（个股日收益对行业日收益回归）。 */
+function olsBetaIntercept(x: number[], y: number[]): { slope: number; intercept: number } {
+  const xMean = mean(x)!;
+  const yMean = mean(y)!;
+  let covariance = 0;
+  let variance = 0;
+  for (let i = 0; i < x.length; i += 1) {
+    covariance += (x[i]! - xMean) * (y[i]! - yMean);
+    variance += (x[i]! - xMean) ** 2;
+  }
+  const slope = variance > 0 ? covariance / variance : 0;
+  return { slope, intercept: yMean - slope * xMean };
+}
+
+/** 止跌K线形态（板块版）：阈值镜像研究冻结口径；优先级 阳包阴 > 双日止跌 > 金针探底。 */
+function boardBottomingPattern(rows: TrendBarRow[], index: number): SectorBottomingPattern | null {
+  if (index < 5) return null;
+  const current = rows[index]!;
+  const previous = rows[index - 1]!;
+  const priorFiveDayLow = Math.min(...rows.slice(index - 5, index).map((row) => row.low));
+  const priorNearFiveDayLow = previous.low <= priorFiveDayLow * 1.005;
+  const bullishEngulfing = previous.close < previous.open && current.close > current.open &&
+    current.open <= previous.close && current.close >= previous.open;
+  const intradayRange = current.high - current.low;
+  const closePosition = intradayRange > 0 ? (current.close - current.low) / intradayRange : 0;
+  const lowerShadow = Math.min(current.open, current.close) - current.low;
+  const body = Math.abs(current.close - current.open);
+  const goldenNeedle = lowerShadow >= 0.01 * current.close && lowerShadow >= body * 1.5 &&
+    closePosition >= 0.65 && priorNearFiveDayLow;
+  const twoDayReversal = priorNearFiveDayLow && current.close > current.open && current.close > previous.high;
+  if (bullishEngulfing) return "阳包阴";
+  if (twoDayReversal) return "双日止跌";
+  if (goldenNeedle) return "金针探底";
+  return null;
+}
+
+interface BoardTrendSnapshot {
+  asOf: string;
+  close: number;
+  normSlope60: number | null;
+  normSlope10: number | null;
+  normSlope13: number | null;
+  ma20: number | null;
+  volumeRatio5: number | null;
+  signal: boolean;
+  /** 触发线标签；同日多线成立按 中期脱离 > 新低回升 > 急跌反转 取最高优先级。 */
+  trigger: "中期脱离" | "新低回升" | "急跌反转" | null;
+  pattern: SectorBottomingPattern | null;
+  patternTier: 1 | 2 | null;
+  volumeClass: "缩量" | "温和放量" | "明显放量" | "爆量" | null;
+  priorLow: number | null;
+  signalHigh: number;
+  secondBottom: boolean;
+  contracting: boolean;
+}
+
+/** 在最后一根K线上计算板块趋势快照；信号 = 三触发线之一（中期脱离/新低回升/急跌反转）。 */
+function boardTrendSnapshot(rows: TrendBarRow[]): BoardTrendSnapshot | null {
+  const index = rows.length - 1;
+  if (index < SECTOR_TREND_RULES.mediumWindow) return null;
+  const current = rows[index]!;
+  const previous = rows[index - 1]!;
+  const closes = rows.map((row) => row.close);
+  const volumes = rows.map((row) => row.volume);
+  const normSlope60 = normalizedSlope(closes.slice(-SECTOR_TREND_RULES.mediumWindow));
+  const normSlope10 = normalizedSlope(closes.slice(-SECTOR_TREND_RULES.shortWindow));
+  const normSlope13 = normalizedSlope(closes.slice(-SECTOR_TREND_RULES.supplementaryWindow));
+  const ma20 = mean(closes.slice(-20));
+  const vma5 = mean(volumes.slice(-5));
+  const volumeRatio5 = vma5 !== null && vma5 > 0 ? current.volume / vma5 : null;
+  const volumeClass = volumeRatio5 === null ? null
+    : volumeRatio5 < 1 ? "缩量"
+      : volumeRatio5 < SECTOR_TREND_RULES.mildVolumeMax ? "温和放量"
+        : volumeRatio5 < 2.5 ? "明显放量" : "爆量";
+  // 主线：脱离 60 日中期下降趋势（上穿回归趋势线 + 10 日斜率转正）。
+  const mediumDowntrend = normSlope60 !== null && normSlope60 <= SECTOR_TREND_RULES.mediumSlopeThreshold;
+  const trendLineNow = trendLineAtLast(closes.slice(-SECTOR_TREND_RULES.mediumWindow));
+  const trendLinePrev = trendLineAtLast(closes.slice(-SECTOR_TREND_RULES.mediumWindow - 1, -1));
+  const escapeMain = mediumDowntrend && trendLineNow !== null && trendLinePrev !== null &&
+    previous.close <= trendLinePrev && current.close > trendLineNow &&
+    normSlope10 !== null && normSlope10 > 0;
+  // 补充线：急跌反转（13 日斜率 ≤-8% 背景下上穿 13 日回归趋势线 + 5 日斜率转正）。
+  const sharpDowntrend = normSlope13 !== null && normSlope13 <= SECTOR_TREND_RULES.supplementarySlopeThreshold;
+  const shortLineNow = trendLineAtLast(closes.slice(-SECTOR_TREND_RULES.supplementaryWindow));
+  const shortLinePrev = trendLineAtLast(closes.slice(-SECTOR_TREND_RULES.supplementaryWindow - 1, -1));
+  const normSlope5 = normalizedSlope(closes.slice(-SECTOR_TREND_RULES.supplementaryShortWindow));
+  const escapeSupplementary = sharpDowntrend && shortLineNow !== null && shortLinePrev !== null &&
+    previous.close <= shortLinePrev && current.close > shortLineNow &&
+    normSlope5 !== null && normSlope5 > 0;
+  // 第三线（新低回升）：近 13 日触及 60 日最低收盘 且 当日收盘创近 10 日最高收盘；不附加形态与量比。
+  const lowBase = Math.min(...closes.slice(-SECTOR_TREND_RULES.donchianLowBase));
+  const touchedLow = rows.slice(index - SECTOR_TREND_RULES.donchianTouchWindow + 1, index + 1)
+    .some((row) => row.close <= lowBase * SECTOR_TREND_RULES.donchianTolerance);
+  const priorHighClose = Math.max(...closes.slice(-SECTOR_TREND_RULES.donchianBreakoutWindow - 1, -1));
+  const donchianEscape = touchedLow && current.close > priorHighClose;
+  let pattern: SectorBottomingPattern | null = null;
+  for (let offset = SECTOR_TREND_RULES.bottomingLookback - 1; offset >= 0; offset -= 1) {
+    const found = boardBottomingPattern(rows, index - offset);
+    if (found) {
+      pattern = found;
+      break;
+    }
+  }
+  let secondBottom = false;
+  for (let first = index - SECTOR_TREND_RULES.secondBottomMinGap;
+    first >= index - SECTOR_TREND_RULES.secondBottomMaxGap; first -= 1) {
+    if (first < 5) break;
+    if (!boardBottomingPattern(rows, first)) continue;
+    const anchorLow = Math.min(...rows.slice(first - 4, first + 1).map((row) => row.low));
+    const pullbackLow = Math.min(...rows.slice(first + 1, index + 1).map((row) => row.low));
+    if (pullbackLow >= anchorLow * SECTOR_TREND_RULES.secondBottomTolerance) {
+      secondBottom = true;
+      break;
+    }
+  }
+  const high10 = Math.max(...rows.slice(index - 9, index + 1).map((row) => row.high));
+  const high20 = Math.max(...rows.slice(index - 19, index + 1).map((row) => row.high));
+  const low20 = Math.min(...rows.slice(index - 19, index + 1).map((row) => row.low));
+  const high20Prev = Math.max(...rows.slice(index - 19, index - 9).map((row) => row.high));
+  const low20Prev = Math.min(...rows.slice(index - 19, index - 9).map((row) => row.low));
+  const low10 = Math.min(...rows.slice(index - 9, index + 1).map((row) => row.low));
+  const range20 = high20 > 0 && low20 > 0 ? high20 / low20 - 1 : null;
+  const high40 = Math.max(...rows.slice(index - 39, index + 1).map((row) => row.high));
+  const low40 = Math.min(...rows.slice(index - 39, index + 1).map((row) => row.low));
+  const range40 = high40 > 0 && low40 > 0 ? high40 / low40 - 1 : null;
+  const ma10 = mean(closes.slice(-10));
+  const contracting = range20 !== null && range40 !== null && range40 > 0 &&
+    range20 / range40 <= SECTOR_TREND_RULES.contractionRatioMax &&
+    high10 < high20Prev && low10 > low20Prev && ma10 !== null && current.close > ma10;
+  const volumeAcceptable = volumeClass === "缩量" || volumeClass === "温和放量";
+  const signalMain = escapeMain && pattern !== null && volumeAcceptable;
+  const signalSupplementary = escapeSupplementary && pattern !== null && volumeAcceptable;
+  const signal = signalMain || signalSupplementary || donchianEscape;
+  return {
+    asOf: current.bar_date,
+    close: current.close,
+    normSlope60,
+    normSlope10,
+    normSlope13,
+    ma20,
+    volumeRatio5,
+    signal,
+    trigger: !signal ? null : signalMain ? "中期脱离" : donchianEscape ? "新低回升" : "急跌反转",
+    pattern,
+    patternTier: pattern === null ? null : pattern === "金针探底" ? 2 : 1,
+    volumeClass,
+    priorLow: Math.min(...rows.slice(index - SECTOR_TREND_RULES.priorLowWindow + 1, index + 1).map((row) => row.low)),
+    signalHigh: current.high,
+    secondBottom,
+    contracting,
+  };
+}
+
+export interface SectorTrendStockCandidate {
+  code: string;
+  name: string;
+  branch: "跌幅补涨" | "止跌修复确认";
+  close: number;
+  ret20: number;
+  ret5: number;
+  turnover20: number;
+  residual5: number | null;
+}
+
+interface CatchUpOutcome {
+  branchA: SectorTrendStockCandidate[];
+  branchB: SectorTrendStockCandidate[];
+  eligibleCount: number;
+  skipped: Array<{ reason: string; count: number }>;
+}
+
+/** 板块内补涨候选：分支A按20日涨跌幅最低，分支B为止跌修复确认后按5日行业残差最高。 */
+async function catchUpCandidates(
+  db: Db,
+  boardCode: string,
+  boardRows: TrendBarRow[],
+  signalDate: string,
+): Promise<CatchUpOutcome | null> {
+  const members = await db.query<{ code: string; name: string }>(
+    `SELECT DISTINCT mi.code, mi.name
+       FROM market_board_membership m
+       JOIN market_instrument bi ON bi.id = m.board_instrument_id
+       JOIN market_instrument mi ON mi.id = m.member_instrument_id
+      WHERE bi.code = $1 AND m.effective_from <= $2::date
+        AND (m.effective_to IS NULL OR m.effective_to > $2::date)
+        AND mi.kind = 'stock' AND (mi.code LIKE '60%' OR mi.code LIKE '00%')`,
+    [boardCode, signalDate],
+  );
+  if (!members.rows.length) return null;
+  const stockBars = grouped(await selectBars(db, members.rows.map((row) => row.code), "day", signalDate, 130));
+  const boardCloses = boardRows.map((row) => row.close);
+  const boardLogReturns: number[] = [];
+  for (let i = boardCloses.length - 60; i < boardCloses.length; i += 1) {
+    if (i < 1) return null;
+    boardLogReturns.push(Math.log(boardCloses[i]! / boardCloses[i - 1]!));
+  }
+  const boardLog5 = boardLogReturns.slice(-5).reduce((sum, value) => sum + value, 0);
+  const skipped = new Map<string, number>();
+  const bump = (reason: string) => skipped.set(reason, (skipped.get(reason) ?? 0) + 1);
+  const eligible: Array<SectorTrendStockCandidate & { residual5: number | null; branchBReady: boolean }> = [];
+  for (const member of members.rows) {
+    const rows = trendBarRows(stockBars.get(member.code) ?? []);
+    if (!rows || rows.length < SECTOR_TREND_RULES.minStockBars) {
+      bump("日线不足 121 根");
+      continue;
+    }
+    const last = rows.at(-1)!;
+    if (last.bar_date !== signalDate) {
+      bump("行情不新鲜");
+      continue;
+    }
+    const closes = rows.map((row) => row.close);
+    const volumes = rows.map((row) => row.volume);
+    const recent20Volumes = volumes.slice(-20);
+    if (recent20Volumes.some((value) => !(value > 0))) {
+      bump("近20日成交量为空");
+      continue;
+    }
+    const turnover20 = mean(closes.slice(-20).map((close, i) => close * recent20Volumes[i]!));
+    if (turnover20 === null || turnover20 < SECTOR_TREND_RULES.minTurnover20Yuan) {
+      bump("20日均成交额不足 2000 万元");
+      continue;
+    }
+    const index = rows.length - 1;
+    const ret20 = closes[index]! / closes[index - 20]! - 1;
+    const ret5 = closes[index]! / closes[index - 5]! - 1;
+    const ma10 = mean(closes.slice(-10))!;
+    const ma20 = mean(closes.slice(-20))!;
+    let residual5: number | null = null;
+    const stockLogReturns: number[] = [];
+    for (let i = closes.length - 60; i < closes.length; i += 1) {
+      if (i < 1 || closes[i - 1]! <= 0) {
+        stockLogReturns.length = 0;
+        break;
+      }
+      stockLogReturns.push(Math.log(closes[i]! / closes[i - 1]!));
+    }
+    if (stockLogReturns.length === 60 && boardLogReturns.length === 60) {
+      const stockLog5 = stockLogReturns.slice(-5).reduce((sum, value) => sum + value, 0);
+      // 60日日频回归 s = a + b·B；5日残差 = 个股5日累积对数收益 − (a×5 + b×行业5日累积对数收益)
+      const { slope, intercept } = olsBetaIntercept(boardLogReturns, stockLogReturns);
+      residual5 = stockLog5 - (intercept * 5 + slope * boardLog5);
+    }
+    const branchBReady = ret20 < 0 && ret5 > 0 && last.close > ma10 && last.close / ma20 - 1 <= 0.10;
+    eligible.push({
+      code: member.code, name: member.name, branch: "跌幅补涨", close: last.close,
+      ret20, ret5, turnover20, residual5, branchBReady,
+    });
+  }
+  const branchA = [...eligible].sort((a, b) => a.ret20 - b.ret20)
+    .slice(0, 2).map(({ branchBReady: _ready, ...candidate }) => candidate);
+  const branchB = eligible.filter((candidate) => candidate.branchBReady)
+    .sort((a, b) => (b.residual5 ?? -Infinity) - (a.residual5 ?? -Infinity))
+    .slice(0, 2).map((candidate) => ({ ...candidate, branch: "止跌修复确认" as const }))
+    .map(({ branchBReady: _ready, ...candidate }) => candidate);
+  return { branchA, branchB, eligibleCount: eligible.length, skipped: [...skipped.entries()].map(([reason, count]) => ({ reason, count })) };
+}
+
+export interface SectorTrendStructureOutcome {
+  result: {
+    as_of: string | null;
+    market_regime: MarketRegimeResult;
+    boards: Array<{
+      sector: string; code: string; as_of: string; close: number;
+      norm_slope_60: number | null; norm_slope_10: number | null; norm_slope_13: number | null;
+      ma20: number | null; volume_ratio_5: number | null;
+    }>;
+    signals: Array<{
+      sector: string; code: string; as_of: string; close: number;
+      pattern: SectorBottomingPattern | null; pattern_tier: 1 | 2 | null;
+      trigger: "中期脱离" | "新低回升" | "急跌反转";
+      volume_ratio_5: number | null;
+      volume_class: "缩量" | "温和放量" | "明显放量" | "爆量";
+      norm_slope_60: number | null; norm_slope_10: number | null; norm_slope_13: number | null;
+      prior_low: number; signal_high: number; valid_through: string | null;
+      second_bottom: boolean; contracting: boolean;
+      catch_up: {
+        branch_a: SectorTrendStockCandidate[];
+        branch_b: SectorTrendStockCandidate[];
+        eligible_count: number;
+        skipped: Array<{ reason: string; count: number }>;
+      } | null;
+    }>;
+    skipped: Array<{ code: string; reason: string }>;
+  };
+  gaps: unknown[];
+  input: { requested_codes: number; available_codes: number; signal_count: number; latest_date: string | null };
+}
+
+export async function querySectorTrendStructure(db: Db, request: AnalysisRequest): Promise<SectorTrendStructureOutcome> {
+  const boards = await industryBoards(db);
+  const defaultUniverse = !request.codes?.length;
+  const namesByCode = new Map(boards);
+  const codes = defaultUniverse ? [...boards.keys()] : request.codes!.filter((code) => namesByCode.has(code));
+  const bars = grouped(await selectBars(db, codes, "day", request.as_of, 140));
+  const skipped: Array<{ code: string; reason: string }> = [];
+  const boardItems: SectorTrendStructureOutcome["result"]["boards"] = [];
+  const signalSnapshots: Array<{ code: string; snapshot: BoardTrendSnapshot; rows: TrendBarRow[] }> = [];
+  for (const code of codes) {
+    const rows = trendBarRows(bars.get(code) ?? []);
+    const snapshot = rows ? boardTrendSnapshot(rows) : null;
+    if (!rows || !snapshot) {
+      skipped.push({ code, reason: `日线不足 ${SECTOR_TREND_RULES.mediumWindow + 1} 根（${rows?.length ?? 0}）` });
+      continue;
+    }
+    boardItems.push({
+      sector: namesByCode.get(code) ?? code, code, as_of: snapshot.asOf, close: snapshot.close,
+      norm_slope_60: round2(snapshot.normSlope60), norm_slope_10: round2(snapshot.normSlope10),
+      norm_slope_13: round2(snapshot.normSlope13),
+      ma20: snapshot.ma20 === null ? null : Number(snapshot.ma20.toFixed(2)),
+      volume_ratio_5: snapshot.volumeRatio5 === null ? null : Number(snapshot.volumeRatio5.toFixed(2)),
+    });
+    if (snapshot.signal && snapshot.priorLow !== null) {
+      signalSnapshots.push({ code, snapshot, rows });
+    }
+  }
+  const latestDate = boardItems.map((item) => item.as_of).sort().at(-1) ?? null;
+  const regime = defaultUniverse
+    ? marketRegime(codes, bars)
+    : unavailableMarketRegime(codes.length, "市场状态只使用完整的 881 一级行业全集计算");
+  const gaps: unknown[] = [];
+  if (defaultUniverse && regime.status !== "success") {
+    gaps.push({ scope: "market_regime", reason: regime.reason });
+  }
+  if (skipped.length > Math.ceil(codes.length * 0.1)) {
+    gaps.push({ scope: "board_coverage", reason: `一级行业日线缺口超过一成（${skipped.length}/${codes.length}）` });
+  }
+  let validThrough: string | null = null;
+  if (signalSnapshots.length && latestDate) {
+    const calendar = await db.query<{ date: string }>(
+      `SELECT trade_date::text AS date FROM market_trading_day
+        WHERE is_open AND trade_date > $1::date ORDER BY trade_date
+        LIMIT 1 OFFSET $2::int`,
+      [latestDate, SECTOR_TREND_RULES.observationDays - 1],
+    );
+    validThrough = calendar.rows[0]?.date ?? null;
+    if (!validThrough) gaps.push({ scope: "calendar", reason: "交易日历不足 20 个开市日，无法确定观察截止日" });
+  }
+  const signals: SectorTrendStructureOutcome["result"]["signals"] = [];
+  for (const { code, snapshot, rows } of signalSnapshots) {
+    // 补涨候选的成员剔除计数保留在板块结果内供任务报告，不计入 run 级缺口。
+    const catchUp = await catchUpCandidates(db, code, rows, snapshot.asOf);
+    signals.push({
+      sector: namesByCode.get(code) ?? code, code, as_of: snapshot.asOf, close: snapshot.close,
+      pattern: snapshot.pattern, pattern_tier: snapshot.patternTier,
+      trigger: snapshot.trigger!,
+      volume_ratio_5: snapshot.volumeRatio5 === null ? null : Number(snapshot.volumeRatio5.toFixed(2)),
+      volume_class: snapshot.volumeClass!,
+      norm_slope_60: round2(snapshot.normSlope60), norm_slope_10: round2(snapshot.normSlope10),
+      norm_slope_13: round2(snapshot.normSlope13),
+      prior_low: Number(snapshot.priorLow!.toFixed(2)),
+      signal_high: Number(snapshot.signalHigh.toFixed(2)),
+      valid_through: validThrough,
+      second_bottom: snapshot.secondBottom,
+      contracting: snapshot.contracting,
+      catch_up: catchUp === null ? null : {
+        branch_a: catchUp.branchA, branch_b: catchUp.branchB,
+        eligible_count: catchUp.eligibleCount, skipped: catchUp.skipped,
+      },
+    });
+  }
+  return {
+    result: {
+      as_of: latestDate,
+      market_regime: regime,
+      boards: boardItems,
+      signals,
+      skipped,
+    },
+    gaps,
+    input: {
+      requested_codes: codes.length,
+      available_codes: boardItems.length,
+      signal_count: signals.length,
+      latest_date: latestDate,
+    },
+  };
+}
+
+function round2(value: number | null): number | null {
+  return value === null ? null : Number(value.toFixed(4));
+}
+
+
 function atr14(rows: Bar[]): number | null {
   const ranges: number[] = [];
   for (let index = 1; index < rows.length; index += 1) {
@@ -430,6 +896,7 @@ export async function executeAnalysis(db: Db, raw: AnalysisRequest): Promise<Ana
   try {
     let outcome;
     if (request.analysis_type === "sector_temperature") outcome = await querySectorTemperature(db, request);
+    else if (request.analysis_type === "sector_trend_structure") outcome = await querySectorTrendStructure(db, request);
     else if (request.analysis_type === "key_levels") outcome = await keyLevels(db, request);
     else if (request.analysis_type === "long_valuation") outcome = await longValuation(db, request);
     else {

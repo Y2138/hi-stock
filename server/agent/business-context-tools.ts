@@ -13,6 +13,7 @@ import { findJobPrompt, listJobPrompts } from "../modules/job-prompts/repo.js";
 import { listJobDefinitions, listJobOutputs, listJobRuns } from "../scheduler/repo.js";
 import { queryAuctionAssessmentContext, queryHistoricalPlanItems } from "../modules/plans/repo.js";
 import { sha256Json } from "./hash.js";
+import { marketNewsTargets, shanghaiDate } from "../modules/market-news/repo.js";
 import { insertToolAudit } from "./repo.js";
 import {
   JobContextQuerySchema,
@@ -102,7 +103,7 @@ function summarizeRun(run: Awaited<ReturnType<typeof listJobRuns>>[number]) {
   };
 }
 
-export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool[] {
+export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: string | null; accountId?: string | null; jobCode?: string }): AgentTool[] {
   return [
     {
       name: "portfolio_context_query",
@@ -112,17 +113,16 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       parameters: PortfolioContextQuerySchema,
       execute: async (_id, raw) => audited<PortfolioContextQueryInput>(
         deps, "portfolio_context_query", raw, validatePortfolioContextQueryInput, async (input) => {
+          if (deps.accountId === null) throw new Error("会话未关联持仓账户，请先在会话中关联账户；这不代表账户没有持仓");
+          const codes=input.codes?.length ? (await deps.pool.query<{code:string}>(`SELECT code FROM market_instrument
+            WHERE code=ANY($1::text[]) OR (kind IN ('stock','etf') AND split_part(code,'.',1)=ANY($1::text[]))`,[input.codes])).rows.map(row=>row.code) : undefined;
           const [allPositions, realized_pnl, recent_changes, matching_limit_up_signals] = await Promise.all([
-            listPositions(deps.pool),
-            getRealizedPnlSummary(deps.pool),
-            listPositionChanges(deps.pool, input.recent_change_limit ?? 20, input.codes),
-            input.codes?.length
-              ? listPassedLimitUpSignals(deps.pool, input.codes, input.change_date)
-              : Promise.resolve([]),
+            listPositions(deps.pool, deps.accountId),
+            getRealizedPnlSummary(deps.pool, deps.accountId),
+            input.codes?.length && !codes?.length ? Promise.resolve([]) : listPositionChanges(deps.pool, input.recent_change_limit ?? 20, codes, deps.accountId),
+            codes?.length ? listPassedLimitUpSignals(deps.pool, codes, input.change_date, deps.accountId) : Promise.resolve([]),
           ]);
-          const positions = input.codes?.length
-            ? allPositions.filter((position) => input.codes!.includes(position.code))
-            : allPositions;
+          const positions = input.codes?.length ? allPositions.filter(position => codes?.includes(position.code)) : allPositions;
           return {
             summary: {
               position_count: positions.length,
@@ -175,6 +175,8 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
             attention_count: members.filter((member) => member.attention_entries.length > 0).length,
             detail_level: input.codes?.length ? "full" : "summary",
             members: memberRows,
+            ...(deps.jobCode === "pre_market_news_scan"
+              ? { news_targets: await marketNewsTargets(deps.pool, asOf ?? shanghaiDate()) } : {}),
             ...(input.include_boards ? { boards: view.boards } : {}),
           };
         },
@@ -189,7 +191,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       execute: async (_id, raw) => audited<JobContextQueryInput>(
         deps, "job_context_query", raw, validateJobContextQueryInput, async (input) => {
           const [allJobs, allPrompts] = await Promise.all([
-            listJobDefinitions(deps.pool),
+            listJobDefinitions(deps.pool, deps.accountId === null ? "0" : deps.accountId ?? "1"),
             listJobPrompts(deps.pool),
           ]);
           const jobs = input.job_codes?.length
@@ -197,8 +199,8 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
             : allJobs;
           const jobRows = await Promise.all(jobs.map(async (job) => {
             const [runs, outputs] = await Promise.all([
-              listJobRuns(deps.pool, job.id, input.recent_runs_per_job ?? 3, input.target_date),
-              listJobOutputs(deps.pool, job.id, input.recent_runs_per_job ?? 3, input.target_date),
+              listJobRuns(deps.pool, job.id, input.recent_runs_per_job ?? 3, input.target_date, deps.accountId === null ? "0" : deps.accountId ?? "1"),
+              listJobOutputs(deps.pool, job.id, input.recent_runs_per_job ?? 3, input.target_date, deps.accountId === null ? "0" : deps.accountId ?? "1"),
             ]);
             return {
               definition: job,
@@ -253,7 +255,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       parameters: AuctionContextQuerySchema,
       execute: async (_id, raw) => audited<AuctionContextQueryInput>(
         deps, "auction_context_query", raw, validateAuctionContextQueryInput,
-        (input) => queryAuctionAssessmentContext(deps.pool, input.date),
+        (input) => queryAuctionAssessmentContext(deps.pool, input.date, deps.accountId ?? "1"),
       ),
     },
     {

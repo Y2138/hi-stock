@@ -384,8 +384,8 @@ const NewsItemSchema = strictObject({
 });
 export const PoolNewsWriteSchema = strictObject({
   target_date: DateSchema,
-  checked_codes: Type.Array(CodeSchema, { maxItems: 2000, description: "本次已实际完成检索的池内标的；遗漏标的显示未覆盖，不能当成无消息。" }),
-  gaps: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 100 }),
+  checked_codes: Type.Array(CodeSchema, { maxItems: 2000, description: "本次已实际完成检索的当前关注池与跨账户持仓标的；检索无新消息也算完成，遗漏不能当成无消息。" }),
+  gaps: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 100, description: "只记录实际未覆盖、检索失败或影响结论的证据缺失。无新消息、剔除旧闻、正常时效说明放正文，不作为缺口；无缺口传空数组。" }),
   market_bias: Type.Union(["positive", "neutral", "negative", "mixed", "unknown"].map((value) => Type.Literal(value))),
   summary: Type.String({ minLength: 1, maxLength: 2000 }),
   items: Type.Array(NewsItemSchema, { maxItems: 100 }),
@@ -676,6 +676,7 @@ const AnalysisTypeSchema = Type.Union([
   Type.Literal("key_levels"),
   Type.Literal("long_valuation"),
   Type.Literal("value_monthly_rank"),
+  Type.Literal("sector_trend_structure"),
 ]);
 export const AnalysisRunSchema = strictObject({
   requests: Type.Array(strictObject({

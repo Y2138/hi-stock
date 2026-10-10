@@ -9,6 +9,7 @@ export interface StrategyExitEvaluationContext {
   pool: pg.Pool;
   targetDate: string;
   strategyCode: string;
+  accountId?: string;
 }
 
 export interface StrategyExitEvaluationResult {
@@ -153,7 +154,7 @@ function atr14(rows: RawBar[]): number | null {
   return mean(ranges);
 }
 
-async function twoYearEvaluations(pool: pg.Pool, targetDate: string): Promise<{
+async function twoYearEvaluations(pool: pg.Pool, targetDate: string, accountId = "1"): Promise<{
   items: StrategyPositionEvaluation[];
   gaps: Array<{ code: string; reason: string }>;
 }> {
@@ -170,7 +171,7 @@ async function twoYearEvaluations(pool: pg.Pool, targetDate: string): Promise<{
           AND board_instrument.code LIKE '881%.TI'
         ORDER BY membership.effective_from DESC LIMIT 1
        ) board ON true
-      WHERE position.quantity>0 AND position.strategy_code='two_year_reversal' ORDER BY instrument.code`, [targetDate]);
+      WHERE position.account_id=$2 AND $1::date IS NOT NULL AND position.quantity>0 AND position.strategy_code='two_year_reversal' ORDER BY instrument.code`, [targetDate, accountId]);
   if (!positions.rows.length) return { items: [], gaps: [] };
   const bars = await pool.query<RawBar>(
     `WITH ranked AS (
@@ -181,8 +182,8 @@ async function twoYearEvaluations(pool: pg.Pool, targetDate: string): Promise<{
               row_number() OVER(PARTITION BY instrument.code ORDER BY bar.bar_date DESC,bar.bar_time DESC) AS row_no
          FROM portfolio_position position JOIN market_instrument instrument ON instrument.id=position.instrument_id
          JOIN market_bar bar ON bar.instrument_id=position.instrument_id AND bar.freq='day' AND bar.bar_date <= $1::date
-        WHERE position.quantity>0 AND position.strategy_code='two_year_reversal')
-     SELECT code,bar_date,high,low,close FROM ranked WHERE row_no<=80 ORDER BY code,bar_date`, [targetDate]);
+        WHERE position.account_id=$2 AND $1::date IS NOT NULL AND position.quantity>0 AND position.strategy_code='two_year_reversal')
+     SELECT code,bar_date,high,low,close FROM ranked WHERE row_no<=80 ORDER BY code,bar_date`, [targetDate, accountId]);
   const byCode = new Map<string, RawBar[]>();
   for (const bar of bars.rows) byCode.set(bar.code, [...(byCode.get(bar.code) ?? []), bar]);
   const boardCodes = [...new Set(positions.rows.map((row) => row.board_code).filter((code): code is string => code !== null))];
@@ -199,10 +200,10 @@ async function twoYearEvaluations(pool: pg.Pool, targetDate: string): Promise<{
   const sellCounts = await pool.query<{ code: string; sell_count: number }>(
     `SELECT instrument.code,count(change.id)::int AS sell_count FROM portfolio_position position
        JOIN market_instrument instrument ON instrument.id=position.instrument_id
-       LEFT JOIN portfolio_position_change change ON change.instrument_id=position.instrument_id
+       LEFT JOIN portfolio_position_change change ON change.account_id=position.account_id AND change.instrument_id=position.instrument_id
         AND change.kind='sell' AND position.opened_at IS NOT NULL AND change.change_date>=position.opened_at
-      WHERE position.quantity>0 AND position.strategy_code='two_year_reversal'
-      GROUP BY instrument.code`);
+      WHERE position.account_id=$2 AND $1::date IS NOT NULL AND position.quantity>0 AND position.strategy_code='two_year_reversal'
+      GROUP BY instrument.code`, [targetDate, accountId]);
   const sold = new Map(sellCounts.rows.map((row) => [row.code, Number(row.sell_count)]));
   const items: StrategyPositionEvaluation[] = [];
   const gaps: Array<{ code: string; reason: string }> = [];
@@ -289,20 +290,20 @@ export function mergeExitEvaluations(
   };
 }
 
-async function compatibility(pool: pg.Pool, targetDate: string, strategyCode?: string): Promise<CompatibilityContext> {
-  return queryPositionCompatibilityContext(pool, targetDate, strategyCode);
+async function compatibility(pool: pg.Pool, targetDate: string, strategyCode?: string, accountId = "1"): Promise<CompatibilityContext> {
+  return queryPositionCompatibilityContext(pool, targetDate, strategyCode, accountId);
 }
 
 export async function evaluateStrategyExit(context: StrategyExitEvaluationContext): Promise<StrategyExitEvaluationResult> {
   if (context.strategyCode === "two_year_reversal") {
-    const result = await twoYearEvaluations(context.pool, context.targetDate);
+    const result = await twoYearEvaluations(context.pool, context.targetDate, context.accountId);
     return {
       status: result.gaps.length ? "partial" : "success", data_date: context.targetDate,
       coverage: { strategy_code: context.strategyCode, position_count: result.items.length, completed_count: result.items.length },
       items: result.items, gaps: result.gaps,
     };
   }
-  const source = await compatibility(context.pool, context.targetDate, context.strategyCode);
+  const source = await compatibility(context.pool, context.targetDate, context.strategyCode, context.accountId);
   const selected = source.positions.items.filter((item) => context.strategyCode === "portfolio_fallback_exit"
     ? item.fallback_strategy_code === "portfolio_fallback_exit"
     : item.strategy_code === context.strategyCode);

@@ -720,7 +720,7 @@ function enforceResultBudget(results: unknown[], offsets: Array<number | null>, 
 }
 
 /** 每项查询按当前表结构重新校验字段，然后构建参数化只读 SQL。 */
-export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown> {
+export async function queryDatabase(db: Db, rawInput: unknown, accountId?: string | null): Promise<unknown> {
   const input = validateDatabaseQueryInput(rawInput);
   if (!input.queries.length) throw new Error("database_query 至少需要一项查询");
   if (input.queries.length > MAX_BATCH_QUERIES) {
@@ -737,7 +737,13 @@ export async function queryDatabase(db: Db, rawInput: unknown): Promise<unknown>
       throw new Error(`${request.table}.columns 存在重复列`);
     }
     const params: unknown[] = [];
-    const where = buildFilters(meta, request.filters, params);
+    let where = buildFilters(meta, request.filters, params);
+    if (["portfolio_position","portfolio_position_change","daily_plan_playbook","daily_plan_auction_assessment","job_run","job_run_output"].includes(meta.table)) {
+      if (!accountId) throw new Error("账户业务查询需要绑定账户上下文");
+      params.push(accountId);
+      const scope = `${quoteIdent("account_id")} = $${params.length}`;
+      where += `${where ? " AND " : " WHERE "}${["job_run","job_run_output","daily_plan_playbook"].includes(meta.table) ? `(${scope} OR account_id IS NULL)` : scope}`;
+    }
     if ((request.mode ?? "rows") === "count") {
       const result = await db.query<{ count: string }>(
         `SELECT count(*)::text AS count FROM ${quoteIdent(meta.table)}${where}`,

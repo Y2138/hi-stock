@@ -5,7 +5,7 @@ import { getLatestMarketNews, instrumentNews } from "../market-news/repo.js";
 import { replaceDraftPlaybook, type DailyPlanKeyLevel, type PlaybookItemInput } from "../plans/repo.js";
 import { listPositions } from "../positions/repo.js";
 import { mergeExitEvaluations } from "./exit-evaluators.js";
-import { reconcileStrategyAttention, type StrategyAttentionChange } from "./attention.js";
+import { type StrategyAttentionChange } from "./attention.js";
 import { ensureStrategyEvaluation, type EnsureStrategyEvaluationResult } from "./service.js";
 import type { StrategyPositionEvaluation, StrategyRuntimeDefinition } from "./types.js";
 import { listStrategyRuntimeDefinitions } from "./repo.js";
@@ -84,12 +84,12 @@ export function buildKeyLevels(levels: PositionTechnicalLevels | undefined): Dai
 
 export async function queryDailyPlanStrategyContext(
   pool: pg.Pool,
-  input: { date: string; requested_by_job_run_id?: string | null },
+  input: { date: string; requested_by_job_run_id?: string | null; account_id?: string },
 ) {
   const [definitions, positions, legacyContext, activeAttentions, newsSnapshot] = await Promise.all([
     listStrategyRuntimeDefinitions(pool),
-    listPositions(pool),
-    queryDailyPlanContext(pool, input.date),
+    listPositions(pool, input.account_id),
+    queryDailyPlanContext(pool, input.date, input.account_id),
     pool.query<{
       code: string; name: string; strategy_code: string; strategy_name: string; status: string; reason: string;
       missing_signals: string[]; data_date: string | null; stale_reason: string | null;
@@ -138,6 +138,7 @@ export async function queryDailyPlanStrategyContext(
     ensured: await ensureStrategyEvaluation(pool, {
       strategy_code: strategy.code,
       phase,
+      account_id: input.account_id ?? "1",
       target_date: input.date,
       requested_by_job_run_id: input.requested_by_job_run_id ?? null,
     }),
@@ -155,15 +156,6 @@ export async function queryDailyPlanStrategyContext(
   }
 
   const attentionChanges: StrategyAttentionChange[] = [];
-  for (const evaluation of evaluations.filter((item) => item.phase === "entry" && item.strategy.attention_policy !== "none")) {
-    if (evaluation.ensured.execution !== "waiting") {
-      attentionChanges.push(...await reconcileStrategyAttention(pool, {
-        run: evaluation.ensured.run,
-        source_job: "daily_plan_flow",
-      }));
-    }
-  }
-
   const technicalByCode = new Map(legacyContext.positions.items.map((item) => [item.code, item.technical_levels]));
   const boardsByCode = new Map(legacyContext.position_boards.items.map((item) => [item.code, item]));
   const positionEvaluations = positions.map((position) => {

@@ -194,8 +194,8 @@ export async function replaceDraftPlaybook(
   input: ReplacePlaybookInput,
 ): Promise<{ replaced: number }> {
   return inServiceTransaction(db, async (client) => {
-    const run = await client.query<{ target_date: string; code: string }>(
-      `SELECT run.target_date::text, definition.code
+    const run = await client.query<{ target_date: string; code: string; account_id: string | null }>(
+      `SELECT run.target_date::text, definition.code, CASE WHEN definition.code='daily_plan_flow' THEN COALESCE(run.account_id,1) ELSE run.account_id END::text AS account_id
          FROM job_run run
          JOIN job_definition definition ON definition.id = run.job_id
         WHERE run.id = $1 AND definition.code IN ('daily_plan_flow','limit_up_close_scan')`,
@@ -218,7 +218,8 @@ export async function replaceDraftPlaybook(
       `SELECT DISTINCT instrument.code
          FROM portfolio_position position
          JOIN market_instrument instrument ON instrument.id = position.instrument_id
-        WHERE position.quantity > 0`,
+        WHERE position.quantity > 0 AND ($1::bigint IS NULL OR position.account_id=$1)`,
+      [run.rows[0]!.account_id],
     );
     const heldSet = new Set(heldCodes.rows.map((row) => row.code));
     const pooledCodes = await client.query<{ code: string }>(
@@ -238,6 +239,14 @@ export async function replaceDraftPlaybook(
       }
     }
 
+    if (run.rows[0]!.account_id) {
+      const evaluationIds=[...new Set(input.items.flatMap(item=>[item.primary_evaluation_run_id,item.fallback_evaluation_run_id]).filter(Boolean))];
+      if(evaluationIds.length) {
+        const scoped=await client.query("SELECT id::text FROM strategy_evaluation_run WHERE id=ANY($1::bigint[]) AND account_id=$2",[evaluationIds,run.rows[0]!.account_id]);
+        if(scoped.rows.length!==evaluationIds.length) throw apiErrors.badRequest("预案评估来源不属于当前账户");
+      }
+    }
+
     await client.query("DELETE FROM daily_plan_playbook WHERE source_job_run_id = $1", [input.source_job_run_id]);
     let index = 0;
     for (const item of input.items) {
@@ -251,9 +260,9 @@ export async function replaceDraftPlaybook(
             grade, priority, action, trigger_kind, price_lower, price_upper,
             headline, auction_md, intraday_md, evidence_md, missing_md, invalidation_md, risk_md, key_levels,
             strategy_code,strategy_runtime_version,primary_evaluation_run_id,fallback_evaluation_run_id,
-            primary_action,fallback_action,effective_action,evaluation_status,evaluation_data_date,evaluation_missing)
+            primary_action,fallback_action,effective_action,evaluation_status,evaluation_data_date,evaluation_missing,account_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$30::jsonb,
-                 $20,$21,$22,$23,$24,$25,$26,$27,$28,$29::jsonb)`,
+                 $20,$21,$22,$23,$24,$25,$26,$27,$28,$29::jsonb,$31)`,
         [
           input.source_job_run_id,
           targetDate,
@@ -285,6 +294,7 @@ export async function replaceDraftPlaybook(
           item.evaluation_data_date ?? null,
           JSON.stringify(item.evaluation_missing ?? []),
           JSON.stringify(item.key_levels ?? []),
+          run.rows[0]!.account_id,
         ],
       );
     }
@@ -298,8 +308,8 @@ export async function replaceDraftScenarios(
   input: ReplaceScenariosInput,
 ): Promise<{ replaced_items: number; replaced_scenarios: number }> {
   return inServiceTransaction(db, async (client) => {
-    const run = await client.query<{ code: string }>(
-      `SELECT definition.code
+    const run = await client.query<{ code: string; account_id: string | null }>(
+      `SELECT definition.code, run.account_id::text
          FROM job_run run
          JOIN job_definition definition ON definition.id = run.job_id
         WHERE run.id = $1 AND definition.code = 'daily_plan_flow'`,
@@ -372,8 +382,8 @@ export async function activatePlaybookForRun(
 ): Promise<number> {
   return inServiceTransaction(db, async (client) => {
     if (!planOutputId) return 0;
-    const source = await client.query<{ code: string }>(
-      `SELECT definition.code
+    const source = await client.query<{ code: string; account_id: string | null }>(
+      `SELECT definition.code,CASE WHEN definition.code='daily_plan_flow' THEN COALESCE(run.account_id,1) ELSE run.account_id END::text AS account_id
          FROM job_run run
          JOIN job_definition definition ON definition.id = run.job_id
         WHERE run.id = $1`,
@@ -395,13 +405,14 @@ export async function activatePlaybookForRun(
       `UPDATE daily_plan_playbook
           SET status = 'superseded', updated_at = now()
         WHERE status = 'active' AND item_kind = $2
+          AND account_id IS NOT DISTINCT FROM $4::bigint
           AND plan_output_id IS DISTINCT FROM $1
           AND plan_output_id IN (
             SELECT output.id FROM job_run_output output
             JOIN job_definition definition ON definition.id = output.job_id
             WHERE definition.code = $3
           )`,
-      [planOutputId, kind, source.rows[0].code],
+      [planOutputId, kind, source.rows[0].code, source.rows[0].account_id],
     );
     await client.query(
       `UPDATE daily_plan_auction_assessment assessment
@@ -421,8 +432,8 @@ export async function replaceDraftAuctionAssessments(
   input: { source_job_run_id: string; items: AuctionAssessmentInput[]; scope_items: AuctionScopeInput[] },
 ): Promise<{ replaced: number }> {
   return inServiceTransaction(db, async (client) => {
-    const run = await client.query<{ id: string; target_date: string }>(
-      `SELECT run.id::text,run.target_date::text
+    const run = await client.query<{ id: string; target_date: string; account_id: string }>(
+      `SELECT run.id::text,run.target_date::text,COALESCE(run.account_id,1)::text AS account_id
          FROM job_run run
          JOIN job_definition definition ON definition.id = run.job_id
         WHERE run.id = $1 AND definition.code = 'auction_opportunity_assessment'`,
@@ -430,7 +441,7 @@ export async function replaceDraftAuctionAssessments(
     );
     if (!run.rows[0]) throw apiErrors.badRequest("竞价研判只能由 auction_opportunity_assessment 任务提交");
 
-    const context = await queryAuctionAssessmentContext(client, run.rows[0]!.target_date);
+    const context = await queryAuctionAssessmentContext(client, run.rows[0]!.target_date, run.rows[0]!.account_id);
     const opportunities = context.opportunities.map((item) => ({ id: item.target_key.slice("board:".length), code: item.code }));
     const expectedCodes = opportunities.map((item) => item.code).sort();
     const submittedCodes = input.items.map((item) => item.code).sort();
@@ -474,11 +485,11 @@ export async function replaceDraftAuctionAssessments(
       await client.query(
         `INSERT INTO auction_scope_assessment
            (source_job_run_id,target_date,target_key,scope_kind,instrument_id,attention_entry_id,strategy_code,
-            conclusion,metrics_summary,assessment_summary,data_status,data_time)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+            conclusion,metrics_summary,assessment_summary,data_status,data_time,account_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
         [input.source_job_run_id,run.rows[0]!.target_date,item.target_key,target.scope_kind,
           instrumentIds.get(target.code)!.id.toString(),target.attention_entry_id,target.strategy_code,
-          item.conclusion,item.metrics_summary.trim(),item.assessment_summary.trim(),item.data_status,item.data_time ?? null],
+          item.conclusion,item.metrics_summary.trim(),item.assessment_summary.trim(),item.data_status,item.data_time ?? null,run.rows[0]!.account_id],
       );
     }
     const opportunityByCode = new Map(opportunities.map((item) => [item.code, item]));
@@ -491,8 +502,8 @@ export async function replaceDraftAuctionAssessments(
       await client.query(
         `INSERT INTO daily_plan_auction_assessment
            (source_job_run_id, playbook_item_id, code, conclusion, review_type, metrics_summary,
-            assessment_summary, benchmark_tags, data_status, data_time)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            assessment_summary, benchmark_tags, data_status, data_time, account_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           input.source_job_run_id,
           opportunity.id,
@@ -504,6 +515,7 @@ export async function replaceDraftAuctionAssessments(
           JSON.stringify(item.benchmark_tags ?? []),
           item.data_status,
           item.data_time ?? null,
+          run.rows[0]!.account_id,
         ],
       );
     }
@@ -518,8 +530,8 @@ export async function activateAuctionAssessmentsForRun(
   outputId: string | null,
 ): Promise<number> {
   if (!outputId) return 0;
-  const run = await db.query<{ code: string; target_date: string; is_open: boolean | null }>(
-    `SELECT definition.code, run.target_date::text, calendar.is_open
+  const run = await db.query<{ code: string; target_date: string; is_open: boolean | null; account_id: string }>(
+    `SELECT definition.code, run.target_date::text, calendar.is_open, COALESCE(run.account_id,1)::text AS account_id
        FROM job_run run
        JOIN job_definition definition ON definition.id = run.job_id
        LEFT JOIN market_trading_day calendar ON calendar.trade_date = run.target_date
@@ -531,7 +543,7 @@ export async function activateAuctionAssessmentsForRun(
   const isOpen = runRow.is_open ?? isWeekdayDate(runRow.target_date);
   const shouldRun = isOpen;
 
-  const context = await queryAuctionAssessmentContext(db, runRow.target_date);
+  const context = await queryAuctionAssessmentContext(db, runRow.target_date, runRow.account_id);
   const expected = context.opportunities.map((item) => ({ id: item.target_key.slice("board:".length), code: item.code }));
   const drafts = await db.query<{ playbook_item_id: string }>(
     `SELECT playbook_item_id::text
@@ -567,8 +579,8 @@ export async function activateAuctionAssessmentsForRun(
     `UPDATE daily_plan_auction_assessment current
         SET status = 'superseded', updated_at = now()
       WHERE current.status = 'active'
-        AND current.playbook_item_id = ANY($1::bigint[])`,
-    [draftIds],
+        AND current.playbook_item_id = ANY($1::bigint[]) AND current.account_id=$2`,
+    [draftIds, runRow.account_id],
   );
   const activated = await db.query(
     `UPDATE daily_plan_auction_assessment
@@ -578,7 +590,7 @@ export async function activateAuctionAssessmentsForRun(
   );
   await db.query(
     `UPDATE auction_scope_assessment previous SET status='superseded',updated_at=now()
-       WHERE previous.status='active' AND previous.target_key IN
+       WHERE previous.status='active' AND previous.account_id=(SELECT account_id FROM job_run WHERE id=$1) AND previous.target_key IN
          (SELECT target_key FROM auction_scope_assessment WHERE source_job_run_id=$1 AND status='draft')`,
     [sourceJobRunId],
   );
@@ -715,14 +727,16 @@ export async function queryHistoricalPlanItems(db: Db, outputId: string, offset 
 }
 
 /** 最新一份每日计划的激活预案；没有计划或计划无结构化数据时抛 404。 */
-export async function getLatestDailyPlanBoard(pool: Db): Promise<DailyPlanBoard> {
+export async function getLatestDailyPlanBoard(pool: Db, accountId = "1"): Promise<DailyPlanBoard> {
   const outputs = await pool.query<{ id: string; target_date: string; status: string; created_at: string }>(
     `SELECT output.id::text, output.target_date::text, output.status, output.created_at::text
        FROM job_run_output output
        JOIN job_definition definition ON definition.id = output.job_id
-      WHERE definition.code = 'daily_plan_flow'
+      LEFT JOIN job_run run ON run.id = output.run_id
+      WHERE definition.code = 'daily_plan_flow' AND COALESCE(run.account_id,output.account_id,1) = $1
       ORDER BY output.id DESC
       LIMIT 1`,
+    [accountId],
   );
   const output = outputs.rows[0];
   if (!output) throw apiErrors.notFound("尚无每日交易计划");
@@ -748,9 +762,10 @@ export async function getLatestDailyPlanBoard(pool: Db): Promise<DailyPlanBoard>
        FROM daily_plan_playbook item
        LEFT JOIN daily_plan_auction_assessment assessment
          ON assessment.playbook_item_id = item.id AND assessment.status = 'active'
-      WHERE item.plan_output_id = $1 AND item.status = 'active' AND item.item_kind='position_action'
+        AND assessment.account_id = item.account_id
+      WHERE item.plan_output_id = $1 AND item.account_id = $2 AND item.status = 'active' AND item.item_kind='position_action'
       ORDER BY item.priority ASC, item.id ASC`,
-    [output.id],
+    [output.id, accountId],
   );
   const rows = items.rows.map(toRow);
   const scenarios = await pool.query<{
@@ -765,8 +780,8 @@ export async function getLatestDailyPlanBoard(pool: Db): Promise<DailyPlanBoard>
             scenario.observable_md, scenario.response_md, scenario.invalidation_md
        FROM daily_plan_scenario scenario
        JOIN daily_plan_playbook item ON item.id = scenario.playbook_item_id
-      WHERE item.plan_output_id = $1 AND item.status = 'active' AND item.item_kind = 'position_action'`,
-    [output.id],
+      WHERE item.plan_output_id = $1 AND item.account_id = $2 AND item.status = 'active' AND item.item_kind = 'position_action'`,
+    [output.id, accountId],
   );
   const scenariosByItem = new Map<string, DailyPlanScenarioRow[]>();
   for (const scenario of scenarios.rows) {
@@ -851,7 +866,7 @@ export async function getLatestLimitUpOpportunities(db: Db) {
 }
 
 /** 集合竞价任务的完整紧凑输入；覆盖候选全集，但不返回无关池属性或历史正文。 */
-export async function queryAuctionAssessmentContext(db: Db, targetDate: string) {
+export async function queryAuctionAssessmentContext(db: Db, targetDate: string, accountId = "1") {
   const calendarResult = await db.query<{ is_open: boolean }>(
       "SELECT is_open FROM market_trading_day WHERE trade_date = $1::date",
       [targetDate],
@@ -866,8 +881,10 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
       `SELECT output.id::text, output.target_date::text, output.status, output.created_at::text
          FROM job_run_output output
          JOIN job_definition definition ON definition.id = output.job_id
-        WHERE definition.code = 'daily_plan_flow'
+        LEFT JOIN job_run run ON run.id=output.run_id
+        WHERE definition.code = 'daily_plan_flow' AND COALESCE(run.account_id,output.account_id,1)=$1
         ORDER BY output.id DESC LIMIT 1`,
+      [accountId],
     );
   const opportunityOutputResult = await db.query<{ id: string; target_date: string; status: string; run_status: string }>(
     `SELECT output.id::text,output.target_date::text,output.status,run.status AS run_status
@@ -876,7 +893,7 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
        ORDER BY output.id DESC LIMIT 1`,
   );
   const opportunityOutput = opportunityOutputResult.rows[0] ?? null;
-  const positions = await listPositions(db);
+  const positions = await listPositions(db, accountId);
   const poolResult = await db.query<{
       code: string;
       name: string;
@@ -1093,12 +1110,14 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string) 
 }
 
 /** 最新成功竞价任务对持仓和各策略关注来源的结构化研判；打板仍从每日计划机会读取。 */
-export async function getLatestAuctionScopeAssessments(db: Db) {
+export async function getLatestAuctionScopeAssessments(db: Db, accountId: string | null = "1") {
   const output = await db.query<{ id: string; target_date: string }>(
     `SELECT output.id::text,output.target_date::text FROM job_run_output output
       JOIN job_definition definition ON definition.id=output.job_id
-     WHERE definition.code='auction_opportunity_assessment' AND output.status IN ('generated','approved')
+     JOIN job_run run ON run.id=output.run_id
+     WHERE definition.code='auction_opportunity_assessment' AND ($1::bigint IS NULL OR COALESCE(run.account_id,output.account_id,1)=$1) AND output.status IN ('generated','approved')
      ORDER BY output.id DESC LIMIT 1`,
+    [accountId],
   );
   if (!output.rows[0]) throw apiErrors.notFound("尚无竞价研判结果");
   const rows = await db.query<{
@@ -1114,6 +1133,7 @@ export async function getLatestAuctionScopeAssessments(db: Db) {
         JOIN market_instrument instrument ON instrument.id=assessment.instrument_id
         LEFT JOIN strategy_definition strategy ON strategy.code=assessment.strategy_code
        WHERE assessment.assessment_output_id=$1 AND assessment.status='active'
-       ORDER BY assessment.scope_kind,instrument.code,assessment.target_key`, [output.rows[0].id]);
+         AND ($2::boolean = false OR assessment.scope_kind <> 'position')
+       ORDER BY assessment.scope_kind,instrument.code,assessment.target_key`, [output.rows[0].id, accountId === null]);
   return { output_id: output.rows[0].id, target_date: output.rows[0].target_date, items: rows.rows };
 }

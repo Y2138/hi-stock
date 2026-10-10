@@ -1,6 +1,7 @@
 import type pg from "pg";
 import { inServiceTransaction, type TransactionDb } from "../../db/transaction.js";
 import { validatePoolNewsWriteInput, type PoolNewsWriteInput } from "../../agent/tool-validation.js";
+import { listPoolView } from "../pools/repo.js";
 
 export type NewsDirection = "positive" | "neutral" | "negative" | "mixed" | "unknown";
 export interface MarketNewsItem {
@@ -17,6 +18,29 @@ export interface MarketNewsSnapshot {
 
 export const shanghaiDate = (now = new Date()) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
 const HOUR = 3600_000;
+
+/** 全局消息任务只读取跨账户去重的公开标的信息，不返回账户、数量或成本。 */
+export async function marketNewsTargets(db: Pick<pg.Pool, "query">, date: string) {
+  const view = await listPoolView(db, date);
+  const positions = (await db.query<{ code: string; name: string }>(
+    `SELECT DISTINCT i.code,i.name FROM portfolio_position p
+     JOIN market_instrument i ON i.id=p.instrument_id ORDER BY i.code`)).rows;
+  const codes = [...new Set([...view.members, ...positions].map((item) => item.code))].sort();
+  const boards = (await db.query<{ code: string; board_code: string; board_name: string }>(
+    `SELECT i.code,b.code AS board_code,b.name AS board_name FROM market_board_membership m
+     JOIN market_instrument i ON i.id=m.member_instrument_id
+     JOIN market_instrument b ON b.id=m.board_instrument_id
+     JOIN market_board board ON board.instrument_id=b.id
+     WHERE i.code=ANY($1::text[]) AND m.effective_from<=$2::date
+       AND (m.effective_to IS NULL OR m.effective_to>$2::date)
+       AND board.active AND board.board_type='industry' AND b.code LIKE '881%.TI'
+     ORDER BY i.code,b.code`, [codes,date])).rows;
+  const held = new Set(positions.map((item) => item.code));
+  const watched = new Set(view.members.map((item) => item.code));
+  const names = new Map([...view.members, ...positions].map((item) => [item.code,item.name]));
+  return codes.map((code) => ({ code, name: names.get(code)!, held: held.has(code), watched: watched.has(code),
+    primary_boards: boards.filter((item) => item.code === code).map((item) => ({ code: item.board_code, name: item.board_name })) }));
+}
 
 export async function getLatestMarketNews(db: Pick<pg.Pool, "query">, date?: string): Promise<MarketNewsSnapshot | null> {
   const { rows } = await db.query<MarketNewsSnapshot>(
@@ -79,17 +103,17 @@ export async function writeMarketNews(db: TransactionDb, raw: PoolNewsWriteInput
       }
     }
     if (!searched) throw new Error('本次运行尚未成功执行网页搜索，不能生成空消息结论');
-    const known = new Set((await client.query<{ code: string }>(
-      `SELECT i.code FROM market_instrument i
-        WHERE i.id IN (SELECT instrument_id FROM pool_membership WHERE effective_to IS NULL)
-           OR i.id IN (SELECT instrument_id FROM portfolio_position)`)).rows.map((r) => r.code));
+    const known = new Set((await marketNewsTargets(client, input.target_date)).map((item) => item.code));
     if (input.checked_codes.some((code) => !known.has(code))) throw new Error('checked_codes 包含非关注池或当前持仓以外的标的');
+    const checked = new Set(input.checked_codes);
+    const missing = [...known].filter((code) => !checked.has(code));
+    const gaps = [...new Set([...input.gaps, ...missing.map((code) => `标的未完成消息检索：${code}`)])];
     const snapshot = (await client.query<{ id: string }>(
       `INSERT INTO market_news_snapshot(target_date,market_bias,summary,run_id,checked_codes,gaps,status)
        VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7)
        ON CONFLICT(run_id) DO UPDATE SET market_bias=EXCLUDED.market_bias,summary=EXCLUDED.summary,
          checked_codes=EXCLUDED.checked_codes,gaps=EXCLUDED.gaps,status=EXCLUDED.status,captured_at=now() RETURNING id::text`,
-      [input.target_date,input.market_bias,input.summary,runId,JSON.stringify([...new Set(input.checked_codes)]),JSON.stringify(input.gaps),input.gaps.length ? 'partial' : 'success'])).rows[0]!;
+      [input.target_date,input.market_bias,input.summary,runId,JSON.stringify([...checked]),JSON.stringify(gaps),gaps.length ? 'partial' : 'success'])).rows[0]!;
     await client.query('DELETE FROM market_news_item WHERE snapshot_id=$1', [snapshot.id]);
     for (const item of input.items) {
       const source = evidence.get(item.source_url);
@@ -115,6 +139,6 @@ export async function writeMarketNews(db: TransactionDb, raw: PoolNewsWriteInput
           item.source_level,item.source_name,item.source_url,item.published_at ?? null,source.fetchedAt,item.facts,item.impact_note,new Date(expires).toISOString()])).rows[0]!;
       for (const i of instruments.rows) await client.query('INSERT INTO market_news_item_instrument(item_id,instrument_id) VALUES($1,$2)', [row.id,i.id]);
     }
-    return { snapshot_id: snapshot.id, item_count: input.items.length, gaps: input.gaps };
+    return { snapshot_id: snapshot.id, item_count: input.items.length, gaps };
   });
 }

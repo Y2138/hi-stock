@@ -48,6 +48,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "company_commodity_metric",
       "company_commodity_profile",
       "daily_plan_auction_assessment",
+      "daily_plan_market_context",
       "daily_plan_playbook",
       "daily_plan_scenario",      "first_board_intraday_snapshot",
       "fundamental_snapshot",
@@ -92,6 +93,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "pool_attention_entry",
       "pool_board_preference",
       "pool_membership",
+      "portfolio_account",
       "portfolio_account_state",
       "portfolio_equity_daily",
       "portfolio_position",
@@ -142,6 +144,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     );
     expect(ladder.rows[0]?.content).toContain("一字板、10:30后至扫描时间封板的标的均不作硬排除");
     expect(ladder.rows[0]?.content).not.toContain("排除09:25后仍未打开的一字板");
+    expect(ladder.rows[0]?.content).toContain("## 唯一首选排队标的");
 
     const session = await pool.query<{
       session_type: string;
@@ -216,10 +219,10 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     );
     expect(retiredJobs.rows).toEqual([]);
     const nightly = promptByCode.get("nightly_sector_opportunity_scan")!;
-    expect(nightly).toContain('"analysis_type":"sector_temperature"');
+    expect(nightly).toContain('"analysis_type":"sector_trend_structure"');
     expect(nightly).toContain("不得传 `codes`");
     expect(nightly).toContain("每个板块最多保留 2 只个股");
-    expect(nightly).toContain("pullback_observing");
+    expect(nightly).toContain("止跌修复确认");
     expect(nightly).toContain("自动初始化到关注池");
     expect(nightly).toContain("## 结论摘要");
     expect(nightly).toContain("不超过 600 个中文字符");
@@ -465,10 +468,24 @@ describe.skipIf(!prepared)("迁移运行器", () => {
         "SELECT content FROM strategy_document WHERE code='swing_strategy'",
       )).rows[0]!.content).toContain("深度评分 0-5 分");
       expect((await pool.query<{ content: string }>(
+        "SELECT content FROM strategy_document WHERE code='swing_strategy'",
+      )).rows[0]!.content).toContain("1. 成交量 < 5 日均量 × 0.70；相对 MA250 偏离 ≤ -35% 的深度标的豁免缩量要求；");
+      expect((await pool.query<{ content: string }>(
+        "SELECT content FROM strategy_document WHERE code='swing_strategy'",
+      )).rows[0]!.content).toContain("仅列为行业逆风复核；行业动量缺数时不降级");
+      expect((await pool.query<{ content: string }>(
         `SELECT revision.content FROM job_prompt prompt
            JOIN job_prompt_revision revision ON revision.id=prompt.current_revision_id
           WHERE prompt.code='swing_signal_scan'`,
       )).rows[0]!.content).toContain("深度评分构成（MA250 偏离、60 日跌幅、行业 20 日动量）");
+      expect((await pool.query<{ content: string }>(
+        `SELECT revision.content FROM job_prompt prompt
+           JOIN job_prompt_revision revision ON revision.id=prompt.current_revision_id
+          WHERE prompt.code='swing_signal_scan'`,
+      )).rows[0]!.content).toContain("行业逆风降级复核标的");
+      expect((await pool.query<{ column_default: string | null; is_nullable: string }>(
+        "SELECT column_default,is_nullable FROM information_schema.columns WHERE table_name='pool_membership' AND column_name='special_attention'",
+      )).rows[0]).toEqual({ column_default: "false", is_nullable: "NO" });
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
@@ -493,4 +510,29 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
+  it("存量单账户持仓、事件、资金基线和任务会话无损归入默认账户", async () => {
+    const srcDir=path.join(import.meta.dirname,"../../server/migrations");
+    const tmpDir=await fs.mkdtemp(path.join(import.meta.dirname,".账户迁移-"));
+    try {
+      const migrations=await loadMigrations(srcDir);
+      for (const migration of migrations.filter(row=>row.version<164)) {
+        await fs.copyFile(migration.filePath,path.join(tmpDir,path.basename(migration.filePath)));
+      }
+      await resetSchema(pool);
+      await runMigrations(pool,tmpDir);
+      const instrument=(await pool.query<{id:string}>(`INSERT INTO market_instrument(code,name,kind)
+        VALUES('990997.SZ','存量账户样本','stock') RETURNING id::text`)).rows[0]!.id;
+      await pool.query("INSERT INTO portfolio_position(instrument_id,quantity,cost_price,opened_at) VALUES($1,123,45.67,'2026-09-28')",[instrument]);
+      await pool.query("INSERT INTO portfolio_position_change(instrument_id,change_date,kind,quantity,price,source) VALUES($1,'2026-09-28','buy',123,45.67,'ingest')",[instrument]);
+      const session=(await pool.query<{id:string}>("INSERT INTO chat_session(title,session_type) VALUES('存量计划','job') RETURNING id::text")).rows[0]!.id;
+      await pool.query("INSERT INTO job_run(job_id,target_date,trigger_kind,session_id) SELECT id,'2026-09-29','manual',$1 FROM job_definition WHERE code='daily_plan_flow'",[session]);
+      await pool.query("UPDATE portfolio_realized_pnl_baseline SET amount=888");
+      expect((await runMigrations(pool)).applied).toContain(164);
+      expect((await pool.query("SELECT account_id::text,quantity::int,cost_price::float FROM portfolio_position")).rows).toEqual([{account_id:"1",quantity:123,cost_price:45.67}]);
+      expect((await pool.query("SELECT account_id::text FROM portfolio_position_change")).rows).toEqual([{account_id:"1"}]);
+      expect((await pool.query("SELECT account_id::text,amount::int FROM portfolio_realized_pnl_baseline")).rows).toEqual([{account_id:"1",amount:888}]);
+      expect((await pool.query("SELECT account_id::text FROM chat_session WHERE id=$1",[session])).rows).toEqual([{account_id:"1"}]);
+    } finally { await fs.rm(tmpDir,{recursive:true,force:true}); }
+  });
+
 });

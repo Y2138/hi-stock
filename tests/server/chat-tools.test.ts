@@ -25,7 +25,7 @@ import {
   findTrialStartMatch,
   inferStopLossMode,
 } from "../../server/modules/plans/daily-context.js";
-import { applySwingDailyDepthLimit, evaluateSwingSignal, swingDepthScore, SWING_DAILY_SIGNAL_LIMIT, SWING_RSI_OVERSOLD_LIMIT } from "../../server/modules/plans/swing-signals.js";
+import { applySwingDailyDepthLimit, evaluateSwingSignal, swingDepthScore, SWING_DAILY_SIGNAL_LIMIT, SWING_DEEP_MA250_DEVIATION, SWING_RSI_OVERSOLD_LIMIT, SWING_VOLUME_DRYNESS_LIMIT } from "../../server/modules/plans/swing-signals.js";
 import { mergeExitEvaluations, queryPositionExitEvaluationBundle } from "../../server/modules/strategy-runtime/exit-evaluators.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
 
@@ -233,6 +233,14 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(deep.price_signal).toBe(true);
     expect(SWING_RSI_OVERSOLD_LIMIT).toBe(30);
 
+    // 缩量或门：量比 0.83 不满足 0.70 门槛；MA250 偏离 ≤ -35% 的深度标的豁免后通过。
+    const damp = rows.map((row, rowIndex) => rowIndex === 39 ? { ...row, volume: 80 } : row);
+    expect(evaluateSwingSignal(damp, "stock", 0.4)!.failed_conditions).toEqual(["volume_contracted"]);
+    expect(evaluateSwingSignal(damp, "stock", 0.4, -0.4)!.price_signal).toBe(true);
+    expect(evaluateSwingSignal(damp, "stock", 0.4, -0.2)!.failed_conditions).toEqual(["volume_contracted"]);
+    expect(SWING_VOLUME_DRYNESS_LIMIT).toBe(0.7);
+    expect(SWING_DEEP_MA250_DEVIATION).toBe(-0.35);
+
 
       const instrument = await pool.query<{ id: string }>(
         `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
@@ -315,6 +323,25 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       expect(signal.excluded).toContainEqual({ code: "600994.SH", reason: "缺少数据日一致的可信护盘收回率" });
       expect(signal.signals).toContainEqual(expect.objectContaining({ code, passed_count: 4 }));
 
+      // 行业逆风降级：行业 20 日动量非负（平盘=0 也算非负）时，正式信号降级为行业逆风复核，不占每日名额。
+      await pool.query(
+        `INSERT INTO market_bar
+           (instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,turnover,adjustment,channel)
+         SELECT $1,'day',day::date,day::date::timestamptz,10,10.5,9.8,10,1000,1000000,'forward','test'
+           FROM generate_series('2026-07-20'::date,'2026-08-17'::date,'1 day') day`,
+        [board.rows[0]!.id],
+      );
+      const headwind = textOf(await tool.execute("tc-swing-headwind", { date: "2026-08-18" })) as {
+        signal_count: number;
+        industry_headwind_count: number;
+        industry_headwind: Array<{ code: string; signal_status: string; reason: string }>;
+      };
+      expect(headwind.signal_count).toBe(0);
+      expect(headwind.industry_headwind_count).toBe(1);
+      expect(headwind.industry_headwind).toContainEqual(expect.objectContaining({
+        code, signal_status: "qualified", reason: expect.stringContaining("行业逆风"),
+      }));
+
       await pool.query(
         "INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at) VALUES ($1, 100, 11, '2026-08-18')",
         [instrumentId],
@@ -340,6 +367,9 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       await pool.query(
         "DELETE FROM portfolio_position WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = $1)",
         [code],
+      );
+      await pool.query(
+        "DELETE FROM market_bar WHERE instrument_id = (SELECT id FROM market_instrument WHERE code = '881105.TI')",
       );
       await pool.query("DELETE FROM market_instrument WHERE code = '881105.TI'");
     }
@@ -803,13 +833,20 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     await pool.query(
       `INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at)
        SELECT id, 10, 10, '2026-08-01' FROM market_instrument WHERE code = '990002.SZ'
-       ON CONFLICT (instrument_id) DO UPDATE SET quantity = 10, cost_price = 10`,
+       ON CONFLICT (account_id, instrument_id) DO UPDATE SET quantity = 10, cost_price = 10`,
     );
     const portfolio = textOf(await tools.find((tool) => tool.name === "portfolio_context_query")!
       .execute("tc-portfolio-context", { codes: ["990002.SZ"], recent_change_limit: 10 })) as {
         summary: { position_count: number };
       };
     expect(portfolio.summary.position_count).toBe(1);
+    const portfolioTool = tools.find(tool => tool.name === "portfolio_context_query")!;
+    const bareCode = textOf(await portfolioTool.execute("tc-bare-code", { codes: ["990002"] }));
+    expect(bareCode).toMatchObject({ summary: { position_count: 1 }, positions: [expect.objectContaining({ code: "990002.SZ" })] });
+    const unknownCode = textOf(await portfolioTool.execute("tc-unknown-code", { codes: ["000000"] }));
+    expect(unknownCode).toMatchObject({ summary: { position_count: 0 }, positions: [], recent_changes: [], matching_limit_up_signals: [] });
+    await expect(buildChatTools({ pool, sessionId, accountId: null }).find(tool => tool.name === "portfolio_context_query")!
+      .execute("tc-no-account", {})).rejects.toThrow("会话未关联持仓账户");
 
     const pools = textOf(await tools.find((tool) => tool.name === "pool_context_query")!
       .execute("tc-pool-context", { codes: ["990002.SZ"] })) as {
@@ -1321,7 +1358,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
           strategy_runtime_version, fallback_strategy_code, exit_policy_mode)
        VALUES ($1, 10, 20, '2026-08-01', 'discretionary', 'discretionary', 1,
                'portfolio_fallback_exit', 'fallback_only')
-       ON CONFLICT (instrument_id) DO UPDATE SET quantity = 10, cost_price = 20, opened_at = '2026-08-01',
+       ON CONFLICT (account_id, instrument_id) DO UPDATE SET quantity = 10, cost_price = 20, opened_at = '2026-08-01',
          entry_signal_type='discretionary', strategy_code='discretionary', strategy_runtime_version=1,
          fallback_strategy_code='portfolio_fallback_exit', exit_policy_mode='fallback_only'`,
       [instrumentId],
@@ -1694,7 +1731,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(jobRun.columns.map((column) => column.name)).not.toEqual(expect.arrayContaining(["log", "artifacts", "result_md"]));
     expect(jobRun.hidden_sensitive_columns).toBe(3);
     const position = data.tables.find((table) => table.table === "portfolio_position")!;
-    expect(position.primary_key).toEqual(["instrument_id"]);
+    expect(position.primary_key).toEqual(["account_id", "instrument_id"]);
     expect(position.write_policy).toContain("portfolio_write");
     const instrument = data.tables.find((table) => table.table === "market_instrument")!;
     expect(instrument.columns.find((column) => column.name === "kind")?.enum_values).toEqual(
@@ -1757,7 +1794,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     await pool.query(
       `INSERT INTO portfolio_position (instrument_id, quantity, cost_price, opened_at)
        SELECT id, 10, 10, '2026-08-01' FROM market_instrument WHERE code = '990002.SZ'
-       ON CONFLICT (instrument_id) DO UPDATE SET quantity = 10, cost_price = 10;
+       ON CONFLICT (account_id, instrument_id) DO UPDATE SET quantity = 10, cost_price = 10;
        INSERT INTO market_bar
          (instrument_id, freq, bar_date, bar_time, open, high, low, close, volume, channel)
        SELECT id, 'day', '2026-08-18', '2026-08-18T00:00:00Z', 11, 12, 10, 12, 1000, 'migrate'

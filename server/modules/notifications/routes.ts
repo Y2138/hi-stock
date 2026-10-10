@@ -29,7 +29,7 @@ export const notificationRoutes = {
     const status = query.get("status") ?? undefined;
     if (status !== undefined && !["pending", "sending", "sent", "failed", "cancelled"].includes(status)) throw apiErrors.badRequest("通知状态不合法");
     const before = query.has("before") ? id(query.get("before")!) : undefined;
-    return { data: await listNotifications(pool, { before, status, jobCode: jobCode(query) }) };
+    return { data: await listNotifications(pool, { before, status, jobCode: jobCode(query), accountId: query.get("account_id") ?? undefined }) };
   },
   async detail({ pool, params }: Ctx) { return { data: await getNotification(pool, id(params.id ?? "")) }; },
   async retry({ pool, params }: Ctx) { return { status: 202, data: await retryNotification(pool, id(params.id ?? "")) }; },

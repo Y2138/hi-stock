@@ -15,12 +15,13 @@ import { attentionSourceLabel, attentionStatusLabel, compareAttentionQuality } f
 
 const router = useRouter();
 const route = useRoute();
-const selected = ref("attention");
+const selected = ref("special");
 const keyword = ref("");
 const detailMember = ref<PoolMember | null>(null);
 const removingAttention = ref<string | null>(null);
+const togglingSpecial = ref<string | null>(null);
 const data = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools"));
-const auctionScope = useResource<AuctionScopeBoard>(() => apiClient.get<AuctionScopeBoard>("/api/auction/latest"));
+const auctionScope = useResource<AuctionScopeBoard>(() => apiClient.get<AuctionScopeBoard>("/api/auction/latest?scope=global"));
 const auctionForEntry = (entry: PoolAttentionEntry) => (auctionScope.data.value?.items ?? []).find((item) =>
   item.scope_kind === "attention" && item.attention_entry_id === entry.id);
 const AUCTION_CONCLUSION_LABELS: Record<string, string> = {
@@ -42,7 +43,7 @@ const categoryMembers = computed(() => {
       ? [...members].sort((left, right) => Number(right.code === focusedMemberCode.value) - Number(left.code === focusedMemberCode.value))
       : members;
   }
-  if (selected.value === "attention") return members.filter(isAttention).sort(compareAttentionQuality);
+  if (selected.value === "special") return members.filter((member) => member.special_attention).sort(compareAttentionQuality);
   if (selected.value === "etf") return members.filter((member) => member.kind === "etf");
   if (selected.value === "unclassified") return members.filter((member) => member.kind === "stock" && member.boards.length === 0);
   return members.filter((member) => member.boards.some((board) => board.code === selected.value));
@@ -68,7 +69,7 @@ const visibleRows = computed(() => visibleMembers.value.map((member) => {
 
 const selectedLabel = computed(() => {
   if (selected.value === "all") return "全部标的";
-  if (selected.value === "attention") return "关注";
+  if (selected.value === "special") return "特别关注";
   if (selected.value === "etf") return "ETF";
   if (selected.value === "unclassified") return "行业待同步";
   return data.data.value?.boards.find((board) => board.code === selected.value)?.name ?? "行业";
@@ -161,6 +162,35 @@ function pct(value: number | null): string {
   return `${value >= 0 ? "+" : ""}${(value * 100).toFixed(2)}%`;
 }
 
+async function toggleSpecial(member: PoolMember): Promise<void> {
+  if (togglingSpecial.value) return;
+  togglingSpecial.value = member.code;
+  const target = !member.special_attention;
+  try {
+    const result = await apiClient.post<{ code: string; special_attention: boolean }>(
+      `/api/pools/${encodeURIComponent(member.code)}/special`, { special: target });
+    if (!result.ok) return;
+    const current = data.data.value;
+    if (current) {
+      data.data.value = {
+        ...current,
+        members: current.members.map((item) => item.code === member.code
+          ? { ...item, special_attention: result.data.special_attention }
+          : item),
+        special_count: Math.max(0, current.special_count + (target ? 1 : -1)),
+      };
+    }
+    if (detailMember.value?.code === member.code) {
+      detailMember.value = data.data.value?.members.find((item) => item.code === member.code) ?? detailMember.value;
+    }
+    appMessage.success(target
+      ? `${member.name} 已标记为特别关注，每日计划不会自动移除`
+      : `${member.name} 已取消特别关注`);
+  } finally {
+    togglingSpecial.value = null;
+  }
+}
+
 const NEWS_DIRECTION_LABEL: Record<string, string> = { positive: "利好", neutral: "中性", negative: "利空", mixed: "多空并存", unknown: "—" };
 const NEWS_STATUS_LABEL: Record<string, string> = { pending: "尚未探查", stale: "已过期", uncovered: "未覆盖", empty: "无相关消息", unverified: "待核验", ready: "已更新" };
 function newsLabel(member: PoolMember): string { return NEWS_DIRECTION_LABEL[member.news.direction] ?? "—"; }
@@ -205,8 +235,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
             <InstrumentPicker class="market-search" placeholder="搜索全市场标的…" @select="openMarketInstrument" />
           </div>
           <nav class="pool-tabs" aria-label="标的池视图">
-            <button type="button" :aria-pressed="selected === 'attention'" :class="{ active: selected === 'attention' }" @click="selected = 'attention'">
-              关注 <small>{{ data.data.value?.attention_count ?? 0 }}</small>
+            <button type="button" :aria-pressed="selected === 'special'" :class="{ active: selected === 'special' }" @click="selected = 'special'">
+              特别关注 <small>{{ data.data.value?.special_count ?? 0 }}</small>
             </button>
             <button type="button" :aria-pressed="selected === 'all'" :class="{ active: selected === 'all' }" @click="selected = 'all'">
               全部 <small>{{ data.data.value?.members.length ?? 0 }}</small>
@@ -233,9 +263,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           <div class="content-head">
             <div>
               <div class="card-title">{{ selectedLabel }}（{{ visibleMembers.length }}）</div>
-              <p class="card-desc">{{ selected === "attention" ? "按信号完整度排序：已成立 → 待补信号 → 人工关注；同档按代码排序。列表展示最完整信号摘要；点击标的查看各来源的完整条件与有效期。" : "当前有效池成员及其研究、阶段与关注状态。" }}</p>
+              <p class="card-desc">{{ selected === "special" ? "用户手动标记的特别关注标的，按信号完整度排序；特别关注不随每日计划自动移除，仅手动取消。" : "当前有效池成员及其研究、阶段与关注状态。" }}</p>
             </div>
-            <div v-if="selected !== 'all' && selected !== 'attention' && selected !== 'etf' && selected !== 'unclassified'" class="content-actions">
+            <div v-if="selected !== 'all' && selected !== 'special' && selected !== 'etf' && selected !== 'unclassified'" class="content-actions">
               <a class="btn compact" :href="`https://q.10jqka.com.cn/thshy/detail/code/${selected.split('.')[0]}/`" target="_blank" rel="noopener noreferrer">查看板块成分</a>
               <button class="btn compact" type="button" @click="goMarket(selected)">查看行业行情</button>
             </div>
@@ -252,7 +282,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
             <button v-if="selected !== 'all'" class="btn" type="button" @click="selected = 'all'">查看全部分类</button>
           </div>
           <div v-else class="table-wrap" role="region" aria-label="池内标的，可左右滚动查看完整列" tabindex="0">
-            <table class="data-table clickable" :class="{ 'attention-view': selected === 'attention' }">
+            <table class="data-table clickable" :class="{ 'attention-view': selected === 'special' }">
               <colgroup>
                 <col class="col-instrument"><col class="col-role"><col class="col-stage"><col class="col-industry"><col class="col-news"><col class="col-attention"><col class="col-action">
               </colgroup>
@@ -260,7 +290,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
               <tbody>
                 <tr v-for="{ member, attention, sources } in visibleRows" :key="member.id" :class="{ 'focused-row': member.code === focusedMemberCode }" tabindex="0" @click="openMemberDetail(member)" @keydown.enter="openMemberDetail(member)" @keydown.space.prevent="openMemberDetail(member)">
                   <td>
-                    <strong>{{ member.name }}</strong><div class="num code-sub">{{ member.code }}</div>
+                    <div class="instrument-head">
+                      <strong>{{ member.name }}</strong>
+                      <span v-if="member.special_attention" class="badge special-badge" title="特别关注：不随每日计划自动移除">★ 特别关注</span>
+                    </div>
+                    <div class="num code-sub">{{ member.code }}</div>
                     <div class="quote"><span class="num">{{ member.last === null ? "—" : fmtNum(member.last) }}</span><span :class="{ up: (member.change_pct ?? 0) > 0, down: (member.change_pct ?? 0) < 0 }">{{ pct(member.change_pct) }}</span></div>
                   </td>
                   <td><span class="badge accent">{{ member.role }}</span></td>
@@ -290,7 +324,19 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                       </div>
                     </div>
                   </td>
-                  <td class="row-action-cell"><button class="btn compact" type="button" @click.stop="goMarket(member.code)">查看行情</button></td>
+                  <td class="row-action-cell">
+                    <div class="row-actions">
+                      <button
+                        class="btn compact"
+                        :class="{ 'special-toggle-on': member.special_attention }"
+                        type="button"
+                        :disabled="togglingSpecial === member.code"
+                        :title="member.special_attention ? '取消特别关注后恢复每日计划常规对账' : '标记后不随每日计划自动移除'"
+                        @click.stop="toggleSpecial(member)"
+                      >{{ togglingSpecial === member.code ? "处理中" : member.special_attention ? "取消特别" : "特别关注" }}</button>
+                      <button class="btn compact" type="button" @click.stop="goMarket(member.code)">查看行情</button>
+                    </div>
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -303,7 +349,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
       <aside class="member-detail-panel" role="dialog" aria-modal="true" :aria-label="`${detailMember.name} 池内详情`">
         <header class="member-detail-head">
           <div><span class="badge accent">关注池</span><strong>{{ detailMember.name }}</strong><span class="num code-sub">{{ detailMember.code }}</span></div>
-          <div class="member-detail-actions"><button class="btn compact" type="button" @click="goMarket(detailMember.code)">查看行情</button><button class="detail-close" type="button" aria-label="关闭池内详情" @click="closeMemberDetail">×</button></div>
+          <div class="member-detail-actions">
+            <button class="btn compact" type="button" :disabled="togglingSpecial === detailMember.code" @click="toggleSpecial(detailMember)">{{ detailMember.special_attention ? "取消特别关注" : "标记特别关注" }}</button>
+            <button class="btn compact" type="button" @click="goMarket(detailMember.code)">查看行情</button>
+            <button class="detail-close" type="button" aria-label="关闭池内详情" @click="closeMemberDetail">×</button>
+          </div>
         </header>
         <div class="member-detail-scroll">
           <dl class="detail-overview">
@@ -359,6 +409,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 
 <style scoped>
 .signal-status{white-space:normal}.signal-status.qualified{color:var(--accent);border:1px solid currentColor}.signal-status.approaching{color:var(--warning, #9a6400);border:1px solid currentColor}.signal-status.manual{color:var(--ink-faint);border:1px solid currentColor}
+.instrument-head{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}
+.special-badge{flex:none;color:var(--warning,#9a6400);border:1px solid currentColor;font-size:10px;padding:0 4px;border-radius:4px}
+.row-actions{display:flex;flex-direction:column;gap:6px;align-items:stretch}
+.special-toggle-on{color:var(--warning,#9a6400);border-color:currentColor}
 .attention-summary{display:grid;gap:5px}
 .attention-summary-head,.attention-sources{display:flex;align-items:center;gap:6px;min-width:0}
 .attention-summary-head .signal-status{white-space:nowrap}
@@ -395,7 +449,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .data-table th:last-child,.data-table td:last-child{position:sticky;right:0;z-index:1;background:var(--card);box-shadow:-1px 0 var(--line)}
 .data-table th:last-child{z-index:3;background:var(--paper-deep)}
 .data-table tbody tr:hover td:first-child,.data-table tbody tr:hover td:last-child{background:var(--accent-soft)}
-.col-instrument{width:130px}.col-role{width:70px}.col-stage{width:130px}.col-industry{width:150px}.col-news{width:98px}.col-attention{width:280px}.col-action{width:86px}
+.col-instrument{width:140px}.col-role{width:70px}.col-stage{width:130px}.col-industry{width:150px}.col-news{width:98px}.col-attention{width:280px}.col-action{width:118px}
 .news-cell{vertical-align:top}.news-badge{display:inline-block;width:max-content;border:1px solid currentColor}.news-positive{color:var(--up)}.news-negative{color:var(--down)}.news-mixed{color:var(--warning,#9a6400)}.news-neutral{color:var(--ink-faint)}.news-status{display:block;margin-top:5px;font-size:11px;color:var(--ink-faint)}.news-section-head,.news-item-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.news-section-head h3{margin:0}.news-meta{margin:5px 0 10px!important;font-size:12px}.news-item{padding:10px 0;border-top:1px dashed var(--line)}.news-title{display:block;margin:6px 0;color:var(--accent-ink);font-weight:700;line-height:1.45}.news-title:hover{text-decoration:underline}.news-item p{margin:5px 0!important}.news-impact{color:var(--ink)!important}
 .attention-footer,.member-detail-head,.member-detail-actions{display:flex;align-items:center;justify-content:space-between;gap:8px}.attention-actions,.detail-attention-actions{display:flex;align-items:center;gap:8px}.detail-trigger{flex:none;border:0;background:transparent;padding:0;color:var(--accent-ink);font:600 11px var(--font-body);cursor:pointer}.detail-trigger:hover{text-decoration:underline}.remove-attention{color:var(--bad)}.remove-attention:disabled{cursor:wait;opacity:.55}.quote{display:flex;gap:8px;margin-top:5px}.cell-clamp{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.clamp-1{-webkit-line-clamp:1}.clamp-2{-webkit-line-clamp:2}.clamp-3{-webkit-line-clamp:3}.tag-preview{display:grid;gap:4px}.attention-cell{min-width:0}.attention-footer{margin-top:6px}.attention-footer>.muted{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-action-cell{vertical-align:middle!important}.row-action-cell .btn{white-space:nowrap}.data-table tbody tr:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}.market-link{display:block;border:0;background:transparent;padding:0;color:var(--accent-ink);text-align:left;cursor:pointer;font:inherit}.market-link:hover{text-decoration:underline}.industry-text{font-weight:600}.up{color:var(--up)}.down{color:var(--down)}
 .member-detail-mask{position:fixed;inset:0;z-index:80;display:flex;justify-content:flex-end;background:var(--overlay)}.member-detail-panel{display:grid;width:min(620px,94vw);height:100%;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow-lift);overscroll-behavior:contain}.member-detail-head{padding:10px 14px;border-bottom:1px solid var(--line);background:var(--card)}.member-detail-head>div:first-child{display:flex;align-items:center;min-width:0;gap:8px}.member-detail-head strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.detail-close{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--line);border-radius:var(--radius-sm);background:transparent;color:var(--ink-soft);font-size:19px;line-height:1;cursor:pointer}.detail-close:hover{border-color:var(--accent);color:var(--accent-ink)}.member-detail-scroll{min-height:0;overflow:auto;padding:10px 14px 20px}.detail-overview{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0;padding:0 0 10px;border-bottom:1px solid var(--line)}.detail-overview>div{display:flex;align-items:baseline;gap:8px;min-width:0}.detail-overview .overview-character{flex-basis:100%}.detail-overview dt{flex:none;color:var(--ink-soft);font-size:var(--fs-sm)}.detail-overview dd{margin:0;overflow-wrap:anywhere;line-height:1.5}.detail-section{padding:10px 0;border-bottom:1px solid var(--line)}.detail-section h3{margin:0 0 6px;font-size:var(--fs-md)}.detail-section p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-soft);line-height:1.65}.detail-section .btn{margin-top:6px}.entry-note summary{cursor:pointer;color:var(--ink-soft);font-size:var(--fs-sm)}.entry-note p{margin-top:6px}.detail-section .attention-entry-head{justify-content:flex-start;flex-wrap:wrap}.detail-section .remove-attention{margin-left:auto}.detail-section .attention-entry-head .source-tag{flex:1;min-width:0;overflow-wrap:anywhere}.detail-section .attention-entry{padding:6px 0}.detail-tags{display:flex;align-items:flex-start;flex-wrap:wrap;gap:6px}.detail-tags .badge{max-width:100%;white-space:normal;overflow-wrap:anywhere}

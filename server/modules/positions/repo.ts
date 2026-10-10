@@ -2,15 +2,25 @@
 // 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §4.1、§十；产品方案 §6.6
 // 盈亏口径：pnl_amount = 数量 × (最新收盘 − 成本)
 import type pg from "pg";
+import { requireAccount } from "../accounts/repo.js";
 import { apiErrors } from "../../http/router.js";
 import { inServiceTransaction, type TransactionDb } from "../../db/transaction.js";
 
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
+export const DEFAULT_ACCOUNT_ID = "1";
+export type AccountId = string | number;
+
+function accountId(value?: AccountId | null): string {
+  const id = value === undefined || value === null ? DEFAULT_ACCOUNT_ID : String(value);
+  if (!/^\d+$/.test(id) || id === "0") throw apiErrors.badRequest(`账户 ID 无效：${id}`);
+  return id;
+}
 
 export const POSITION_CHANGE_KINDS = ["buy", "sell", "adjust", "note"] as const;
 export type PositionChangeKind = (typeof POSITION_CHANGE_KINDS)[number];
 
 export interface PositionRow {
+  account_id: string;
   instrument_id: string;
   code: string;
   name: string;
@@ -60,6 +70,7 @@ const STRATEGY_ENTRY_SIGNAL_MAP = Object.fromEntries(
 ) as Record<string, EntrySignalType>;
 
 export interface PositionChangeRow {
+  account_id: string;
   id: string;
   instrument_id: string;
   code: string;
@@ -117,9 +128,10 @@ function round2(n: number): number {
 }
 
 /** 当前持仓：join instrument 与 market_bar day 最新一行收盘价，计算市值与盈亏 */
-export async function listPositions(db: Db): Promise<PositionRow[]> {
+export async function listPositions(db: Db, requestedAccountId?: AccountId | null): Promise<PositionRow[]> {
+  const currentAccountId = accountId(requestedAccountId);
   const r = await db.query<PositionRow>(
-    `SELECT p.instrument_id::text, i.code, i.name, i.kind,
+    `SELECT p.account_id::text, p.instrument_id::text, i.code, i.name, i.kind,
             p.quantity::float, p.cost_price::float, p.cost_basis,
             p.opened_at::text, p.entry_signal_type, p.strategy_code, strategy.name AS strategy_name,
             strategy.status AS strategy_status, p.strategy_runtime_version, p.entry_signal_id::text,
@@ -139,14 +151,16 @@ export async function listPositions(db: Db): Promise<PositionRow[]> {
          SELECT jsonb_object_agg(origin, event_count) AS breakdown
            FROM (
              SELECT change.decision_origin AS origin, count(*)::int AS event_count
-               FROM portfolio_position_change change
-              WHERE change.instrument_id = p.instrument_id
+      FROM portfolio_position_change change
+              WHERE change.account_id = p.account_id AND change.instrument_id = p.instrument_id
                 AND change.kind <> 'note'
                 AND (p.opened_at IS NULL OR change.change_date >= p.opened_at)
               GROUP BY change.decision_origin
            ) grouped
        ) attribution ON true
+      WHERE p.account_id = $1
       ORDER BY i.code`,
+    [currentAccountId],
   );
   return r.rows.map((row) => {
     const close = row.close === null ? null : Number(row.close);
@@ -163,9 +177,10 @@ export async function listPositions(db: Db): Promise<PositionRow[]> {
 }
 
 /** 变更事件流（join instrument，change_date/id 降序） */
-export async function listPositionChanges(db: Db, limit = 100, codes?: string[]): Promise<PositionChangeRow[]> {
+export async function listPositionChanges(db: Db, limit = 100, codes?: string[], requestedAccountId?: AccountId | null): Promise<PositionChangeRow[]> {
+  const currentAccountId = accountId(requestedAccountId);
   const r = await db.query<PositionChangeRow>(
-    `SELECT c.id::text, c.instrument_id::text, i.code, i.name,
+    `SELECT c.account_id::text,c.id::text, c.instrument_id::text, i.code, i.name,
             c.change_date::text, c.kind, c.quantity::float, c.price::float, c.amount::float,
             c.cost_price_before::float, c.realized_pnl::float,
             c.reason, c.source, c.decision_origin, c.execution_compliance,
@@ -188,10 +203,11 @@ export async function listPositionChanges(db: Db, limit = 100, codes?: string[])
          ON entry_assessment.id = c.entry_auction_assessment_id
        LEFT JOIN daily_plan_playbook entry_item ON entry_item.id = entry_assessment.playbook_item_id
        LEFT JOIN job_run entry_run ON entry_run.id = entry_assessment.source_job_run_id
-      WHERE ($2::text[] IS NULL OR i.code = ANY($2::text[]))
+      WHERE c.account_id = $3
+        AND ($2::text[] IS NULL OR i.code = ANY($2::text[]))
       ORDER BY c.change_date DESC, c.id DESC
       LIMIT $1`,
-    [limit, codes?.length ? codes : null],
+    [limit, codes?.length ? codes : null, currentAccountId],
   );
   return r.rows;
 }
@@ -201,6 +217,7 @@ export async function listPassedLimitUpSignals(
   db: Db,
   codes: string[],
   changeDate?: string,
+  requestedAccountId?: AccountId | null,
 ): Promise<PassedLimitUpSignalRow[]> {
   if (codes.length === 0) return [];
   const result = await db.query<PassedLimitUpSignalRow>(
@@ -216,13 +233,13 @@ export async function listPassedLimitUpSignals(
        JOIN daily_plan_playbook item ON item.id = assessment.playbook_item_id
        JOIN job_run auction_run ON auction_run.id = assessment.source_job_run_id
        JOIN market_instrument instrument ON instrument.code = assessment.code
-      WHERE assessment.code = ANY($1::text[])
+      WHERE assessment.account_id=$3 AND assessment.code = ANY($1::text[])
         AND assessment.conclusion = 'signal_passed'
         AND assessment.status IN ('active','superseded')
         AND ($2::date IS NULL OR auction_run.target_date = $2::date)
       ORDER BY assessment.code, auction_run.target_date DESC, assessment.id DESC
       LIMIT 20`,
-    [codes, changeDate ?? null],
+    [codes, changeDate ?? null, accountId(requestedAccountId)],
   );
   return result.rows.map((row) => ({ ...row, priority: Number(row.priority) }));
 }
@@ -237,7 +254,8 @@ export interface RealizedPnlSummaryRow {
 }
 
 /** 累计已实现盈亏：一次性历史基线 + 基线后的可计算卖出事件，未计费用。 */
-export async function getRealizedPnlSummary(db: Db): Promise<RealizedPnlSummaryRow> {
+export async function getRealizedPnlSummary(db: Db, requestedAccountId?: AccountId | null): Promise<RealizedPnlSummaryRow> {
+  const currentAccountId = accountId(requestedAccountId);
   const result = await db.query<{
     baseline_pnl: number;
     event_pnl: number;
@@ -252,11 +270,13 @@ export async function getRealizedPnlSummary(db: Db): Promise<RealizedPnlSummaryR
             COUNT(change.id) FILTER (WHERE change.realized_pnl IS NULL)::text AS missing_sell_count
        FROM portfolio_realized_pnl_baseline baseline
        LEFT JOIN portfolio_position_change change
-         ON change.kind = 'sell' AND change.created_at > baseline.through_created_at
-      WHERE baseline.singleton = true
+         ON change.account_id = baseline.account_id
+        AND change.kind = 'sell' AND change.created_at > baseline.through_created_at
+      WHERE baseline.account_id = $1
       GROUP BY baseline.amount`,
+    [currentAccountId],
   );
-  const row = result.rows[0]!;
+  const row = result.rows[0] ?? { baseline_pnl: 0, event_pnl: 0, realized_pnl: 0, sell_count: "0", missing_sell_count: "0" };
   return {
     ...row,
     baseline_pnl: Number(row.baseline_pnl),
@@ -269,6 +289,7 @@ export async function getRealizedPnlSummary(db: Db): Promise<RealizedPnlSummaryR
 }
 
 export interface RecordChangeInput {
+  account_id?: AccountId;
   code: string;
   kind: PositionChangeKind;
   quantity?: number;
@@ -356,13 +377,14 @@ async function resolveEntryAuctionSignal(
          FROM daily_plan_auction_assessment assessment
          JOIN daily_plan_playbook item ON item.id = assessment.playbook_item_id
          JOIN job_run auction_run ON auction_run.id = assessment.source_job_run_id
-        WHERE assessment.code = $1
+        WHERE assessment.account_id = $3
+          AND assessment.code = $1
           AND auction_run.target_date = $2::date
           AND assessment.conclusion = 'signal_passed'
           AND assessment.status IN ('active','superseded')
         ORDER BY (assessment.status = 'active') DESC, assessment.id DESC
         LIMIT 1`,
-      [code, input.change_date],
+      [code, input.change_date, accountId(input.account_id)],
     );
     return match.rows[0] ?? null;
   }
@@ -381,11 +403,12 @@ async function resolveEntryAuctionSignal(
          ON assessment.id = change.entry_auction_assessment_id
        JOIN daily_plan_playbook item ON item.id = assessment.playbook_item_id
        JOIN job_run auction_run ON auction_run.id = assessment.source_job_run_id
-      WHERE change.instrument_id = $1
+      WHERE change.account_id = $1
+        AND change.instrument_id = $2
         AND change.kind = 'buy'
-        AND change.change_date >= $2::date
+        AND change.change_date >= $3::date
       HAVING count(DISTINCT assessment.id) = 1`,
-    [instrumentId, existing.opened_at],
+    [accountId(input.account_id), instrumentId, existing.opened_at],
   );
   return inherited.rows[0]?.id ? inherited.rows[0] : null;
 }
@@ -402,6 +425,10 @@ export async function recordPositionChange(
   input: RecordChangeInput,
 ): Promise<{ change: PositionChangeRow; position: PositionRow | null }> {
   return inServiceTransaction(db, async (client) => {
+    const currentAccountId = accountId(input.account_id);
+    await client.query("SELECT id FROM portfolio_account WHERE id=$1 FOR UPDATE", [currentAccountId]);
+    const account = await requireAccount(client, currentAccountId);
+    if (account.status !== "active") throw apiErrors.conflict("账户已归档，不能修改持仓");
     const inst = await client.query<{ id: string; name: string }>(
       "SELECT id::text, name FROM market_instrument WHERE code = $1",
       [input.code],
@@ -419,7 +446,7 @@ export async function recordPositionChange(
       throw apiErrors.badRequest("strategy_code、entry_signal_type 和 entry_signal_id 仅买入事件可以填写");
     }
     if (input.plan_output_id) {
-      const plan = await client.query("SELECT id FROM job_run_output WHERE id = $1", [input.plan_output_id]);
+      const plan = await client.query("SELECT id FROM job_run_output WHERE id = $1 AND (account_id=$2 OR account_id IS NULL)", [input.plan_output_id,currentAccountId]);
       if (!plan.rows[0]) throw apiErrors.badRequest(`关联计划结果不存在：${input.plan_output_id}`);
     }
     const strategy = await client.query<{ change_seq: string; current_hash: string }>(
@@ -432,8 +459,8 @@ export async function recordPositionChange(
       const current = await client.query<PositionState>(
         `SELECT quantity::float, cost_price::float, opened_at::text, strategy_code,
                 strategy_runtime_version, fallback_strategy_code, exit_policy_mode
-           FROM portfolio_position WHERE instrument_id = $1 FOR UPDATE`,
-        [instrumentId],
+           FROM portfolio_position WHERE account_id = $1 AND instrument_id = $2 FOR UPDATE`,
+        [currentAccountId, instrumentId],
       );
       existing = current.rows[0] ?? null;
       if (input.kind === "sell") {
@@ -490,14 +517,14 @@ export async function recordPositionChange(
       : null;
     const change = await client.query<PositionChangeRow>(
       `INSERT INTO portfolio_position_change
-         (instrument_id, change_date, kind, quantity, price, amount, reason, source,
+         (account_id, instrument_id, change_date, kind, quantity, price, amount, reason, source,
           decision_origin, execution_compliance, strategy_change_seq, strategy_snapshot_hash,
           plan_output_id, entry_auction_assessment_id, entry_signal_type,
           strategy_code, strategy_runtime_version, entry_signal_id, fallback_strategy_code, exit_policy_mode,
           source_session_id, attribution_note, deviation_reason, cost_price_before, realized_pnl)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-               $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
-       RETURNING id::text, instrument_id::text, change_date::text, kind,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+               $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+       RETURNING account_id::text,id::text, instrument_id::text, change_date::text, kind,
                  quantity::float, price::float, amount::float,
                  cost_price_before::float, realized_pnl::float, reason, source,
                  decision_origin, execution_compliance, strategy_change_seq::text,
@@ -510,6 +537,7 @@ export async function recordPositionChange(
                  NULL::text AS entry_signal_headline, source_session_id::text,
                  attribution_note, deviation_reason, created_at`,
       [
+        currentAccountId,
         instrumentId,
         input.change_date,
         input.kind,
@@ -538,16 +566,16 @@ export async function recordPositionChange(
           // 无持仓或已清零：按本次成交重新建仓
           await client.query(
             `INSERT INTO portfolio_position
-               (instrument_id, quantity, cost_price, opened_at, entry_signal_type,
+               (account_id, instrument_id, quantity, cost_price, opened_at, entry_signal_type,
                 strategy_code, strategy_runtime_version, entry_signal_id, fallback_strategy_code, exit_policy_mode, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
-             ON CONFLICT (instrument_id) DO UPDATE SET
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+             ON CONFLICT (account_id, instrument_id) DO UPDATE SET
                quantity = EXCLUDED.quantity, cost_price = EXCLUDED.cost_price,
                opened_at = EXCLUDED.opened_at, entry_signal_type = EXCLUDED.entry_signal_type,
                strategy_code = EXCLUDED.strategy_code, strategy_runtime_version = EXCLUDED.strategy_runtime_version,
                entry_signal_id = EXCLUDED.entry_signal_id, fallback_strategy_code = EXCLUDED.fallback_strategy_code,
                exit_policy_mode = EXCLUDED.exit_policy_mode, updated_at = now()`,
-            [instrumentId, qty, price, input.change_date, attribution!.entry_signal_type,
+            [currentAccountId, instrumentId, qty, price, input.change_date, attribution!.entry_signal_type,
              attribution!.code, attribution!.runtime_version, input.entry_signal_id ?? null,
              attribution!.fallback_strategy_code, attribution!.exit_policy_mode],
           );
@@ -558,33 +586,24 @@ export async function recordPositionChange(
           const newCost = (oldQty * oldCost + qty * price) / newQty;
           // 同策略加仓保持原管理策略，只更新加权成本；跨策略已在前置校验拒绝。
           await client.query(
-            `UPDATE portfolio_position SET quantity = $2, cost_price = $3, updated_at = now()
-              WHERE instrument_id = $1`,
-            [instrumentId, newQty, newCost],
+            `UPDATE portfolio_position SET quantity = $3, cost_price = $4, updated_at = now()
+              WHERE account_id = $1 AND instrument_id = $2`,
+            [currentAccountId, instrumentId, newQty, newCost],
           );
         }
-        // 定时任务自动关注用于等待入场，买入成交后已经完成使命；人工关注继续保留。
-        await client.query(
-          `DELETE FROM pool_attention_entry entry
-            USING pool_membership membership
-           WHERE entry.instrument_id = membership.instrument_id
-             AND membership.instrument_id = $1 AND membership.effective_to IS NULL
-             AND entry.source_type = 'strategy' AND entry.strategy_code = $2`,
-          [instrumentId, attribution!.code],
-        );
       } else if (input.kind === "sell") {
         const oldQty = Number(existing!.quantity);
         const qty = input.quantity!;
         const newQty = oldQty - qty;
         if (newQty === 0) {
           await client.query(
-            "DELETE FROM portfolio_position WHERE instrument_id = $1",
-            [instrumentId],
+            "DELETE FROM portfolio_position WHERE account_id = $1 AND instrument_id = $2",
+            [currentAccountId, instrumentId],
           );
         } else {
           await client.query(
-            "UPDATE portfolio_position SET quantity = $2, updated_at = now() WHERE instrument_id = $1",
-            [instrumentId, newQty],
+            "UPDATE portfolio_position SET quantity = $3, updated_at = now() WHERE account_id = $1 AND instrument_id = $2",
+            [currentAccountId, instrumentId, newQty],
           );
         }
       } else {
@@ -594,12 +613,12 @@ export async function recordPositionChange(
              quantity = COALESCE($2, quantity),
              cost_price = COALESCE($3, cost_price),
              updated_at = now()
-           WHERE instrument_id = $1`,
-          [instrumentId, input.quantity ?? null, input.price ?? null],
+           WHERE account_id = $1 AND instrument_id = $4`,
+          [currentAccountId, input.quantity ?? null, input.price ?? null, instrumentId],
         );
       }
 
-      const rows = await listPositions(client);
+      const rows = await listPositions(client, currentAccountId);
       position = rows.find((p) => p.instrument_id === instrumentId) ?? null;
     }
 
@@ -620,6 +639,7 @@ export async function recordPositionChange(
 }
 
 export interface UpdateEntrySignalTypeInput {
+  account_id?: AccountId;
   code: string;
   entry_signal_type: EntrySignalType;
   reason: string;
@@ -636,6 +656,10 @@ export async function updatePositionEntrySignalType(
   input: UpdateEntrySignalTypeInput,
 ): Promise<{ position: PositionRow; previous_type: EntrySignalType | null }> {
   return inServiceTransaction(db, async (client) => {
+    const currentAccountId = accountId(input.account_id);
+    await client.query("SELECT id FROM portfolio_account WHERE id=$1 FOR UPDATE", [currentAccountId]);
+    const account = await requireAccount(client, currentAccountId);
+    if (account.status !== "active") throw apiErrors.conflict("账户已归档，不能修改持仓");
     const inst = await client.query<{ id: string }>(
       "SELECT id::text FROM market_instrument WHERE code = $1",
       [input.code],
@@ -646,8 +670,8 @@ export async function updatePositionEntrySignalType(
 
     const current = await client.query<{ entry_signal_type: EntrySignalType | null; strategy_code: string | null; opened_at: string | null }>(
       `SELECT entry_signal_type, strategy_code, opened_at::text
-         FROM portfolio_position WHERE instrument_id = $1 AND quantity > 0 FOR UPDATE`,
-      [instrumentId],
+         FROM portfolio_position WHERE account_id = $1 AND instrument_id = $2 AND quantity > 0 FOR UPDATE`,
+      [currentAccountId, instrumentId],
     );
     if (!current.rows[0]) throw apiErrors.badRequest(`标的 ${input.code} 当前无持仓，不能修正买入信号类型`);
     const previousType = current.rows[0].entry_signal_type ?? null;
@@ -668,35 +692,37 @@ export async function updatePositionEntrySignalType(
 
     await client.query(
       `UPDATE portfolio_position
-          SET entry_signal_type = $2, strategy_code = $3, strategy_runtime_version = $4,
-              entry_signal_id = NULL, fallback_strategy_code = $5, exit_policy_mode = $6, updated_at = now()
-        WHERE instrument_id = $1`,
-      [instrumentId, input.entry_signal_type, strategyCode, runtime.rows[0].runtime_version,
+          SET entry_signal_type = $3, strategy_code = $4, strategy_runtime_version = $5,
+              entry_signal_id = NULL, fallback_strategy_code = $6, exit_policy_mode = $7, updated_at = now()
+        WHERE account_id = $1 AND instrument_id = $2`,
+      [currentAccountId, instrumentId, input.entry_signal_type, strategyCode, runtime.rows[0].runtime_version,
        runtime.rows[0].fallback_strategy_code, runtime.rows[0].exit_policy_mode],
     );
     // 持仓周期内最近一笔买入事件同步补正；无买入事件的历史导入持仓只改持仓行。
     await client.query(
       `UPDATE portfolio_position_change change
-          SET entry_signal_type = $2, strategy_code = $4, strategy_runtime_version = $5,
-              entry_signal_id = NULL, fallback_strategy_code = $6, exit_policy_mode = $7
+          SET entry_signal_type = $3, strategy_code = $5, strategy_runtime_version = $6,
+              entry_signal_id = NULL, fallback_strategy_code = $7, exit_policy_mode = $8
          WHERE change.id = (
            SELECT latest.id
              FROM portfolio_position_change latest
-            WHERE latest.instrument_id = $1
+            WHERE latest.account_id = $1
+              AND latest.instrument_id = $2
               AND latest.kind = 'buy'
-              AND $3::date IS NOT NULL
-              AND latest.change_date >= $3::date
+              AND $4::date IS NOT NULL
+              AND latest.change_date >= $4::date
             ORDER BY latest.change_date DESC, latest.id DESC LIMIT 1
          )`,
-      [instrumentId, input.entry_signal_type, current.rows[0].opened_at, strategyCode,
+      [currentAccountId, instrumentId, input.entry_signal_type, current.rows[0].opened_at, strategyCode,
        runtime.rows[0].runtime_version, runtime.rows[0].fallback_strategy_code, runtime.rows[0].exit_policy_mode],
     );
     await client.query(
       `INSERT INTO portfolio_position_change
-         (instrument_id, change_date, kind, reason, source, decision_origin, execution_compliance,
+         (account_id, instrument_id, change_date, kind, reason, source, decision_origin, execution_compliance,
           strategy_change_seq, strategy_snapshot_hash, source_session_id, attribution_note)
-       VALUES ($1, CURRENT_DATE, 'note', $2, $3, 'fact_correction', 'not_applicable', $4, $5, $6, $7)`,
+       VALUES ($1, $2, CURRENT_DATE, 'note', $3, $4, 'fact_correction', 'not_applicable', $5, $6, $7, $8)`,
       [
+        currentAccountId,
         instrumentId,
         input.reason.trim(),
         input.source,
@@ -707,7 +733,7 @@ export async function updatePositionEntrySignalType(
       ],
     );
 
-    const rows = await listPositions(client);
+    const rows = await listPositions(client, currentAccountId);
     const position = rows.find((row) => row.instrument_id === instrumentId) ?? null;
     if (!position) throw apiErrors.conflict("修正后持仓行缺失");
     return { position, previous_type: previousType };

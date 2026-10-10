@@ -13,11 +13,6 @@ const REQUIRED_READS: Record<string, readonly string[]> = {
     "pool_context_query",
     "strategy_document_query",
     "analysis_run",
-    "board_query",
-    "market_snapshot_query",
-    "indicator_query",
-    "strategy_screen_query",
-    "stock_research_query",
   ],
   pre_market_news_scan: ["pool_context_query", "web_search", "pool_news_write"],
 };
@@ -152,20 +147,27 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
           missing.push("strategy_document_query（必须读取本任务策略和投资总策略）");
         }
       }
+      if (jobCode === "nightly_sector_opportunity_scan" && results.has("strategy_document_query")) {
+        const docs = results.get("strategy_document_query")?.documents;
+        if (!Array.isArray(docs) || !docs.some((item) => object(item).code === "nightly_sector_strategy")
+          || !docs.some((item) => object(item).role === "portfolio")) {
+          missing.push("strategy_document_query（必须读取夜间板块左侧趋势策略和投资总策略）");
+        }
+      }
       if (jobCode === "nightly_sector_opportunity_scan" && results.has("analysis_run")) {
         const items = results.get("analysis_run")?.items;
         const requests = successfulArgs.get("analysis_run")?.requests;
         const hasFullSectorScan = Array.isArray(items) && items.some((item) =>
-          object(item).analysis_type === "sector_temperature"
+          object(item).analysis_type === "sector_trend_structure"
           && ["success", "partial"].includes(String(object(item).status)),
         ) && Array.isArray(requests) && requests.some((request) => {
           const value = object(request);
-          return value.analysis_type === "sector_temperature"
+          return value.analysis_type === "sector_trend_structure"
             && value.as_of === targetDate
             && value.codes === undefined;
         });
         if (!hasFullSectorScan) {
-          missing.push("analysis_run（需要目标日完整 881 一级行业板块温度扫描或明确缺口）");
+          missing.push("analysis_run（需要目标日完整 881 一级行业趋势结构扫描或明确缺口）");
         }
       }
       if (jobCode === "limit_up_close_scan" && results.has("strategy_evaluation_query")) {

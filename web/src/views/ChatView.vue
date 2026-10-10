@@ -25,6 +25,7 @@ import ToolGroupCard from "../components/chat/ToolGroupCard.vue";
 import UiSelect, { type SelectOption } from "../components/ui/UiSelect.vue";
 import { useResource } from "../composables/useResource";
 import { useStreamTypewriter } from "../composables/useStreamTypewriter";
+import { accountWorkspaceState, selectedAccountId, portfolioAccounts } from "../stores/account";
 import { appMessage } from "../stores/message";
 import { fmtTime } from "../utils/format";
 import { activityLabel } from "../utils/agent-activity";
@@ -40,13 +41,14 @@ import {
 import type { AskAiRequest } from "../utils/askAi";
 
 const props = withDefaults(
-  defineProps<{ embedded?: boolean; request?: AskAiRequest | null }>(),
+  defineProps<{ embedded?: boolean; request?: AskAiRequest | null; accountId?: string | null }>(),
   { embedded: false, request: null },
 );
 const emit = defineEmits<{
   "request-close": [];
   "request-consumed": [id: string];
   "ui-refresh": [request: UiRefreshRequest];
+  "context-label": [label:string];
 }>();
 
 const llm = useResource<LlmStatus>(() => apiClient.get<LlmStatus>("/api/llm/status"));
@@ -55,10 +57,43 @@ const llmCatalog = useResource<LlmConfigCatalog>(() =>
 );
 
 // ---- 会话列表 ----
+const accountScope = props.accountId === undefined ? selectedAccountId.value : props.accountId;
+const workspaceKey = accountScope ?? "global";
+const savedWorkspace = accountWorkspaceState.get(workspaceKey);
+let disposed = false;
 const sessions = ref<ChatSession[]>([]);
 const sessionsError = ref<string | null>(null);
 const activeId = ref<string | null>(null);
 const activeSession = computed(() => sessions.value.find((s) => s.id === activeId.value) ?? null);
+const jobSessionsExpanded = ref(false);
+const activeAccounts = computed(() => portfolioAccounts.value.filter(account => account.status === "active"));
+const selectableAccounts = computed(() => accountScope === null ? activeAccounts.value : activeAccounts.value.filter(account => account.id === accountScope));
+const sessionAccount = computed(() => portfolioAccounts.value.find(account => account.id === activeSession.value?.account_id));
+const contextLabel = computed(() => activeSession.value?.account_id
+  ? `${sessionAccount.value?.name ?? "账户会话"}${sessionAccount.value?.status === "archived" ? " · 历史账户" : ""}`
+  : activeSession.value?.session_type === "job" ? "全局任务" : "自由对话");
+watch(contextLabel, label => emit("context-label",label),{immediate:true});
+const accountDialog = ref<HTMLDialogElement | null>(null);
+const accountChoice = ref("");
+const accountAction = ref<"new" | "bind">("new");
+const bindingSessionId = ref<string | null>(null);
+const accountBusy = ref(false);
+const accountError = ref("");
+
+const sessionGroups = computed(() => [
+  {
+    type: "interactive" as const,
+    title: "我的对话",
+    items: sessions.value.filter((session) => session.session_type === "interactive"),
+    expanded: true,
+  },
+  {
+    type: "job" as const,
+    title: "任务会话",
+    items: sessions.value.filter((session) => session.session_type === "job"),
+    expanded: jobSessionsExpanded.value,
+  },
+]);
 
 const SESSION_TYPE_LABELS: Record<ChatSession["session_type"], string> = {
   interactive: "对话",
@@ -125,7 +160,7 @@ const showArchived = ref(false);
 
 async function loadSessions(): Promise<void> {
   const r = await apiClient.get<ChatSession[]>(
-    `/api/chat/sessions${showArchived.value ? "?archived=1" : ""}`,
+    `/api/chat/sessions?account_id=${accountScope ?? "0"}&include_interactive=${accountScope === null ? "1" : "0"}${showArchived.value ? "&archived=1" : ""}`,
   );
   if (r.ok) {
     sessions.value = r.data;
@@ -138,14 +173,16 @@ async function loadSessions(): Promise<void> {
 async function toggleArchivedView(): Promise<void> {
   detachLocalStream("已切换会话，当前运行继续在后台执行");
   showArchived.value = !showArchived.value;
+  jobSessionsExpanded.value = false;
   activeId.value = null;
   messages.value = [];
   closeEvents();
   await loadSessions();
 }
 
-async function createNewSession(): Promise<void> {
-  const r = await apiClient.post<ChatSession>("/api/chat/sessions", {});
+async function createNewSession(accountId: string | null): Promise<void> {
+  sessionsError.value=null;
+  const r = await apiClient.post<ChatSession>("/api/chat/sessions", { account_id: accountId });
   if (r.ok) {
     if (showArchived.value) {
       showArchived.value = false;
@@ -157,6 +194,53 @@ async function createNewSession(): Promise<void> {
   } else {
     sessionsError.value = `${r.code}：${r.message}`;
   }
+}
+
+async function loadAccountChoices() {
+  const result=await apiClient.get<import("../stores/account").PortfolioAccount[]>("/api/accounts");
+  if (!result.ok) { sessionsError.value=result.message; return false; }
+  portfolioAccounts.value=result.data;
+  return true;
+}
+async function startNewSession(forceChoice = false) {
+  if (!(await loadAccountChoices()) || disposed) return;
+  if (!forceChoice || accountScope !== null) {
+    const account=activeAccounts.value.find(account=>account.id===accountScope)
+      ?? (activeAccounts.value.length===1 ? activeAccounts.value[0] : undefined);
+    if (account) { await createNewSession(account.id); return; }
+  }
+  accountAction.value="new";
+  bindingSessionId.value=null;
+  accountChoice.value="";
+  accountError.value="";
+  accountDialog.value?.showModal();
+}
+async function chooseSessionAccount() {
+  if (!activeSession.value || activeSession.value.session_type!=="interactive" || activeSession.value.account_id || isAgentRunning.value) return;
+  if (!(await loadAccountChoices()) || disposed) return;
+  accountAction.value="bind";
+  bindingSessionId.value=activeSession.value.id;
+  accountChoice.value=selectableAccounts.value.length===1 ? selectableAccounts.value[0]!.id : "";
+  accountError.value="";
+  accountDialog.value?.showModal();
+}
+async function submitSessionAccount() {
+  if (accountBusy.value) return;
+  if (!accountChoice.value) { accountError.value="请选择要维护的账户，或新建仅用于研究的会话"; return; }
+  accountBusy.value=true;
+  accountError.value="";
+  try {
+    if (accountAction.value==="new") {
+      await createNewSession(accountChoice.value==="global" ? null : accountChoice.value);
+      if (sessionsError.value) { accountError.value=sessionsError.value; return; }
+    } else {
+      const result=await apiClient.post<ChatSession>(`/api/chat/sessions/${bindingSessionId.value}/account`,{account_id:accountChoice.value});
+      if (!result.ok) { accountError.value=result.message; return; }
+      sessions.value=sessions.value.map(session=>session.id===result.data.id ? result.data : session);
+      appMessage.success(`本会话可维护「${portfolioAccounts.value.find(account=>account.id===result.data.account_id)?.name ?? "已关联账户"}」的持仓`);
+    }
+    accountDialog.value?.close();
+  } finally { accountBusy.value=false; }
 }
 
 // ---- 重命名 / 归档 ----
@@ -541,8 +625,8 @@ function applyConfirmationResult(data: ConfirmationResultEvent): void {
 }
 
 // ---- 发送与 SSE 帧处理 ----
-const draft = ref("");
-const draftContextLabel = ref<string | null>(null);
+const draft = ref(savedWorkspace?.draft ?? "");
+const draftContextLabel = ref<string | null>(savedWorkspace?.contextLabel ?? null);
 const composerInput = ref<HTMLTextAreaElement | null>(null);
 const workspaceReady = ref(false);
 let handlingRequestId: string | null = null;
@@ -601,7 +685,7 @@ const canControl = computed(
 );
 
 async function consumeWorkspaceRequest(request: AskAiRequest): Promise<void> {
-  if (!workspaceReady.value || handlingRequestId !== null) return;
+  if (disposed || !workspaceReady.value || handlingRequestId !== null) return;
   handlingRequestId = request.id;
   try {
     if (showArchived.value) {
@@ -615,13 +699,18 @@ async function consumeWorkspaceRequest(request: AskAiRequest): Promise<void> {
         sessionsError.value = `会话不存在或已归档：${request.sessionId}`;
         return;
       }
+      if (sessions.value.find((session) => session.id === request.sessionId)?.session_type === "job") {
+        jobSessionsExpanded.value = true;
+      }
       await selectSession(request.sessionId);
     } else {
       if (!request.prompt) return;
       const created = await apiClient.post<ChatSession>("/api/chat/sessions", {
+        account_id: accountScope,
         title: request.title ?? request.contextLabel ?? "新会话",
         parent_session_id: request.parentSessionId ?? null,
       });
+      if (disposed) return;
       if (!created.ok) {
         sessionsError.value = `${created.code}：${created.message}`;
         return;
@@ -633,10 +722,10 @@ async function consumeWorkspaceRequest(request: AskAiRequest): Promise<void> {
       await nextTick();
       composerInput.value?.focus();
     }
-    emit("request-consumed", request.id);
+    if (!disposed) emit("request-consumed", request.id);
   } finally {
     handlingRequestId = null;
-    if (props.request && props.request.id !== request.id) {
+    if (!disposed && props.request && props.request.id !== request.id) {
       void consumeWorkspaceRequest(props.request);
     }
   }
@@ -1036,13 +1125,19 @@ onMounted(async () => {
   window.addEventListener("stock:agent-settings-changed", llm.reload);
   window.addEventListener("stock:llm-config-changed", reloadLlmConfig);
   await Promise.all([llm.reload(), llmCatalog.reload(), loadSessions()]);
-  const first = sessions.value[0];
+  if (disposed) return;
+  const saved = savedWorkspace;
+  const first = sessions.value.find(session => session.id === saved?.sessionId)
+    ?? sessions.value.find(session => session.session_type === "interactive");
   if (first) await selectSession(first.id);
+  if (disposed) return;
   workspaceReady.value = true;
   if (props.request) await consumeWorkspaceRequest(props.request);
 });
 
 onBeforeUnmount(() => {
+  disposed = true;
+  accountWorkspaceState.set(workspaceKey, { sessionId: activeId.value ?? savedWorkspace?.sessionId ?? null, draft: draft.value, contextLabel: draftContextLabel.value });
   window.removeEventListener("stock:agent-settings-changed", llm.reload);
   window.removeEventListener("stock:llm-config-changed", reloadLlmConfig);
   detachLocalStream("已关闭对话面板，当前运行继续在后台执行");
@@ -1079,63 +1174,79 @@ onBeforeUnmount(() => {
     <div class="chat-layout">
       <!-- 会话列表 -->
       <aside class="card session-panel">
-        <button class="btn primary new-session agent-entry" type="button" @click="createNewSession">
+        <button class="btn primary new-session agent-entry" type="button" @click="startNewSession()">
           新建会话
         </button>
         <p v-if="sessionsError" class="panel-error">{{ sessionsError }}</p>
         <p v-else-if="sessions.length === 0" class="panel-empty">
           {{ showArchived ? "没有已归档会话" : "还没有会话，点上方新建" }}
         </p>
-        <ul v-else class="session-list">
-          <li
-            v-for="s in sessions"
-            :key="s.id"
-            class="session-item"
-            :class="{ active: s.id === activeId }"
-            @click="selectSession(s.id)"
-          >
-            <input
-              v-if="renamingId === s.id"
-              v-model="renameDraft"
-              class="rename-input"
-              type="text"
-              @click.stop
-              @keydown.enter.prevent="commitRename"
-              @keydown.esc.prevent="renamingId = null"
-              @blur="commitRename"
-              v-focus
-            />
-            <template v-else>
-              <span class="session-title-row">
-                <span class="session-title">{{ s.title }}</span>
-                <span v-if="s.session_type !== 'interactive'" class="session-kind">
-                  {{ SESSION_TYPE_LABELS[s.session_type] }}
-                </span>
-              </span>
-              <span class="session-meta">
-                <span class="session-id num">#{{ s.id }}</span>
-                <span v-if="s.session_status !== 'idle'" class="session-state">
-                  {{ SESSION_STATUS_LABELS[s.session_status] }}
-                </span>
-                <span class="session-actions" @click.stop>
-                  <button type="button" title="重命名" @click="startRename(s)">✏️</button>
-                  <button
-                    v-if="!showArchived"
-                    type="button"
-                    title="归档"
-                    @click="setArchived(s, true)"
-                  >🗂</button>
-                  <button
-                    v-else
-                    type="button"
-                    title="取消归档"
-                    @click="setArchived(s, false)"
-                  >↩︎</button>
-                </span>
-              </span>
-            </template>
-          </li>
-        </ul>
+        <div v-else class="session-groups">
+          <section v-for="group in sessionGroups" :key="group.type" class="session-group">
+            <button
+              v-if="group.type === 'job'"
+              class="session-group-head toggle"
+              type="button"
+              :aria-expanded="group.expanded"
+              @click="jobSessionsExpanded = !jobSessionsExpanded"
+            >
+              <span><span class="group-chevron" aria-hidden="true">{{ group.expanded ? "⌄" : "›" }}</span>{{ group.title }}</span>
+              <span class="session-count">{{ group.items.length }}</span>
+            </button>
+            <div v-else class="session-group-head">
+              <span>{{ group.title }}</span>
+              <span class="session-count">{{ group.items.length }}</span>
+            </div>
+            <ul v-if="group.expanded && group.items.length" class="session-list">
+              <li
+                v-for="s in group.items"
+                :key="s.id"
+                class="session-item"
+                :class="{ active: s.id === activeId }"
+                @click="selectSession(s.id)"
+              >
+                <input
+                  v-if="renamingId === s.id"
+                  v-model="renameDraft"
+                  class="rename-input"
+                  type="text"
+                  @click.stop
+                  @keydown.enter.prevent="commitRename"
+                  @keydown.esc.prevent="renamingId = null"
+                  @blur="commitRename"
+                  v-focus
+                />
+                <template v-else>
+                  <span class="session-title-row">
+                    <span class="session-title">{{ s.title }}</span>
+                  </span>
+                  <span class="session-meta">
+                    <span class="session-id num">#{{ s.id }}</span>
+                    <span v-if="accountScope === null" class="session-account-label" :title="portfolioAccounts.find(account => account.id === s.account_id)?.name">{{ s.account_id ? portfolioAccounts.find(account => account.id === s.account_id)?.name ?? '账户会话' : '全局' }}</span>
+                    <span v-if="s.session_status !== 'idle'" class="session-state">
+                      {{ SESSION_STATUS_LABELS[s.session_status] }}
+                    </span>
+                    <span class="session-actions" @click.stop>
+                      <button type="button" title="重命名" @click="startRename(s)">✏️</button>
+                      <button
+                        v-if="!showArchived"
+                        type="button"
+                        title="归档"
+                        @click="setArchived(s, true)"
+                      >🗂</button>
+                      <button
+                        v-else
+                        type="button"
+                        title="取消归档"
+                        @click="setArchived(s, false)"
+                      >↩︎</button>
+                    </span>
+                  </span>
+                </template>
+              </li>
+            </ul>
+          </section>
+        </div>
         <button class="archived-toggle" type="button" @click="toggleArchivedView">
           {{ showArchived ? "← 返回进行中的会话" : "已归档会话" }}
         </button>
@@ -1270,6 +1381,11 @@ onBeforeUnmount(() => {
         </button>
 
         <!-- 输入区 -->
+        <div v-if="activeSession?.session_type === 'interactive'" class="conversation-account-bar">
+          <div><strong>{{ activeSession.account_id ? `持仓账户：${sessionAccount?.name ?? activeSession.account_id}` : '尚未关联持仓账户' }}</strong><small>{{ activeSession.account_id ? '可登记开仓、加仓、部分买卖及清仓' : '需要维护持仓时，请先关联账户' }}</small></div>
+          <button v-if="!activeSession.account_id" class="btn compact" type="button" :disabled="isAgentRunning || isArchivedSession" @click="chooseSessionAccount">关联账户</button>
+          <button v-else class="btn compact" type="button" :disabled="isAgentRunning" @click="startNewSession(true)">新建账户会话</button>
+        </div>
         <div class="composer">
           <p v-if="draftContextLabel" class="context-prefill">
             <span>✦ 已带入：{{ draftContextLabel }}</span>
@@ -1353,6 +1469,16 @@ onBeforeUnmount(() => {
       </div>
     </div>
   </section>
+    <dialog ref="accountDialog" class="session-account-dialog" aria-labelledby="session-account-title" @keydown.esc.stop @cancel="accountBusy && $event.preventDefault()">
+      <form @submit.prevent="submitSessionAccount">
+        <h2 id="session-account-title">{{ accountAction === 'bind' ? '关联持仓账户' : '新建会话' }}</h2>
+        <p>{{ accountAction === 'bind' ? '本会话将在这个账户登记持仓变化。关联后保持固定，不改变其他账户或任务会话。' : '选择要维护的持仓账户；也可新建仅用于共享研究的会话。' }}</p>
+        <label for="session-account-choice">{{ accountAction === 'bind' ? '维护账户' : '会话范围' }}</label>
+        <select id="session-account-choice" v-model="accountChoice" required :disabled="accountBusy"><option value="" disabled>请选择账户</option><option v-for="account in selectableAccounts" :key="account.id" :value="account.id">{{ account.name }}</option><option v-if="accountAction === 'new'" value="global">仅全局研究（不维护持仓）</option></select>
+        <p v-if="accountError" class="panel-error" role="alert">{{ accountError }}</p>
+        <div class="session-account-actions"><button class="btn" type="button" :disabled="accountBusy" @click="accountDialog?.close()">取消</button><button class="btn primary" type="submit" :disabled="accountBusy">{{ accountBusy ? '处理中…' : accountAction === 'bind' ? '关联此账户' : '创建会话' }}</button></div>
+      </form>
+    </dialog>
 </template>
 
 <style scoped>
@@ -1467,6 +1593,52 @@ onBeforeUnmount(() => {
   color: var(--bad);
 }
 
+.session-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.session-group-head {
+  width: 100%;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  font: 600 var(--fs-sm) var(--font-body);
+  text-align: left;
+}
+
+.session-group-head.toggle {
+  cursor: pointer;
+}
+
+.session-group-head.toggle:hover {
+  color: var(--accent-ink);
+}
+
+.group-chevron {
+  display: inline-block;
+  width: 14px;
+  color: var(--ink-faint);
+}
+
+.session-count {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--paper-deep);
+  color: var(--ink-faint);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  text-align: center;
+}
+
 .session-list {
   list-style: none;
   margin: 0;
@@ -1524,7 +1696,6 @@ onBeforeUnmount(() => {
   padding-right: 44px;
 }
 
-.session-kind,
 .session-state {
   flex: none;
   border-radius: 999px;
@@ -1533,11 +1704,6 @@ onBeforeUnmount(() => {
   padding: 1px 6px;
   font-size: 10px;
   line-height: 1.5;
-}
-
-.session-kind {
-  background: var(--accent-soft);
-  color: var(--accent-ink);
 }
 
 .session-meta {
@@ -1557,6 +1723,7 @@ onBeforeUnmount(() => {
   font-size: var(--fs-xs);
   color: var(--ink-faint);
 }
+.session-account-label { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--accent-ink); }
 
 /* 悬浮操作：绝对定位浮在标题行右端，不参与排版，避免挤压时间换行 */
 .session-actions {
@@ -2183,4 +2350,18 @@ onBeforeUnmount(() => {
     animation: none;
   }
 }
+</style>
+
+<style scoped>
+.conversation-account-bar { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:9px 12px; border-top:1px solid var(--line); background:var(--accent-soft); }
+.conversation-account-bar > div { display:grid; gap:2px; min-width:0; }
+.conversation-account-bar strong { font-size:11px; color:var(--accent-ink); }
+.conversation-account-bar small { font-size:10px; color:var(--ink-soft); }
+.session-account-dialog { width:min(420px,calc(100vw - 32px)); padding:24px; border:1px solid var(--line); border-radius:var(--radius-md); background:var(--card); color:var(--ink); }
+.session-account-dialog::backdrop { background:var(--overlay); }
+.session-account-dialog h2 { font-size:18px; }
+.session-account-dialog p { font-size:12px; color:var(--ink-soft); line-height:1.7; }
+.session-account-dialog label { display:block; font-size:12px; margin:16px 0 6px; }
+.session-account-dialog select { width:100%; padding:9px; background:var(--paper); color:var(--ink); border:1px solid var(--line); border-radius:var(--radius-sm); }
+.session-account-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:22px; }
 </style>

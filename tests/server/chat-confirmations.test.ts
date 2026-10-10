@@ -1,5 +1,6 @@
 // 领域写工具确认制、YOLO、事务审计、写锁与状态冲突测试。
 import type pg from "pg";
+import { createAccount } from "../../server/modules/accounts/repo.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../server/db/migrate.js";
 import {
@@ -9,7 +10,7 @@ import {
   rejectConfirmation,
 } from "../../server/agent/confirmations.js";
 import { subscribeSessionEvents, type SessionEventFrame } from "../../server/agent/events.js";
-import { createSession } from "../../server/agent/repo.js";
+import { bindSessionAccount, createSession } from "../../server/agent/repo.js";
 import { buildChatTools } from "../../server/agent/tools.js";
 import { storeBars } from "../../server/datasource/service.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
@@ -416,4 +417,53 @@ describe.skipIf(!prepared)("领域写工具确认与执行（stock_test 真实�
     expect((await getConfirmation(pool, expiringId))?.status).toBe("expired");
     await expect(approveConfirmation(pool, expiringId)).rejects.toMatchObject({ httpStatus: 409 });
   });
+  it("确认批准继续使用提案会话绑定账户，不落入默认账户", async () => {
+    const account=await createAccount(pool,"确认隔离账户");
+    const session=await createSession(pool,{title:"账户确认",account_id:account.id});
+    const tool=buildChatTools({pool,sessionId:session.id,accountId:account.id}).find(tool=>tool.name==="portfolio_write")!;
+    const result=await tool.execute("账户买入",{reason:"用户登记账户买入",changes:[{code:"990001.SZ",kind:"buy",quantity:15,price:8,
+      change_date:"2026-09-29",strategy_code:"discretionary",decision_origin:"planned_discretionary",execution_compliance:"matched"}]});
+    const confirmationId=(result.details as {confirmation_id:string}).confirmation_id;
+    const before=(await pool.query("SELECT quantity::text FROM portfolio_position WHERE account_id=1 ORDER BY instrument_id")).rows;
+    await approveConfirmation(pool,confirmationId);
+    expect((await pool.query("SELECT quantity::int,cost_price::float FROM portfolio_position WHERE account_id=$1",[account.id])).rows).toEqual([{quantity:15,cost_price:8}]);
+    expect((await pool.query("SELECT quantity::text FROM portfolio_position WHERE account_id=1 ORDER BY instrument_id")).rows).toEqual(before);
+  });
+
+  it("手动会话首次关联账户后可确认开仓、加仓、部分卖出及清仓，其他账户不变", async () => {
+    const account = await createAccount(pool, "手动成交账户");
+    const session = await createSession(pool, { title: "手动维护", account_id: null });
+    const trade = { code: "990001.SZ", kind: "buy", quantity: 100, price: 10, change_date: "2026-10-09",
+      strategy_code: "discretionary", decision_origin: "planned_discretionary", execution_compliance: "matched" };
+    await expect(buildChatTools({ pool, sessionId: session.id, accountId: null }).find(tool => tool.name === "portfolio_write")!
+      .execute("未关联买入", { reason: "用户登记", changes: [trade] })).rejects.toThrow("绑定账户会话");
+    await bindSessionAccount(pool, session.id, account.id);
+    const tool = buildChatTools({ pool, sessionId: session.id, accountId: account.id }).find(tool => tool.name === "portfolio_write")!;
+    const otherPositions = (await pool.query("SELECT * FROM portfolio_position WHERE account_id<>$1 ORDER BY account_id,instrument_id", [account.id])).rows;
+    const otherChanges = (await pool.query("SELECT * FROM portfolio_position_change WHERE account_id<>$1 ORDER BY id", [account.id])).rows;
+    const current = async () => (await pool.query("SELECT quantity::float,cost_price::float FROM portfolio_position WHERE account_id=$1", [account.id])).rows;
+    const operations = [
+      { kind: "buy", quantity: 100, price: 10, expected: [{ quantity: 100, cost_price: 10 }] },
+      { kind: "buy", quantity: 100, price: 12, expected: [{ quantity: 200, cost_price: 11 }] },
+      { kind: "sell", quantity: 50, price: 13, expected: [{ quantity: 150, cost_price: 11 }] },
+      { kind: "sell", quantity: 150, price: 14, expected: [] },
+    ];
+    for (const [index, operation] of operations.entries()) {
+      const before = await current();
+      const { expected, ...change } = operation;
+      const { strategy_code, ...facts } = trade;
+      const result = await tool.execute(`手动成交${index}`, { reason: "登记用户已成交记录", changes: [{ ...facts, ...change, ...(change.kind === "buy" ? { strategy_code } : {}) }] });
+      const confirmationId = (result.details as { confirmation_id: string }).confirmation_id;
+      expect((await getConfirmation(pool, confirmationId))?.status).toBe("pending");
+      expect(await current()).toEqual(before);
+      await approveConfirmation(pool, confirmationId);
+      expect(await current()).toEqual(expected);
+    }
+    const changes = (await pool.query("SELECT kind,quantity::int,realized_pnl::float,source,source_session_id::text FROM portfolio_position_change WHERE account_id=$1 ORDER BY id", [account.id])).rows;
+    expect(changes).toEqual(operations.map(operation => ({ kind: operation.kind, quantity: operation.quantity,
+      realized_pnl: operation.kind === "sell" ? operation.quantity * (operation.price - 11) : null, source: "chat", source_session_id: session.id })));
+    expect((await pool.query("SELECT * FROM portfolio_position WHERE account_id<>$1 ORDER BY account_id,instrument_id", [account.id])).rows).toEqual(otherPositions);
+    expect((await pool.query("SELECT * FROM portfolio_position_change WHERE account_id<>$1 ORDER BY id", [account.id])).rows).toEqual(otherChanges);
+  });
+
 });

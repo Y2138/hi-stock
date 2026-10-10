@@ -16,45 +16,48 @@ import StateBlock from "../components/StateBlock.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
 import { fmtDate, fmtNum } from "../utils/format";
-import { askAi } from "../utils/askAi";
+import { type PortfolioAccount } from "../stores/account";
 
 const router = useRouter();
 
-function maintainFactsWithAgent(): void {
-  askAi(
-    "请先核对我要记录的持仓或标的池变化，再通过对应领域工具生成提案。不要根据页面猜测业务事实。",
-    "维护业务事实",
-    { confirmation: "打开 Agent 维护业务事实？\n\n页面只提供查询，写入会先由 Agent 核对。" },
-  );
+interface AccountOverview {
+  accounts: Array<{ account: PortfolioAccount; positions: Position[]; plan: DailyPlanBoard | null; jobs: JobDefinition[] }>;
+  global_jobs: JobDefinition[];
 }
-
+const overview = useResource<AccountOverview>(() => apiClient.get<AccountOverview>("/api/accounts/overview"));
+function accountRoute(id: string, path = "/positions") { return { path, query: { account: id, ...(path === "/jobs" ? { scope:"account" } : {}) } }; }
+const portfolios = computed(() => overview.data.value?.accounts ?? []);
+type OverviewJob = JobDefinition & { ownerAccountId?: string };
+const jobs = {
+  data: computed<OverviewJob[]>(() => [
+    ...(overview.data.value?.global_jobs ?? []),
+    ...portfolios.value.flatMap(({account,jobs}) => jobs.map(job => ({ ...job, name:`${account.name} · ${job.name}`, ownerAccountId:account.id }))),
+  ]), loading:overview.loading, error:overview.error, reload:overview.reload,
+};
+const positions = { data:computed(() => portfolios.value.flatMap(item => item.positions)), loading:overview.loading, error:overview.error };
+const globalOpportunities = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>("/api/plans/limit-up/latest"));
 const coverage = useResource<MarketCoverage[]>(() =>
   apiClient.get<MarketCoverage[]>("/api/market/coverage"),
 );
-const jobs = useResource<JobDefinition[]>(() => apiClient.get<JobDefinition[]>("/api/jobs"));
-const positions = useResource<Position[]>(() => apiClient.get<Position[]>("/api/positions"));
 const watchPool = useResource<PoolViewData>(() => apiClient.get<PoolViewData>("/api/pools"));
-const dailyPlan = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>("/api/plans/latest"));
-
-// 打板机会：仪表盘只汇总数量，明细在市场结构页展示。404 = 计划尚未生成结构化预案，不算错误。
-const planLoading = computed(() => dailyPlan.loading.value);
-const planMissing = computed(() => !dailyPlan.data.value && dailyPlan.error.value?.status === 404);
-const planError = computed(() => (planMissing.value ? null : dailyPlan.error.value));
-const planEmpty = computed(() => {
-  const board = dailyPlan.data.value;
-  return board !== null && board.opportunities.length === 0;
-});
-const opportunities = computed(() => dailyPlan.data.value?.opportunities ?? []);
-const planPositionActions = computed(() => dailyPlan.data.value?.position_actions ?? []);
-const planStrategyCovered = computed(() => planPositionActions.value.filter((item) => item.primary_evaluation_run_id).length);
-const planFallbackCovered = computed(() => planPositionActions.value.filter((item) => item.fallback_evaluation_run_id).length);
-const planIncomplete = computed(() => planPositionActions.value.filter((item) => item.evaluation_status && item.evaluation_status !== "success").length);
-const planTargetDate = computed(() => dailyPlan.data.value?.plan.target_date ?? null);
-const planPendingReview = computed(() =>
-  opportunities.value.filter((item) => item.auction_assessment === null).length,
-);
-const planDataGap = computed(() => opportunities.value.filter((item) => item.grade === null).length);
-
+const planLoading = computed(() => overview.loading.value || globalOpportunities.loading.value);
+const planMissing = computed(() => !portfolios.value.some(item => item.plan));
+const planError = computed(() => overview.error.value ?? (globalOpportunities.error.value?.status === 404 ? null : globalOpportunities.error.value));
+const planEmpty = computed(() => false);
+const opportunities = computed(() => globalOpportunities.data.value?.opportunities ?? []);
+const planPositionActions = computed(() => portfolios.value.flatMap(item => item.plan?.position_actions ?? []));
+const planStrategyCovered = computed(() => planPositionActions.value.filter(item => item.primary_evaluation_run_id).length);
+const planFallbackCovered = computed(() => planPositionActions.value.filter(item => item.fallback_evaluation_run_id).length);
+const planIncomplete = computed(() => planPositionActions.value.filter(item => item.evaluation_status && item.evaluation_status !== "success").length);
+const planPendingReview = computed(() => opportunities.value.filter(item => item.auction_assessment === null).length);
+const planDataGap = computed(() => opportunities.value.filter(item => item.grade === null).length);
+const accountSummaries = computed(() => portfolios.value.map(item => ({
+  ...item,
+  marketValue:item.positions.reduce((sum,p)=>sum+(p.market_value??0),0),
+  pnl:item.positions.reduce((sum,p)=>sum+(p.pnl_amount??0),0),
+  missing:item.positions.filter(p=>p.close===null).length,
+  planCount:item.plan?.position_actions.length ?? 0,
+})));
 const recentAttentionCount = computed(() =>
   (watchPool.data.value?.members ?? []).filter((member) => member.attention_entries.length > 0).length,
 );
@@ -84,7 +87,7 @@ const largestPosition = computed(() => {
     .filter((item) => item.market_value !== null)
     .sort((a, b) => (b.market_value ?? 0) - (a.market_value ?? 0))[0];
   if (!position || total <= 0) return null;
-  return { position, ratio: (position.market_value ?? 0) / total };
+  return { position, accountName: portfolios.value.find(item => item.account.id === position.account_id)?.account.name, ratio: (position.market_value ?? 0) / total };
 });
 
 const coverageRows = computed(() => {
@@ -105,8 +108,8 @@ const latestRuns = computed(() => {
     .filter((definition) => definition.latest_run !== null)
     .map((definition) => ({ name: definition.name, code: definition.code, run: definition.latest_run! }))
     .sort((a, b) =>
-      String(b.run.started_at ?? b.run.scheduled_for ?? "").localeCompare(
-        String(a.run.started_at ?? a.run.scheduled_for ?? ""),
+      String(b.run.started_at ?? b.run.scheduled_for ?? b.run.target_date ?? "").localeCompare(
+        String(a.run.started_at ?? a.run.scheduled_for ?? a.run.target_date ?? ""),
       ),
     )
     .slice(0, 4);
@@ -140,7 +143,7 @@ const attentionItems = computed<AttentionItem[]>(() => {
   const loadErrors = [
     { key: "coverage", title: "行情覆盖读取失败", error: coverage.error.value, to: "/datasync" },
     { key: "jobs", title: "任务状态读取失败", error: jobs.error.value, to: "/jobs" },
-    { key: "positions", title: "持仓读取失败", error: positions.error.value, to: "/positions" },
+    { key: "positions", title: "持仓读取失败", error: positions.error.value, to: "/#dashboard-accounts" },
   ];
   for (const failure of loadErrors) {
     if (failure.error) {
@@ -158,11 +161,13 @@ const attentionItems = computed<AttentionItem[]>(() => {
     const run = definition.latest_run;
     if (!run || !["failed", "partial", "missed", "cancelled"].includes(run.status)) continue;
     items.push({
-      key: `job-${definition.code}`,
+      key: `job-${definition.ownerAccountId ?? "global"}-${definition.code}`,
       title: `${definition.name}${RUN_STATUS[run.status]?.label ?? run.status}`,
       detail: `目标日 ${fmtDate(run.target_date) ?? "未记录"} · 查看日志和缺口后再处理`,
       tone: run.status === "failed" ? "bad" : "warn",
-      to: "/jobs",
+      to: definition.execution_scope === "account"
+        ? `/jobs?scope=account&account=${definition.ownerAccountId}&job=${definition.code}`
+        : `/jobs?scope=global&job=${definition.code}`,
     });
   }
 
@@ -179,13 +184,13 @@ const attentionItems = computed<AttentionItem[]>(() => {
   const unassigned = activePositions.value.filter((position) => !position.strategy_code).length;
   if (unassigned > 0) items.push({
     key: "unassigned-positions", title: `${unassigned} 只持仓待策略归因`,
-    detail: "每日计划无法为待归因持仓选择主出场策略", tone: "bad", to: "/positions",
+    detail: "每日计划无法为待归因持仓选择主出场策略", tone: "bad", to: "/#dashboard-accounts",
   });
-  const incompleteActions = (dailyPlan.data.value?.position_actions ?? []).filter((item) =>
+  const incompleteActions = planPositionActions.value.filter((item) =>
     item.evaluation_status && item.evaluation_status !== "success").length;
   if (incompleteActions > 0) items.push({
     key: "incomplete-plan-evaluation", title: `${incompleteActions} 笔持仓预案评估不完整`,
-    detail: "查看主策略、兜底策略和数据缺口", tone: "warn", to: "/positions",
+    detail: "查看主策略、兜底策略和数据缺口", tone: "warn", to: "/#dashboard-accounts",
   });
   const staleAttention = (watchPool.data.value?.members ?? []).flatMap((member) => member.attention_entries)
     .filter((entry) => entry.stale_reason).length;
@@ -200,7 +205,7 @@ const attentionItems = computed<AttentionItem[]>(() => {
       title: `${positionSummary.value.missingQuote} 只持仓缺少最新收盘`,
       detail: "相关市值与浮动盈亏不完整，先补齐行情再判断持仓状态",
       tone: "bad",
-      to: "/positions",
+      to: "/#dashboard-accounts",
     });
   }
 
@@ -248,10 +253,9 @@ function percent(value: number | null): string {
 function reloadAll(): void {
   void Promise.all([
     coverage.reload(),
-    jobs.reload(),
-    positions.reload(),
+    overview.reload(),
     watchPool.reload(),
-    dailyPlan.reload(),
+    globalOpportunities.reload(),
   ]);
 }
 
@@ -264,12 +268,12 @@ onMounted(reloadAll);
     <header class="dashboard-head">
       <div class="head-copy">
         <h1>仪表盘</h1>
-        <p>先确认数据与异常，再看持仓状态和下一步动作。</p>
+        <p><span class="badge accent">全部账户</span> 汇总各账户持仓、独立计划与全局任务，不随账户切换变化。</p>
       </div>
       <div class="head-actions" aria-label="常用操作">
-        <button class="btn primary agent-entry" type="button" @click="maintainFactsWithAgent">通过 Agent 记录变化</button>
+        <a class="btn primary" href="#dashboard-accounts">查看各账户</a>
         <button class="btn" type="button" @click="router.push('/pools')">查看关注池</button>
-        <button class="btn" type="button" @click="router.push('/jobs')">运行任务</button>
+        <button class="btn" type="button" @click="router.push('/jobs?scope=global')">全局任务</button>
       </div>
     </header>
 
@@ -282,7 +286,7 @@ onMounted(reloadAll);
         <p>
           日线 {{ fmtDate(dayCoverage?.last_date) ?? "未就绪" }}
           <span aria-hidden="true">·</span>
-          {{ positionSummary.count }} 只持仓
+          {{ positionSummary.count }} 笔持仓
         </p>
       </div>
       <a v-if="attentionItems.length > 0" class="status-link" href="#dashboard-attention">
@@ -295,10 +299,10 @@ onMounted(reloadAll);
       <article class="card dashboard-card account-card">
         <div class="card-heading">
           <div>
-            <span class="section-label">当前持仓</span>
-            <h2>关键持仓状态</h2>
+            <span class="section-label">全部账户持仓汇总</span>
+            <h2>全部持仓状态</h2>
           </div>
-          <RouterLink to="/positions">查看持仓明细</RouterLink>
+          <a href="#dashboard-accounts">按账户查看</a>
         </div>
         <StateBlock
           :loading="positionLoading"
@@ -326,7 +330,7 @@ onMounted(reloadAll);
             <div class="metric-item">
               <span class="metric-label">持仓数量</span>
               <strong class="num">{{ positionSummary.count }}</strong>
-              <span class="metric-meta">当前持仓标的</span>
+              <span class="metric-meta">跨账户持仓笔数</span>
             </div>
             <div class="metric-item">
               <span class="metric-label">行情缺口</span>
@@ -335,10 +339,10 @@ onMounted(reloadAll);
             </div>
           </div>
           <div v-if="largestPosition" class="account-foot">
-            <span>第一大持仓</span>
+            <span>第一大账户持仓 · {{ largestPosition.accountName }}</span>
             <RouterLink :to="{ path: '/market', query: { code: largestPosition.position.code, view: 'detail' } }"><strong>{{ largestPosition.position.name }}</strong></RouterLink>
             <span class="num">{{ money(largestPosition.position.market_value) }} 元</span>
-            <span>占当前持仓市值 {{ percent(largestPosition.ratio) }}</span>
+            <span>占全部持仓市值 {{ percent(largestPosition.ratio) }}</span>
           </div>
         </StateBlock>
       </article>
@@ -383,6 +387,21 @@ onMounted(reloadAll);
       </article>
     </div>
 
+    <article id="dashboard-accounts" class="card dashboard-card account-overview-card">
+      <div class="card-heading"><div><span class="section-label">账户入口</span><h2>各账户持仓与计划</h2></div><span class="badge">{{ portfolios.length }} 个账户</span></div>
+      <StateBlock :loading="overview.loading.value" :error="overview.error.value" :skeleton-rows="3" @retry="overview.reload">
+        <div class="account-overview-list">
+          <div v-for="item in accountSummaries" :key="item.account.id" class="account-overview-row">
+            <div><strong>{{ item.account.name }}</strong><span v-if="item.account.status === 'archived'" class="badge">已归档</span><small>{{ item.positions.length }} 笔持仓 · {{ item.missing ? `${item.missing} 笔缺行情` : '行情完整' }}</small></div>
+            <div><span>持仓市值</span><strong class="num">{{ money(item.marketValue) }} 元</strong></div>
+            <div><span>浮动盈亏</span><strong class="num" :class="item.pnl >= 0 ? 'up' : 'down'">{{ signedMoney(item.pnl) }} 元</strong></div>
+            <div><span>每日计划</span><strong>{{ item.plan ? `${item.planCount} 笔预案` : '尚未生成' }}</strong><small v-if="item.plan">{{ item.plan.plan.target_date }}</small></div>
+            <div class="account-overview-links"><RouterLink :to="accountRoute(item.account.id)">查看持仓 →</RouterLink><RouterLink :to="accountRoute(item.account.id,'/jobs')">账户任务 →</RouterLink></div>
+          </div>
+        </div>
+      </StateBlock>
+    </article>
+
     <article class="card dashboard-card recent-attention-card">
       <div class="card-heading">
         <div>
@@ -410,13 +429,13 @@ onMounted(reloadAll);
     <article class="card dashboard-card plan-opportunities-card">
       <div class="card-heading">
         <div>
-          <span class="section-label">每日计划 · {{ planTargetDate ?? "—" }}</span>
+          <span class="section-label">全部账户计划 · 全局机会</span>
           <h2>计划覆盖与打板机会</h2>
         </div>
         <RouterLink to="/market-structure">查看市场结构</RouterLink>
       </div>
       <p class="strategy-scope-note">
-        汇总持仓主策略、兜底覆盖与打板数量；逐只动作在持仓页查看，竞价复核在市场结构页查看。
+        持仓预案按账户分别生成后汇总，打板信号来自共享的全局扫描。逐账户详情在上方账户入口查看。
       </p>
       <StateBlock
         :loading="planLoading"
@@ -424,10 +443,10 @@ onMounted(reloadAll);
         :empty="planEmpty"
         empty-text="本计划没有形成有效打板信号"
         :skeleton-rows="2"
-        @retry="dailyPlan.reload"
+        @retry="reloadAll"
       >
-        <p v-if="planMissing" class="no-runs">每日计划尚未生成结构化预案，生成后此处显示打板机会数量。</p>
-        <div v-else class="overview-grid">
+        <p v-if="planMissing" class="no-runs">各账户尚无每日计划，生成后显示账户计划覆盖。</p>
+        <div class="overview-grid">
           <div class="overview-item">
             <span class="overview-label">持仓预案</span>
             <strong class="num">{{ planPositionActions.length }}</strong>
@@ -441,7 +460,7 @@ onMounted(reloadAll);
           <div class="overview-item">
             <span class="overview-label">打板信号</span>
             <strong class="num">{{ opportunities.length }}</strong>
-            <small>本计划有效信号</small>
+            <small>全局收盘扫描信号</small>
           </div>
           <div class="overview-item">
             <span class="overview-label">待 T+1 复核</span>
@@ -503,7 +522,7 @@ onMounted(reloadAll);
         >
           <p v-if="latestRuns.length === 0" class="no-runs">尚无运行记录</p>
           <div v-else class="run-list">
-            <div v-for="item in latestRuns" :key="item.code" class="run-row">
+            <div v-for="item in latestRuns" :key="item.run.id" class="run-row">
               <span class="dot" :class="RUN_STATUS[item.run.status]?.dot ?? 'idle'" />
               <span class="run-content">
                 <strong>{{ item.name }}</strong>
@@ -1138,4 +1157,15 @@ onMounted(reloadAll);
 .auction-tags {
   color: var(--ink-faint);
 }
+</style>
+
+<style scoped>
+.account-overview-list { display:grid; }
+.account-overview-row { display:grid; grid-template-columns:minmax(140px,1.2fr) repeat(3,minmax(100px,1fr)) auto; gap:16px; align-items:center; padding:14px 0; border-bottom:1px solid var(--line); }
+.account-overview-row:last-child { border-bottom:0; }
+.account-overview-row > div { display:grid; gap:4px; }
+.account-overview-row small,.account-overview-row span:not(.badge) { color:var(--ink-faint); font-size:11px; }
+.account-overview-row strong { font-size:13px; }
+.account-overview-links { font-size:12px; }
+@container business (max-width:800px) { .account-overview-row { grid-template-columns:repeat(2,minmax(0,1fr)); } .account-overview-row > div:first-child { grid-column:1/-1; } }
 </style>

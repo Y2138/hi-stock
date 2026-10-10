@@ -361,8 +361,9 @@ async function runAgentFlow(
   strategy: StrategyBundle,
   jobCode: string,
   targetDate: string,
+  accountId?: string | null,
 ): Promise<{ markdown: string; unavailableGaps: unknown[] }> {
-  const systemPrompt = await buildSystemPrompt(pool, strategy);
+  const systemPrompt = await buildSystemPrompt(pool, strategy, accountId);
   const completion = createJobCompletionGate(jobCode, targetDate);
   const turn = await runAgentSessionTurn({
     pool,
@@ -528,15 +529,26 @@ async function executeDatasource(
         dataGaps: summary.gaps,
       };
     } else if (config.pipeline === "commodity_copper_inventory_sync") {
-      const summary = deps.commodityCopperInventorySync
-        ? await deps.commodityCopperInventorySync(run.target_date, run.id)
-        : await syncShfeCopperWeeklyInventory(deps.pool, run.target_date, { jobRunId: run.id });
-      result = {
-        status: summary.gaps.length > 0 ? "partial" : "success",
-        log: `铜库存周报同步完成：本周 ${summary.inventory} 吨，上周 ${summary.previousInventory} 吨，缺口 ${summary.gaps.length}。`,
-        artifacts: [{ kind: "market_fetch_run", id: summary.fetchRunId }],
-        dataGaps: summary.gaps,
-      };
+      const calendar = await deps.pool.query<{ report_date: string | null }>(
+        `SELECT max(trade_date)::text AS report_date
+           FROM market_trading_day
+          WHERE is_open AND trade_date BETWEEN date_trunc('week', $1::date)::date AND $1::date`,
+        [run.target_date],
+      );
+      const reportDate = calendar.rows[0]?.report_date ?? null;
+      if (!reportDate) {
+        result = { status: "success", log: `目标周 ${run.target_date} 无交易日，无需同步铜库存周报。` };
+      } else {
+        const summary = deps.commodityCopperInventorySync
+          ? await deps.commodityCopperInventorySync(reportDate, run.id)
+          : await syncShfeCopperWeeklyInventory(deps.pool, reportDate, { jobRunId: run.id });
+        result = {
+          status: summary.gaps.length > 0 ? "partial" : "success",
+          log: `铜库存周报同步完成：报告日 ${summary.reportDate}，本周 ${summary.inventory} 吨，上周 ${summary.previousInventory} 吨，缺口 ${summary.gaps.length}。`,
+          artifacts: [{ kind: "market_fetch_run", id: summary.fetchRunId }],
+          dataGaps: summary.gaps,
+        };
+      }
     } else if (config.pipeline === "commodity_copper_macro_sync") {
       const summary = deps.commodityCopperMacroSync
         ? await deps.commodityCopperMacroSync(run.target_date, run.id)
@@ -665,7 +677,7 @@ async function executeAgentFlow(
     markdown = markdown.startsWith(RESULT_BANNER) ? markdown : `${RESULT_BANNER}\n\n${markdown}`;
     await appendConversationMessage(deps.pool, run.session_id, "assistant", markdown);
   } else {
-    const result = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, definition.code, run.target_date);
+    const result = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, definition.code, run.target_date, run.account_id);
     markdown = result.markdown;
     unavailableGaps = result.unavailableGaps;
   }
@@ -683,7 +695,7 @@ async function executeAgentFlow(
 }
 
 const RUN_RETURNING = `id::text, job_id::text, prompt_revision_id::text,
-  session_id::text, strategy_change_seq::text, strategy_snapshot_hash,
+  session_id::text, account_id::text, strategy_change_seq::text, strategy_snapshot_hash,
   target_date::text, trigger_kind, scheduled_for, status, attempt_count, next_retry_at,
   log, artifacts, data_gaps, result_md, started_at, finished_at, created_at`;
 
@@ -730,9 +742,9 @@ async function finishRun(
     if (result.resultMd) {
       const output = await client.query<{ id: string }>(
         `INSERT INTO job_run_output
-           (job_id, run_id, session_id, output_type, target_date, markdown, sha256,
+           (job_id, run_id, session_id, account_id, output_type, target_date, markdown, sha256,
             status, source, strategy_change_seq, strategy_snapshot_hash, created_at)
-         SELECT r.job_id, r.id, r.session_id,
+         SELECT r.job_id, r.id, r.session_id, r.account_id,
                 CASE d.code WHEN 'daily_plan_flow' THEN 'daily_plan' ELSE d.code END,
                 r.target_date, $2, $3, 'generated', 'agent_flow',
                 r.strategy_change_seq, r.strategy_snapshot_hash, $4
@@ -755,7 +767,7 @@ async function finishRun(
       ).rows[0]?.id ?? null;
       await activatePlaybookForRun(client, run.id, outputId);
       await activateAuctionAssessmentsForRun(client, run.id, outputId);
-      if (outputId && status === "success") await enqueueJobConclusion(client, outputId);
+      if (outputId) await enqueueJobConclusion(client, outputId);
     }
     await client.query("COMMIT");
     return { run: finished, outputId };
