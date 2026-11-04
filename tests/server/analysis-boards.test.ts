@@ -228,8 +228,8 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
          SELECT date '2026-01-12'+n, true, 'test', now() FROM generate_series(0,24) n`,
       );
       // 成分股：补跌、止跌修复、低流动性、创业板（应被主板过滤排除）。
-      await pool.query(`INSERT INTO market_instrument(code,name,kind)
-        SELECT code,code,'stock' FROM unnest($1::text[]) code`, [stockCodes]);
+      await pool.query(`INSERT INTO market_instrument(code,name,kind,lifecycle_status)
+        SELECT code,code,'stock','active' FROM unnest($1::text[]) code`, [stockCodes]);
       await pool.query(
         `INSERT INTO market_board_membership(board_instrument_id,member_instrument_id,effective_from)
          SELECT board.id, member.id, date '2020-01-01'
@@ -255,12 +255,43 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
       await pool.query(
         `UPDATE market_bar SET volume=100000 WHERE instrument_id=(SELECT id FROM market_instrument WHERE code='600003.SH')`,
       );
+      // 当日确认度：上证指数 +2%，成分股当日上涨（主板 3 只 +10% 计入涨停、创业板 +10% 只计上涨）；
+      // 板块单根大阳成立脉冲扣分，总分 5 → B 档，仍按规则输出候选。
+      await pool.query(`INSERT INTO market_instrument(code,name,kind) VALUES ('000001.SH','上证指数','index')`);
+      await pool.query(
+        `WITH instrument AS (SELECT id FROM market_instrument WHERE code='000001.SH'), points(bar_date,open,high,low,close) AS (
+           VALUES (date '2026-01-10',100.0,100.5,99.5,100.0),(date '2026-01-11',100.0,102.6,99.9,102.0))
+         INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,channel)
+         SELECT instrument.id,'day',points.bar_date,points.bar_date::timestamp AT TIME ZONE 'UTC',
+                points.open,points.high,points.low,points.close,1000,'test' FROM instrument CROSS JOIN points`,
+      );
+      await pool.query(
+        `UPDATE market_bar b
+            SET close=b.close*f.factor, high=b.close*f.factor, low=LEAST(b.low,b.close*f.factor)
+           FROM market_instrument i,
+                (VALUES ('600001.SH',1.1),('600002.SH',1.05),('600003.SH',1.1),('300001.SZ',1.1))
+                  AS f(code,factor)
+          WHERE b.instrument_id=i.id AND b.bar_date=date '2026-01-11' AND i.code=f.code`,
+      );
 
       const row = await executeAnalysis(pool, { analysis_type: "sector_trend_structure" });
       const result = row.result_json as {
         signals: Array<{
-          code: string; pattern: string; pattern_tier: number; trigger: string; volume_class: string;
+          code: string; close: number; pattern: string; pattern_tier: number; trigger: string; volume_class: string;
           valid_through: string | null; prior_low: number; second_bottom: boolean; contracting: boolean;
+          confirmation: {
+            tier: "A" | "B" | "C"; score: number;
+            parts: { m1: number; m2: number; m3: number; m4: number; m5: number };
+            metrics: {
+              advance_ratio: number | null; relative_pct: number | null; limit_up_count: number;
+              limit_up_20cm_count: number; intraday_pulse: boolean; close_position: number | null;
+            };
+            excluded: { st_or_delisting: number; inactive: number; missing_prev_close: number };
+            invalidation: {
+              price: number; distance_pct: number; basis: string;
+              second_price: number | null; second_basis: string | null; note: string | null;
+            };
+          };
           catch_up: {
             branch_a: Array<{ code: string; ret20: number }>;
             branch_b: Array<{ code: string }>;
@@ -281,6 +312,17 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
       expect(signal.valid_through).toBe("2026-01-31");
       expect(signal.prior_low).toBeLessThan(27);
       expect(signal.second_bottom).toBe(false);
+      // 当日确认度：完整上涨广度、涨停 3 家、量比 1.12、收盘位置 0.97，脉冲扣 2 分 → B 档。
+      expect(signal.confirmation.tier).toBe("B");
+      expect(signal.confirmation.score).toBe(5);
+      expect(signal.confirmation.parts).toEqual({ m1: 2, m2: 2, m3: 1, m4: 1, m5: 1 });
+      expect(signal.confirmation.metrics.advance_ratio).toBe(100);
+      expect(signal.confirmation.metrics.relative_pct).toBeCloseTo(67.12, 1);
+      expect(signal.confirmation.metrics.limit_up_count).toBe(2);
+      expect(signal.confirmation.metrics.limit_up_20cm_count).toBe(0);
+      expect(signal.confirmation.metrics.intraday_pulse).toBe(true);
+      expect(signal.confirmation.invalidation.price).toBeLessThan(signal.close);
+      expect(signal.confirmation.invalidation.note).toBeNull();
       expect(signal.catch_up!.branch_a.map((item) => item.code)).toEqual(["600001.SH", "600002.SH"]);
       expect(signal.catch_up!.branch_a[0]!.ret20).toBeLessThan(-0.2);
       expect(signal.catch_up!.branch_b.map((item) => item.code)).toEqual(["600002.SH"]);
@@ -289,9 +331,9 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
       expect(result.skipped).toContainEqual(expect.objectContaining({ code: "881103.TI" }));
     } finally {
       await pool.query("DELETE FROM market_board_membership WHERE board_instrument_id=(SELECT id FROM market_instrument WHERE code=$1)", [boardCode]);
-      await pool.query("DELETE FROM market_bar WHERE instrument_id IN (SELECT id FROM market_instrument WHERE code=$1 OR code=ANY($2::text[]))", [boardCode, stockCodes]);
+      await pool.query("DELETE FROM market_bar WHERE instrument_id IN (SELECT id FROM market_instrument WHERE code=$1 OR code=ANY($2::text[]) OR code='000001.SH')", [boardCode, stockCodes]);
       await pool.query("DELETE FROM market_board WHERE instrument_id=(SELECT id FROM market_instrument WHERE code=$1)", [boardCode]);
-      await pool.query("DELETE FROM market_instrument WHERE code=$1 OR code=ANY($2::text[])", [boardCode, stockCodes]);
+      await pool.query("DELETE FROM market_instrument WHERE code=$1 OR code=ANY($2::text[]) OR code='000001.SH'", [boardCode, stockCodes]);
       await pool.query("DELETE FROM market_trading_day WHERE source='test'");
     }
   });
@@ -493,6 +535,107 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
     expect(missingReviewDate.gaps).toEqual(expect.arrayContaining([
       expect.objectContaining({ domain: "calendar" }),
     ]));
+  });
+
+  it("板块确认度：A 档与结构位失效位按当日振幅尺度取最近有效档", async () => {
+    const boardCode = "881107.TI";
+    const memberCodes = ["600745.SH", "002371.SZ", "605001.SH", "605002.SH"];
+    try {
+      // 复刻 2026-11-04 游戏板块的结构位数字：MA5=9021.02、MA10=8954.38、近20日前低=8173.84、收盘 9464.15。
+      await pool.query(`INSERT INTO market_instrument(code,name,kind,lifecycle_status)
+        VALUES ($1,'测试确认度行业','board','active'),('000001.SH','上证指数','index','active')`, [boardCode]);
+      await pool.query(`INSERT INTO market_board(instrument_id,board_type,source,active)
+        SELECT id,'industry','hithink',true FROM market_instrument WHERE code=$1`, [boardCode]);
+      await pool.query(
+        `WITH instrument AS (SELECT id FROM market_instrument WHERE code=$1), points AS (
+           SELECT n FROM generate_series(0,60) n)
+         INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,channel)
+         SELECT instrument.id,'day',date '2025-08-01'+n, (date '2025-08-01'+n)::timestamp AT TIME ZONE 'UTC',
+                CASE WHEN n=60 THEN 9000 WHEN n=48 THEN 9800 ELSE v.close*1.001 END,
+                CASE WHEN n=60 THEN 9700 WHEN n=48 THEN 9850 ELSE v.close*1.005+5 END,
+                CASE WHEN n=60 THEN 8900 WHEN n=48 THEN 8173.84 ELSE v.close*0.995-5 END,
+                v.close,
+                CASE WHEN n=60 THEN 2000 ELSE 1000 END, 'test'
+           FROM instrument CROSS JOIN points
+           CROSS JOIN LATERAL (SELECT CASE WHEN n<=47 THEN 10000+(n%2)*10
+                                            WHEN n=48 THEN 8200
+                                            WHEN n<=55 THEN 8887.74
+                                            WHEN n<=59 THEN 8910.24
+                                            ELSE 9464.15 END AS close) v`,
+        [boardCode],
+      );
+      await pool.query(
+        `WITH instrument AS (SELECT id FROM market_instrument WHERE code='000001.SH'), points(bar_date,open,high,low,close) AS (
+           VALUES (date '2025-09-29',100.0,100.5,99.5,100.0),(date '2025-09-30',100.0,102.6,99.9,102.0))
+         INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,channel)
+         SELECT instrument.id,'day',points.bar_date,points.bar_date::timestamp AT TIME ZONE 'UTC',
+                points.open,points.high,points.low,points.close,1000,'test' FROM instrument CROSS JOIN points`,
+      );
+      await pool.query(`INSERT INTO market_trading_day(trade_date,is_open,source,fetched_at)
+        SELECT date '2025-10-01'+n, true, 'test', now() FROM generate_series(0,24) n ON CONFLICT DO NOTHING`);
+      // 成分股：*ST 闻泰必须出局，其余三只当日涨停并满足分支B。
+      await pool.query(`INSERT INTO market_instrument(code,name,kind,lifecycle_status)
+        VALUES ('600745.SH','*ST闻泰','stock','active'),('002371.SZ','北方华创','stock','active'),
+               ('605001.SH','测试普通甲','stock','active'),('605002.SH','测试普通乙','stock','active')`);
+      await pool.query(
+        `INSERT INTO market_board_membership(board_instrument_id,member_instrument_id,effective_from)
+         SELECT board.id, member.id, date '2020-01-01'
+           FROM market_instrument board, market_instrument member
+          WHERE board.code=$1 AND member.code=ANY($2::text[])`,
+        [boardCode, memberCodes],
+      );
+      await pool.query(
+        `WITH instrument AS (SELECT id, code FROM market_instrument WHERE code=ANY($1::text[])), points AS (
+           SELECT n FROM generate_series(0,124) n)
+         INSERT INTO market_bar(instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,channel)
+         SELECT instrument.id,'day',date '2025-05-29'+n, (date '2025-05-29'+n)::timestamp AT TIME ZONE 'UTC',
+                v.close*1.001, v.close*1.005, v.close*0.995, v.close, 3000000, 'test'
+           FROM instrument CROSS JOIN points
+           CROSS JOIN LATERAL (SELECT CASE WHEN n<100 THEN 22 - n*0.03
+                                           WHEN n=124 THEN (19-(n-1-99)*0.17)*1.1
+                                           ELSE 19-(n-99)*0.17 END AS close) v`,
+        [memberCodes],
+      );
+
+      const row = await executeAnalysis(pool, { analysis_type: "sector_trend_structure" });
+      const result = row.result_json as {
+        signals: Array<{
+          code: string; trigger: string; close: number;
+          confirmation: {
+            tier: "A" | "B" | "C"; score: number; parts: Record<string, number>;
+            metrics: { advance_ratio: number | null; limit_up_count: number };
+            excluded: { st_or_delisting: number };
+            invalidation: { price: number; basis: string; second_price: number | null; note: string | null };
+          };
+          catch_up: { branch_a: Array<{ code: string }>; branch_b: Array<{ code: string }> } | null;
+        }>;
+      };
+      const signal = result.signals.find((item) => item.code === boardCode);
+      expect(signal).toBeDefined();
+      expect(signal!.trigger).toBe("新低回升");
+      expect(signal!.confirmation.tier).toBe("A");
+      expect(signal!.confirmation.score).toBe(7);
+      expect(signal!.confirmation.parts).toEqual({ m1: 2, m2: 2, m3: 1, m4: 2, m5: 0 });
+      expect(signal!.confirmation.metrics.advance_ratio).toBe(100);
+      expect(signal!.confirmation.metrics.limit_up_count).toBe(3);
+      // ST 以简称排除：*ST闻泰 不进分支B，也不计入扩散度。
+      expect(signal!.confirmation.excluded.st_or_delisting).toBe(1);
+      expect(signal!.catch_up!.branch_b.map((item) => item.code)).not.toContain("600745.SH");
+      expect(signal!.catch_up!.branch_b.map((item) => item.code)).toContain("002371.SZ");
+      // 失效位取收盘下方最近且未被当日振幅吞掉的结构位：MA5 9021.02，第二道 MA10 8954.38。
+      expect(signal!.confirmation.invalidation.basis).toBe("MA5");
+      expect(signal!.confirmation.invalidation.price).toBeGreaterThan(9021.02 * 0.995);
+      expect(signal!.confirmation.invalidation.price).toBeLessThan(9021.02 * 1.005);
+      expect(signal!.confirmation.invalidation.second_price).toBeGreaterThan(8954.38 * 0.995);
+      expect(signal!.confirmation.invalidation.second_price).toBeLessThan(8954.38 * 1.005);
+      expect(signal!.confirmation.invalidation.note).toBeNull();
+    } finally {
+      await pool.query("DELETE FROM market_board_membership WHERE board_instrument_id=(SELECT id FROM market_instrument WHERE code=$1)", [boardCode]);
+      await pool.query("DELETE FROM market_bar WHERE instrument_id IN (SELECT id FROM market_instrument WHERE code=$1 OR code=ANY($2::text[]) OR code='000001.SH')", [boardCode, memberCodes]);
+      await pool.query("DELETE FROM market_board WHERE instrument_id=(SELECT id FROM market_instrument WHERE code=$1)", [boardCode]);
+      await pool.query("DELETE FROM market_instrument WHERE code=$1 OR code=ANY($2::text[]) OR code='000001.SH'", [boardCode, memberCodes]);
+      await pool.query("DELETE FROM market_trading_day WHERE source='test'");
+    }
   });
 
 });

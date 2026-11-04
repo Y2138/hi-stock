@@ -340,7 +340,14 @@ const NIGHTLY_TRIGGER_REASON: Record<string, string> = {
   新低回升: "60日新低后回升",
   急跌反转: "13日急跌后反抽",
 };
-const NIGHTLY_TRIGGER_ORDER: Record<string, number> = { 中期脱离: 0, 新低回升: 1, 急跌反转: 2 };
+/** 板块优先级按当日确认度分档，触发线不再决定排序（口径见 docs/strategy/板块机会筛选确认度分级口径.md）。 */
+const NIGHTLY_TIER_ORDER: Record<string, number> = { A: 0, B: 1, C: 2 };
+
+interface NightlySectorConfirmation {
+  tier?: unknown;
+  score?: unknown;
+  invalidation?: unknown;
+}
 
 interface NightlySectorSignal {
   sector?: unknown;
@@ -352,11 +359,24 @@ interface NightlySectorSignal {
   valid_through?: unknown;
   second_bottom?: unknown;
   contracting?: unknown;
+  confirmation?: NightlySectorConfirmation;
+}
+
+function nightlyTier(signal: NightlySectorSignal): string {
+  return String(signal.confirmation?.tier ?? "");
+}
+
+function nightlyScore(signal: NightlySectorSignal): number {
+  const score = Number(signal.confirmation?.score);
+  return Number.isFinite(score) ? score : 0;
 }
 
 function nightlySectorReason(signal: NightlySectorSignal): string {
   const trigger = String(signal.trigger ?? "");
-  const parts = [NIGHTLY_TRIGGER_REASON[trigger] ?? (trigger || "信号成立")];
+  const parts: string[] = [];
+  const tier = nightlyTier(signal);
+  if (tier) parts.push(`${tier}档 ${nightlyScore(signal)}分`);
+  parts.push(NIGHTLY_TRIGGER_REASON[trigger] ?? (trigger || "信号成立"));
   // 新低回升是纯 Donchian 口径，不附加止跌形态与量比；写进消息会暗示并不存在的门槛。
   if (trigger !== "新低回升") {
     if (signal.pattern) parts.push(`${String(signal.pattern)}${signal.pattern_tier === 2 ? "（降权）" : ""}`);
@@ -421,10 +441,10 @@ function renderNightlySectorNotification(
     return [{ signal, code, sector,
       stocks: targets.filter((target) => (membership.get(target.code) ?? []).includes(code)) }];
   });
-  // 有标的的板块优先，其次按触发线优先级，最后按板块名称稳定排序。
+  // 有标的的板块优先，其次按当日确认度分档与总分，最后按板块名称稳定排序。
   groups.sort((left, right) => (left.stocks.length ? 0 : 1) - (right.stocks.length ? 0 : 1)
-    || (NIGHTLY_TRIGGER_ORDER[String(left.signal.trigger ?? "")] ?? 9)
-      - (NIGHTLY_TRIGGER_ORDER[String(right.signal.trigger ?? "")] ?? 9)
+    || (NIGHTLY_TIER_ORDER[nightlyTier(left.signal)] ?? 9) - (NIGHTLY_TIER_ORDER[nightlyTier(right.signal)] ?? 9)
+    || nightlyScore(right.signal) - nightlyScore(left.signal)
     || left.sector.localeCompare(right.sector, "zh-CN"));
   const grouped = new Set(groups.flatMap((group) => group.stocks.map((stock) => stock.code)));
   const leftovers = targets.filter((target) => !grouped.has(target.code));

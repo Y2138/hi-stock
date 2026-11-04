@@ -314,6 +314,73 @@ const SECTOR_TREND_RULES = {
   minTurnover20Yuan: 20_000_000,
 } as const;
 
+/** 板块当日确认度分级（docs/strategy/板块机会筛选确认度分级口径.md）：
+ *  触发线只决定是否进入观察，优先级由当日确认度决定。权重与阈值在冻结回测前是初始值，不得临场调参。 */
+const SECTOR_CONFIRMATION_RULES = {
+  /** M1 上涨家数占比：≥90% 得 2 分，≥80% 得 1 分。 */
+  advanceRatioFull: 0.9,
+  advanceRatioHalf: 0.8,
+  /** M2 板块涨幅 − 上证涨幅（百分点）。 */
+  relativeFullPct: 3,
+  relativeHalfPct: 1,
+  /** M3 涨停家数：≥5 家得 2 分，1–4 家得 1 分。 */
+  limitUpFull: 5,
+  /** M4 量比：≥1.30 得 2 分，≥1.10 得 1 分。 */
+  volumeRatioFull: 1.3,
+  volumeRatioHalf: 1.1,
+  /** M5 日内确认：收盘位置阈值与脉冲扣分。 */
+  closePositionConfirmed: 0.9,
+  closePositionPulse: 0.95,
+  openReturnMaxPulse: 0.01,
+  pulseJumpPct: 6,
+  pulsePenalty: 2,
+  /** 分档：A ≥6，B 3–5，C ≤2。 */
+  tierAFull: 6,
+  tierBFull: 3,
+  /** 涨停推断阈值（%）按板块与代码前缀区分。 */
+  limitUpPct: { main: 9.8, star: 19.8, bse: 29.8 },
+  /** 结构位失效位：距收盘 ≥ 0.5×当日振幅尺度才算未被吞掉。 */
+  invalidationAtrFactor: 0.5,
+  /** 上证指数代码（sector_trend_structure 相对强度基准）。 */
+  shanghaiIndexCode: "000001.SH",
+} as const;
+
+export type SectorConfirmationTier = "A" | "B" | "C";
+
+export interface SectorConfirmation {
+  /** 当日确认度分档：A 进前列、B 待确认、C 只记录不出候选。 */
+  tier: SectorConfirmationTier;
+  /** 五项分值加脉冲扣分后的总分，0–10。 */
+  score: number;
+  parts: { m1: number; m2: number; m3: number; m4: number; m5: number };
+  metrics: {
+    member_count: number;
+    counted_members: number;
+    advance_count: number;
+    advance_ratio: number | null;
+    day_return_pct: number | null;
+    shanghai_return_pct: number | null;
+    relative_pct: number | null;
+    limit_up_count: number;
+    limit_up_20cm_count: number;
+    limit_event_count: number | null;
+    volume_ratio_5: number | null;
+    close_position: number | null;
+    open_return_pct: number | null;
+    intraday_pulse: boolean;
+  };
+  excluded: { st_or_delisting: number; inactive: number; missing_prev_close: number };
+  invalidation: {
+    price: number;
+    distance_pct: number;
+    basis: "MA5" | "MA10" | "prior_low";
+    second_price: number | null;
+    second_distance_pct: number | null;
+    second_basis: "MA5" | "MA10" | "prior_low" | null;
+    note: string | null;
+  };
+}
+
 export type SectorBottomingPattern = "阳包阴" | "双日止跌" | "金针探底";
 
 interface TrendBarRow {
@@ -521,6 +588,222 @@ function boardTrendSnapshot(rows: TrendBarRow[]): BoardTrendSnapshot | null {
   };
 }
 
+/** 涨停推断阈值按交易权限区分：创业板/科创板 20cm，北交所 30cm，其余主板 10cm。 */
+function boardLimitUpThresholdPct(code: string): number {
+  if (/^(300|301|688|689)/.test(code)) return SECTOR_CONFIRMATION_RULES.limitUpPct.star;
+  if (/^(43|83|87|88)/.test(code)) return SECTOR_CONFIRMATION_RULES.limitUpPct.bse;
+  return SECTOR_CONFIRMATION_RULES.limitUpPct.main;
+}
+
+/** ST 与退市风险：以证券简称为主，is_st 与生命周期为辅（库内 is_st 存在空值）。 */
+function isRiskStock(row: { name: string | null; lifecycle_status?: string | null; is_st?: boolean | null }): boolean {
+  const name = row.name ?? "";
+  if (/ST/i.test(name) || name.includes("退")) return true;
+  if (row.is_st === true) return true;
+  return (row.lifecycle_status ?? "active") !== "active";
+}
+
+/** 结构位失效位（口径 2.6）：MA5/MA10/近20日前低中，取收盘下方最近且未被当日振幅吞掉的一档。 */
+function structureInvalidation(
+  rows: TrendBarRow[],
+  snapshot: BoardTrendSnapshot,
+): SectorConfirmation["invalidation"] {
+  const current = rows.at(-1)!;
+  const closes = rows.map((row) => row.close);
+  const close = snapshot.close;
+  const amplitude = current.high > current.low ? (current.high - current.low) / close : 0;
+  const minGap = amplitude * SECTOR_CONFIRMATION_RULES.invalidationAtrFactor;
+  const ma5 = mean(closes.slice(-5));
+  const ma10 = mean(closes.slice(-10));
+  const candidates: Array<{ basis: "MA5" | "MA10" | "prior_low"; price: number }> = [];
+  for (const [basis, price] of [["MA5", ma5], ["MA10", ma10], ["prior_low", snapshot.priorLow]] as const) {
+    if (price !== null && price < close) candidates.push({ basis, price });
+  }
+  const valid = candidates.filter((candidate) => (close - candidate.price) / close >= minGap)
+    .sort((left, right) => right.price - left.price);
+  const primary = valid[0];
+  const second = valid[1];
+  const distance = (price: number) => Number((((price - close) / close) * 100).toFixed(2));
+  if (!primary) {
+    const fallback = snapshot.priorLow ?? close;
+    return {
+      price: Number(fallback.toFixed(2)),
+      distance_pct: distance(fallback),
+      basis: "prior_low",
+      second_price: null,
+      second_distance_pct: null,
+      second_basis: null,
+      note: "结构位过近，失效位退至近20日前低",
+    };
+  }
+  return {
+    price: Number(primary.price.toFixed(2)),
+    distance_pct: distance(primary.price),
+    basis: primary.basis,
+    second_price: second ? Number(second.price.toFixed(2)) : null,
+    second_distance_pct: second ? distance(second.price) : null,
+    second_basis: second?.basis ?? null,
+    note: null,
+  };
+}
+
+interface BoardMemberRow {
+  code: string;
+  name: string | null;
+  lifecycle_status: string | null;
+  is_st: boolean | null;
+}
+
+/** 板块当日确认度：M1–M5 分项、脉冲、总分、分档与结构位失效位；全部服务端确定性计算。 */
+async function sectorConfirmation(
+  db: Db,
+  boardCode: string,
+  rows: TrendBarRow[],
+  snapshot: BoardTrendSnapshot,
+  asOf: string,
+): Promise<{ confirmation: SectorConfirmation; gaps: string[] }> {
+  const members = await db.query<BoardMemberRow>(
+    `SELECT mi.code, mi.name, mi.lifecycle_status,
+            COALESCE((SELECT bool_or(e.is_st) FROM market_limit_event e
+                       WHERE e.instrument_id = mi.id AND e.trade_date = $2::date), false) AS is_st
+       FROM market_board_membership m
+       JOIN market_instrument bi ON bi.id = m.board_instrument_id
+       JOIN market_instrument mi ON mi.id = m.member_instrument_id
+      WHERE bi.code = $1 AND m.effective_from <= $2::date
+        AND (m.effective_to IS NULL OR m.effective_to > $2::date)
+        AND mi.kind = 'stock'
+      ORDER BY mi.code`,
+    [boardCode, asOf],
+  );
+  const gaps: string[] = [];
+  let stOrDelisting = 0;
+  let inactive = 0;
+  const usable: BoardMemberRow[] = [];
+  for (const member of members.rows) {
+    if (isRiskStock(member)) {
+      stOrDelisting += 1;
+      continue;
+    }
+    if ((member.lifecycle_status ?? "active") !== "active") {
+      inactive += 1;
+      continue;
+    }
+    usable.push(member);
+  }
+  const memberBars = grouped(await selectBars(db, usable.map((member) => member.code), "day", asOf, 2));
+  let advance = 0;
+  let counted = 0;
+  let limitUp = 0;
+  let limitUp20cm = 0;
+  let missingPrevClose = 0;
+  for (const member of usable) {
+    const bars = memberBars.get(member.code) ?? [];
+    if (bars.length < 2) {
+      missingPrevClose += 1;
+      continue;
+    }
+    const latest = bars.at(-1)!;
+    const previous = bars.at(-2)!;
+    if (latest.bar_date !== asOf) {
+      missingPrevClose += 1;
+      continue;
+    }
+    const close = number(latest.close);
+    const previousClose = number(previous.close);
+    if (close === null || previousClose === null || previousClose <= 0) {
+      missingPrevClose += 1;
+      continue;
+    }
+    counted += 1;
+    const returnPct = (close / previousClose - 1) * 100;
+    if (returnPct > 0) advance += 1;
+    if (returnPct >= boardLimitUpThresholdPct(member.code)) {
+      limitUp += 1;
+      if (boardLimitUpThresholdPct(member.code) > SECTOR_CONFIRMATION_RULES.limitUpPct.main) limitUp20cm += 1;
+    }
+  }
+  if (stOrDelisting > 0) gaps.push(`板块 ${boardCode} 确认度统计排除 ST/退市风险股 ${stOrDelisting} 只`);
+  if (missingPrevClose > 0) gaps.push(`板块 ${boardCode} 有 ${missingPrevClose} 只成分股缺少前收或当日行情，未计入扩散度`);
+  const advanceRatio = counted > 0 ? advance / counted : null;
+  const index = rows.at(-1)!;
+  const previous = rows.at(-2)!;
+  const boardReturnPct = previous.close > 0 ? (index.close / previous.close - 1) * 100 : null;
+  const shanghai = grouped(await selectBars(db, [SECTOR_CONFIRMATION_RULES.shanghaiIndexCode], "day", asOf, 2))
+    .get(SECTOR_CONFIRMATION_RULES.shanghaiIndexCode) ?? [];
+  let shanghaiReturnPct: number | null = null;
+  if (shanghai.length >= 2 && shanghai.at(-1)!.bar_date === asOf) {
+    const latest = number(shanghai.at(-1)!.close);
+    const prior = number(shanghai.at(-2)!.close);
+    if (latest !== null && prior !== null && prior > 0) shanghaiReturnPct = (latest / prior - 1) * 100;
+  }
+  if (shanghaiReturnPct === null) {
+    gaps.push(`缺少 ${SECTOR_CONFIRMATION_RULES.shanghaiIndexCode} 当日与前收，相对强度按 0 分计`);
+  }
+  const relativePct = boardReturnPct !== null && shanghaiReturnPct !== null ? boardReturnPct - shanghaiReturnPct : null;
+  const range = index.high - index.low;
+  const closePosition = range > 0 ? (index.close - index.low) / range : null;
+  const openReturnPct = previous.close > 0 ? (index.open / previous.close - 1) * 100 : null;
+  const pulse = openReturnPct !== null && boardReturnPct !== null && closePosition !== null &&
+    openReturnPct <= SECTOR_CONFIRMATION_RULES.openReturnMaxPulse * 100 &&
+    boardReturnPct - openReturnPct >= SECTOR_CONFIRMATION_RULES.pulseJumpPct &&
+    closePosition >= SECTOR_CONFIRMATION_RULES.closePositionPulse;
+  // M4 按口径字段 volume_ratio_5（两位小数）比较，与回放参考结果同一口径，避免 1.2959 这类边界分歧。
+  const volumeRatio = snapshot.volumeRatio5 === null ? null : Number(snapshot.volumeRatio5.toFixed(2));
+  const m1 = advanceRatio === null ? 0
+    : advanceRatio >= SECTOR_CONFIRMATION_RULES.advanceRatioFull ? 2
+      : advanceRatio >= SECTOR_CONFIRMATION_RULES.advanceRatioHalf ? 1 : 0;
+  const m2 = relativePct === null ? 0
+    : relativePct >= SECTOR_CONFIRMATION_RULES.relativeFullPct ? 2
+      : relativePct >= SECTOR_CONFIRMATION_RULES.relativeHalfPct ? 1 : 0;
+  const m3 = limitUp >= SECTOR_CONFIRMATION_RULES.limitUpFull ? 2 : limitUp >= 1 ? 1 : 0;
+  const m4 = volumeRatio === null ? 0
+    : volumeRatio >= SECTOR_CONFIRMATION_RULES.volumeRatioFull ? 2
+      : volumeRatio >= SECTOR_CONFIRMATION_RULES.volumeRatioHalf ? 1 : 0;
+  const m5 = closePosition === null ? 0
+    : closePosition >= SECTOR_CONFIRMATION_RULES.closePositionConfirmed ? (pulse ? 1 : 2) : 0;
+  const score = Math.max(0, m1 + m2 + m3 + m4 + m5 - (pulse ? SECTOR_CONFIRMATION_RULES.pulsePenalty : 0));
+  const tier: SectorConfirmationTier = score >= SECTOR_CONFIRMATION_RULES.tierAFull ? "A"
+    : score >= SECTOR_CONFIRMATION_RULES.tierBFull ? "B" : "C";
+  const limitEvent = await db.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM market_limit_event e
+       JOIN market_board_membership m ON m.member_instrument_id = e.instrument_id
+       JOIN market_instrument bi ON bi.id = m.board_instrument_id
+      WHERE bi.code = $1 AND e.trade_date = $2::date AND e.event_type = 'up'
+        AND m.effective_from <= $2::date AND (m.effective_to IS NULL OR m.effective_to > $2::date)`,
+    [boardCode, asOf],
+  );
+  const eventCount = Number(limitEvent.rows[0]?.count ?? "0");
+  if (limitUp > 0 && Math.abs(eventCount - limitUp) > limitUp * 0.2) {
+    gaps.push(`板块 ${boardCode} 封板事件源不完整：事件表 ${eventCount} 条，日线推断 ${limitUp} 家，以推断为准`);
+  }
+  return {
+    confirmation: {
+      tier,
+      score,
+      parts: { m1, m2, m3, m4, m5 },
+      metrics: {
+        member_count: members.rows.length,
+        counted_members: counted,
+        advance_count: advance,
+        advance_ratio: advanceRatio === null ? null : Number((advanceRatio * 100).toFixed(1)),
+        day_return_pct: boardReturnPct === null ? null : round2(boardReturnPct),
+        shanghai_return_pct: shanghaiReturnPct === null ? null : round2(shanghaiReturnPct),
+        relative_pct: relativePct === null ? null : round2(relativePct),
+        limit_up_count: limitUp,
+        limit_up_20cm_count: limitUp20cm,
+        limit_event_count: eventCount,
+        volume_ratio_5: volumeRatio,
+        close_position: closePosition === null ? null : Number(closePosition.toFixed(2)),
+        open_return_pct: openReturnPct === null ? null : round2(openReturnPct),
+        intraday_pulse: pulse,
+      },
+      excluded: { st_or_delisting: stOrDelisting, inactive, missing_prev_close: missingPrevClose },
+      invalidation: structureInvalidation(rows, snapshot),
+    },
+    gaps,
+  };
+}
+
 export interface SectorTrendStockCandidate {
   code: string;
   name: string;
@@ -546,8 +829,10 @@ async function catchUpCandidates(
   boardRows: TrendBarRow[],
   signalDate: string,
 ): Promise<CatchUpOutcome | null> {
-  const members = await db.query<{ code: string; name: string }>(
-    `SELECT DISTINCT mi.code, mi.name
+  const members = await db.query<BoardMemberRow>(
+    `SELECT DISTINCT mi.code, mi.name, mi.lifecycle_status,
+            COALESCE((SELECT bool_or(e.is_st) FROM market_limit_event e
+                       WHERE e.instrument_id = mi.id AND e.trade_date = $2::date), false) AS is_st
        FROM market_board_membership m
        JOIN market_instrument bi ON bi.id = m.board_instrument_id
        JOIN market_instrument mi ON mi.id = m.member_instrument_id
@@ -569,6 +854,11 @@ async function catchUpCandidates(
   const bump = (reason: string) => skipped.set(reason, (skipped.get(reason) ?? 0) + 1);
   const eligible: Array<SectorTrendStockCandidate & { residual5: number | null; branchBReady: boolean }> = [];
   for (const member of members.rows) {
+    // ST/退市风险与停牌标的一律不进入补涨候选（简称优先，is_st 与生命周期为辅）。
+    if (isRiskStock(member)) {
+      bump((member.lifecycle_status ?? "active") !== "active" ? "非活跃标的排除" : "ST/退市风险排除");
+      continue;
+    }
     const rows = trendBarRows(stockBars.get(member.code) ?? []);
     if (!rows || rows.length < SECTOR_TREND_RULES.minStockBars) {
       bump("日线不足 121 根");
@@ -613,7 +903,7 @@ async function catchUpCandidates(
     }
     const branchBReady = ret20 < 0 && ret5 > 0 && last.close > ma10 && last.close / ma20 - 1 <= 0.10;
     eligible.push({
-      code: member.code, name: member.name, branch: "跌幅补涨", close: last.close,
+      code: member.code, name: member.name ?? member.code, branch: "跌幅补涨", close: last.close,
       ret20, ret5, turnover20, residual5, branchBReady,
     });
   }
@@ -644,6 +934,7 @@ export interface SectorTrendStructureOutcome {
       norm_slope_60: number | null; norm_slope_10: number | null; norm_slope_13: number | null;
       prior_low: number; signal_high: number; valid_through: string | null;
       second_bottom: boolean; contracting: boolean;
+      confirmation: SectorConfirmation;
       catch_up: {
         branch_a: SectorTrendStockCandidate[];
         branch_b: SectorTrendStockCandidate[];
@@ -710,6 +1001,9 @@ export async function querySectorTrendStructure(db: Db, request: AnalysisRequest
   for (const { code, snapshot, rows } of signalSnapshots) {
     // 补涨候选的成员剔除计数保留在板块结果内供任务报告，不计入 run 级缺口。
     const catchUp = await catchUpCandidates(db, code, rows, snapshot.asOf);
+    const confirmed = await sectorConfirmation(db, code, rows, snapshot, snapshot.asOf);
+    gaps.push(...confirmed.gaps);
+    const confirmation = confirmed.confirmation;
     signals.push({
       sector: namesByCode.get(code) ?? code, code, as_of: snapshot.asOf, close: snapshot.close,
       pattern: snapshot.pattern, pattern_tier: snapshot.patternTier,
@@ -723,12 +1017,20 @@ export async function querySectorTrendStructure(db: Db, request: AnalysisRequest
       valid_through: validThrough,
       second_bottom: snapshot.secondBottom,
       contracting: snapshot.contracting,
-      catch_up: catchUp === null ? null : {
+      confirmation,
+      // C 档没有当日资金确认：不输出板块内候选，也不得写入关注池。
+      catch_up: confirmation.tier === "C" || catchUp === null ? null : {
         branch_a: catchUp.branchA, branch_b: catchUp.branchB,
         eligible_count: catchUp.eligibleCount, skipped: catchUp.skipped,
       },
     });
   }
+  const tierRank: Record<SectorConfirmationTier, number> = { A: 0, B: 1, C: 2 };
+  signals.sort((left, right) => tierRank[left.confirmation.tier] - tierRank[right.confirmation.tier]
+    || right.confirmation.score - left.confirmation.score
+    || right.confirmation.parts.m3 - left.confirmation.parts.m3
+    || right.confirmation.parts.m4 - left.confirmation.parts.m4
+    || left.code.localeCompare(right.code));
   return {
     result: {
       as_of: latestDate,
