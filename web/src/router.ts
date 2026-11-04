@@ -5,7 +5,6 @@ import DashboardView from "./views/DashboardView.vue";
 import StrategiesView from "./views/StrategiesView.vue";
 import PoolsView from "./views/PoolsView.vue";
 import PositionsView from "./views/PositionsView.vue";
-import MarketView from "./views/MarketView.vue";
 import MarketStructureView from "./views/MarketStructureView.vue";
 import JobsView from "./views/JobsView.vue";
 import DataSyncView from "./views/DataSyncView.vue";
@@ -13,6 +12,8 @@ import NotificationHistoryView from "./views/NotificationHistoryView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import MemoryView from "./views/MemoryView.vue";
 import MarketNewsView from "./views/MarketNewsView.vue";
+import UltraShortView from "./views/UltraShortView.vue";
+import { openMarket } from "./composables/useMarketDrawer";
 
 export const router = createRouter({
   history: createWebHistory("/"),
@@ -27,9 +28,17 @@ export const router = createRouter({
     },
     { path: "/pools", name: "pools", component: PoolsView, meta: { title: "关注池" } },
     { path: "/positions", name: "positions", component: PositionsView, meta: { title: "持仓" } },
-    { path: "/market", name: "market", component: MarketView, meta: { title: "行情" } },
+    {
+      path: "/market",
+      redirect: (to) => {
+        const code = typeof to.query.code === "string" ? to.query.code : undefined;
+        if (code) openMarket(code);
+        return { path: "/" };
+      },
+    },
     { path: "/market-structure", name: "market-structure", component: MarketStructureView, meta: { title: "市场结构" } },
     { path: "/market-news", name: "market-news", component: MarketNewsView, meta: { title: "市场消息" } },
+    { path: "/ultra-short", name: "ultra-short", component: UltraShortView, meta: { title: "超短关注池" } },
     { path: "/memories", name: "memories", component: MemoryView, meta: { title: "Agent 记忆" } },
     { path: "/jobs", name: "jobs", component: JobsView, meta: { title: "任务中心" } },
     {

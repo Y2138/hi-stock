@@ -81,7 +81,7 @@ onUnmounted(() => { disposed = true; request++; detailRequest++; if (timer) clea
       <p v-if="!page.items.length" class="empty">{{ loading ? '正在读取通知…' : '没有符合条件的通知' }}</p>
       <article v-for="item in page.items" :key="item.id" class="history-row">
         <div class="row-main">
-          <div><strong>{{ item.kind === 'test' ? '连接测试' : item.job_name || '任务结果' }}</strong><span class="meta">{{ item.account_name ?? "全局" }}</span><span class="meta">{{ channelLabels[item.channel] }}</span><span v-if="item.output_id" class="meta">结果 #{{ item.output_id }}</span><p class="meta">{{ time(item.created_at) }} · 本轮尝试 {{ item.attempts }} 次</p></div>
+          <div><strong>{{ item.kind === 'test' ? '连接测试' : item.kind === 'intraday_risk' ? '盘中加减仓提醒' : item.job_name || '任务结果' }}</strong><span class="meta">{{ item.account_name ?? "全局" }}</span><span class="meta">{{ channelLabels[item.channel] }}</span><span v-if="item.output_id" class="meta">结果 #{{ item.output_id }}</span><p class="meta">{{ time(item.created_at) }} · 本轮尝试 {{ item.attempts }} 次</p></div>
           <span class="badge" :class="{ ok: item.status === 'sent', bad: item.status === 'failed' }">{{ labels[item.status] }}</span>
         </div>
         <p v-if="item.error" class="hint">{{ item.error }}</p>

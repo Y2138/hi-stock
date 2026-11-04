@@ -6,6 +6,7 @@ import { useRouter } from "vue-router";
 import { apiClient } from "../api/client";
 import type {
   DailyPlanBoard,
+  DailyPlanMarketForecast,
   JobDefinition,
   MarketCoverage,
   PoolViewData,
@@ -15,6 +16,7 @@ import { FREQ_LABELS } from "../api/types";
 import StateBlock from "../components/StateBlock.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
+import { openMarket } from "../composables/useMarketDrawer";
 import { fmtDate, fmtNum } from "../utils/format";
 import { type PortfolioAccount } from "../stores/account";
 
@@ -46,6 +48,12 @@ const planError = computed(() => overview.error.value ?? (globalOpportunities.er
 const planEmpty = computed(() => false);
 const opportunities = computed(() => globalOpportunities.data.value?.opportunities ?? []);
 const planPositionActions = computed(() => portfolios.value.flatMap(item => item.plan?.position_actions ?? []));
+const marketForecast = computed<DailyPlanMarketForecast | null>(() => {
+  for (const item of portfolios.value) {
+    if (item.plan?.market_forecast) return item.plan.market_forecast;
+  }
+  return null;
+});
 const planStrategyCovered = computed(() => planPositionActions.value.filter(item => item.primary_evaluation_run_id).length);
 const planFallbackCovered = computed(() => planPositionActions.value.filter(item => item.fallback_evaluation_run_id).length);
 const planIncomplete = computed(() => planPositionActions.value.filter(item => item.evaluation_status && item.evaluation_status !== "success").length);
@@ -295,6 +303,39 @@ onMounted(reloadAll);
       <RouterLink v-else class="status-link" to="/datasync">查看数据明细</RouterLink>
     </div>
 
+    <article class="card dashboard-card forecast-card">
+      <div class="card-heading">
+        <div>
+          <span class="section-label">明日大盘预期</span>
+          <h2>{{ overview.loading.value ? "读取中" : marketForecast ? `目标日 ${marketForecast.target_date}` : "等待每日计划写入" }}</h2>
+        </div>
+        <span v-if="marketForecast" class="badge">{{ marketForecast.scenarios.length }} 个情景 · {{ marketForecast.as_of }} 数据</span>
+      </div>
+      <template v-if="marketForecast">
+        <p class="strategy-scope-note">{{ marketForecast.summary_md }}</p>
+        <div class="forecast-grid">
+          <div v-for="scenario in marketForecast.scenarios" :key="scenario.label" class="forecast-item">
+            <div class="forecast-head">
+              <strong>{{ scenario.label }}</strong>
+              <span class="badge">{{ scenario.probability }}%</span>
+            </div>
+            <p>{{ scenario.view }}</p>
+            <small><b>触发：</b>{{ scenario.triggers }}</small>
+            <small><b>应对：</b>{{ scenario.response }}</small>
+            <small><b>失效：</b>{{ scenario.invalidation }}</small>
+          </div>
+        </div>
+        <div v-if="marketForecast.key_levels.length" class="forecast-levels">
+          <span v-for="level in marketForecast.key_levels" :key="level.name">
+            <b>{{ level.name }}</b>：支撑 {{ level.support ?? "—" }} / 压力 {{ level.resistance ?? "—" }}
+            <template v-if="level.volume_note">（{{ level.volume_note }}）</template>
+          </span>
+        </div>
+      </template>
+      <p v-else-if="overview.loading.value" class="no-runs">正在读取最新每日计划……</p>
+      <p v-else class="no-runs">最新每日计划尚未写明明日大盘预期；盘前任务完成后自动显示。</p>
+    </article>
+
     <div class="primary-grid">
       <article class="card dashboard-card account-card">
         <div class="card-heading">
@@ -340,7 +381,7 @@ onMounted(reloadAll);
           </div>
           <div v-if="largestPosition" class="account-foot">
             <span>第一大账户持仓 · {{ largestPosition.accountName }}</span>
-            <RouterLink :to="{ path: '/market', query: { code: largestPosition.position.code, view: 'detail' } }"><strong>{{ largestPosition.position.name }}</strong></RouterLink>
+            <button class="link-button" type="button" @click="openMarket(largestPosition.position.code, largestPosition.position.name)"><strong>{{ largestPosition.position.name }}</strong></button>
             <span class="num">{{ money(largestPosition.position.market_value) }} 元</span>
             <span>占全部持仓市值 {{ percent(largestPosition.ratio) }}</span>
           </div>
@@ -669,6 +710,55 @@ onMounted(reloadAll);
 
 .plan-opportunities-card {
   margin-top: var(--dashboard-gap);
+}
+
+.forecast-card {
+  margin-top: var(--dashboard-gap);
+}
+
+.forecast-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.forecast-item {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+
+.forecast-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.forecast-item p {
+  margin: 8px 0;
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+
+.forecast-item small {
+  display: block;
+  color: var(--ink-soft);
+  font-size: var(--fs-xs);
+  line-height: 1.7;
+}
+
+.forecast-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin-top: 12px;
+  color: var(--ink-soft);
+  font-size: var(--fs-sm);
 }
 
 .recent-attention-card {

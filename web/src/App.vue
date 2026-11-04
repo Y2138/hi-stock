@@ -11,6 +11,8 @@ import CommandPalette from "./components/CommandPalette.vue";
 import AppMessageCenter from "./components/AppMessageCenter.vue";
 import AgentWorkspace from "./components/chat/AgentWorkspace.vue";
 import ResultPreview from "./components/ResultPreview.vue";
+import MarketDrawer from "./components/MarketDrawer.vue";
+import { openMarket } from "./composables/useMarketDrawer";
 import type { UiRefreshRequest } from "./api/types";
 import { dispatchUiRefresh } from "./composables/useUiRefresh";
 import { appMessage } from "./stores/message";
@@ -38,7 +40,7 @@ const settingsAgentOpen = ref(false);
 const isSettingsPage = computed(() => route.path === "/settings" || route.path.startsWith("/settings/"));
 const workspaceOpen = computed(() => isSettingsPage.value ? settingsAgentOpen.value : agentOpen.value);
 const accountPage = computed(() => route.path === "/positions" || (route.path === "/jobs" && taskScope.value === "account"));
-const globalResearchPage = computed(() => ["/pools", "/strategies", "/market", "/market-structure", "/market-news"].includes(route.path));
+const globalResearchPage = computed(() => ["/pools", "/strategies", "/market-structure", "/market-news"].includes(route.path));
 const accountViewKey = computed(() => route.path === "/positions" ? selectedAccountId.value : "global");
 const agentAccountId = computed(() => accountPage.value ? selectedAccountId.value : null);
 watch(() => [route.path, route.query.account], () => {
@@ -169,19 +171,24 @@ onBeforeUnmount(() => {
       </div>
       <div v-for="group in NAV_GROUPS" :key="group.label" class="nav-group">
         <div class="nav-group-label">{{ group.label }}</div>
-        <RouterLink
-          v-for="item in group.items"
-          :key="item.to"
-          :to="item.to"
-          class="nav-item"
-          :exact-active-class="item.to === '/' ? 'active' : undefined"
-          :active-class="item.to === '/' ? undefined : 'active'"
-          :title="item.label"
-          :aria-label="item.label"
-        >
-          <span class="icon" aria-hidden="true">{{ item.icon }}</span>
-          <span class="nav-label">{{ item.label }}</span>
-        </RouterLink>
+        <template v-for="item in group.items" :key="item.to ?? item.action">
+          <button v-if="item.action === 'market'" class="nav-item" type="button" :title="item.label" :aria-label="item.label" @click="openMarket()">
+            <span class="icon" aria-hidden="true">{{ item.icon }}</span>
+            <span class="nav-label">{{ item.label }}</span>
+          </button>
+          <RouterLink
+            v-else
+            :to="item.to!"
+            class="nav-item"
+            :exact-active-class="item.to === '/' ? 'active' : undefined"
+            :active-class="item.to === '/' ? undefined : 'active'"
+            :title="item.label"
+            :aria-label="item.label"
+          >
+            <span class="icon" aria-hidden="true">{{ item.icon }}</span>
+            <span class="nav-label">{{ item.label }}</span>
+          </RouterLink>
+        </template>
       </div>
     </nav>
 
@@ -204,6 +211,7 @@ onBeforeUnmount(() => {
     </main>
 
     <CommandPalette :open="paletteOpen" @close="paletteOpen = false" />
+    <MarketDrawer />
     <AppMessageCenter />
     <AgentWorkspace
       :key="agentAccountId ?? 'global'"

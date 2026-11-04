@@ -1,5 +1,12 @@
 // 导航与全局搜索共用页面名称，避免入口缺失或命名不一致。
-export const NAV_GROUPS = [
+export interface NavItem {
+  to?: string;
+  action?: "market";
+  icon: string;
+  label: string;
+}
+
+export const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
   { label: "全部账户总览", items: [
     { to: "/", icon: "📊", label: "仪表盘" },
   ] },
@@ -9,10 +16,11 @@ export const NAV_GROUPS = [
   ] },
   { label: "全局研究", items: [
     { to: "/pools", icon: "🌱", label: "关注池" },
+    { to: "/ultra-short", icon: "⚡", label: "超短关注池" },
     { to: "/market-structure", icon: "▦", label: "市场结构" },
     { to: "/market-news", icon: "📰", label: "市场消息" },
     { to: "/strategies", icon: "📜", label: "当前策略" },
-    { to: "/market", icon: "📈", label: "行情" },
+    { action: "market", icon: "📈", label: "行情" },
   ] },
   { label: "管理", items: [
     { to: "/memories", icon: "🧠", label: "Agent 记忆" },

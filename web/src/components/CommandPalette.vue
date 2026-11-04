@@ -6,6 +6,7 @@ import { useRouter } from "vue-router";
 import { apiClient } from "../api/client";
 import { INSTRUMENT_KIND_LABELS, type Instrument } from "../api/types";
 import { NAV_GROUPS } from "../navigation";
+import { openMarket } from "../composables/useMarketDrawer";
 
 interface Candidate {
   icon: string;
@@ -13,6 +14,7 @@ interface Candidate {
   hint?: string;
   kind: string;
   to?: string;
+  action?: "market";
   code?: string;
 }
 
@@ -110,7 +112,8 @@ function move(delta: number): void {
 }
 
 function choose(item: Candidate): void {
-  if (item.code) void router.push({ path: "/market", query: { code: item.code, view: "detail" } });
+  if (item.code) openMarket(item.code, item.label);
+  else if (item.action === "market") openMarket();
   else if (item.to) void router.push(item.to);
   emit("close");
 }

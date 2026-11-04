@@ -10,6 +10,7 @@ import StateBlock from "../components/StateBlock.vue";
 import UiInput from "../components/ui/UiInput.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
+import { useMarketDrawer } from "../composables/useMarketDrawer";
 import { appMessage } from "../stores/message";
 import { fmtTime, prettyJson } from "../utils/format";
 import { askAi, openAgentSession } from "../utils/askAi";
@@ -24,7 +25,7 @@ const STATUS_CLASS: Record<string, string> = {
   partial: "warn", missed: "", cancelled: "",
 };
 const TYPE_LABELS: Record<string, string> = {
-  datasource: "数据链路", analysis: "服务内分析", agent_flow: "Agent 任务",
+  datasource: "数据链路", analysis: "服务内分析", agent_flow: "Agent 任务", worker: "盘中常驻",
 };
 const DATASOURCE_INFO: Record<string, { label: string; responsibility: string; result: string }> = {
   daily_market_update: {
@@ -90,6 +91,7 @@ const historyError = ref<ApiFail | null>(null);
 const selectedRun = ref<JobRunDetail | null>(null);
 const selectedRunId = ref<string | null>(null);
 const runLoading = ref(false);
+const market = useMarketDrawer();
 const promptJob = ref<JobDefinition | null>(null);
 const promptDetail = ref<JobPrompt | null>(null);
 const promptLoading = ref(false);
@@ -155,6 +157,7 @@ function pipelineOf(job: JobDefinition): string {
 }
 
 function executionLabel(job: JobDefinition): string {
+  if (job.job_type === "worker") return `常驻 worker · 每 ${String(job.config.interval_seconds ?? "?")} 秒`;
   if (job.job_type === "datasource") {
     const pipeline = pipelineOf(job);
     return `${DATASOURCE_INFO[pipeline]?.label ?? "未知数据链路"} · ${pipeline}`;
@@ -198,6 +201,7 @@ function responsibility(job: JobDefinition): string {
 }
 
 function expectedResult(job: JobDefinition): string {
+  if (job.job_type === "worker") return "心跳、汇总提醒与业务表状态；不写运行历史。";
   if (job.job_type === "datasource") return DATASOURCE_INFO[pipelineOf(job)]?.result ?? "数据同步记录。";
   if (job.job_type === "agent_flow") return "任务结果与来源对话；完整结果在“历史与结果”中查看。";
   return "分析记录、指标结果和数据缺口。";
@@ -205,6 +209,7 @@ function expectedResult(job: JobDefinition): string {
 
 /** 调度节奏：由 cron 推导出人类可读的频率标签，不参与调度。 */
 function cadenceLabel(job: JobDefinition): string {
+  if (job.job_type === "worker") return `常驻 · 每 ${String(job.config.interval_seconds ?? "?")} 秒`;
   const [minute, hour, dom, , dow] = job.cron.split(/\s+/);
   const at = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
   if (dow === "*") return `每天 ${at}`;
@@ -354,11 +359,11 @@ function showRunList(): void {
 }
 
 function onKeydown(event: KeyboardEvent): void {
-  if (event.key === "Escape" && promptJob.value) {
+  if (event.key === "Escape" && promptJob.value && !market.open) {
     closePrompt();
     return;
   }
-  if (event.key === "Escape" && historyJob.value && !resultOpen.value) closeHistory();
+  if (event.key === "Escape" && historyJob.value && !resultOpen.value && !market.open) closeHistory();
 }
 
 function switchScope(scope: "account" | "global") {
@@ -446,7 +451,11 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
                     <p class="job-purpose-text">{{ responsibility(job) }}</p>
                   </td>
                   <td>
-                    <div class="cell-stack"><strong>{{ cadenceLabel(job) }}</strong><small class="code">{{ job.cron }}</small><small>下次 {{ job.next_run ? fmtTime(job.next_run) : "已暂停" }}</small></div>
+                    <div class="cell-stack">
+                      <strong>{{ cadenceLabel(job) }}</strong>
+                      <template v-if="job.job_type === 'worker'"><small class="code">常驻 worker</small><small>心跳：{{ job.latest_run?.finished_at ? fmtTime(job.latest_run.finished_at) : "尚未运行" }}</small></template>
+                      <template v-else><small class="code">{{ job.cron }}</small><small>下次 {{ job.next_run ? fmtTime(job.next_run) : "已暂停" }}</small></template>
+                    </div>
                   </td>
                   <td>
                     <div class="cell-stack">
@@ -457,9 +466,14 @@ watch(() => [route.query.job, route.query.run], () => void openRequestedJob());
                   </td>
                   <td>
                     <div class="row-actions">
-                      <button class="btn compact primary" :class="{ 'agent-entry': job.job_type === 'agent_flow' }" type="button" :disabled="actionKey === `trigger:${job.code}`" @click="trigger(job)">立即运行</button>
-                      <button class="btn compact" type="button" @click="openHistory(job)">历史与结果</button>
-                      <button v-if="job.latest_run && ['failed','partial','missed'].includes(job.latest_run.status)" class="btn compact" :class="{ 'agent-entry': job.job_type === 'agent_flow' }" type="button" @click="trigger(job, true)">重试</button>
+                      <template v-if="job.job_type === 'worker'">
+                        <button class="btn compact" type="button" :disabled="actionKey === `toggle:${job.code}`" @click="toggle(job)">{{ job.enabled ? "暂停" : "启用" }}</button>
+                      </template>
+                      <template v-else>
+                        <button class="btn compact primary" :class="{ 'agent-entry': job.job_type === 'agent_flow' }" type="button" :disabled="actionKey === `trigger:${job.code}`" @click="trigger(job)">立即运行</button>
+                        <button class="btn compact" type="button" @click="openHistory(job)">历史与结果</button>
+                        <button v-if="job.latest_run && ['failed','partial','missed'].includes(job.latest_run.status)" class="btn compact" :class="{ 'agent-entry': job.job_type === 'agent_flow' }" type="button" @click="trigger(job, true)">重试</button>
+                      </template>
                     </div>
                   </td>
                 </tr>

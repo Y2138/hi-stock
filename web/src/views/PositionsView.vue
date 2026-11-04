@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 持仓（/positions）：持仓概览、次日执行预案、持仓表（单日涨跌默认排序）与带归因的变化时间线。
+// 持仓（/positions）：以持仓明细为主体；执行预案在表格内按行打开抽屉，盘中加减仓折叠为一行摘要。
 // 业务事实只能由 Agent 通过领域工具写入；估值由当前持仓与最新行情派生。
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute } from "vue-router";
@@ -7,7 +7,6 @@ import { selectedAccount, selectedAccountId } from "../stores/account";
 import { apiClient } from "../api/client";
 import type {
   BarsResponse,
-  AuctionScopeBoard,
   DailyPlanBoard,
   DailyPlanKeyLevel,
   DailyPlanPlaybookItem,
@@ -23,6 +22,7 @@ import StateBlock from "../components/StateBlock.vue";
 import MarkdownView from "../components/MarkdownView.vue";
 import { useResource } from "../composables/useResource";
 import { useUiRefresh } from "../composables/useUiRefresh";
+import { openMarket, useMarketDrawer } from "../composables/useMarketDrawer";
 import { fmtDate, fmtNum, fmtPrice, fmtTime } from "../utils/format";
 import { askAi } from "../utils/askAi";
 
@@ -36,16 +36,23 @@ const realizedPnl = useResource<RealizedPnlSummary>(() =>
 );
 // 次日执行预案：来自最新每日计划的结构化盯防数据；404 = 尚无预案，不算错误。
 const dailyPlan = useResource<DailyPlanBoard>(() => apiClient.get<DailyPlanBoard>(`/api/plans/latest?account_id=${selectedAccountId.value}`));
-const auctionScope = useResource<AuctionScopeBoard>(() => apiClient.get<AuctionScopeBoard>(`/api/auction/latest?account_id=${selectedAccountId.value}`));
 const intradayRisk = useResource<IntradayRiskSnapshot>(() => apiClient.get<IntradayRiskSnapshot>(`/api/intraday-risk?account_id=${selectedAccountId.value}`));
-const intradayRiskByCode = computed(() => new Map((intradayRisk.data.value?.positions ?? []).map((item) => [item.code, item])));
-const riskLabel: Record<IntradayRiskRow["risk"], string> = { normal: "正常", watch: "关注", high: "风险" };
-const riskClass: Record<IntradayRiskRow["risk"], string> = { normal: "", watch: "warn", high: "down" };
+const riskLabel: Record<IntradayRiskRow["action"], string> = { add: "加仓触发", reduce: "减仓触发", wait: "等待" };
+const emotionLabel: Record<IntradayRiskRow["emotion"], string> = { ice_point: "情绪冰点", weak: "情绪偏弱", neutral: "情绪平稳", strong: "情绪偏热", unknown: "情绪待确认" };
+const priceZone = (plan: NonNullable<IntradayRiskRow["add_plan"]>) => `${plan.price_lower.toFixed(2)}～${plan.price_upper.toFixed(2)}`;
+const currentReminder = (item: IntradayRiskRow) => Boolean(intradayRisk.data.value?.running && item.data_time && Date.now() - new Date(item.data_time).getTime() <= 90_000);
+const reminderLabel = (item: IntradayRiskRow) => item.action === "wait" || currentReminder(item) ? riskLabel[item.action] : `上次${riskLabel[item.action]}`;
+
+const riskClass: Record<IntradayRiskRow["action"], string> = { add: "up", reduce: "down", wait: "" };
 let intradayRiskTimer: number | null = null;
-const positionAuctionRows = computed(() => (auctionScope.data.value?.items ?? []).filter((item) => item.scope_kind === "position"));
 const planMissing = computed(() => !dailyPlan.data.value && dailyPlan.error.value?.status === 404);
-const planError = computed(() => (planMissing.value ? null : dailyPlan.error.value));
 const positionActions = computed(() => dailyPlan.data.value?.position_actions ?? []);
+const planByCode = computed(() => new Map(positionActions.value.map((item) => [item.code, item])));
+const planDate = computed(() => dailyPlan.data.value?.plan.target_date ?? null);
+// 盘中加减仓默认只保留一行摘要，价位明细按需展开，避免挤占持仓明细。
+const showIntradayDetail = ref(false);
+const intradayAddCount = computed(() => (intradayRisk.data.value?.positions ?? []).filter((item) => item.action === "add" && currentReminder(item)).length);
+const intradayReduceCount = computed(() => (intradayRisk.data.value?.positions ?? []).filter((item) => item.action === "reduce" && currentReminder(item)).length);
 
 const ACTION_LABELS: Record<DailyPlanPlaybookItem["action"], string> = {
   exit: "退出",
@@ -85,22 +92,22 @@ const SCENARIO_LABELS: Record<DailyPlanScenarioKind, string> = {
   weak_breakdown: "弱势破位",
 };
 
-function tPlanText(item: DailyPlanPlaybookItem): string {
-  const plan = item.t_plan;
-  if (!plan) return "—";
-  if ("skip_reason" in plan) return "不设";
-  return `${fmtPrice(plan.buy_lower)}~${fmtPrice(plan.buy_upper)} 低吸 / ${fmtPrice(plan.sell_lower)}~${fmtPrice(plan.sell_upper)} 兑现`;
-}
-
 function levelClass(level: DailyPlanKeyLevel): string {
   return level.kind;
 }
 
 // ---- 预案详情抽屉：列表保持紧凑，关键点位、情景矩阵与做T点位在抽屉内展开。 ----
+const market = useMarketDrawer();
 const detailItem = ref<DailyPlanPlaybookItem | null>(null);
 
 function openItemDetail(item: DailyPlanPlaybookItem): void {
   detailItem.value = item;
+}
+
+/** 持仓明细行内的执行预案按钮：只打开最新每日计划为这只持仓生成的结构化预案。 */
+function openPlanFor(code: string): void {
+  const item = planByCode.value.get(code);
+  if (item) openItemDetail(item);
 }
 
 function closeItemDetail(): void {
@@ -108,7 +115,7 @@ function closeItemDetail(): void {
 }
 
 function onDialogKeydown(event: KeyboardEvent): void {
-  if (event.key === "Escape" && detailItem.value) closeItemDetail();
+  if (event.key === "Escape" && detailItem.value && !market.open) closeItemDetail();
 }
 
 window.addEventListener("keydown", onDialogKeydown);
@@ -244,7 +251,7 @@ function recordWithAgent(): void {
 }
 
 async function reloadPositionsData(): Promise<void> {
-  await Promise.all([positions.reload(), changes.reload(), realizedPnl.reload(), dailyPlan.reload(), auctionScope.reload(), intradayRisk.reload()]);
+  await Promise.all([positions.reload(), changes.reload(), realizedPnl.reload(), dailyPlan.reload(), intradayRisk.reload()]);
   await loadDayChanges(positions.data.value ?? []);
 }
 
@@ -261,7 +268,7 @@ onUnmounted(() => {
 <template>
   <section>
     <div class="page-head position-head">
-      <div><h1>持仓</h1><div class="sub">{{ selectedAccount?.name ?? "当前账户" }} · 持仓、成交、计划与盘中风险独立维护</div></div>
+      <div><h1>持仓</h1><div class="sub">{{ selectedAccount?.name ?? "当前账户" }} · 持仓、成交、计划与盘中加减仓提醒独立维护</div></div>
       <button class="btn primary agent-entry" type="button" @click="recordWithAgent">记录持仓变化</button>
     </div>
 
@@ -315,110 +322,64 @@ onUnmounted(() => {
       </StateBlock>
     </div>
 
-    <div class="card intraday-risk-card" style="margin-top:16px">
+    <!-- 盘中加减仓：默认一行摘要，价位明细按需展开，把页面主体留给持仓明细。 -->
+    <div class="card intraday-risk-card">
       <div class="card-title">
-        盘中风险观察
+        盘中加减仓
         <small v-if="intradayRisk.data.value?.sample_at" class="plan-source num">最近采样 {{ fmtTime(intradayRisk.data.value.sample_at) }}</small>
+        <button
+          v-if="intradayRisk.data.value?.positions.length"
+          class="btn compact intraday-toggle"
+          type="button"
+          :aria-expanded="showIntradayDetail"
+          @click="showIntradayDetail = !showIntradayDetail"
+        >{{ showIntradayDetail ? "收起价位" : "查看价位" }}</button>
       </div>
       <StateBlock
         :loading="intradayRisk.loading.value"
         :error="intradayRisk.error.value"
         :empty="false"
-        :skeleton-rows="2"
+        :skeleton-rows="1"
         @retry="intradayRisk.reload"
       >
-        <div v-if="intradayRisk.data.value" class="intraday-risk-summary">
-          <span class="badge" :class="{ warn: intradayRisk.data.value.positions.some((item) => item.risk === 'watch'), down: intradayRisk.data.value.positions.some((item) => item.risk === 'high') }">
-            {{ intradayRisk.data.value.positions.filter((item) => item.risk === "high").length }} 个风险 ·
-            {{ intradayRisk.data.value.positions.filter((item) => item.risk === "watch").length }} 个关注
+        <div class="intraday-risk-summary">
+          <span class="badge" :class="{ up: intradayAddCount > 0 }">{{ intradayAddCount }} 个加仓触发</span>
+          <span class="badge" :class="{ down: intradayReduceCount > 0 }">{{ intradayReduceCount }} 个减仓触发</span>
+          <span class="code-sub">
+            {{ intradayRisk.data.value?.running ? "交易时段观察中" : "非交易时段" }} · 数据{{ intradayRisk.data.value?.data_status === "ready" ? "正常" : intradayRisk.data.value?.data_status === "stale" ? "过期，仅展示上次结果" : "不完整" }} · 仅提醒，不自动交易
           </span>
-          <span class="code-sub">{{ intradayRisk.data.value.running ? "交易时段观察中" : "非交易时段" }} · 数据{{ intradayRisk.data.value.data_status === "ready" ? "正常" : "不完整" }}</span>
         </div>
-        <div v-if="intradayRisk.data.value?.positions.some((item) => item.risk !== 'normal')" class="intraday-risk-list">
-          <div v-for="item in intradayRisk.data.value.positions.filter((row) => row.risk !== 'normal')" :key="item.code" class="intraday-risk-line">
-            <strong>{{ item.name }}</strong><span class="num code-sub">{{ item.code }}</span>
-            <span class="badge" :class="riskClass[item.risk]">{{ riskLabel[item.risk] }}</span>
-            <span>{{ item.reason }}</span><span v-if="item.key_level" class="num">关键位 {{ item.key_level }}</span>
+        <p v-if="!intradayRisk.data.value?.positions.length" class="card-desc">等待本交易日的持仓量价分析。</p>
+        <div v-else-if="showIntradayDetail" class="intraday-risk-list">
+          <div v-for="item in intradayRisk.data.value.positions" :key="item.code" class="intraday-position-plan">
+            <div class="intraday-risk-line">
+              <strong>{{ item.name }}</strong><span class="num code-sub">{{ item.code }}</span>
+              <span class="badge" :class="riskClass[item.action]">{{ reminderLabel(item) }}</span>
+              <span class="badge" :class="{ accent: item.emotion === 'ice_point' }">{{ emotionLabel[item.emotion] }}</span>
+              <span>{{ item.reason }}</span><small v-if="item.data_time" class="code-sub num">{{ fmtTime(item.data_time) }}</small>
+            </div>
+            <div v-if="item.add_plan" class="intraday-price-plan">
+              <b class="up">加仓 {{ priceZone(item.add_plan) }}</b><span class="badge">{{ item.add_plan.status === 'triggered' ? currentReminder(item) ? '已触发' : '上次触发' : '等待条件' }}</span>
+              <span>确认：{{ item.add_plan.condition }}</span><span class="code-sub">取消：{{ item.add_plan.invalidation }}</span>
+            </div>
+            <div v-if="item.reduce_plan" class="intraday-price-plan">
+              <b class="down">减仓 {{ priceZone(item.reduce_plan) }}</b><span class="badge">{{ item.reduce_plan.status === 'triggered' ? currentReminder(item) ? '已触发' : '上次触发' : '等待条件' }}</span>
+              <span>确认：{{ item.reduce_plan.condition }}</span><span class="code-sub">取消：{{ item.reduce_plan.invalidation }}</span>
+            </div>
+            <p v-if="!item.add_plan && !item.reduce_plan" class="card-desc">当前暂无明确价位，继续观察量价与承接。</p>
           </div>
         </div>
-        <p v-else class="card-desc">当前没有需要提醒的持仓风险。模型只在风险状态变化时提醒。</p>
       </StateBlock>
-    </div>
-
-    <!-- 次日执行预案：独立于持仓表，来自最新每日计划的结构化盯防数据（不动上方表格）。 -->
-    <div class="card plan-playbook-card">
-      <div class="card-title">
-        🎯 执行预案
-        <small v-if="dailyPlan.data.value" class="plan-source num">
-          {{ fmtDate(dailyPlan.data.value.plan.target_date) }} 每日计划生成
-        </small>
-      </div>
-      <StateBlock
-        :loading="dailyPlan.loading.value"
-        :error="planError"
-        :empty="positionActions.length === 0 && !planMissing"
-        empty-text="本计划没有输出持仓执行预案"
-        :skeleton-rows="3"
-        @retry="dailyPlan.reload"
-      >
-        <p v-if="planMissing" class="card-desc">每日计划尚未生成结构化预案；盘前生成后此处展示每笔持仓的开盘动作、触发价位、做 T 点位与情景预案。</p>
-        <div v-else class="table-wrap">
-          <table class="data-table clickable playbook-table">
-            <thead>
-              <tr>
-                <th scope="col">标的</th>
-                <th scope="col">策略 / 动作</th>
-                <th scope="col">触发方式</th>
-                <th scope="col">预案要点</th>
-                <th scope="col">做 T 点位</th>
-                <th scope="col">情景</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="item in positionActions"
-                :key="item.id"
-                class="playbook-row"
-                tabindex="0"
-                :aria-label="`查看 ${item.name} 预案详情`"
-                @click="openItemDetail(item)"
-                @keydown.enter="openItemDetail(item)"
-              >
-                <td><strong>{{ item.name }}</strong><br /><small class="num">{{ item.code }}</small></td>
-                <td>
-                  <RouterLink v-if="item.strategy_code" class="badge accent" :to="{ path: '/strategies', query: { strategy: item.strategy_code } }">{{ item.strategy_code }} ↗</RouterLink>
-                  <span class="num" :class="triggerClass(item)">{{ ACTION_LABELS[item.effective_action ?? item.action] }}</span>
-                  <div class="code-sub">主 {{ item.primary_action ? ACTION_LABELS[item.primary_action] : "—" }} · 兜底 {{ item.fallback_action ? ACTION_LABELS[item.fallback_action] : "—" }}</div>
-                  <span v-if="item.evaluation_status" class="badge" :class="{ warn:item.evaluation_status !== 'success' }">{{ item.evaluation_status === 'success' ? '评估完整' : item.evaluation_status === 'waiting' ? '评估中' : '待补齐' }}</span>
-                </td>
-                <td><small>{{ triggerLabel(item) }}</small></td>
-                <td>{{ item.headline }}</td>
-                <td><small class="num">{{ tPlanText(item) }}</small></td>
-                <td>
-                  <span v-if="(item.scenarios ?? []).length" class="badge accent num">{{ item.scenarios!.length }} 情景</span>
-                  <small v-else class="missing">未写入</small>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-          <p class="card-desc" style="margin-top: 8px">点击行查看该持仓的关键点位、情景预案与做 T 详情。</p>
-        </div>
-      </StateBlock>
-    </div>
-
-    <div v-if="positionAuctionRows.length" class="card" style="margin-top:16px">
-      <div class="card-title">竞价持仓复核 · {{ fmtDate(auctionScope.data.value?.target_date) }}</div>
-      <div v-for="item in positionAuctionRows" :key="item.id" class="auction-position-row">
-        <strong>{{ item.name }} · {{ item.strategy_name ?? item.strategy_code ?? "待归因" }}</strong>
-        <span class="badge" :class="{ warn:item.conclusion !== 'plan_aligned' }">{{ item.conclusion === 'plan_aligned' ? '原预案匹配' : item.conclusion === 'risk_alert' ? '竞价风险升级' : '数据不足' }}</span>
-        <small>{{ item.assessment_summary }} · {{ item.metrics_summary }}</small>
-      </div>
     </div>
 
     <!-- 持仓表 -->
     <div class="card" style="margin-top: 16px">
       <div class="card-title position-table-title">
         <span>持仓明细</span>
+        <small v-if="planDate" class="plan-source num">{{ fmtDate(planDate) }} 每日计划</small>
+        <small v-else-if="planMissing" class="plan-source num">每日计划未生成</small>
+        <small v-else-if="dailyPlan.loading.value" class="plan-source num">预案读取中</small>
+        <small v-else-if="dailyPlan.error.value" class="plan-source down">执行预案读取失败</small>
         <span class="sort-switch">
           排序：
           <button
@@ -454,6 +415,7 @@ onUnmounted(() => {
             <thead>
               <tr>
                 <th>标的</th>
+                <th>执行预案</th>
                 <th>数量</th>
                 <th>成本</th>
                 <th>最新收盘</th>
@@ -462,7 +424,6 @@ onUnmounted(() => {
                 <th>浮动盈亏</th>
                 <th>收益率</th>
                 <th>占比</th>
-                <th>盘中风险</th>
                 <th>管理策略</th>
                 <th>本轮持仓归因构成</th>
               </tr>
@@ -470,8 +431,18 @@ onUnmounted(() => {
             <tbody>
               <tr v-for="p in sortedPositions" :key="p.instrument_id">
                 <td>
-                  <RouterLink :to="{ path: '/market', query: { code: p.code, view: 'detail' } }">{{ p.name }}</RouterLink>
+                  <button class="link-button" type="button" @click="openMarket(p.code, p.name)">{{ p.name }}</button>
                   <div class="num code-sub">{{ p.code }}</div>
+                </td>
+                <td>
+                  <button
+                    v-if="planByCode.get(p.code)"
+                    class="btn compact plan-open-btn"
+                    type="button"
+                    :aria-label="`查看 ${p.name} 的执行预案`"
+                    @click="openPlanFor(p.code)"
+                  >查看预案</button>
+                  <span v-else class="missing">—</span>
                 </td>
                 <td class="num">{{ fmtNum(p.quantity) }}</td>
                 <td class="num">{{ fmtPrice(p.cost_price) }}</td>
@@ -501,13 +472,6 @@ onUnmounted(() => {
                      : `${((p.market_value / totalMarketValue) * 100).toFixed(1)}%` }}
                 </td>
                 <td>
-                  <template v-if="intradayRiskByCode.get(p.code)">
-                    <span class="badge" :class="riskClass[intradayRiskByCode.get(p.code)!.risk]">{{ riskLabel[intradayRiskByCode.get(p.code)!.risk] }}</span>
-                    <div class="code-sub risk-reason">{{ intradayRiskByCode.get(p.code)!.reason }}</div>
-                  </template>
-                  <span v-else class="missing">待观察</span>
-                </td>
-                <td>
                   <RouterLink v-if="p.strategy_code" class="badge accent" :to="{ path: '/strategies', query: { strategy: p.strategy_code } }">{{ p.strategy_name ?? p.strategy_code }} ↗</RouterLink>
                   <span v-else class="missing">待归因</span>
                   <div v-if="p.fallback_strategy_code" class="code-sub">兜底：<RouterLink :to="{ path: '/strategies', query: { strategy: p.fallback_strategy_code } }">{{ p.fallback_strategy_name ?? p.fallback_strategy_code }} ↗</RouterLink></div>
@@ -518,7 +482,7 @@ onUnmounted(() => {
           </table>
         </div>
         <p class="card-desc" style="margin-top: 8px">
-          盈亏口径：数量 ×（最新收盘 − 成本）；单日涨跌由最近两根日线计算；完全清仓后从当前持仓表移除，历史成交仍保留在变化时间线。
+          盈亏口径：数量 ×（最新收盘 − 成本）；单日涨跌由最近两根日线计算；完全清仓后从当前持仓表移除，历史成交仍保留在变化时间线。「执行预案」来自最新每日计划，点击查看关键点位、情景与做 T 详情。
         </p>
       </StateBlock>
     </div>
@@ -554,7 +518,7 @@ onUnmounted(() => {
             <tbody>
               <tr v-for="c in visibleChanges" :key="c.id" :class="{ 'focused-row': c.id === focusedChangeId }">
                 <td class="num">{{ fmtDate(c.change_date) }}</td>
-                <td><RouterLink :to="{ path: '/market', query: { code: c.code, view: 'detail' } }">{{ c.name }}</RouterLink> <span class="num code-sub">{{ c.code }}</span></td>
+                <td><button class="link-button" type="button" @click="openMarket(c.code, c.name)">{{ c.name }}</button> <span class="num code-sub">{{ c.code }}</span></td>
                 <td>
                   <span class="badge" :class="{ accent: c.kind === 'buy', warn: c.kind === 'sell' }">{{ CHANGE_KIND_LABELS[c.kind] ?? c.kind }}</span>
                   <RouterLink v-if="c.kind === 'buy' && c.strategy_code" class="badge accent" :to="{ path: '/strategies', query: { strategy: c.strategy_code } }">{{ c.strategy_code }} ↗</RouterLink>
@@ -642,7 +606,7 @@ onUnmounted(() => {
                 <span class="num code-sub">{{ detailItem.code }}</span>
                 <span class="num" :class="triggerClass(detailItem)">{{ ACTION_LABELS[detailItem.effective_action ?? detailItem.action] }}</span>
                 <RouterLink v-if="detailItem.strategy_code" class="badge accent" :to="{ path: '/strategies', query: { strategy: detailItem.strategy_code } }">{{ detailItem.strategy_code }} ↗</RouterLink>
-                <RouterLink class="btn compact detail-quote-link" :to="{ path: '/market', query: { code: detailItem.code, view: 'detail' } }">📈 查看行情</RouterLink>
+                <button class="btn compact detail-quote-link" type="button" @click="openMarket(detailItem.code, detailItem.name)">📈 查看行情</button>
               </div>
               <button class="detail-close" type="button" aria-label="关闭预案详情" @click="closeItemDetail">×</button>
             </header>
@@ -690,6 +654,7 @@ onUnmounted(() => {
                     <thead>
                       <tr>
                         <th scope="col">情景</th>
+                        <th scope="col">概率</th>
                         <th scope="col">可观测触发</th>
                         <th scope="col">应对</th>
                         <th scope="col">失效条件</th>
@@ -698,6 +663,7 @@ onUnmounted(() => {
                     <tbody>
                       <tr v-for="scenario in detailItem.scenarios" :key="scenario.id">
                         <td><span class="badge">{{ SCENARIO_LABELS[scenario.scenario_kind] ?? scenario.scenario_kind }}</span></td>
+                        <td><strong class="num">{{ scenario.probability ?? "—" }}<template v-if="scenario.probability != null">%</template></strong></td>
                         <td><small>{{ scenario.observable_md }}</small></td>
                         <td><small>{{ scenario.response_md }}</small></td>
                         <td><small>{{ scenario.invalidation_md }}</small></td>
@@ -757,9 +723,15 @@ onUnmounted(() => {
 .realized-summary dd { font-size: 14px; white-space: nowrap; }
 .realized-summary small { color: var(--ink-faint); font-size: 10.5px; }
 
+.position-table-title { flex-wrap: wrap; row-gap: 6px; }
+.position-table-title > span:first-child,
+.position-table-title .plan-source { flex: none; white-space: nowrap; }
+.position-table-title .sort-switch { flex: 0 0 auto; }
+
 .sort-switch {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   margin-left: auto;
   font-size: 12px;
@@ -824,12 +796,9 @@ onUnmounted(() => {
   .sort-switch { width: 100%; margin-left: 0; flex-wrap: wrap; }
 }
 
-.plan-playbook-card { margin-top: 16px; }
 .plan-source { margin-left: var(--space-sm); color: var(--ink-faint); font-weight: 400; }
-/* 覆盖上方 .table-wrap .data-table 的 1220px 通用宽度：紧凑预案表不需要横向滚动。 */
-.table-wrap .playbook-table { min-width: 960px; }
-.playbook-table td small { line-height: 1.5; }
-.playbook-row { cursor: pointer; }
+.position-table-title .plan-source { margin-left: 0; }
+.plan-open-btn { padding: 2px 10px; font-size: 12px; }
 
 /* ---- 预案详情抽屉 ---- */
 .playbook-detail-mask {
@@ -932,11 +901,13 @@ onUnmounted(() => {
   .detail-overview { grid-template-columns: 1fr; }
 }
 
-.auction-position-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:8px 0;border-top:1px solid var(--line)}
-.auction-position-row small{flex-basis:100%;color:var(--ink-soft)}
+.intraday-risk-card{margin-top:16px}
 .intraday-risk-summary{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.intraday-risk-summary .badge{white-space:nowrap}
+.intraday-toggle{margin-left:auto;padding:2px 10px;font-size:12px}
+.intraday-price-plan{display:flex;gap:8px;flex-wrap:wrap;padding:5px 0;font-size:13px}
+.intraday-position-plan{padding:4px 0;border-top:1px solid var(--line)}
 .intraday-risk-list{display:grid;gap:6px;margin-top:10px}
 .intraday-risk-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;border-top:1px solid var(--line);font-size:13px}
 .intraday-risk-line span:nth-last-child(2){color:var(--ink-soft)}
-.risk-reason{max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>

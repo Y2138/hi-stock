@@ -6,6 +6,7 @@ import type { DailyPlanBoard, DailyPlanPlaybookItem, MarketStructureDataset, Mar
 import StateBlock from "../components/StateBlock.vue";
 import UiInput from "../components/ui/UiInput.vue";
 import { useUiRefresh } from "../composables/useUiRefresh";
+import { openMarket as openMarketDrawer } from "../composables/useMarketDrawer";
 import { fmtTime } from "../utils/format";
 
 interface DatasetDefinition {
@@ -170,7 +171,7 @@ async function selectDataset(value: MarketStructureDataset): Promise<void> {
 }
 
 function openMarket(code: string | null): void {
-  if (code) void router.push({ path: "/market", query: { code, view: "detail" } });
+  if (code) openMarketDrawer(code);
 }
 
 function formatNumber(value: unknown): string | null {
@@ -261,7 +262,7 @@ onMounted(() => void loadAll());
           </div>
         </header>
         <p class="plan-scope">
-          T 日收盘按当前《打板策略》筛选，信号来自独立收盘打板策略任务的结构化结果；是否成交及数量由用户自主决定。
+          以下为独立收盘任务的观察候选与数据顺位。参与首选需结合任务中的同高度 PK、消息和竞价复核；一字强势不代表能成交，是否成交及数量由用户自主决定。
         </p>
         <StateBlock
           :loading="planLoading"
@@ -276,10 +277,10 @@ onMounted(() => void loadAll());
             <table class="data-table plan-opportunity-table">
               <thead>
                 <tr>
-                  <th scope="col">优先级</th>
+                  <th scope="col">数据顺位</th>
                   <th scope="col">标的</th>
                   <th scope="col">T 日信号</th>
-                  <th scope="col">评分与依据</th>
+                  <th scope="col">承接与 PK 依据</th>
                   <th scope="col">T+1 竞价复核</th>
                   <th scope="col">风险与失效</th>
                 </tr>
@@ -288,10 +289,10 @@ onMounted(() => void loadAll());
                 <tr v-for="item in opportunities" :key="item.id">
                   <td class="num">{{ item.priority }}</td>
                   <td>
-                    <RouterLink :to="{ path: '/market', query: { code: item.code, view: 'detail' } }">
+                    <button class="link-button" type="button" @click="openMarket(item.code)">
                       <strong>{{ item.name }}</strong>
                       <small class="num"> {{ item.code }}</small>
-                    </RouterLink>
+                    </button>
                   </td>
                   <td class="signal-cell">
                     <span class="grade-badge" :class="`grade-${item.grade?.toLowerCase()}`">

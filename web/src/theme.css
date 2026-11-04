@@ -208,7 +208,7 @@ code,
   grid-area: nav;
   background: var(--card);
   border-right: 1px solid var(--line);
-  padding: 14px 10px;
+  padding: 12px 8px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -287,7 +287,7 @@ code,
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 7px 9px;
+  padding: 6px 8px;
   border-radius: var(--radius-sm);
   color: var(--ink-soft);
   font-size: var(--fs-md);
@@ -1069,4 +1069,155 @@ input[type="radio"] {
 }
 @media (max-width: 720px) {
   .shell .nav-collapse { display: none; }
+}
+
+/* ---------- 2026-10 视觉层级校正：标题、正文、辅助信息明确分层 ---------- */
+
+.side-nav button.nav-item {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font-family: var(--font-body);
+  cursor: pointer;
+}
+
+.side-nav .nav-group-label {
+  color: var(--ink-faint);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+}
+
+.side-nav .nav-item.active {
+  position: relative;
+}
+
+.side-nav .nav-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.main-area {
+  padding: 18px 26px 38px;
+  max-width: 1240px;
+}
+
+.page-head {
+  margin-bottom: 18px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.page-head h1 {
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  line-height: 1.18;
+}
+
+.page-head .sub {
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.65;
+  max-width: 72ch;
+}
+
+.card {
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  border-color: color-mix(in srgb, var(--line) 82%, transparent);
+}
+
+.card .card-title {
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin-bottom: 6px;
+}
+
+.card .card-desc {
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+.data-table {
+  font-size: 12.5px;
+}
+
+.data-table th {
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 6px 9px;
+  border-bottom-color: color-mix(in srgb, var(--line) 86%, transparent);
+}
+
+.data-table td {
+  padding: 7px 9px;
+}
+
+.data-table tbody tr:hover {
+  background: color-mix(in srgb, var(--accent-soft) 58%, transparent);
+}
+
+.link-button {
+  display: inline;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.num,
+.metric-item strong,
+.drawer-last {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 1100px) {
+  .main-area {
+    padding: 16px 18px 30px;
+  }
+  .page-head h1 {
+    font-size: 24px;
+  }
+}
+
+@media (max-width: 720px) {
+  .main-area {
+    padding: 14px 12px 24px;
+  }
+  .page-head {
+    margin-bottom: 18px;
+    padding-bottom: 12px;
+  }
+  .page-head h1 {
+    font-size: 22px;
+  }
+  .card {
+    padding: 14px;
+  }
 }

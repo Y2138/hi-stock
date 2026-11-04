@@ -105,7 +105,7 @@ export interface StrategyRuntimeDefinition {
 
 // ---- 二期 M3：系统调度作业 ----
 
-export type JobType = "datasource" | "analysis" | "agent_flow";
+export type JobType = "datasource" | "analysis" | "agent_flow" | "worker";
 export type JobStatus = "queued" | "running" | "success" | "failed" | "partial" | "missed" | "cancelled";
 
 export interface JobRunSummary {
@@ -393,9 +393,34 @@ export type DailyPlanScenarioKind =
 export interface DailyPlanScenario {
   id: string;
   scenario_kind: DailyPlanScenarioKind;
+  probability: number | null;
   observable_md: string;
   response_md: string;
   invalidation_md: string;
+}
+
+export interface DailyPlanMarketForecastScenario {
+  label: string;
+  probability: number;
+  view: string;
+  triggers: string;
+  response: string;
+  invalidation: string;
+}
+
+export interface DailyPlanMarketForecastKeyLevel {
+  name: string;
+  support: number | null;
+  resistance: number | null;
+  volume_note: string | null;
+}
+
+export interface DailyPlanMarketForecast {
+  target_date: string;
+  as_of: string;
+  scenarios: DailyPlanMarketForecastScenario[];
+  key_levels: DailyPlanMarketForecastKeyLevel[];
+  summary_md: string;
 }
 
 /** 关键点位事实：服务端机械计算（均线/近10、20日高低/前日高低/次日涨跌停）。 */
@@ -459,19 +484,21 @@ export interface DailyPlanPlaybookItem {
 
 export interface DailyPlanBoard {
   plan: { output_id: string; target_date: string; status: string; created_at: string };
+  market_forecast: DailyPlanMarketForecast | null;
   position_actions: DailyPlanPlaybookItem[];
   opportunities: DailyPlanPlaybookItem[];
 }
 export interface AuctionScopeAssessment {
   id: string;
   target_key: string;
-  scope_kind: "position" | "attention";
+  /** 持仓竞价复核已下线；历史持仓结论不再返回。 */
+  scope_kind: "attention" | "ladder";
   code: string;
   name: string;
   attention_entry_id: string | null;
   strategy_code: string | null;
   strategy_name: string | null;
-  conclusion: "plan_aligned" | "risk_alert" | "confirmed" | "wait" | "give_up" | "unavailable";
+  conclusion: "confirmed" | "wait" | "give_up" | "promotion_strong" | "promotion_normal" | "divergence_hold" | "weak_exit" | "unavailable";
   metrics_summary: string;
   assessment_summary: string;
   data_status: "ready" | "not_ready" | "missing" | "stale";
@@ -647,7 +674,7 @@ export interface MarketNewsSnapshot {
   target_date: string;
   captured_at: string;
   status: "success" | "partial" | "failed";
-  market_bias: "positive" | "neutral" | "negative" | "mixed" | "unknown";
+  market_bias: "positive" | "neutral" | "negative" | "mixed" | "mixed_positive" | "mixed_negative" | "unknown";
   summary: string;
   checked_codes: string[];
   gaps: string[];
@@ -676,6 +703,26 @@ export interface PoolViewData {
   attention_count: number;
   special_count: number;
   unclassified_count: number;
+}
+
+/** 关注池按需实时快照：只用于页面展示，不写日线。 */
+export interface PoolQuoteItem {
+  code: string;
+  name: string;
+  kind: "stock" | "etf";
+  last: number;
+  prev_close: number | null;
+  change_pct: number | null;
+  /** 快照所属交易日（CST，YYYY-MM-DD） */
+  quote_time: string;
+  /** 数据源采样时间（ISO） */
+  captured_at: string;
+}
+
+export interface PoolQuotesSnapshot {
+  sampled_at: string;
+  items: PoolQuoteItem[];
+  gaps: string[];
 }
 
 // ---- Agent 可复用记忆 ----
@@ -962,6 +1009,7 @@ export const TOOL_LABELS: Record<string, string> = {
   daily_plan_strategy_query: "统筹每日计划策略评估",
   strategy_evaluation_query: "查询单策略结构化评估",
   web_search: "搜索公开网页", web_fetch: "读取公开网页",
+  selection_context_query: "读取盘后策略初筛", selection_result_write: "提交统一研究推荐",
   two_year_reversal_signal_query: "查询两年结构反转信号", value_anchor_signal_query: "查询价值错杀信号",
   strategy_screen_query: "筛选策略条件",
   portfolio_context_query: "查询组合与持仓",
@@ -1028,7 +1076,7 @@ export interface NotificationDelivery {
   account_name: string | null;
   id: string;
   output_id: string | null;
-  kind: "daily_plan" | "agent_result" | "intraday_risk" | "test";
+  kind: "daily_plan" | "agent_result" | "intraday_risk" | "test" | "ultra_short";
   channel: "personal" | "strategy";
   job_code: string | null;
   job_name: string | null;
@@ -1046,11 +1094,59 @@ export interface NotificationPage {
   next_cursor: string | null;
 }
 
+/** 独立邮件通知通道：SMTP 设置与任务范围；密码只返回配置状态 */
+export interface EmailNotificationSettings {
+  enabled: boolean;
+  smtp_host: string | null;
+  smtp_port: number | null;
+  smtp_secure: boolean;
+  smtp_user: string | null;
+  smtp_password_configured: boolean;
+  from_address: string | null;
+  recipients: string[];
+  job_codes: string[];
+  revision: number;
+  updated_at: string;
+  jobs: Array<{ code: string; name: string }>;
+}
+
+export interface EmailDelivery {
+  id: string;
+  output_id: string | null;
+  kind: "agent_result" | "test";
+  job_code: string | null;
+  job_name: string | null;
+  subject: string;
+  content?: string;
+  status: "pending" | "sending" | "sent" | "failed" | "cancelled";
+  attempts: number;
+  error: string | null;
+  created_at: string;
+  sent_at: string | null;
+  next_attempt_at: string;
+}
+
+export interface EmailDeliveryPage {
+  items: EmailDelivery[];
+  next_cursor: string | null;
+}
+
 export type IntradayRiskLevel = "normal" | "watch" | "high";
+export interface IntradayTradePlan {
+  price_lower: number;
+  price_upper: number;
+  condition: string;
+  invalidation: string;
+  status: "waiting" | "triggered";
+}
 export interface IntradayRiskRow {
   code: string;
   name: string;
   risk: IntradayRiskLevel;
+  action: "add" | "reduce" | "wait";
+  add_plan: IntradayTradePlan | null;
+  reduce_plan: IntradayTradePlan | null;
+  emotion: "ice_point" | "weak" | "neutral" | "strong" | "unknown";
   key_level: string | null;
   reason: string;
   sample_at: string | null;
@@ -1064,4 +1160,73 @@ export interface IntradayRiskSnapshot {
   sample_at: string | null;
   data_status: "ready" | "partial" | "stale" | "unavailable";
   positions: IntradayRiskRow[];
+}
+
+export type UltraShortPriority = "P1" | "P2" | "P3";
+export type UltraShortAuctionBranch = "one_word" | "turnover_advance" | "high_open" | "low_open" | "weak" | "insufficient";
+export type UltraShortIntradayStatus = "waiting" | "triggered" | "invalidated" | "no_chase" | "filled";
+export interface UltraShortKeyLevels {
+  prev_close?: number | null;
+  limit_up_price?: number | null;
+  ma5?: number | null;
+  ma10?: number | null;
+  ma20?: number | null;
+  ma60?: number | null;
+  pattern_low?: number | null;
+  breakout_price?: number | null;
+  invalidation_price?: number | null;
+  stop_price?: number | null;
+}
+export interface UltraShortWatchlistRow {
+  id: string;
+  target_date: string;
+  data_date: string;
+  code: string;
+  name: string;
+  sources: string[];
+  tags: string[];
+  resonance: boolean;
+  priority: UltraShortPriority;
+  priority_reason: string;
+  stage: string | null;
+  streak_count: number | null;
+  key_levels: UltraShortKeyLevels;
+  auction_expect: Record<string, unknown>;
+  intraday_plan: Record<string, unknown>;
+  risk: Record<string, unknown>;
+  review_status: "pass" | "flag" | "invalid";
+  risk_level: "high" | "medium" | "low" | "unknown";
+  risk_flags: string[];
+  review_note: string | null;
+  auction_branch: UltraShortAuctionBranch | null;
+  auction_fill_tier: "high" | "medium" | "low" | "none" | null;
+  auction_priority: UltraShortPriority | null;
+  auction_note: string | null;
+  auction_status: string;
+  intraday_status: UltraShortIntradayStatus;
+  trigger_type: string | null;
+  trigger_at: string | null;
+  trigger_price: number | null;
+  trigger_reason: string | null;
+  intraday_note: string | null;
+  reminder_at: string | null;
+  reminder_type: string | null;
+  gaps: unknown[];
+  data_status: "ready" | "partial" | "insufficient";
+  entry_price: number | null;
+  position_opened_at: string | null;
+  exit_status: "none" | "holding" | "exit_triggered" | "closed";
+  exit_stage: number;
+  exit_reason: string | null;
+  exit_price: number | null;
+  exit_at: string | null;
+  realized_r: number | null;
+  exit_reminder_at: string | null;
+  exit_reminder_type: string | null;
+  updated_at: string;
+}
+export interface UltraShortWatchlistPage {
+  target_date: string | null;
+  counts?: { total: number; p1: number; p2: number; p3: number; triggered: number; oneWord: number };
+  items: UltraShortWatchlistRow[];
 }
