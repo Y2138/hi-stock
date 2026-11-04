@@ -1,7 +1,7 @@
 import type pg from "pg";
 
 export type Db = Pick<pg.Pool, "query">;
-export type JobType = "datasource" | "agent_flow" | "analysis";
+export type JobType = "datasource" | "agent_flow" | "analysis" | "worker";
 export type JobStatus =
   | "queued"
   | "running"
@@ -106,10 +106,14 @@ export interface DatasourceJobConfig {
 }
 
 export interface AnalysisJobConfig {
-  analysis_type: "sector_temperature" | "key_levels" | "long_valuation" | "value_monthly_rank";
+  analysis_type: "sector_temperature" | "key_levels" | "long_valuation" | "value_monthly_rank" | "ultra_short_auction";
   request?: { codes?: string[]; as_of?: string; lookback?: number; force?: boolean };
 }
 
 export type AgentFlowJobConfig = Record<string, never>;
 
-export type ValidatedJobConfig = DatasourceJobConfig | AnalysisJobConfig | AgentFlowJobConfig;
+export interface WorkerJobConfig {
+  interval_seconds: number;
+}
+
+export type ValidatedJobConfig = DatasourceJobConfig | AnalysisJobConfig | AgentFlowJobConfig | WorkerJobConfig;

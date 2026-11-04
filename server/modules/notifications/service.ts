@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type pg from "pg";
 import { apiErrors } from "../../http/router.js";
+import { ACTION_LABELS as INTRADAY_ACTION_LABELS, EMOTION_LABELS, tradePlanLabel, type IntradaySignal } from "../intraday-risk/signals.js";
 
 type Db = Pick<pg.Pool | pg.PoolClient, "query">;
 const SAFE_SETTINGS = `enabled, job_codes,
@@ -150,14 +151,8 @@ function field(value: unknown, max: number): string {
   return [...plain].length > max ? "内容较长，请在系统查看完整原文" : plain;
 }
 
-/** 没有内容的明细行整行省略，不补占位备注。 */
-function detailLine(label: string, value: string | null | undefined, max: number): string | null {
-  const text = field(value, max);
-  return text ? `   ${label}：${text}` : null;
-}
-
 /** 只提取明确的结论段；跳过代码块，不把中间进度或任意长报告头部当结论。 */
-export function extractConclusion(markdown: string): string | null {
+export function extractConclusion(markdown: string, maxChars = AGENT_NOTIFICATION_SUMMARY_MAX_CHARS): string | null {
   const headings = ["结论摘要", "推送摘要", "核心结论", "结论", "总结"];
   const sections: Array<{ name: string; level: number; lines: string[] }> = [];
   let current: (typeof sections)[number] | null = null;
@@ -197,243 +192,273 @@ export function extractConclusion(markdown: string): string | null {
   if (!text || /^(?:无|暂无|无结论|暂无结论|无可推送结论)[。.!！]?$/.test(text))
     return "";
   // 不截断条件与例外；违反摘要长度契约时只提示阅读原文。
-  if ([...text].length > AGENT_NOTIFICATION_SUMMARY_MAX_CHARS)
+  if ([...text].length > maxChars)
     return "本次结论较长，请在 Stock 工作台查看完整结果，避免遗漏条件与风险。";
   return text.replace(/</g, "＜").replace(/>/g, "＞");
 }
 
-type DailyPlanItem = {
-  item_kind: "position_action" | "off_pool_opportunity";
-  code: string;
-  name: string;
-  grade: string | null;
-  priority: number;
-  action: string;
-  trigger_kind: string;
-  price_lower: string | number | null;
-  price_upper: string | number | null;
-  headline: string;
-  auction_md: string | null;
-  intraday_md: string | null;
-  evidence_md: string | null;
-  missing_md: string | null;
-  invalidation_md: string | null;
-  risk_md: string | null;
-};
-
-type DailyPlanSignal = {
-  code: string;
-  name: string;
-  pool: string;
-  attention_status: string;
-  attention_reason: string;
-  attention_from: string;
-  attention_until: string;
-};
-
-type DailyPlanOutput = {
-  id: string;
-  created_at: string | Date;
-  data_gaps: unknown;
-  session_id: string | null;
-};
+type FocusTarget = { code: string; name?: string; label?: string; boards?: string[]; reason?: string };
+type FocusOutput = { id: string; run_id: string; session_id: string | null; job_code: string; target_date: string };
 
 const ACTION_LABELS: Record<string, string> = {
-  exit: "退出",
-  reduce: "减仓",
-  buy: "买入",
-  hold: "持有",
-  observe: "观察",
+  exit: "退出预案", reduce: "减仓预案", buy: "买入预案", hold: "持有", observe: "观察",
 };
+export const TASK_NOTIFICATION_MAX_CHARS = 600;
 
-function triggerLabel(item: DailyPlanItem): string {
-  if (item.trigger_kind === "price_range") {
-    return `价格区间 ${item.price_lower ?? "未设下限"}～${item.price_upper ?? "未设上限"}；仍需核对其他条件`;
-  }
-  return item.trigger_kind === "open"
-    ? "开盘时复核预案条件"
-    : "满足原预案全部条件后再评估";
+/** 只保留完整短句，不把缺口、验证或执行统计拼回通知。 */
+function briefReason(value: string): string {
+  return value.replace(/[*`]/g, "").split(/[。；;\n]/).map((part) => field(part, 120))
+    .filter((part) => part && part !== "内容较长，请在系统查看完整原文"
+      && !/缺口|缺失|缺数|数据不足|T\s*\+\s*1|验证|复核|核对|replaced|skipped|open_count|候选全集|扫描成功|主升分|最高分|评分|\d+\s*分/i.test(part))
+    .reduce((summary, part) => [...[summary, part].filter(Boolean).join("；")].length <= 120
+      ? [summary, part].filter(Boolean).join("；") : summary, "");
 }
 
-export const DAILY_PLAN_NOTIFICATION_MAX_CHARS = 3_200;
-
-function charLength(value: string): number {
-  return [...value].length;
+function focusExplanation(conclusion: string, targets: FocusTarget[]): string {
+  const explicit = /^\s*(?:[-*]\s*)?(?:\*\*)?(?:总说明|简要说明|关注原因)(?:\*\*)?[:：]\s*(.+)$/m.exec(conclusion);
+  const explanation = briefReason(explicit?.[1] ?? "");
+  if (explanation) return explanation;
+  return targets.slice(0, 2).map((target) => {
+    const reason = briefReason(target.reason ?? "");
+    return reason ? `${target.name || target.code}：${reason}` : "";
+  }).filter(Boolean).reduce((summary, part) => [...[summary, part].filter(Boolean).join("；")].length <= 120
+    ? [summary, part].filter(Boolean).join("；") : summary, "");
 }
 
-function appendBudgetedSection(
-  lines: string[],
-  title: string,
-  emptyText: string,
-  blocks: string[][],
-  budget: number,
-  omittedNoun: string,
-): void {
-  const section = [title];
-  if (!blocks.length) {
-    section.push(emptyText);
-    lines.push("", ...section);
-    return;
-  }
-  let used = charLength(title) + 1;
+/** 统一展示简要原因与关注清单；执行细节不进入消息。 */
+function renderFocusNotification(header: string, targets: FocusTarget[], footer: string, marketBias?: string, explanation = ""): string {
+  const lines = [header, "", ...(marketBias ? [`整体偏向：${marketBias}`, ""] : []),
+    ...(explanation ? [`简要说明：${explanation}`, ""] : []), "关注标的"];
+  const seen = new Set<string>();
+  const rows = targets.filter((target) => {
+    if (seen.has(target.code)) return false;
+    seen.add(target.code);
+    return true;
+  }).map((target) =>
+    `• ${field(target.name || target.code, 30)}${target.name && target.name !== target.code ? `（${target.code}）` : ""}` +
+    `${target.boards?.length ? `｜${target.boards.map((board) => field(board, 30)).join("、")}` : ""}` +
+    `${target.label ? `｜${field(target.label, 20)}` : ""}`);
+  if (!rows.length) lines.push("本次未列出关注标的。");
   let shown = 0;
-  for (const block of blocks) {
-    const blockLength = charLength(block.join("\n")) + 1;
-    // 为“其余 N 项”提示预留空间，避免为了多塞一行导致摘要失去完整性。
-    if (used + blockLength + 45 > budget) break;
-    section.push(...block);
-    used += blockLength;
-    shown += 1;
+  for (const row of rows) {
+    if ([...[...lines, row, `另有 ${rows.length} 个标的，详见工作台。`, "", footer].join("\n")].length > TASK_NOTIFICATION_MAX_CHARS) break;
+    lines.push(row);
+    shown++;
   }
-  if (!shown) {
-    section.push(blocks[0]![0]!);
-    shown = 1;
-  }
-  if (shown < blocks.length) {
-    section.push(
-      `另有 ${blocks.length - shown} ${omittedNoun}，请在 Stock 工作台查看完整内容。`,
-    );
-  }
-  lines.push("", ...section);
+  if (shown < rows.length) lines.push(`另有 ${rows.length - shown} 个标的，详见工作台。`);
+  return [...lines, "", footer].join("\n");
 }
 
-async function buildDailyPlanConclusion(
-  db: Db,
-  output: DailyPlanOutput,
+async function withTargetBoards(db: Db, targets: FocusTarget[], date: string, conclusion = ""): Promise<FocusTarget[]> {
+  if (!targets.length) return [];
+  const instruments = await db.query<{ code: string; name: string; kind: string; boards: string[] }>(
+    `SELECT i.code,i.name,i.kind,ARRAY(
+      SELECT b.name FROM market_board_membership m
+      JOIN market_instrument b ON b.id=m.board_instrument_id
+      JOIN market_board board ON board.instrument_id=b.id AND board.active
+      WHERE m.member_instrument_id=i.id AND m.effective_from <= $2::date
+        AND (m.effective_to IS NULL OR m.effective_to > $2::date)
+        AND (board.board_type='industry' OR strpos($3,b.name)>0)
+      ORDER BY CASE WHEN strpos($3,b.name)>0 THEN 0 ELSE 1 END,
+        CASE WHEN b.code LIKE '881%.TI' THEN 0 ELSE 1 END,b.code LIMIT 1
+    ) AS boards FROM market_instrument i WHERE i.code=ANY($1::text[])`,
+    [targets.map((target) => target.code), date, conclusion],
+  );
+  const byCode = new Map(instruments.rows.map((row) => [row.code,row]));
+  return targets.map((target) => {
+    const instrument = byCode.get(target.code);
+    return { ...target, name: instrument?.name ?? target.name,
+      boards: instrument?.boards ?? [], label: target.label ?? (instrument?.kind === "board" ? "板块关注" : undefined) };
+  });
+}
+
+async function jobFocusTargets(db: Db, output: FocusOutput, conclusion: string): Promise<FocusTarget[]> {
+  if (["daily_plan_flow", "limit_up_close_scan"].includes(output.job_code)) {
+    // 每日计划个人通道只展示本账户持仓；收盘打板只展示本轮正式机会。
+    const result = await db.query<FocusTarget & { action: string }>(
+      `SELECT code,name,action,headline AS reason FROM daily_plan_playbook WHERE plan_output_id=$1 AND status <> 'draft'
+       AND item_kind=$2 ORDER BY CASE action WHEN 'exit' THEN 0 WHEN 'reduce' THEN 1 ELSE 2 END,priority,id`,
+      [output.id, output.job_code === "daily_plan_flow" ? "position_action" : "off_pool_opportunity"],
+    );
+    return result.rows.map((item) => ({ ...item, label: output.job_code === "daily_plan_flow" ? ACTION_LABELS[item.action] : undefined }));
+  }
+  if (output.job_code === "auction_opportunity_assessment") {
+    // 持仓竞价复核已下线，只推送关注来源确认与打板机会两类结果。
+    const result = await db.query<FocusTarget>(
+      `SELECT i.code,i.name,CASE a.conclusion WHEN 'confirmed' THEN '条件成立' ELSE '等待条件' END AS label,a.assessment_summary AS reason
+       FROM auction_scope_assessment a JOIN market_instrument i ON i.id=a.instrument_id
+       WHERE a.assessment_output_id=$1 AND a.conclusion IN ('confirmed','wait')
+       UNION ALL SELECT a.code,p.name,CASE a.conclusion WHEN 'worth_entering' THEN '条件成立' ELSE '等待条件' END,a.assessment_summary
+       FROM daily_plan_auction_assessment a JOIN daily_plan_playbook p ON p.id=a.playbook_item_id
+       WHERE a.assessment_output_id=$1 AND a.conclusion IN ('worth_entering','observe')`, [output.id],
+    );
+    return result.rows;
+  }
+  const writes = await db.query<{ args: { items: Array<{ action: string; code: string; attention_status: string; attention_reason?: string }> } }>(
+    `SELECT args FROM agent_tool_audit WHERE session_id=$1 AND tool_name='pool_attention_write'
+     AND status='ok' AND jsonb_typeof(args->'items')='array' ORDER BY id DESC LIMIT 1`, [output.session_id],
+  );
+  if (writes.rows[0]) return writes.rows[0].args.items.filter((item) => item.action === "mark")
+    .map((item) => ({ code: item.code, reason: item.attention_reason, label: item.attention_status === "qualified" ? "条件成立" : "等待条件" }));
+  const signals = await db.query<FocusTarget>(
+    `SELECT i.code,i.name,CASE s.signal_status WHEN 'qualified' THEN '条件成立' ELSE '等待条件' END AS label,s.reason
+     FROM strategy_entry_signal s JOIN strategy_evaluation_run r ON r.id=s.run_id
+     JOIN market_instrument i ON i.id=s.instrument_id
+     WHERE r.requested_by_job_run_id=$1 AND r.status='success'
+     ORDER BY CASE s.signal_status WHEN 'qualified' THEN 0 ELSE 1 END,s.id`, [output.run_id],
+  );
+  if (signals.rows.length) return signals.rows;
+  // 自定义任务及旧结果兼容：只认结论中明确列出的目录标的，忽略缺口、验证和排除项。
+  let omittedSectionLevel = 0;
+  const focusText = conclusion.split(/\r?\n/).filter((line) => {
+    const heading = /^(#{1,6})\s+(.+)/.exec(line);
+    if (heading) {
+      const level = heading[1]!.length;
+      if (level <= omittedSectionLevel) omittedSectionLevel = 0;
+      if (/缺口|验证|复核|风险|执行|统计|剔除|排除|T\s*\+\s*1/i.test(heading[2]!)) omittedSectionLevel = level;
+    }
+    return !omittedSectionLevel && !/数据缺口|数据不足|缺失|漏查|未完成检索|被剔除|不关注|放弃|排除|T\s*\+\s*1|下一交易日.*(?:验证|复核)/i.test(line);
+  }).join("\n");
+  const matched = (await db.query<FocusTarget & { kind: string }>(
+    `SELECT code,name,kind FROM market_instrument WHERE kind IN ('stock','board')
+       AND (strpos($1,code)>0 OR (length(name)>=3 AND strpos($1,name)>0))
+     ORDER BY LEAST(NULLIF(strpos($1,code),0),NULLIF(strpos($1,name),0)),code`, [focusText],
+  )).rows;
+  const mentions = (line: string, target: FocusTarget) => line.includes(target.code) || Boolean(target.name && line.includes(target.name));
+  // 个股行里的板块只是归属，不重复增加一条板块关注。
+  return matched.filter((target) => target.kind !== "board" || focusText.split("\n").some((line) =>
+    mentions(line, target) && !matched.some((stock) => stock.kind === "stock" && mentions(line, stock))))
+    .map((target) => ({ ...target, label: focusText.split("\n").find((line) => mentions(line, target))
+      ?.match(/｜(条件成立|等待条件)\s*$/)?.[1] }));
+}
+
+/** 板块机会筛选：通知必须按板块给出筛选结果（板块、简要原因、板块内标的），
+ *  原因只取本轮服务端确定性分析信号，标的一律来自本轮关注写入，不用模型自述补全。 */
+const NIGHTLY_SECTOR_JOB = "nightly_sector_opportunity_scan";
+const NIGHTLY_TRIGGER_REASON: Record<string, string> = {
+  中期脱离: "脱离60日中期下降趋势",
+  新低回升: "60日新低后回升",
+  急跌反转: "13日急跌后反抽",
+};
+const NIGHTLY_TRIGGER_ORDER: Record<string, number> = { 中期脱离: 0, 新低回升: 1, 急跌反转: 2 };
+
+interface NightlySectorSignal {
+  sector?: unknown;
+  code?: unknown;
+  trigger?: unknown;
+  pattern?: unknown;
+  pattern_tier?: unknown;
+  volume_class?: unknown;
+  valid_through?: unknown;
+  second_bottom?: unknown;
+  contracting?: unknown;
+}
+
+function nightlySectorReason(signal: NightlySectorSignal): string {
+  const trigger = String(signal.trigger ?? "");
+  const parts = [NIGHTLY_TRIGGER_REASON[trigger] ?? (trigger || "信号成立")];
+  // 新低回升是纯 Donchian 口径，不附加止跌形态与量比；写进消息会暗示并不存在的门槛。
+  if (trigger !== "新低回升") {
+    if (signal.pattern) parts.push(`${String(signal.pattern)}${signal.pattern_tier === 2 ? "（降权）" : ""}`);
+    if (signal.volume_class) parts.push(String(signal.volume_class));
+  }
+  if (signal.second_bottom === true) parts.push("二次止跌");
+  if (signal.contracting === true) parts.push("上下收敛");
+  const validThrough = signal.valid_through ? String(signal.valid_through) : "";
+  if (validThrough) parts.push(`观察至${validThrough.slice(5)}`);
+  return parts.join("｜");
+}
+
+/** 本轮板块信号；读不到结构化初筛时返回 null，回退统一关注模板。 */
+async function nightlySectorSignals(db: Db, output: FocusOutput): Promise<NightlySectorSignal[] | null> {
+  const payload = (await db.query<{ payload: Record<string, unknown> | null }>(
+    `SELECT payload FROM strategy_candidate_shortlist
+      WHERE source_job_run_id=$1 AND strategy_code='nightly_sector'`, [output.run_id])).rows[0]?.payload;
+  const source = payload?.source && typeof payload.source === "object" && !Array.isArray(payload.source)
+    ? payload.source as Record<string, unknown> : null;
+  const analysisId = source?.analysis_run_id === undefined ? "" : String(source.analysis_run_id);
+  if (!/^\d+$/.test(analysisId)) return null;
+  const analysis = (await db.query<{ result_json: Record<string, unknown> | null }>(
+    `SELECT result_json FROM analysis_run WHERE id=$1::bigint AND analysis_type='sector_trend_structure'`,
+    [analysisId])).rows[0]?.result_json;
+  if (!analysis) return null;
+  return Array.isArray(analysis.signals) ? analysis.signals as NightlySectorSignal[] : [];
+}
+
+async function nightlyStockBoards(db: Db, codes: string[], date: string): Promise<Map<string, string[]>> {
+  if (!codes.length) return new Map();
+  const rows = (await db.query<{ code: string; boards: string[] | null }>(
+    `SELECT i.code,ARRAY(SELECT DISTINCT b.code FROM market_board_membership m
+       JOIN market_instrument b ON b.id=m.board_instrument_id
+      WHERE m.member_instrument_id=i.id AND m.effective_from<=$2::date
+        AND (m.effective_to IS NULL OR m.effective_to>$2::date)) AS boards
+     FROM market_instrument i WHERE i.code=ANY($1::text[])`, [codes, date])).rows;
+  return new Map(rows.map((row) => [row.code, row.boards ?? []]));
+}
+
+function nightlyTargetLine(targets: FocusTarget[], empty: string): string {
+  if (!targets.length) return empty;
+  const shown = targets.slice(0, 4)
+    .map((target) => `${field(target.name || target.code, 24)}（${target.code}）`);
+  const rest = targets.length > 4 ? `等 ${targets.length} 只` : "";
+  const labels = new Set(targets.map((target) => target.label ?? ""));
+  const label = labels.size === 1 ? [...labels][0] ?? "" : "";
+  return `${shown.join("、")}${rest}${label ? `｜${field(label, 20)}` : ""}`;
+}
+
+function renderNightlySectorNotification(
   header: string,
   footer: string,
-  conclusion: string | null,
-  personalOnly = false,
-): Promise<string | null> {
-  const playbook = await db.query<DailyPlanItem>(
-    `SELECT item_kind, code, name, grade, priority, action, trigger_kind,
-      price_lower, price_upper, headline, auction_md, intraday_md, evidence_md, missing_md, invalidation_md, risk_md
-    FROM daily_plan_playbook WHERE plan_output_id=$1 AND status <> 'draft'
-    ORDER BY CASE item_kind WHEN 'position_action' THEN 0 ELSE 1 END,
-      CASE action WHEN 'exit' THEN 0 WHEN 'reduce' THEN 1 ELSE 2 END, priority, id`,
-    [output.id],
-  );
-  const signals = !personalOnly && output.session_id
-    ? await db.query<DailyPlanSignal>(
-        `WITH latest_write AS (
-      SELECT args FROM agent_tool_audit WHERE session_id=$1 AND tool_name='pool_attention_write'
-        AND status='ok' AND jsonb_typeof(args->'items')='array' ORDER BY id DESC LIMIT 1
-    )
-    SELECT item->>'code' AS code, COALESCE(instrument.name, item->>'code') AS name,
-      item->>'pool' AS pool, item->>'attention_status' AS attention_status,
-      item->>'attention_reason' AS attention_reason, item->>'attention_from' AS attention_from,
-      item->>'attention_until' AS attention_until
-    FROM latest_write CROSS JOIN LATERAL jsonb_array_elements(latest_write.args->'items') item
-    LEFT JOIN market_instrument instrument ON instrument.code=item->>'code'
-    WHERE item->>'action'='mark'
-    ORDER BY CASE item->>'attention_status' WHEN 'qualified' THEN 0 ELSE 1 END,
-      CASE item->>'pool' WHEN 'short' THEN 0 ELSE 1 END, item->>'code'`,
-        [output.session_id],
-      )
-    : { rows: [] as DailyPlanSignal[] };
-  const positions = playbook.rows.filter(
-    (item) => item.item_kind === "position_action",
-  );
-  const opportunities = playbook.rows.filter(
-    (item) => item.item_kind === "off_pool_opportunity",
-  );
-  if (
-    !conclusion &&
-    !positions.length &&
-    (personalOnly || (!signals.rows.length && !opportunities.length))
-  )
-    return null;
-
-  const lines = [
-    header,
-    `生成：${new Date(output.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`,
-    "以下均为条件预案，不代表信号已触发或交易已执行；盘前/盘中须按计划复核。",
-  ];
-  if (conclusion) lines.push("", "【结论摘要】", field(conclusion, 450));
-
-  const positionBlocks = positions.map((item, index) => [
-    `${index + 1}. ${field(item.name, 20)} ${item.code}｜${ACTION_LABELS[item.action] ?? "观察"}｜${field(triggerLabel(item), 90)}`,
-    `   预案：${field(item.headline, 90)}`,
-    detailLine("复核", [item.auction_md, item.intraday_md].filter(Boolean).join("；"), 120),
-    detailLine("风险/失效", [item.risk_md, item.invalidation_md, item.missing_md].filter(Boolean).join("；"), 120),
-  ].filter((line): line is string => line !== null));
-  appendBudgetedSection(
-    lines,
-    `【持仓预案｜${positions.length} 项】`,
-    "当前没有需要展示的持仓预案。",
-    positionBlocks,
-    700,
-    "项持仓预案",
-  );
-
-  const signalBlocks = personalOnly ? [] : signals.rows.map((signal, index) => {
-    const pool =
-      signal.pool === "short"
-        ? "短线"
-        : signal.pool === "long"
-          ? "长线/波段"
-          : signal.pool;
-    const status =
-      signal.attention_status === "qualified" ? "已符合" : "即将符合";
-    return [
-      `${index + 1}. ${field(signal.name, 20)} ${signal.code}｜${pool}｜${status}｜${signal.attention_from}～${signal.attention_until}`,
-      detailLine("信号", signal.attention_reason, 180),
-    ].filter((line): line is string => line !== null);
+  explanation: string,
+  targets: FocusTarget[],
+  signals: NightlySectorSignal[],
+  membership: Map<string, string[]>,
+): string {
+  const groups = signals.flatMap((signal) => {
+    const code = String(signal.code ?? "");
+    if (!code) return [];
+    const sector = String(signal.sector ?? code);
+    return [{ signal, code, sector,
+      stocks: targets.filter((target) => (membership.get(target.code) ?? []).includes(code)) }];
   });
-  if (!personalOnly) appendBudgetedSection(
-    lines,
-    `【标的信号｜${signals.rows.length} 项】`,
-    "本轮没有保留池内已符合或即将符合的标的信号。",
-    signalBlocks,
-    650,
-    "项标的信号",
-  );
-
-  const opportunityBlocks = personalOnly ? [] : opportunities.map((item, index) => [
-    `${index + 1}. ${field(item.name, 20)} ${item.code}｜${item.grade ? `${item.grade} 级` : "未评级"}｜顺序 ${item.priority}`,
-    `   预案：${field(item.headline, 100)}`,
-    detailLine("竞价/盘中", [item.auction_md, item.intraday_md].filter(Boolean).join("；"), 140),
-    detailLine("证据", item.evidence_md, 100),
-    detailLine("风险/失效", [item.risk_md, item.invalidation_md, item.missing_md].filter(Boolean).join("；"), 130),
-  ].filter((line): line is string => line !== null));
-  if (!personalOnly) appendBudgetedSection(
-    lines,
-    `【打板机会预案｜${opportunities.length} 项】`,
-    "本轮没有形成有效打板机会。",
-    opportunityBlocks,
-    1_000,
-    "项打板机会",
-  );
-
-  if (Array.isArray(output.data_gaps) && output.data_gaps.length) {
-    lines.push(
-      "",
-      `数据提示：任务有 ${output.data_gaps.length} 项缺口，详见原文。`,
-    );
-  }
-  lines.push("", footer);
-  const content = lines.join("\n");
-  // 各分组按字符预算只追加完整条目；这里兜底防止未来字段扩展突破移动端摘要上限。
-  if (charLength(content) > DAILY_PLAN_NOTIFICATION_MAX_CHARS) {
-    return [
-      header,
-      `生成：${new Date(output.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`,
-      "每日计划内容较多，已压缩为数量摘要；请在 Stock 工作台查看完整预案。",
-      personalOnly
-        ? `持仓预案 ${positions.length} 项`
-        : `持仓预案 ${positions.length} 项｜标的信号 ${signals.rows.length} 项｜打板机会 ${opportunities.length} 项`,
-      "",
+  // 有标的的板块优先，其次按触发线优先级，最后按板块名称稳定排序。
+  groups.sort((left, right) => (left.stocks.length ? 0 : 1) - (right.stocks.length ? 0 : 1)
+    || (NIGHTLY_TRIGGER_ORDER[String(left.signal.trigger ?? "")] ?? 9)
+      - (NIGHTLY_TRIGGER_ORDER[String(right.signal.trigger ?? "")] ?? 9)
+    || left.sector.localeCompare(right.sector, "zh-CN"));
+  const grouped = new Set(groups.flatMap((group) => group.stocks.map((stock) => stock.code)));
+  const leftovers = targets.filter((target) => !grouped.has(target.code));
+  const leftoverLine = leftovers.length ? `其他复核：${nightlyTargetLine(leftovers, "")}` : "";
+  const lines = [header, ""];
+  if (explanation) lines.push(`简要说明：${explanation}`, "");
+  if (!groups.length) lines.push("板块：本次无符合条件板块", "");
+  let shown = 0;
+  for (const group of groups) {
+    const block = [
+      `板块：${field(group.sector, 36)}（${group.code}）`,
+      `简要原因：${nightlySectorReason(group.signal)}`,
+      `板块内标的：${nightlyTargetLine(group.stocks, "本次未保留个股")}`,
+    ];
+    const remaining = groups.length - shown;
+    const tail = [
+      ...(leftoverLine ? [leftoverLine] : []),
+      ...(remaining > 0 ? [`另有 ${remaining} 个板块，详见工作台。`] : []),
       footer,
-    ].join("\n");
+    ];
+    if ([...[...lines, ...block, "", ...tail].join("\n")].length > TASK_NOTIFICATION_MAX_CHARS) break;
+    lines.push(...block, "");
+    shown += 1;
   }
-  return content;
+  if (leftoverLine) lines.push(leftoverLine, "");
+  if (shown < groups.length) lines.push(`另有 ${groups.length - shown} 个板块，详见工作台。`, "");
+  lines.push(footer);
+  return lines.join("\n");
 }
 
 export async function previewJobConclusion(
   db: Db,
   outputId?: string,
   jobCode?: string,
-  options: { personalOnly?: boolean } = {},
 ): Promise<{
   output_id: string;
   job_code: string;
@@ -441,13 +466,13 @@ export async function previewJobConclusion(
   content: string;
 } | null> {
   const result = await db.query(
-    `SELECT o.id::text, o.job_id::text, o.target_date::text, o.created_at, o.markdown,
+    `SELECT o.id::text, o.run_id::text, o.job_id::text, o.target_date::text, o.created_at, o.markdown,
       r.status AS run_status, r.data_gaps, r.account_id::text, account.name AS account_name, r.session_id::text AS session_id, j.code AS job_code, j.name AS job_name,
       EXISTS (SELECT 1 FROM job_run_output older WHERE older.job_id=o.job_id
         AND older.account_id IS NOT DISTINCT FROM o.account_id AND older.target_date=o.target_date AND older.id < o.id) AS revised
     FROM job_run_output o JOIN job_run r ON r.id=o.run_id JOIN job_definition j ON j.id=o.job_id
     LEFT JOIN portfolio_account account ON account.id=r.account_id
-    WHERE j.job_type='agent_flow' AND (r.status='success' OR (r.status='partial' AND j.code='pre_market_news_scan')) AND o.source='agent_flow'
+    WHERE j.job_type='agent_flow' AND (r.status='success' OR (r.status='partial' AND j.code IN ('pre_market_news_scan','cross_strategy_selection','weekly_trading_review'))) AND o.source='agent_flow'
       AND o.status IN ('generated','approved') AND length(btrim(o.markdown))>0
       AND ($1::bigint IS NULL OR o.id=$1) AND ($2::text IS NULL OR j.code=$2)
     ORDER BY o.id DESC LIMIT 1`,
@@ -455,40 +480,44 @@ export async function previewJobConclusion(
   );
   const output = result.rows[0];
   if (!output) return null;
-  const conclusion = extractConclusion(output.markdown);
-  const header = `Stock ${output.account_name ? `【${field(output.account_name,100)}】` : ""}${field(output.job_name, 60)}${output.revised ? "（更新版）" : ""}${output.run_status === "partial" ? "（部分成功）" : ""}｜任务日期 ${output.target_date}`;
-  const footer = `结果 #${output.id}｜完整内容请在 Stock 工作台查看。`;
-  const wrap = (content: string) => ({
-    output_id: output.id,
-    job_code: output.job_code,
-    job_name: output.job_name,
-    content,
-  });
-  if (output.job_code === "daily_plan_flow") {
-    const content = await buildDailyPlanConclusion(
-      db,
-      output,
-      header,
-      footer,
-      conclusion,
-      options.personalOnly ?? false,
-    );
-    return content ? wrap(content) : null;
+  if (output.job_code === "cross_strategy_selection") {
+    const selected = (await db.query<{ result: { summary: string; status: string } }>(
+      "SELECT result FROM candidate_selection_result WHERE job_run_id=$1 AND status='generated'", [output.run_id])).rows[0];
+    if (!selected?.result?.summary) return null;
+    return { output_id: output.id, job_code: output.job_code, job_name: output.job_name,
+      content: `Stock｜${field(output.job_name, 60)}${selected.result.status === 'partial' ? '（部分覆盖）' : ''}｜${output.target_date}\n\n`
+        + `${selected.result.summary}\n\n结果 #${output.id}｜详情见 Stock 工作台` };
   }
-  if (conclusion === null || !conclusion) return null;
-  return wrap(
-    [
-      header,
-      `生成：${new Date(output.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`,
-      "",
-      conclusion,
-      ...(Array.isArray(output.data_gaps) && output.data_gaps.length
-        ? [`数据提示：任务有 ${output.data_gaps.length} 项缺口，详见原文。`]
-        : []),
-      "",
-      footer,
-    ].join("\n"),
-  );
+  const conclusion = extractConclusion(output.markdown, Infinity);
+  if (!conclusion && output.job_code !== "daily_plan_flow" && output.job_code !== "limit_up_close_scan") return null;
+  const targets = await jobFocusTargets(db, output, conclusion ?? "");
+  if (!conclusion && !targets.length) return null;
+  const partialMark = output.run_status === "partial" && output.job_code === "weekly_trading_review"
+    ? "（部分覆盖·正文列明数据缺口）" : "";
+  const header = `Stock｜${field(output.job_name, 60)}${output.revised ? "（更新版）" : ""}${partialMark}｜${output.target_date}${output.account_name ? `｜${field(output.account_name,100)}` : ""}`;
+  let marketBias: string | undefined;
+  if (output.job_code === "pre_market_news_scan") {
+    const news = (await db.query<{ market_bias: string }>("SELECT market_bias FROM market_news_snapshot WHERE run_id=$1", [output.run_id])).rows[0];
+    marketBias = news?.market_bias === "mixed_positive" ? "mixed 偏多" : news?.market_bias === "mixed_negative" ? "mixed 偏空" : undefined;
+  }
+  const focusTargets = await withTargetBoards(db, targets, output.target_date, conclusion ?? "");
+  const footer = `结果 #${output.id}｜详情见 Stock 工作台`;
+  if (output.job_code === NIGHTLY_SECTOR_JOB) {
+    const signals = await nightlySectorSignals(db, output);
+    if (signals !== null) {
+      const membership = await nightlyStockBoards(db, focusTargets.map((target) => target.code), output.target_date);
+      return {
+        output_id: output.id, job_code: output.job_code, job_name: output.job_name,
+        content: renderNightlySectorNotification(header, footer,
+          focusExplanation(conclusion ?? "", focusTargets), focusTargets, signals, membership),
+      };
+    }
+  }
+  return {
+    output_id: output.id, job_code: output.job_code, job_name: output.job_name,
+    content: renderFocusNotification(header, focusTargets, footer, marketBias,
+      focusExplanation(conclusion ?? "", focusTargets)),
+  };
 }
 
 /** 与任务结果保存共享事务；网络发送始终在提交后由独立工作器执行。 */
@@ -504,7 +533,7 @@ export async function enqueueJobConclusion(
        FROM notification_setting WHERE singleton FOR SHARE`,
     )
   ).rows[0]!;
-  const summary = await previewJobConclusion(db, outputId, undefined, { personalOnly: true });
+  const summary = await previewJobConclusion(db, outputId);
   if (!summary) return;
   const personal = summary.job_code === "daily_plan_flow";
   const legacyChannel = personal
@@ -528,8 +557,7 @@ export async function enqueueJobConclusion(
 export async function enqueueIntradayRiskAlert(
   db: Db,
   riskId: string,
-  content: string,
-): Promise<void> {
+): Promise<boolean> {
   const settings = (await db.query<{
     enabled: boolean;
     personal_enabled: boolean;
@@ -543,20 +571,103 @@ export async function enqueueIntradayRiskAlert(
             webhook, sign_secret, personal_revision
        FROM notification_setting WHERE singleton FOR SHARE`,
   )).rows[0];
-  if (!settings) return;
+  if (!settings) return false;
   const webhook = settings.personal_webhook ?? settings.webhook;
   const secret = settings.personal_sign_secret ?? settings.sign_secret;
   const enabled = settings.personal_webhook == null && settings.personal_sign_secret == null
     ? settings.enabled
     : settings.personal_enabled;
-  if (!enabled || !webhook || !secret) return;
-  await db.query(
+  if (!enabled || !webhook || !secret) return false;
+  const risk = (await db.query<IntradaySignal & { name: string; trade_date: string; account_name: string; data_time: string | null }>(
+    `SELECT r.code,r.name,r.action,r.add_plan,r.reduce_plan,r.emotion,r.reason,r.trade_date::text,r.data_time::text,a.name AS account_name
+     FROM intraday_position_risk r JOIN portfolio_account a ON a.id=r.account_id WHERE r.id=$1`, [riskId],
+  )).rows[0];
+  if (!risk || !["add", "reduce"].includes(risk.action)) return false;
+  const plan = risk.action === "add" ? risk.add_plan : risk.reduce_plan;
+  if (!plan || plan.status !== "triggered") return false;
+  const target = (await withTargetBoards(db, [{ code: risk.code, name: risk.name }], risk.trade_date))[0]!;
+  const time = risk.data_time ? ` ${new Date(risk.data_time).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}` : "";
+  const content = [
+    `Stock｜盘中加减仓提醒｜${risk.trade_date}${time}｜${field(risk.account_name,40)}`, "",
+    `${field(target.name,30)}（${target.code}）${target.boards?.length ? `｜${field(target.boards[0],30)}` : ""}`,
+    `${INTRADAY_ACTION_LABELS[risk.action]}：${tradePlanLabel(plan)}`, `情绪：${EMOTION_LABELS[risk.emotion]}`,
+    `依据：${field(briefReason(risk.reason),100)}`, `确认：${field(plan.condition,100)}`, `取消：${field(plan.invalidation,100)}`,
+    "", "详情见 Stock 工作台持仓页",
+  ].join("\n");
+  const queued = await db.query(
     `INSERT INTO notification_delivery
       (intraday_risk_id, kind, channel, channel_revision, content,account_id)
      VALUES ($1, 'intraday_risk', 'personal', $2, $3,(SELECT account_id FROM intraday_position_risk WHERE id=$1))
      ON CONFLICT DO NOTHING`,
     [riskId, settings.personal_revision, content],
   );
+  return (queued.rowCount ?? 0) > 0;
+}
+
+/**
+ * 超短提醒统一走个人通道，不关联任务结果；event_key 保证同一事件只入队一次。
+ * 返回是否实际入队，发送失败由现有通知工作器重试。
+ */
+export async function enqueueUltraShortAlert(
+  db: Db,
+  input: { event_key: string; content: string },
+): Promise<boolean> {
+  const settings = (await db.query<{
+    enabled: boolean;
+    personal_enabled: boolean;
+    personal_webhook: string | null;
+    personal_sign_secret: string | null;
+    webhook: string | null;
+    sign_secret: string | null;
+    personal_revision: number;
+  }>(
+    `SELECT enabled, personal_enabled, personal_webhook, personal_sign_secret,
+            webhook, sign_secret, personal_revision
+       FROM notification_setting WHERE singleton FOR SHARE`,
+  )).rows[0];
+  if (!settings) return false;
+  const webhook = settings.personal_webhook ?? settings.webhook;
+  const secret = settings.personal_sign_secret ?? settings.sign_secret;
+  const enabled = settings.personal_webhook == null && settings.personal_sign_secret == null
+    ? settings.enabled
+    : settings.personal_enabled;
+  if (!enabled || !webhook || !secret) return false;
+  const queued = await db.query(
+    `INSERT INTO notification_delivery (kind, channel, channel_revision, content, event_key)
+     VALUES ('ultra_short', 'personal', $1, $2, $3)
+     ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING`,
+    [settings.personal_revision, input.content, input.event_key],
+  );
+  return (queued.rowCount ?? 0) > 0;
+}
+
+/** 盘中任务汇总提醒：每个任务每轮最多一条，event_key 用内容哈希去重。 */
+export async function enqueueBatchAlert(
+  db: Db,
+  input: { kind: "intraday_digest" | "ultra_short"; event_key: string; content: string; account_id?: string | null },
+): Promise<boolean> {
+  const settings = (await db.query<{
+    enabled: boolean; personal_enabled: boolean; personal_webhook: string | null;
+    personal_sign_secret: string | null; webhook: string | null; sign_secret: string | null; personal_revision: number;
+  }>(
+    `SELECT enabled, personal_enabled, personal_webhook, personal_sign_secret,
+            webhook, sign_secret, personal_revision
+       FROM notification_setting WHERE singleton FOR SHARE`,
+  )).rows[0];
+  if (!settings) return false;
+  const webhook = settings.personal_webhook ?? settings.webhook;
+  const secret = settings.personal_sign_secret ?? settings.sign_secret;
+  const enabled = settings.personal_webhook == null && settings.personal_sign_secret == null
+    ? settings.enabled
+    : settings.personal_enabled;
+  if (!enabled || !webhook || !secret) return false;
+  const queued = await db.query(
+    `INSERT INTO notification_delivery (kind, channel, channel_revision, content, event_key, account_id)
+     VALUES ($1, 'personal', $2, $3, $4, $5)
+     ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING`,
+    [input.kind, settings.personal_revision, input.content, input.event_key, input.account_id ?? null],
+  );
+  return (queued.rowCount ?? 0) > 0;
 }
 
 export async function queueTestNotification(db: Db, channel: NotificationChannel = "personal") {
@@ -612,12 +723,20 @@ const SUBSCRIBED = `(d.kind='test' OR (CASE WHEN d.channel='personal' THEN CASE 
   ELSE CASE WHEN s.strategy_webhook IS NULL AND s.strategy_sign_secret IS NULL THEN s.enabled ELSE s.strategy_enabled END END AND (d.channel='personal' OR s.job_codes IS NULL OR EXISTS (
   SELECT 1 FROM job_run_output source JOIN job_definition job ON job.id=source.job_id
   WHERE source.id=d.output_id AND job.code=ANY(s.job_codes)))))`;
-const SUPERSEDED = `EXISTS (SELECT 1 FROM job_run_output newer JOIN job_run_output original ON original.id=d.output_id
+const SUPERSEDED = `(EXISTS (SELECT 1 FROM job_run_output newer JOIN job_run_output original ON original.id=d.output_id
   JOIN job_run newer_run ON newer_run.id=newer.run_id
   WHERE newer.job_id=original.job_id AND newer.account_id IS NOT DISTINCT FROM original.account_id AND newer.target_date=original.target_date AND newer.id>original.id
     AND newer.source='agent_flow' AND newer.status IN ('generated','approved')
     AND (newer_run.status='success' OR (newer_run.status='partial' AND EXISTS (
-      SELECT 1 FROM job_definition job WHERE job.id=newer.job_id AND job.code='pre_market_news_scan'))))`;
+      SELECT 1 FROM job_definition job WHERE job.id=newer.job_id AND job.code IN ('pre_market_news_scan','cross_strategy_selection','weekly_trading_review')))))
+  OR (d.kind='intraday_risk' AND NOT EXISTS (
+    SELECT 1 FROM intraday_position_risk r JOIN market_instrument i ON i.code=r.code
+    JOIN portfolio_position p ON p.instrument_id=i.id AND p.account_id=r.account_id AND p.quantity>0
+    WHERE r.id=d.intraday_risk_id AND r.action IN ('add','reduce')
+      AND d.created_at>=now()-interval '90 seconds'
+      AND r.data_time>=now()-interval '90 seconds' AND r.trade_date=(now() AT TIME ZONE 'Asia/Shanghai')::date
+      AND (((now() AT TIME ZONE 'Asia/Shanghai')::time >= time '09:30' AND (now() AT TIME ZONE 'Asia/Shanghai')::time < time '11:30')
+        OR ((now() AT TIME ZONE 'Asia/Shanghai')::time >= time '13:00' AND (now() AT TIME ZONE 'Asia/Shanghai')::time < time '15:00')))))`;
 
 export async function retryNotification(db: Db, id: string) {
   const result = await db.query(
@@ -704,7 +823,7 @@ export async function deliverNextNotification(
   fetcher = fetch,
 ): Promise<boolean> {
   await pool.query(`UPDATE notification_delivery d SET status='cancelled', lease_until=NULL,
-    error='通知过期、渠道已变更或同任务同日期已有更新结果'
+    error='通知过期、条件失效、渠道变更或已有更新结果'
     FROM notification_setting s WHERE s.singleton AND (d.status IN ('pending','failed') OR (d.status='sending' AND d.lease_until<=now()))
       AND (d.created_at<=now()-interval '1 day' OR d.channel_revision<>CASE WHEN d.channel='personal' THEN s.personal_revision ELSE s.strategy_revision END
         OR ${SUPERSEDED})`);

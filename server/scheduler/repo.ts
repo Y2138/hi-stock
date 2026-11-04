@@ -88,10 +88,48 @@ export async function listJobDefinitions(db: Db, accountId?: string): Promise<Jo
       ORDER BY d.priority NULLS LAST, d.code`,
     [accountId ?? null],
   );
-  return result.rows.map((row) => ({
-    ...row,
-    next_run: row.enabled ? nextCronRun(row.cron)?.toISOString() ?? null : null,
-  }));
+  const workerCodes = result.rows.filter((row) => row.job_type === "worker").map((row) => row.code);
+  const workerStatus = new Map<string, {
+    status: string; trade_date: string | null; last_tick_at: string | null; last_summary: string | null; error: string | null;
+  }>();
+  if (workerCodes.length > 0) {
+    const rows = await db.query<{
+      code: string; status: string; trade_date: string | null; last_tick_at: string | null;
+      last_summary: string | null; error: string | null;
+    }>(
+      `SELECT code, status, trade_date::text, last_tick_at::text, last_summary, error
+         FROM job_worker_status WHERE code = ANY($1::text[])`,
+      [workerCodes],
+    );
+    for (const row of rows.rows) workerStatus.set(row.code, row);
+  }
+  return result.rows.map((row) => {
+    if (row.job_type === "worker") {
+      const heartbeat = workerStatus.get(row.code);
+      return {
+        ...row,
+        next_run: null,
+        latest_run: heartbeat ? {
+          id: `worker:${row.code}`,
+          target_date: heartbeat.trade_date ?? "",
+          trigger_kind: "cron" as const,
+          status: (heartbeat.status === "idle" ? "success" : heartbeat.status) as JobRunRow["status"],
+          session_id: null,
+          account_id: null,
+          strategy_change_seq: null,
+          strategy_snapshot_hash: null,
+          attempt_count: 0,
+          scheduled_for: null,
+          started_at: heartbeat.last_tick_at,
+          finished_at: heartbeat.last_tick_at,
+        } : null,
+      };
+    }
+    return {
+      ...row,
+      next_run: row.enabled ? nextCronRun(row.cron)?.toISOString() ?? null : null,
+    };
+  });
 }
 
 export async function findJobByCode(db: Db, code: string): Promise<JobDefinitionRow | null> {

@@ -47,6 +47,9 @@ async function seedPrivateRunFixture(pool: pg.Pool): Promise<void> {
      VALUES ($1, 'manual', NULL, 'manual', 'manual', 'RUNTIME_EVENT_MUST_NOT_EXPORT', '[]'::jsonb, '2026-01-05')`,
     [instrument],
   );
+  await pool.query(`INSERT INTO intraday_market_sentiment(trade_date,captured_at,status,payload)
+    VALUES('2026-01-05',now(),'unavailable','{"private_marker":"INTRADAY_SENTIMENT_MUST_NOT_EXPORT"}'::jsonb)`);
+
 }
 
 
@@ -167,6 +170,7 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     expect(payload).not.toContain("PORTABLE_BACKTEST_SOURCE_MUST_NOT_EXPORT");
     expect(payload).not.toContain("FROZEN_INPUT_MUST_NOT_EXPORT");
     expect(payload).not.toContain("RUNTIME_EVENT_MUST_NOT_EXPORT");
+    expect(payload).not.toContain("INTRADAY_SENTIMENT_MUST_NOT_EXPORT");
     for (const code of ["copper_inventory_strategy", "lithium_warehouse_strategy", "commodity_lithium_warehouse_sync", "copper_inventory_signal_review", "lithium_warehouse_signal_review"]) {
       expect(payload).not.toContain(`"code":"${code}"`);
     }
@@ -175,8 +179,12 @@ describe.skipIf(!prepared)("可移植初始化包（白名单导出→空库恢�
     expect(payload).toContain('"model_provider_key":"deepseek"');
     expect(payload).toContain('"model_key":"deepseek-v4-pro"');
     for (const forbidden of [
+      "strategy_candidate_shortlist",
+      "candidate_selection_result",
       "notification_setting",
       "notification_delivery",
+      "email_notification_setting",
+      "email_delivery",
       "chat_session",
       "chat_message",
       "agent_confirmation",

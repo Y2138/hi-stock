@@ -261,7 +261,7 @@ export async function appendMessages(
 
 /** 追加单条完成消息并返回其稳定 id，供可重放 message_completed 事件引用。 */
 export async function appendMessage(
-  db: Db,
+  db: TransactionDb,
   input: {
     session_id: string;
     seq: number;
@@ -269,18 +269,23 @@ export async function appendMessage(
     json: unknown;
   },
 ): Promise<ChatMessageRow> {
-  const result = await db.query<ChatMessageRow>(
-    `INSERT INTO chat_message (session_id, seq, role, content)
-     VALUES ($1, $2, $3, $4)
-     RETURNING ${MESSAGE_COLS}`,
-    [
-      input.session_id,
-      input.seq,
-      toDbRole(input.role),
-      JSON.stringify(redactAgentMessage(input.json as import("@earendil-works/pi-agent-core").AgentMessage)),
-    ],
-  );
-  return result.rows[0]!;
+  return inServiceTransaction(db, async (client) => {
+    // 会话行锁覆盖取号与写入，避免多个续写同时重取到相同序号。
+    await client.query("SELECT id FROM chat_session WHERE id=$1 FOR UPDATE", [input.session_id]);
+    const seq = Math.max(input.seq, await nextMessageSeq(client, input.session_id));
+    const result = await client.query<ChatMessageRow>(
+      `INSERT INTO chat_message (session_id, seq, role, content)
+       VALUES ($1, $2, $3, $4)
+       RETURNING ${MESSAGE_COLS}`,
+      [
+        input.session_id,
+        seq,
+        toDbRole(input.role),
+        JSON.stringify(redactAgentMessage(input.json as import("@earendil-works/pi-agent-core").AgentMessage)),
+      ],
+    );
+    return result.rows[0]!;
+  });
 }
 
 export async function nextMessageSeq(db: Db, sessionId: string): Promise<number> {

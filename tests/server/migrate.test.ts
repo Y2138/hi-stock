@@ -40,7 +40,9 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "agent_tool_audit",
       "agent_tool_metric",
       "analysis_run",
+      "auction_intraday_sample",
       "auction_scope_assessment",
+      "candidate_selection_result",
       "chat_attachment",
       "chat_message",
       "chat_session",
@@ -48,18 +50,26 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "company_commodity_metric",
       "company_commodity_profile",
       "daily_plan_auction_assessment",
+      "daily_plan_evening_preview",
       "daily_plan_market_context",
+      "daily_plan_market_forecast",
       "daily_plan_playbook",
-      "daily_plan_scenario",      "first_board_intraday_snapshot",
+      "daily_plan_scenario",
+      "email_delivery",
+      "email_notification_setting",
+      "first_board_intraday_snapshot",
       "fundamental_snapshot",
       "hithink_dataset_snapshot",
       "intraday_market_sample",
+      "intraday_market_sentiment",
       "intraday_position_risk",
+      "intraday_position_signal",
       "job_definition",
       "job_prompt",
       "job_prompt_revision",
       "job_run",
       "job_run_output",
+      "job_worker_status",
       "llm_model",
       "llm_provider",
       "llm_setting",
@@ -100,6 +110,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "portfolio_position_change",
       "portfolio_realized_pnl_baseline",
       "schema_migrations",
+      "strategy_candidate_shortlist",
       "strategy_definition",
       "strategy_document",
       "strategy_entry_signal",
@@ -108,9 +119,11 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "strategy_score_benchmark",
       "strategy_state",
       "system_setting",
+      "ultra_short_watchlist",
       "valuation_snapshot",
       "value_rank_snapshot",
       "volume_snapshot",
+      "weekly_review_snapshot",
     ]);
     const undocumented = await pool.query<{ object_name: string }>(
       `SELECT current_database() AS object_name
@@ -142,7 +155,8 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     const ladder = await pool.query<{ content: string }>(
       "SELECT content FROM strategy_document WHERE code='first_board_advance_strategy'",
     );
-    expect(ladder.rows[0]?.content).toContain("一字板、10:30后至扫描时间封板的标的均不作硬排除");
+    expect(ladder.rows[0]?.content).toContain("一字与10:30后封板不作资格硬排除");
+    expect(ladder.rows[0]?.content).toContain("同高度完整分组");
     expect(ladder.rows[0]?.content).not.toContain("排除09:25后仍未打开的一字板");
     expect(ladder.rows[0]?.content).toContain("## 唯一首选排队标的");
 
@@ -267,7 +281,16 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(auction.content).toContain("auction_snapshot");
     expect(auction.content).toContain("limit_up_close_scan");
     expect(auction.content).toContain("auction_context_query");
+    expect(auction.content).toContain("same_height_groups");
+    expect(auction.content).toContain("observe + divergence");
     expect(auction.content).toContain("前一开市日收盘打板独立任务");
+    expect(auction.content).toContain("持仓竞价复核已下线");
+    // 0181：取消持仓复核后竞价任务改为全局单次执行。
+    expect((await pool.query<{ execution_scope: string }>(
+      "SELECT execution_scope FROM job_definition WHERE code='auction_opportunity_assessment'",
+    )).rows[0]!.execution_scope).toBe("global");
+    expect(auction.content).toContain("scope_items 只覆盖关注及盘中梯队全部目标键");
+    expect(auction.content).not.toContain("scope_items覆盖持仓");
     expect(auction.content).not.toContain("本节替代前文");
     expect(auction.content).not.toContain("worth_entering");
     expect(auction.content).not.toContain("## 交易日历缺行降级口径");
@@ -277,13 +300,14 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     expect(auction.content).not.toContain("E 日候选");
     const nightlyJob = (await pool.query<{
       code: string;
+      name: string;
       cron: string;
       model_key: string;
       provider_key: string;
       context_window: number;
       max_tokens: number;
     }>(
-      `SELECT definition.code, definition.cron, model.model_key, provider.provider_key,
+      `SELECT definition.code, definition.name, definition.cron, model.model_key, provider.provider_key,
               model.context_window, model.max_tokens
          FROM job_definition definition
          JOIN llm_model model ON model.id = definition.model_id
@@ -292,12 +316,18 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     )).rows[0]!;
     expect(nightlyJob).toEqual({
       code: "nightly_sector_opportunity_scan",
-      cron: "0 23 * * 1-5",
+      // 0180：展示名从“夜间板块机会筛选”简化为“板块机会筛选”，调度与提示词不变。
+      name: "板块机会筛选",
+      cron: "40 18 * * 1-5",
       model_key: "deepseek-v4-pro",
       provider_key: "deepseek",
       context_window: 1_000_000,
       max_tokens: 128_000,
     });
+    const nightlyPromptName = (await pool.query<{ name: string }>(
+      "SELECT name FROM job_prompt WHERE code = 'nightly_sector_opportunity_scan'",
+    )).rows[0]!.name;
+    expect(nightlyPromptName).toBe("板块机会筛选");
     const leftPromptGone = (await pool.query<{ code: string }>(
       `SELECT code FROM job_prompt WHERE code='left_reversal_opportunity_scan'`,
     )).rows[0];
@@ -533,6 +563,69 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       expect((await pool.query("SELECT account_id::text,amount::int FROM portfolio_realized_pnl_baseline")).rows).toEqual([{account_id:"1",amount:888}]);
       expect((await pool.query("SELECT account_id::text FROM chat_session WHERE id=$1",[session])).rows).toEqual([{account_id:"1"}]);
     } finally { await fs.rm(tmpDir,{recursive:true,force:true}); }
+  });
+
+  it("存量盘中风险向前迁移保留原记录，不把旧止损判断当成新加减仓信号", async () => {
+    const dir = await fs.mkdtemp(path.join(import.meta.dirname, ".量价迁移-"));
+    try {
+      const files = await loadMigrations(path.join(import.meta.dirname,"../../server/migrations"));
+      for (const file of files.filter((file) => file.version < 172)) await fs.copyFile(file.filePath,path.join(dir,path.basename(file.filePath)));
+      await resetSchema(pool);
+      await runMigrations(pool,dir);
+      await pool.query(`INSERT INTO intraday_position_risk(trade_date,code,name,risk,reason,model_key,input_sha256,account_id)
+        VALUES('2026-08-17','990998.SZ','存量风险样本','high','旧止损参考判断','test',repeat('a',64),1)`);
+      expect((await runMigrations(pool)).applied).toEqual(migrationVersions.filter((version) => version >= 172));
+      expect((await pool.query("SELECT reason,action,add_plan,reduce_plan,emotion FROM intraday_position_risk")).rows).toEqual([
+        { reason:"旧止损参考判断",action:null,add_plan:null,reduce_plan:null,emotion:"unknown" },
+      ]);
+      expect((await runMigrations(pool)).applied).toEqual([]);
+    } finally { await fs.rm(dir,{recursive:true,force:true}); }
+  });
+
+  it("存量分红种子行去重并校正到真实除权日", async () => {
+    const dir = await fs.mkdtemp(path.join(import.meta.dirname, ".分红迁移-"));
+    try {
+      const files = await loadMigrations(path.join(import.meta.dirname,"../../server/migrations"));
+      for (const file of files.filter((file) => file.version < 174)) await fs.copyFile(file.filePath,path.join(dir,path.basename(file.filePath)));
+      await resetSchema(pool);
+      await runMigrations(pool,dir);
+      // 种子行按 UTC 取日、正式行按北京时间取日，同一次除权相差一天
+      await pool.query(`INSERT INTO market_instrument(code,name,kind) VALUES
+        ('990996.SZ','分红重复样本','stock'),('990997.SZ','分红孤立样本','stock'),('990995.SZ','分红金额不符样本','stock')`);
+      await pool.query(`INSERT INTO market_corporate_action(instrument_id,ex_date,dividend_per_share,source,raw_summary)
+        SELECT instrument.id,seed.ex_date::date,seed.dps::numeric,'hithink',seed.summary::jsonb
+          FROM (VALUES ('990996.SZ','2026-06-02',0.22,'{"seed":"research-cache"}'),
+                       ('990996.SZ','2026-06-03',0.22,'{"ticker":"990996"}'),
+                       ('990997.SZ','2017-07-11',0.10,'{"seed":"research-cache"}'),
+                       ('990995.SZ','2026-07-01',0.50,'{"seed":"research-cache"}'),
+                       ('990995.SZ','2026-07-02',0.90,'{"ticker":"990995"}')) AS seed(code,ex_date,dps,summary)
+          JOIN market_instrument instrument ON instrument.code=seed.code`);
+      await pool.query(`INSERT INTO market_corporate_action_sync_state(instrument_id,last_checked_at,latest_ex_date,status)
+        SELECT instrument.id,'2026-09-16',seed.latest::date,'success'
+          FROM (VALUES ('990997.SZ','2017-07-11'),('990996.SZ','2026-06-03')) AS seed(code,latest)
+          JOIN market_instrument instrument ON instrument.code=seed.code`);
+      expect((await runMigrations(pool)).applied).toEqual(migrationVersions.filter((version) => version >= 174));
+      expect((await pool.query<{ code:string; ex_date:string; dividend_per_share:number }>(
+        `SELECT instrument.code,action.ex_date::text AS ex_date,action.dividend_per_share::float8 AS dividend_per_share
+           FROM market_corporate_action action JOIN market_instrument instrument ON instrument.id=action.instrument_id
+          ORDER BY instrument.code,action.ex_date`,
+      )).rows).toEqual([
+        { code:"990995.SZ",ex_date:"2026-07-01",dividend_per_share:0.5 },
+        { code:"990995.SZ",ex_date:"2026-07-02",dividend_per_share:0.9 },
+        { code:"990996.SZ",ex_date:"2026-06-03",dividend_per_share:0.22 },
+        { code:"990997.SZ",ex_date:"2017-07-12",dividend_per_share:0.1 },
+      ]);
+      // 同步游标跟随前移，删除的种子行不改变游标
+      expect((await pool.query<{ code:string; latest_ex_date:string }>(
+        `SELECT instrument.code,state.latest_ex_date::text AS latest_ex_date
+           FROM market_corporate_action_sync_state state JOIN market_instrument instrument ON instrument.id=state.instrument_id
+          ORDER BY instrument.code`,
+      )).rows).toEqual([
+        { code:"990996.SZ",latest_ex_date:"2026-06-03" },
+        { code:"990997.SZ",latest_ex_date:"2017-07-12" },
+      ]);
+      expect((await runMigrations(pool)).applied).toEqual([]);
+    } finally { await fs.rm(dir,{recursive:true,force:true}); }
   });
 
 });

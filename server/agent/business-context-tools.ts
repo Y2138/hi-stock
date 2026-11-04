@@ -12,6 +12,7 @@ import { getCurrentStrategy } from "../modules/strategy/repo.js";
 import { findJobPrompt, listJobPrompts } from "../modules/job-prompts/repo.js";
 import { listJobDefinitions, listJobOutputs, listJobRuns } from "../scheduler/repo.js";
 import { queryAuctionAssessmentContext, queryHistoricalPlanItems } from "../modules/plans/repo.js";
+import { loadWeeklyReviewSnapshot } from "../modules/weekly-review/service.js";
 import { sha256Json } from "./hash.js";
 import { marketNewsTargets, shanghaiDate } from "../modules/market-news/repo.js";
 import { insertToolAudit } from "./repo.js";
@@ -21,16 +22,19 @@ import {
   PoolContextQuerySchema,
   PortfolioContextQuerySchema,
   StrategyDocumentQuerySchema,
+  WeeklyReviewContextQuerySchema,
   validateJobContextQueryInput,
   validateAuctionContextQueryInput,
   validatePoolContextQueryInput,
   validatePortfolioContextQueryInput,
   validateStrategyDocumentQueryInput,
+  validateWeeklyReviewContextQueryInput,
   type JobContextQueryInput,
   type AuctionContextQueryInput,
   type PoolContextQueryInput,
   type PortfolioContextQueryInput,
   type StrategyDocumentQueryInput,
+  type WeeklyReviewContextQueryInput,
 } from "./tool-validation.js";
 
 function result(value: unknown): AgentToolResult<unknown> {
@@ -251,11 +255,30 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "auction_context_query",
       label: "查询集合竞价任务上下文",
       description:
-        "按目标日一次返回交易日门禁、前一开市日、最新每日计划持仓有效性、前一开市日独立收盘打板任务有效性，以及全部持仓、有效近期关注、收盘涨停接力候选、前一日盘中涨停梯队先手候选、候选代码、覆盖计数和逐项缺口。集合竞价任务只用本工具取得候选全集，不得调用完整标的池、每日计划扫描或通用数据库工具重复拼装。",
+        "按目标日一次返回交易日门禁、前一开市日、前一开市日独立收盘打板任务有效性，以及有效近期关注、收盘打板候选、前一日盘中涨停梯队先手候选、候选代码、覆盖计数和逐项缺口。持仓竞价复核已下线，上下文不再返回持仓或每日计划；集合竞价任务只用本工具取得候选全集，不得调用完整标的池或通用数据库工具重复拼装。",
       parameters: AuctionContextQuerySchema,
       execute: async (_id, raw) => audited<AuctionContextQueryInput>(
         deps, "auction_context_query", raw, validateAuctionContextQueryInput,
-        (input) => queryAuctionAssessmentContext(deps.pool, input.date, deps.accountId ?? "1"),
+        (input) => queryAuctionAssessmentContext(deps.pool, input.date),
+      ),
+    },
+    {
+      name: "weekly_review_context_query",
+      label: "查询周复盘事实快照",
+      description:
+        "按目标日返回服务端在周复盘任务运行前构建的确定性事实快照：复盘窗口、账户净值、持仓与本周成交、本周产出机会标的及其信号生效日后走势、指数与 881 一级行业板块周表现、每日涨跌停与涨跌家数、数据缺口。只读；不传 date 时取最新一份。周复盘任务只用本工具取完整事实，不重复用通用数据库工具拼装持仓、行情或任务产出。",
+      parameters: WeeklyReviewContextQuerySchema,
+      execute: async (_id, raw) => audited<WeeklyReviewContextQueryInput>(
+        deps, "weekly_review_context_query", raw, validateWeeklyReviewContextQueryInput,
+        async (input) => {
+          const snapshot = await loadWeeklyReviewSnapshot(deps.pool, input.date);
+          if (!snapshot) {
+            throw new Error(input.date
+              ? `目标日 ${input.date} 没有周复盘快照；快照由周复盘任务在模型运行前生成`
+              : "还没有任何周复盘快照；快照由周复盘任务在模型运行前生成");
+          }
+          return snapshot;
+        },
       ),
     },
     {

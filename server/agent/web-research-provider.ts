@@ -1,4 +1,5 @@
 // Web 研究供应商契约与首期 DeepSeek 原生搜索实现。只搜索并返回来源，不抓取任意 URL。
+import { insufficientBalanceMessage } from "./ai/errors.js";
 
 export interface WebResearchResult {
   title: string;
@@ -77,82 +78,97 @@ export function createDeepSeekWebResearchProvider(
 ): WebResearchProvider {
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? (() => new Date());
+  let initialSearch: Promise<WebResearchResult[]> | null = null;
+  let balanceError: Error | null = null;
+  const search: WebResearchProvider["search"] = async (input, signal) => {
+    if (signal?.aborted) throw signal.reason ?? new Error("Web Search 已中断");
+    if (balanceError) throw balanceError;
+    const apiKey = await options.resolveApiKey();
+    if (!apiKey) {
+      throw new Error("DeepSeek Web Search 不可用：请在设置页启用 DeepSeek 官方 api.deepseek.com 配置并填写 API Key");
+    }
+    if (signal?.aborted) throw signal.reason ?? new Error("Web Search 已中断");
+
+    const cutoff = input.recencyDays === undefined
+      ? null
+      : new Date(now().getTime() - input.recencyDays * 86_400_000).toISOString().slice(0, 10);
+    const scopedQuery = [
+      `Perform a web search for the query: ${input.query}`,
+      input.domains?.length ? `Only return sources from these domains: ${input.domains.join(", ")}.` : "",
+      cutoff ? `Prefer sources published on or after ${cutoff}; keep the publication date when available.` : "",
+    ].filter(Boolean).join("\n");
+    const timeoutSignal = AbortSignal.timeout(60_000);
+    const requestSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
+    const response = await fetchImpl(DEEPSEEK_SEARCH_ENDPOINT, {
+      method: "POST",
+      redirect: "error",
+      signal: requestSignal,
+      headers: {
+        "x-api-key": apiKey,
+        authorization: `Bearer ${apiKey}`,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        max_tokens: 4096,
+        messages: [{ role: "user", content: [{ type: "text", text: scopedQuery }] }],
+        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
+      }),
+    });
+    if (response.status === 402) {
+      balanceError = new Error(`DeepSeek Web Search：${insufficientBalanceMessage({ status: 402 })}。保留逐股研究，未完成消息核验的标的标记 pending，不要清空 reviews。`);
+      throw balanceError;
+    }
+    if (!response.ok) throw new Error(`DeepSeek Web Search 请求失败（HTTP ${response.status}）`);
+
+    const payload = await response.json() as { content?: unknown };
+    if (!Array.isArray(payload.content)) throw new Error("DeepSeek Web Search 返回了无法识别的响应");
+    const blocks = payload.content as DeepSeekContentBlock[];
+    const snippets = citationSnippets(blocks);
+    const fetchedAt = now().toISOString();
+    const results: WebResearchResult[] = [];
+    const seen = new Set<string>();
+    let totalChars = 0;
+    let sawSearchResultBlock = false;
+
+    for (const block of blocks) {
+      if (block.type !== "web_search_tool_result" || !Array.isArray(block.content)) continue;
+      sawSearchResultBlock = true;
+      for (const item of block.content as Array<Record<string, unknown>>) {
+        if (item.type !== "web_search_result" || typeof item.url !== "string") continue;
+        const normalized = normalizeResearchUrl(item.url, input.domains);
+        if (!normalized || seen.has(normalized.url)) continue;
+        const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : normalized.domain;
+        const snippet = (snippets.get(item.url) ?? snippets.get(normalized.url) ?? "供应商未返回摘要")
+          .slice(0, WEB_RESEARCH_CONTRACT_LIMITS.maxSnippetChars);
+        const result: WebResearchResult = {
+          title,
+          url: normalized.url,
+          domain: normalized.domain,
+          publishedAt: typeof item.page_age === "string" && item.page_age.trim() ? item.page_age : null,
+          fetchedAt,
+          snippet,
+        };
+        const chars = title.length + normalized.url.length + snippet.length;
+        if (totalChars + chars > WEB_RESEARCH_CONTRACT_LIMITS.maxTotalChars) return results;
+        seen.add(normalized.url);
+        results.push(result);
+        totalChars += chars;
+        if (results.length >= input.maxResults) return results;
+      }
+    }
+    if (!sawSearchResultBlock) throw new Error("DeepSeek 未执行原生 Web Search，请稍后重试");
+    return results;
+  };
   return {
     async search(input, signal) {
-      const apiKey = await options.resolveApiKey();
-      if (!apiKey) {
-        throw new Error("DeepSeek Web Search 不可用：请在设置页启用 DeepSeek 官方 api.deepseek.com 配置并填写 API Key");
-      }
-      if (signal?.aborted) throw signal.reason ?? new Error("Web Search 已中断");
-
-      const cutoff = input.recencyDays === undefined
-        ? null
-        : new Date(now().getTime() - input.recencyDays * 86_400_000).toISOString().slice(0, 10);
-      const scopedQuery = [
-        `Perform a web search for the query: ${input.query}`,
-        input.domains?.length ? `Only return sources from these domains: ${input.domains.join(", ")}.` : "",
-        cutoff ? `Prefer sources published on or after ${cutoff}; keep the publication date when available.` : "",
-      ].filter(Boolean).join("\n");
-      const timeoutSignal = AbortSignal.timeout(60_000);
-      const requestSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
-      const response = await fetchImpl(DEEPSEEK_SEARCH_ENDPOINT, {
-        method: "POST",
-        redirect: "error",
-        signal: requestSignal,
-        headers: {
-          "x-api-key": apiKey,
-          authorization: `Bearer ${apiKey}`,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-          accept: "application/json",
-        },
-        body: JSON.stringify({
-          model: "deepseek-v4-flash",
-          max_tokens: 4096,
-          messages: [{ role: "user", content: [{ type: "text", text: scopedQuery }] }],
-          tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
-        }),
-      });
-      if (!response.ok) throw new Error(`DeepSeek Web Search 请求失败（HTTP ${response.status}）`);
-
-      const payload = await response.json() as { content?: unknown };
-      if (!Array.isArray(payload.content)) throw new Error("DeepSeek Web Search 返回了无法识别的响应");
-      const blocks = payload.content as DeepSeekContentBlock[];
-      const snippets = citationSnippets(blocks);
-      const fetchedAt = now().toISOString();
-      const results: WebResearchResult[] = [];
-      const seen = new Set<string>();
-      let totalChars = 0;
-      let sawSearchResultBlock = false;
-
-      for (const block of blocks) {
-        if (block.type !== "web_search_tool_result" || !Array.isArray(block.content)) continue;
-        sawSearchResultBlock = true;
-        for (const item of block.content as Array<Record<string, unknown>>) {
-          if (item.type !== "web_search_result" || typeof item.url !== "string") continue;
-          const normalized = normalizeResearchUrl(item.url, input.domains);
-          if (!normalized || seen.has(normalized.url)) continue;
-          const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : normalized.domain;
-          const snippet = (snippets.get(item.url) ?? snippets.get(normalized.url) ?? "供应商未返回摘要")
-            .slice(0, WEB_RESEARCH_CONTRACT_LIMITS.maxSnippetChars);
-          const result: WebResearchResult = {
-            title,
-            url: normalized.url,
-            domain: normalized.domain,
-            publishedAt: typeof item.page_age === "string" && item.page_age.trim() ? item.page_age : null,
-            fetchedAt,
-            snippet,
-          };
-          const chars = title.length + normalized.url.length + snippet.length;
-          if (totalChars + chars > WEB_RESEARCH_CONTRACT_LIMITS.maxTotalChars) return results;
-          seen.add(normalized.url);
-          results.push(result);
-          totalChars += chars;
-          if (results.length >= input.maxResults) return results;
-        }
-      }
-      if (!sawSearchResultBlock) throw new Error("DeepSeek 未执行原生 Web Search，请稍后重试");
-      return results;
+      // 首次请求确认可用后再放行并行搜索；402 后不再发出新请求。
+      if (initialSearch) await initialSearch.catch(() => {});
+      const result = search(input, signal);
+      initialSearch ??= result;
+      return result;
     },
   };
 }

@@ -5,13 +5,17 @@ import { runMigrations } from "../../server/db/migrate.js";
 import { queryDailyPlanStrategyContext } from "../../server/modules/strategy-runtime/daily-plan.js";
 import { limitUpOpportunityItems } from "../../server/modules/strategy-runtime/limit-up-opportunities.js";
 import { classifyIntradayBoardForm, classifyIntradayLadderRole } from "../../server/modules/market/first-board-advance.js";
+import { limitUpPkNews } from "../../server/modules/market/limit-up-pk.js";
 import { fetchBatchIsolated } from "../../server/datasource/batch-isolation.js";
 import { validateDailyPlanWriteInput, validateDailyPlanScenarioWriteInput } from "../../server/agent/tool-validation.js";
 import {
   activatePlaybookForRun,
   getLatestDailyPlanBoard,
+  listEveningPreviews,
   replaceDraftScenarios,
+  replaceEveningPreview,
 } from "../../server/modules/plans/repo.js";
+import { buildTomorrowPreview } from "../../server/modules/plans/tomorrow-preview.js";
 import { prepareTestDb, resetSchema } from "./helpers.js";
 
 const prepared = await prepareTestDb();
@@ -79,6 +83,30 @@ describe.skipIf(!prepared)("每日计划策略统一编排", () => {
   });
 
   afterAll(async () => pool.end());
+
+  it("同高度消息只读取当时已发布且已取得的事实，未来公告和后来抓取不回填", async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const run = (await client.query(`INSERT INTO job_run(job_id,target_date,trigger_kind,status)
+        SELECT id,'2026-09-17','manual','success' FROM job_definition WHERE code='pre_market_news_scan' RETURNING id`)).rows[0]!;
+      const snapshot = (await client.query(`INSERT INTO market_news_snapshot(target_date,captured_at,run_id)
+        VALUES('2026-09-17','2026-09-17T09:20:00+08:00',$1) RETURNING id`, [run.id])).rows[0]!;
+      for (const [title, published, fetched, level] of [
+        ["当时已知", "09:00", "09:20", "primary"], ["未来公告", "10:00", "09:20", "primary"],
+        ["后来取得", "09:00", "10:00", "primary"], ["未经核实", "09:00", "09:20", "unverified"],
+      ]) await client.query(`INSERT INTO market_news_item(snapshot_id,title,summary,category,scope,direction,impact_level,
+        source_level,source_name,source_url,published_at,fetched_at,facts,impact_note)
+        VALUES($1,$2,'测试摘要','company','market','neutral','low',$3,'公告','https://example.invalid/announcement',
+        $4::timestamptz,$5::timestamptz,'测试事实','仅用于时点验证')`,
+      [snapshot.id, title, level, `2026-09-17T${published}:00+08:00`, `2026-09-17T${fetched}:00+08:00`]);
+      const news = await limitUpPkNews(client, ["600001.SH"], "2026-09-17T09:30:00+08:00");
+      expect(news.items.map((item) => item.title)).toEqual(["当时已知"]);
+      expect(news.uncovered_codes).toEqual(["600001.SH"]);
+    } finally {
+      await client.query("ROLLBACK"); client.release();
+    }
+  });
 
   it("无持仓时不运行入场与打板扫描", async () => {
     const first = await queryDailyPlanStrategyContext(pool, { date: "2026-09-17" });
@@ -271,7 +299,18 @@ describe.skipIf(!prepared)("每日计划策略统一编排", () => {
       { kind: "limit", label: "预案日跌停价", price: 10.35 },
     ]));
 
-    const scenarioItems = validateDailyPlanScenarioWriteInput({
+    const marketForecast = {
+      as_of: "2026-09-16",
+      summary_md: "基准震荡，放量才转强",
+      scenarios: [
+        { label: "基准", probability: 45, view: "缩量震荡", triggers: "量能低于 0.9 倍", response: "只做 T 不加仓", invalidation: "跌破 10.4" },
+        { label: "乐观", probability: 30, view: "放量站上 MA10", triggers: "量能 1.2 倍且收盘站上", response: "小仓加", invalidation: "收盘跌回" },
+        { label: "悲观", probability: 25, view: "冲高回落", triggers: "冲高后跌破均价", response: "高抛不追", invalidation: "站稳 MA10" },
+      ],
+      key_levels: [{ name: "创业板指", support: 2563, resistance: 2682, volume_note: "1.2 倍量能" }],
+    };
+    const scenarioWrite = validateDailyPlanScenarioWriteInput({
+      market_forecast: marketForecast,
       items: [{
         code: "600777.SH",
         auction_md: "高开超 2% 直接按兑现区间核对",
@@ -280,13 +319,15 @@ describe.skipIf(!prepared)("每日计划策略统一编排", () => {
           confirm_md: "回踩不破前日低点 10.4 且缩量", cancel_md: "收盘跌破 10.35",
         },
         scenarios: [
-          { scenario_kind: "open_plunge", observable_md: "开盘低于 10.4", response_md: "观察跌停位 10.35 承接，不追加", invalidation_md: "盘中收回 10.6 上方" },
-          { scenario_kind: "wide_swing", observable_md: "全天在 10.4~11.8 区间震荡", response_md: "低吸 10.6~10.9，兑现 11.6~12.0", invalidation_md: "跌破 10.35" },
+          { scenario_kind: "open_plunge", probability: 40, observable_md: "开盘低于 10.4", response_md: "观察跌停位 10.35 承接，不追加", invalidation_md: "盘中收回 10.6 上方" },
+          { scenario_kind: "wide_swing", probability: 35, observable_md: "全天在 10.4~11.8 区间震荡", response_md: "低吸 10.6~10.9，兑现 11.6~12.0", invalidation_md: "跌破 10.35" },
+          { scenario_kind: "strong_continuation", probability: 25, observable_md: "放量站上 11.8", response_md: "持有不追", invalidation_md: "跌回 11.6" },
         ],
       }],
-    }).items;
-    const write = await replaceDraftScenarios(pool, { source_job_run_id: runId, items: scenarioItems });
-    expect(write).toEqual({ replaced_items: 1, replaced_scenarios: 2 });
+    });
+    const scenarioItems = scenarioWrite.items;
+    const write = await replaceDraftScenarios(pool, { source_job_run_id: runId, market_forecast: scenarioWrite.market_forecast, items: scenarioItems });
+    expect(write).toEqual({ replaced_items: 1, replaced_scenarios: 3 });
     expect((await pool.query(
       "SELECT auction_md, t_plan FROM daily_plan_playbook WHERE source_job_run_id=$1", [runId],
     )).rows[0]).toMatchObject({ auction_md: "高开超 2% 直接按兑现区间核对", t_plan: expect.objectContaining({ buy_lower: 10.6 }) });
@@ -294,15 +335,18 @@ describe.skipIf(!prepared)("每日计划策略统一编排", () => {
     // 覆盖不完整（缺持仓 / 多余标的）都必须显式失败。
     await expect(replaceDraftScenarios(pool, {
       source_job_run_id: runId,
+      market_forecast: scenarioWrite.market_forecast,
       items: [{ code: "000001.SZ", t_plan: { skip_reason: "非持仓" }, scenarios: scenarioItems[0]!.scenarios }],
     })).rejects.toThrow("情景预案覆盖不完整");
 
     // 重复情景与倒挂的做T区间在工具入口被拒绝。
     expect(() => validateDailyPlanScenarioWriteInput({
+      market_forecast: scenarioWrite.market_forecast,
       items: [{ code: "600777.SH", t_plan: { skip_reason: "停牌" },
         scenarios: [scenarioItems[0]!.scenarios[0]!, scenarioItems[0]!.scenarios[0]!] }],
     })).toThrow("重复");
     expect(() => validateDailyPlanScenarioWriteInput({
+      market_forecast: scenarioWrite.market_forecast,
       items: [{ code: "600777.SH",
         t_plan: { buy_lower: 11.7, buy_upper: 11.8, sell_lower: 11.6, sell_upper: 12.0, confirm_md: "x", cancel_md: "y" },
         scenarios: scenarioItems[0]!.scenarios }],
@@ -311,7 +355,7 @@ describe.skipIf(!prepared)("每日计划策略统一编排", () => {
     // 重新执行统筹查询会整体替换草稿行：旧情景随之级联清理，需要重新提交。
     await queryDailyPlanStrategyContext(pool, { date: "2026-09-17", requested_by_job_run_id: runId });
     expect((await pool.query("SELECT count(*)::int AS count FROM daily_plan_scenario")).rows[0]!.count).toBe(0);
-    await replaceDraftScenarios(pool, { source_job_run_id: runId, items: scenarioItems });
+    await replaceDraftScenarios(pool, { source_job_run_id: runId, market_forecast: scenarioWrite.market_forecast, items: scenarioItems });
 
     const output = await pool.query<{ id: string }>(
       `INSERT INTO job_run_output(job_id,run_id,output_type,target_date,markdown,sha256,source)
@@ -330,12 +374,53 @@ describe.skipIf(!prepared)("每日计划策略统一编排", () => {
         key_levels: expect.arrayContaining([{ kind: "limit", label: "预案日涨停价", price: 12.65 }]),
         t_plan: expect.objectContaining({ buy_lower: 10.6, sell_upper: 12 }),
         scenarios: [
-          expect.objectContaining({ scenario_kind: "open_plunge", observable_md: "开盘低于 10.4" }),
-          expect.objectContaining({ scenario_kind: "wide_swing", response_md: "低吸 10.6~10.9，兑现 11.6~12.0" }),
+          expect.objectContaining({ scenario_kind: "open_plunge", probability: 40, observable_md: "开盘低于 10.4" }),
+          expect.objectContaining({ scenario_kind: "wide_swing", probability: 35, response_md: "低吸 10.6~10.9，兑现 11.6~12.0" }),
+          expect.objectContaining({ scenario_kind: "strong_continuation", probability: 25 }),
         ],
       }),
     ]);
+    expect(board.market_forecast).toMatchObject({
+      target_date: "2026-09-17",
+      as_of: "2026-09-16",
+      summary_md: "基准震荡，放量才转强",
+      scenarios: expect.arrayContaining([expect.objectContaining({ label: "基准", probability: 45 })]),
+    });
 
+    // 晚间轻量预览：按运行目标日自动落到下一交易日，并可由精选报告/邮件读取。
+    await pool.query(
+      `INSERT INTO market_trading_day (trade_date, is_open, source)
+       VALUES ('2026-09-18', true, 'test')
+       ON CONFLICT (trade_date) DO UPDATE SET is_open = EXCLUDED.is_open`,
+    );
+    const eveningRun = (await pool.query<{ id: string }>(
+      `INSERT INTO job_run (job_id, target_date, trigger_kind, status, account_id)
+       SELECT id, '2026-09-17', 'manual', 'success', 1 FROM job_definition WHERE code='evening_plan_preview'
+       RETURNING id::text`,
+    )).rows[0]!.id;
+    const eveningWrite = await replaceEveningPreview(pool, {
+      source_job_run_id: eveningRun,
+      as_of: "2026-09-17",
+      market_forecast: scenarioWrite.market_forecast,
+      positions: [{
+        code: "600777.SH", action: "hold", headline: "守住 10.4 则持有",
+        scenarios: [
+          { label: "基准", probability: 55, trigger: "量能不足且守住 10.4", response: "持有观察", invalidation: "跌破 10.4" },
+          { label: "悲观", probability: 45, trigger: "放量跌破 10.4", response: "减仓", invalidation: "收回 10.6" },
+        ],
+      }],
+    });
+    expect(eveningWrite.target_date).toBe("2026-09-18");
+    expect((await listEveningPreviews(pool, "2026-09-18"))[0]).toMatchObject({
+      target_date: "2026-09-18", as_of: "2026-09-17",
+      position_previews: [expect.objectContaining({ code: "600777.SH", action: "hold" })],
+    });
+    expect(await buildTomorrowPreview(pool, "2026-09-17")).toContain("晚间预览");
+
+    await pool.query("DELETE FROM daily_plan_evening_preview WHERE source_job_run_id=$1", [eveningRun]);
+    await pool.query("DELETE FROM job_run WHERE id=$1", [eveningRun]);
+    await pool.query("DELETE FROM market_trading_day WHERE trade_date='2026-09-18'");
+    await pool.query("DELETE FROM daily_plan_market_forecast WHERE source_job_run_id=$1", [runId]);
     await pool.query("DELETE FROM daily_plan_scenario");
     await pool.query("DELETE FROM daily_plan_playbook WHERE source_job_run_id=$1", [runId]);
     await pool.query("DELETE FROM job_run_output WHERE run_id=$1", [runId]);

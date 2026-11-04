@@ -16,6 +16,7 @@ import {
 } from "../datasource/hithink-datasets.js";
 import { findJobByCode, queueManualJob } from "../scheduler/repo.js";
 import { wakeScheduler } from "../scheduler/service.js";
+import { buildSelectionTools } from "./selection-tools.js";
 import { executeAnalysis } from "../analysis/service.js";
 import { queryStrategyScreen } from "../modules/plans/strategy-screen.js";
 import { initializePoolOnboarding } from "../modules/pools/onboarding.js";
@@ -47,10 +48,12 @@ import {
   buildSwingSignalTool,
 } from "./market-domain-tools.js";
 import { buildBusinessContextTools } from "./business-context-tools.js";
+import { buildUltraShortReviewTool } from "./ultra-short-tools.js";
 import {
   buildJobAuctionAssessmentTool,
   buildJobDailyPlanTool,
   buildJobDailyPlanScenarioTool,
+  buildJobEveningPreviewTool,
   buildJobPoolAttentionTool,
   buildPoolNewsWriteTool,
 } from "./job-tools.js";
@@ -228,10 +231,14 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "daily_plan_strategy_query",
     "daily_plan_scenario_write",
   ],
+  evening_plan_preview: [
+    "daily_plan_context_query",
+    "evening_preview_write",
+  ],
   swing_signal_scan: ["strategy_document_query", "strategy_evaluation_query", "fetch_market_data"],
   copper_left_launch_signal_scan: ["strategy_document_query", "strategy_evaluation_query", "fetch_market_data"],
   first_board_intraday_scan: ["strategy_document_query", "strategy_evaluation_query"],
-  limit_up_close_scan: ["strategy_document_query", "strategy_evaluation_query"],
+  limit_up_close_scan: ["strategy_document_query", "strategy_evaluation_query", "ultra_short_review_write"],
   two_year_reversal_scan: ["strategy_document_query", "strategy_evaluation_query", "two_year_reversal_signal_query", "fetch_market_data"],
   value_anchor_opportunity_scan: [
     "fetch_market_data",
@@ -252,7 +259,17 @@ export const JOB_FLOW_TOOL_BUNDLES: Record<string, readonly string[]> = {
     "market_event_query",
     "pool_attention_write",
   ],
+  cross_strategy_selection: ["strategy_document_query", "selection_context_query", "selection_result_write", "stock_research_query", "fetch_market_data"],
   pre_market_news_scan: ["pool_context_query", "pool_news_write"],
+  weekly_trading_review: [
+    "weekly_review_context_query",
+    "strategy_document_query",
+    "fetch_market_data",
+    "stock_research_query",
+    "board_query",
+    "market_snapshot_query",
+    "market_event_query",
+  ],
 };
 
 /** 展示任务明确授权的工具；未知任务不把交互工具回退目录伪装成专项授权。 */
@@ -263,13 +280,17 @@ export function jobFlowAvailableTools(jobCode: string): string[] {
 
 /** 任务流程工具只挂到绑定任务会话；交互会话中它们本就无法通过运行期守卫。 */
 const JOB_FLOW_ONLY_TOOLS = new Set([
+  "selection_context_query", "selection_result_write",
   "daily_plan_strategy_query",
   "auction_context_query",
   "pool_attention_write",
   "daily_plan_write",
   "daily_plan_scenario_write",
+  "evening_preview_write",
   "pool_news_write",
   "auction_assessment_write",
+  "ultra_short_review_write",
+  "weekly_review_context_query",
 ]);
 
 function toolsForScope(tools: AgentTool[], scope: ToolScope): AgentTool[] {
@@ -495,9 +516,11 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
   };
 
   const tools: AgentTool[] = [
+    ...buildSelectionTools({ pool, sessionId: deps.sessionId }),
     ...buildBusinessContextTools({ pool, sessionId: deps.sessionId, accountId: deps.accountId, jobCode: scope.kind === "job" ? scope.jobCode : undefined }),
     ...buildHithinkTools({ pool, sessionId: deps.sessionId, query: deps.queryHithink }),
     ...buildMarketDomainTools({ pool, sessionId: deps.sessionId }),
+    buildUltraShortReviewTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined }),
     buildDailyPlanContextTool({ pool, sessionId: deps.sessionId, accountId: deps.accountId }),
     buildDailyPlanStrategyTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined, accountId: deps.accountId }),
     buildStrategyEvaluationTool({ pool, sessionId: deps.sessionId, jobCode: scope.kind === "job" ? scope.jobCode : undefined, accountId: deps.accountId }),
@@ -572,6 +595,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     buildJobPoolAttentionTool({ pool, sessionId: deps.sessionId }),
     buildJobDailyPlanTool({ pool, sessionId: deps.sessionId }),
     buildJobDailyPlanScenarioTool({ pool, sessionId: deps.sessionId }),
+    buildJobEveningPreviewTool({ pool, sessionId: deps.sessionId }),
     buildJobAuctionAssessmentTool({ pool, sessionId: deps.sessionId }),
     {
       name: "analysis_run",

@@ -12,7 +12,7 @@ export interface MarketNewsItem {
 }
 export interface MarketNewsSnapshot {
   id: string; target_date: string; captured_at: string; status: string;
-  market_bias: NewsDirection; summary: string; checked_codes: string[]; gaps: string[];
+  market_bias: NewsDirection | "mixed_positive" | "mixed_negative"; summary: string; checked_codes: string[]; gaps: string[];
   items: MarketNewsItem[]; stale: boolean;
 }
 

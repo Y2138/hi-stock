@@ -2,6 +2,7 @@
 import { Type, type Static, type TSchema } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
+import { saveStrategyShortlist, SELECTION_SOURCES } from "../modules/selection/service.js";
 import { listBoardConstituents, listBoards } from "../modules/boards/repo.js";
 import {
   findInstrumentByCode,
@@ -49,7 +50,10 @@ const InstrumentSearchSchema = strict({
 const SnapshotSchema = strict({
   codes: Type.Array(Code, { minItems: 1, maxItems: 200 }),
 });
-const StockResearchSchema = strict({ codes: Type.Array(Code, { minItems: 1, maxItems: 20, uniqueItems: true }) });
+const StockResearchSchema = strict({
+  codes: Type.Array(Code, { minItems: 1, maxItems: 20, uniqueItems: true }),
+  as_of: Type.Optional(DateString),
+});
 const BoardSchema = strict({
   mode: Type.Union([Type.Literal("list"), Type.Literal("constituents")]),
   type: Type.Optional(Type.Union([
@@ -122,8 +126,8 @@ function stripSourcePayload(value: unknown): unknown {
 export function buildLimitUpSignalTool(deps: { pool: pg.Pool; sessionId: string | null }): AgentTool {
   return {
     name: "limit_up_signal_query",
-    label: "查询打板确定性评分",
-    description: "按目标交易日完整读取涨停事件、真实封单与成交额、历史日线和打板策略的评分基准，由服务端一次性计算全部候选的抱团分、主升分、路线名次、有效信号、风险与数据缺口；结果不分页、不截断，不要再用通用查询手算分位或分数。",
+    label: "查询涨停分阶段与同高度PK",
+    description: "按目标日完整扫描涨停事件，返回首板、二三板确认、高位续板的承接证据、同高度竞争组、两路线数据顺位和当时可用消息。旧抱团分、主升分仅作背景，不再作为入选线。数据首位仍须核验消息、情绪、竞价与可成交性；不得把顺位或一字强势解释为买入收益。",
     parameters: LimitUpSignalSchema,
     execute: async (_id, raw) => {
       const input = validateToolInput<Static<typeof LimitUpSignalSchema>>("limit_up_signal_query", LimitUpSignalSchema, raw);
@@ -148,6 +152,7 @@ export function buildLimitUpSignalTool(deps: { pool: pg.Pool; sessionId: string 
             data_status: candidate.data_status,
             missing_inputs: candidate.missing_inputs,
             risk_flags: candidate.risk_flags,
+            pk: candidate.pk,
           })),
         };
       });
@@ -208,6 +213,12 @@ export function buildStrategyEvaluationTool(deps: {
           requested_by_job_run_id: requestedByJobRunId,
           account_id: deps.accountId,
         });
+        if (requestedByJobRunId && input.phase === "entry" && ensured.execution !== "waiting"
+          && deps.jobCode && Object.hasOwn(SELECTION_SOURCES, deps.jobCode)) {
+          await saveStrategyShortlist(deps.pool, requestedByJobRunId, strategyCode!, input.date, ensured.result,
+            { evaluation_run_id: ensured.run.id, evaluator_version: ensured.run.evaluator_version,
+              strategy_snapshot_hash: ensured.run.strategy_snapshot_hash }, ensured.run.status, ensured.run.gaps);
+        }
         let opportunityWrite: { replaced: number } | null = null;
         if (deps.jobCode === "limit_up_close_scan" && input.phase === "entry"
           && requestedByJobRunId && ensured.execution !== "waiting" && ensured.run.status === "success") {
@@ -221,6 +232,14 @@ export function buildStrategyEvaluationTool(deps: {
           && input.phase === "entry" && ensured.execution !== "waiting"
           ? await reconcileStrategyAttention(deps.pool, { run: ensured.run, source_job: deps.jobCode })
           : [];
+        const native = ensured.result && typeof ensured.result === "object" && !Array.isArray(ensured.result)
+          ? ensured.result as Record<string, unknown> : null;
+        if (native?.shortlisted) {
+          // 完整命中登记供统一精选读取，策略报告只展开初筛，减少模型重复阅读。
+          const { shortlist_matches: _matches, ...reportResult } = native;
+          return { ...ensured, result: reportResult, run: { ...ensured.run, result: reportResult },
+            attention_changes: attentionChanges, opportunity_write: opportunityWrite };
+        }
         return { ...ensured, attention_changes: attentionChanges, opportunity_write: opportunityWrite };
       });
     },
@@ -348,12 +367,18 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
     {
       name: "stock_research_query",
       label: "查询标的研究证据",
-      description: "一次读取最多20个任意本地标的的日线快照、最新正式五维股性与阶段、财报和估值；不要求在池内，不同步、不入池、不写分析。回答股性、当前阶段和多标的对比时优先使用；返回每项日期、计算版本和缺口，池内档案快照另用 pool_context_query。本地缺失用扶摇临时查询补证，新闻用 web_search。",
+      description: "一次读取最多20个本地标的在as_of目标日及此前的日线、正式股性、财报和估值。任务内自动绑定任务目标日，普通对话默认今日；财报披露日和报告期都不能晚于目标日。不要求在池内，不同步、不入池；返回日期、计算版本和缺口。本地缺失用扶摇补证，新闻用 web_search。",
       parameters: StockResearchSchema,
       execute: async (_id, raw) => {
         const input = validateToolInput<Static<typeof StockResearchSchema>>("stock_research_query", StockResearchSchema, raw);
         const codes = [...new Set(input.codes.map((code) => code.toUpperCase()))];
-        return audited(deps, "stock_research_query", { codes }, () => queryStockResearch(deps.pool, codes));
+        const run = deps.sessionId ? (await deps.pool.query<{ target_date: string }>(
+          "SELECT target_date::text FROM job_run WHERE session_id=$1 AND status='running' ORDER BY id DESC LIMIT 1",
+          [deps.sessionId],
+        )).rows[0] : undefined;
+        if (run && input.as_of && input.as_of !== run.target_date) throw new Error("研究日期必须与任务目标日一致");
+        const asOf = run?.target_date ?? input.as_of;
+        return audited(deps, "stock_research_query", { codes, as_of: asOf }, () => queryStockResearch(deps.pool, codes, asOf));
       },
     },
     {

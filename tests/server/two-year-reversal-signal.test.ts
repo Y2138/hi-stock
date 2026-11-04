@@ -61,6 +61,25 @@ describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
       `UPDATE market_bar SET low_raw=NULL WHERE freq='day' AND bar_date=$1::date
        AND instrument_id IN (SELECT id FROM market_instrument WHERE kind='stock')`, [date],
     );
+    // 创业板、科创板、北交所即使满足全部价格条件，也不得进入扫描、关注与未复权补数。
+    const restrictedCodes = ["300001.SZ", "688001.SH", "920001.BJ"] as const;
+    for (const code of restrictedCodes) {
+      const row = await pool.query<{ id: string }>(
+        "INSERT INTO market_instrument (code,name,kind,lifecycle_status) VALUES ($1,$1,'stock','active') RETURNING id::text", [code],
+      );
+      await pool.query(
+        `INSERT INTO market_board_membership (board_instrument_id,member_instrument_id,effective_from)
+         SELECT board.id,$1,'2024-01-01' FROM market_instrument board WHERE board.code='881001.TI'`, [row.rows[0]!.id],
+      );
+      await pool.query(
+        `INSERT INTO market_bar (instrument_id,freq,bar_date,bar_time,open,high,low,low_raw,close,volume,channel)
+         SELECT $1,'day',$2::date-19+n,($2::date-19+n)::timestamp AT TIME ZONE 'UTC',
+                CASE WHEN n=19 THEN 85 ELSE 100 END,
+                101,CASE WHEN n=19 THEN 84 ELSE 99 END,CASE WHEN n=19 THEN 84 ELSE 99 END,
+                CASE WHEN n=19 THEN 85 ELSE 100 END,1000,'test'
+         FROM generate_series(0,19) n`, [row.rows[0]!.id, date],
+      );
+    }
     expect((await missingTwoYearRawCodes(pool, date)).sort()).toEqual(stocks.map(([code]) => code).sort());
     const unavailable = await queryTwoYearReversalSignals(pool, date);
     expect(unavailable).toMatchObject({ status: "unavailable", gaps: ["合格行业成员日线覆盖不足80%（0/4）"] });
@@ -98,7 +117,7 @@ describe.skipIf(!prepared)("两年结构反转独立新开仓信号", () => {
     } finally { vi.unstubAllGlobals(); }
     const result = await queryTwoYearReversalSignals(pool, date);
     expect(result.status).toBe("success");
-    expect(result.coverage).toMatchObject({ stocks: 4, boards: 80, complete_boards: 80, qualified_boards: 1 });
+    expect(result.coverage).toMatchObject({ stocks: 7, boards: 80, complete_boards: 80, qualified_boards: 1 });
     expect(result.eligible_industries?.map((item) => item.code)).toEqual(["881001.TI"]);
     expect(result.qualified.map((item) => item.code)).toEqual(["000001.SZ"]);
     expect(result.qualified[0]).toMatchObject({ reference_fraction: 0.20, already_held: false, signal_low_raw: 84 });

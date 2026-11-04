@@ -1,5 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type pg from "pg";
+import * as marketStore from "../../server/datasource/service.js";
+import { buildSelectionTools } from "../../server/agent/selection-tools.js";
+import { simpleShortlist } from "../../server/modules/selection/shortlist.js";
+import { loadSelectionContext, prepareSelectionContext, saveStrategyShortlist, writeSelectionResult, selectionReport, type SelectionReview, type SelectionContext } from "../../server/modules/selection/service.js";
+import { shanghaiDate } from "../../server/modules/market-news/repo.js";
+import { queueManualJob } from "../../server/scheduler/repo.js";
 import { storeBars } from "../../server/datasource/service.js";
 import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
 import { querySwingSignals } from "../../server/modules/plans/swing-signals.js";
@@ -13,6 +19,13 @@ import type { StrategyEvaluationRunSummary } from "../../server/modules/strategy
 import { prepareTestDb, resetSchema } from "./helpers.js";
 
 const prepared = await prepareTestDb();
+
+it("原生初筛正式优先、每行业两只，正式足够忽略更高技术分的接近", () => {
+  const formal = Array.from({ length: 6 }, (_, i) => ({ code: String(i), industry_code: i < 4 ? "A" : "B" }));
+  const outcome = simpleShortlist(formal, [{ code: "near", industry_code: "C" }]);
+  expect(outcome.kept.map(({ item }) => item.code)).toEqual(["0", "1", "4", "5"]);
+  expect(outcome.deferred.map(({ item }) => item.code)).toEqual(["2", "3", "near"]);
+});
 
 it("历史缺口按持仓隔离、提取原因并去重", () => {
   expect(positionGapReasons([
@@ -405,6 +418,113 @@ describe.skipIf(!prepared)("策略评估运行幂等复用", () => {
     expect(scan.review_gaps).toContainEqual({ code: "000136.SZ", reason: "波段扫描至少需要40根日线，当前0根" });
     expect((await listPoolView(pool, "2026-09-24")).members.map((row) => row.code)).not.toContain("000136.SZ");
     expect(await listStrategyAttentionReviewEntries(pool)).toContainEqual(expect.objectContaining({ code: "000136.SZ", strategy_code: "swing" }));
+  });
+
+  it("统一精选锁定同日来源、真实研究证据与正式优先，跨家族共振增强并保存草稿", async () => {
+    const date = shanghaiDate();
+    const codes = ["991201.SZ", "991202.SZ", "991203.SZ", "991204.SZ", "991205.SZ"];
+    const instruments = (await pool.query(`INSERT INTO market_instrument(code,name,kind)
+      SELECT code,code,'stock' FROM unnest($1::text[]) code RETURNING id::text,code`, [codes])).rows;
+    for (const item of instruments) await storeBars(pool, item.id, "day", [{ date, open: 20, high: 21, low: 19, close: 20,
+      volume: 1000, adjustment: "none" }], "hithink");
+    const candidate = (code: string, industry: string, status: "qualified" | "approaching" = "qualified") => ({
+      code, name: code, industry_code: industry, industry, status, evidence: { code, industry_code: industry, industry },
+    });
+    const groups: Record<string, ReturnType<typeof candidate>[]> = {
+      swing_signal_scan: [candidate(codes[0]!, "881001.TI"), candidate(codes[1]!, "881001.TI"), candidate(codes[2]!, "881002.TI")],
+      two_year_reversal_scan: [candidate(codes[0]!, "881001.TI")],
+      value_anchor_opportunity_scan: [candidate(codes[1]!, "881001.TI")],
+      limit_up_close_scan: [], nightly_sector_opportunity_scan: [candidate(codes[3]!, "881003.TI", "approaching")],
+    };
+    const strategies = { swing_signal_scan: "swing", two_year_reversal_scan: "two_year_reversal",
+      value_anchor_opportunity_scan: "value_anchor", limit_up_close_scan: "limit_up", nightly_sector_opportunity_scan: "nightly_sector" };
+    for (const [job, strategy] of Object.entries(strategies)) {
+      const run = await queueManualJob(pool, job, date);
+      const group = groups[job]!;
+      await saveStrategyShortlist(pool, run.id, strategy, date, { data_date: date, shortlist_matches: group,
+        signals: group.filter((i) => i.status === "qualified").map((i) => i.evidence),
+        qualified: group.filter((i) => i.status === "qualified").map((i) => i.evidence),
+        near: group.filter((i) => i.status === "approaching").map((i) => i.evidence), near_candidates: [],
+      }, { test: true }, "success");
+      await pool.query("UPDATE job_run SET status='success',finished_at=now() WHERE id=$1", [run.id]);
+    }
+    const run = await queueManualJob(pool, "cross_strategy_selection", date);
+    await pool.query("UPDATE job_run SET status='running',started_at=now() WHERE id=$1", [run.id]);
+    await pool.query("UPDATE market_bar SET adjustment='forward',close_raw=NULL WHERE instrument_id=$1", [instruments[0].id]);
+    const rawPrice = vi.spyOn(marketStore, "fillRawStockDaily").mockImplementation(async () => {
+      await pool.query("UPDATE market_bar SET close_raw=20 WHERE instrument_id=$1", [instruments[0].id]);
+      return 1;
+    });
+    let context: SelectionContext;
+    try {
+      const tool = buildSelectionTools({ pool, sessionId: run.session_id }).find((item) => item.name === "selection_context_query")!;
+      context = (await tool.execute("selection-context", { date })).details as SelectionContext;
+      expect(rawPrice).toHaveBeenCalledOnce();
+      expect(context.candidates.find((item) => item.code === codes[0])?.reference_price).toBe(20);
+      expect(context.sources.every((item) => item.payload === null)).toBe(true);
+    } finally { rawPrice.mockRestore(); }
+    expect(context.gaps).toEqual([]);
+    expect(context.candidates.find((i) => i.code === codes[0])?.resonance_bonus).toBe(3);
+    expect(context.candidates.find((i) => i.code === codes[1])?.resonance_bonus).toBe(10);
+    const reviews: SelectionReview[] = codes.slice(0, 4).map((code, i) => ({ code,
+      decision: i < 3 ? "priority" : "observe", strength: "strong", rank: i + 1, reason: "经营支撑和修复依据完整",
+      risk: "需求恢复仍待确认", condition: "核对原策略触发价与风险线",
+      dimensions: { fundamental: "报告已核验", news: "完成最新公告检索", industry_position: "公开资料支持",
+        character: "有效画像", execution: "成交连续", price_fit: "两位数参考适配" },
+      sources: [{ kind: "local", reference: code, fact: "本地报告与画像" },
+        { kind: "web", reference: "https://example.com/selection-research", fact: "核验公告" }],
+    }));
+    const input = { target_date: date, input_hash: context.input_hash, reviews, gaps: [] };
+    await expect(writeSelectionResult(pool, run.id, input)).rejects.toThrow("本地来源必须引用本次");
+    const evidence = [{ toolName: "stock_research_query", details: { items: codes.slice(0, 4).map((code) => ({ code,
+      profile_status: "ready", quote: { bar_date: date }, fundamental: { as_of_date: date, report_period: date } })) } },
+      { toolName: "web_search", details: { sources: [{ url: "https://example.com/selection-research", fetchedAt: new Date().toISOString() }] } }];
+    for (const item of evidence) await pool.query(`INSERT INTO chat_message(session_id,seq,role,content)
+      SELECT $1,COALESCE(max(seq),0)+1,'tool',$2::jsonb FROM chat_message WHERE session_id=$1`, [run.session_id, JSON.stringify(item)]);
+    await expect(writeSelectionResult(pool, run.id, { ...input, reviews: [{ ...reviews[3]!, decision: "priority" }] }))
+      .rejects.toThrow("接近候选不能升级");
+    const selected = await writeSelectionResult(pool, run.id, input);
+    expect(selected.recommendations.map((i) => i.code)).toEqual([codes[1], codes[0], codes[2]]);
+    expect(selected.recommendations).toHaveLength(3);
+    expect(selected.summary).not.toContain(codes[3]);
+    expect([...selected.summary].length).toBeLessThanOrEqual(500);
+    expect((await selectionReport(pool, run.id)).markdown).toContain("## 结论摘要");
+    expect((await pool.query("SELECT status FROM candidate_selection_result WHERE job_run_id=$1", [run.id])).rows[0].status).toBe("draft");
+    await pool.query("UPDATE candidate_selection_result SET status='generated' WHERE job_run_id=$1", [run.id]);
+    expect((await prepareSelectionContext(pool, run.id, date)).input_hash).toBe(input.input_hash);
+    expect((await selectionReport(pool, run.id)).recommendations).toEqual(selected.recommendations);
+    expect((await pool.query("SELECT status FROM candidate_selection_result WHERE job_run_id=$1", [run.id])).rows[0].status).toBe("generated");
+    await expect(writeSelectionResult(pool, run.id, { ...input, reviews: [] })).rejects.toThrow("不得清空 reviews");
+    expect((await selectionReport(pool, run.id)).reviews).toEqual(selected.reviews);
+    await pool.query(`INSERT INTO chat_message(session_id,seq,role,content)
+      SELECT $1,COALESCE(max(seq),0)+1,'tool',$2::jsonb FROM chat_message WHERE session_id=$1`,
+      [run.session_id, JSON.stringify({ toolName: "web_search", isError: true,
+        content: [{ type: "text", text: "DeepSeek余额不足（HTTP 402）" }] })]);
+    const unverified = reviews.map((review, index): SelectionReview => ({ ...review,
+      decision: index === 2 ? "exclude" : review.decision,
+      sources: review.sources.filter((source) => source.kind === "local"),
+    }));
+    const degraded = await writeSelectionResult(pool, run.id, { ...input, reviews: unverified });
+    expect(degraded).toMatchObject({ status: "partial", recommendations: [] });
+    expect(degraded.reviews.map((review) => review.decision)).toEqual(["pending", "pending", "exclude", "pending"]);
+    expect(degraded.reviews[0]?.dimensions).toEqual(reviews[0]?.dimensions);
+    expect(degraded.reviews[0]?.sources).toEqual(unverified[0]?.sources);
+    expect(unverified[0]?.decision).toBe("priority");
+    expect(degraded.gaps).toContain(`公开消息核验失败，保留逐股研究并标记待核验：${codes[0]}`);
+    expect(degraded.summary).toContain("逐股研究已保留");
+    expect((await selectionReport(pool, run.id)).markdown).toContain("经营支撑和修复依据完整");
+    expect((await prepareSelectionContext(pool, run.id, date)).input_hash).toBe(input.input_hash);
+    expect((await selectionReport(pool, run.id)).reviews).toEqual(degraded.reviews);
+    // 其他标的检索失败不影响已取得真实网页证据的研究。
+    expect((await writeSelectionResult(pool, run.id, input)).recommendations).toEqual(selected.recommendations);
+    const source = (await pool.query("SELECT source_job_run_id FROM strategy_candidate_shortlist WHERE strategy_code='swing' AND target_date=$1", [date])).rows[0];
+    await pool.query("UPDATE strategy_candidate_shortlist SET input_hash=repeat('f',64) WHERE source_job_run_id=$1", [source.source_job_run_id]);
+    await expect(writeSelectionResult(pool, run.id, input)).rejects.toThrow("来源初筛已变化");
+    expect((await prepareSelectionContext(pool, run.id, date)).input_hash).not.toBe(input.input_hash);
+    await expect(selectionReport(pool, run.id)).rejects.toThrow("尚未完成结构化研究提交");
+    await pool.query("UPDATE job_run SET status='running' WHERE id=$1", [source.source_job_run_id]);
+    expect((await loadSelectionContext(pool, date)).pending).toContain("swing_signal_scan");
+    await expect(prepareSelectionContext(pool, run.id, date)).rejects.toThrow("来源仍在执行");
   });
 
 });

@@ -16,14 +16,14 @@ type Metrics={name:string;window:string;annual_return:number;total_return:number
 
 const START="2020-01-02",END="2026-08-31";
 const WINDOWS={train:{start:"2020-01-02",end:"2022-12-30"},test:{start:"2023-01-03",end:END},full:{start:START,end:END}} as const;
-const ROOT=path.resolve("支撑/tmp/左侧替代池研究"),CACHE_ROOT=path.resolve("datavolume/research-cache"),DIVFILE=path.join(CACHE_ROOT,"稳定价值行业分红缓存.json"),CODEFILE=path.join(ROOT,"稳定价值行业代码.txt"),OUTPUT=path.join(ROOT,"价值底仓加左侧增配回测.json");
+const ROOT=path.resolve("支撑/tmp/左侧替代池研究"),CACHE_ROOT=path.resolve("datavolume/research-cache"),DIVFILE=path.join(CACHE_ROOT,"稳定价值行业分红缓存.json"),CODEFILE=path.join(ROOT,"稳定价值行业代码.txt"),OUTPUT=path.join(ROOT,"价值底仓加左侧增配回测.json"),CST_OFFSET_MS=8*3600*1000;
 const pool=getPool(loadConfig().databaseUrl);
 const codes=fs.readFileSync(CODEFILE,"utf8").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
 fs.mkdirSync(CACHE_ROOT,{recursive:true});
 const cached:Record<string,Dividend[]>=fs.existsSync(DIVFILE)?JSON.parse(fs.readFileSync(DIVFILE,"utf8")):{};
 const missing=codes.filter(code=>cached[code]===undefined);
 console.log(`分红缓存已有${codes.length-missing.length}只，待补${missing.length}只。`);
-for(const [index,code] of missing.entries()){try{const out=execFileSync("hithink-finance",["market","corporate-actions","--thscode",code,"--from-date","2017-01-01","--to-date",END,"--format","json"],{encoding:"utf8",stdio:["ignore","pipe","ignore"]});const parsed=JSON.parse(out) as {ok:boolean;data?:{item?:Array<Record<string,unknown>>}};cached[code]=(parsed.data?.item??[]).map(row=>({exDate:new Date(Number(row.ex_date_ms)).toISOString().slice(0,10),dividendPerShare:Number(row.dividend_per_share)||0,bonusPerShare:Number(row.per_share_bonus)||0}));}catch{cached[code]=[];}if((index+1)%10===0||index+1===missing.length){fs.writeFileSync(DIVFILE,JSON.stringify(cached,null,2));console.log(`分红进度${index+1}/${missing.length}`);}if(index+1<missing.length)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,3100);}
+for(const [index,code] of missing.entries()){try{const out=execFileSync("hithink-finance",["market","corporate-actions","--thscode",code,"--from-date","2017-01-01","--to-date",END,"--format","json"],{encoding:"utf8",stdio:["ignore","pipe","ignore"]});const parsed=JSON.parse(out) as {ok:boolean;data?:{item?:Array<Record<string,unknown>>}};cached[code]=(parsed.data?.item??[]).map(row=>({exDate:new Date(Number(row.ex_date_ms)+CST_OFFSET_MS).toISOString().slice(0,10),dividendPerShare:Number(row.dividend_per_share)||0,bonusPerShare:Number(row.per_share_bonus)||0}));}catch{cached[code]=[];}if((index+1)%10===0||index+1===missing.length){fs.writeFileSync(DIVFILE,JSON.stringify(cached,null,2));console.log(`分红进度${index+1}/${missing.length}`);}if(index+1<missing.length)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,3100);}
 const dividends=cached;
 const pct=(v:number|null)=>v===null?"-":`${(v*100).toFixed(2)}%`,clamp=(v:number,a=0,b=1)=>Math.max(a,Math.min(b,v));
 function nearEx(code:string,date:string){const t=Date.parse(date);return (dividends[code]??[]).some(d=>d.dividendPerShare>0&&t>=Date.parse(d.exDate)&&t-Date.parse(d.exDate)<=3*86400000);}

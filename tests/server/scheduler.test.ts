@@ -1,12 +1,16 @@
 import crypto from "node:crypto";
+import { prepareSelectionContext, writeSelectionResult } from "../../server/modules/selection/service.js";
 import { createAccount } from "../../server/modules/accounts/repo.js";
-import { AGENT_NOTIFICATION_SUMMARY_MAX_CHARS, DAILY_PLAN_NOTIFICATION_MAX_CHARS, deliverNextNotification, enqueueJobConclusion, listNotifications as listNotificationPage, getNotification, extractConclusion, previewJobConclusion, queueTestNotification, retryNotification, sendFeishu, updateNotificationSettings, validateWebhook } from "../../server/modules/notifications/service.js";
+import { AGENT_NOTIFICATION_SUMMARY_MAX_CHARS, TASK_NOTIFICATION_MAX_CHARS, deliverNextNotification, enqueueIntradayRiskAlert, enqueueJobConclusion, listNotifications as listNotificationPage, getNotification, extractConclusion, previewJobConclusion, queueTestNotification, retryNotification, sendFeishu, updateNotificationSettings, validateWebhook } from "../../server/modules/notifications/service.js";
 // M3 作业系统：cron 去重/missed、Runner/重试/锁、API 与安全配置回归。
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createModels, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import type pg from "pg";
 import { setAiRuntimeForTests } from "../../server/agent/ai/runtime.js";
 import * as hithinkDatasets from "../../server/datasource/hithink-datasets.js";
+import * as hithinkMarket from "../../server/datasource/hithink.js";
+import * as hithinkSpecial from "../../server/datasource/hithink-special.js";
+import { normalizeIntradaySignals, sameIntradaySignal } from "../../server/modules/intraday-risk/signals.js";
 import { createJobCompletionGate } from "../../server/agent/job-workflow.js";
 import { buildChatTools } from "../../server/agent/tools.js";
 import { acquireAgentMutationLock } from "../../server/agent/mutation-lock.js";
@@ -28,8 +32,19 @@ import {
 import { executeJobRun, resolveDailyUpdateScope } from "../../server/scheduler/runner.js";
 import { JobScheduler } from "../../server/scheduler/service.js";
 import { cronOccurrences, dailyMarketGate, shanghaiDate } from "../../server/scheduler/time.js";
-import { intradayRiskNextDelayMs, runIntradayRiskCycle } from "../../server/modules/intraday-risk/service.js";
+import { IntradayRiskWorker, intradayRiskNextDelayMs, runIntradayRiskCycle } from "../../server/modules/intraday-risk/service.js";
 import { api, prepareTestDb, resetSchema, seedTestStrategy, startTestServer, type TestServer } from "./helpers.js";
+
+async function seedNightlyCandidates(pool: pg.Pool, run: { id: string; session_id: string | null }, date: string, codes: string[]) {
+  const result = { as_of: date, signals: [{ code: "881777.TI", sector: "测试行业", as_of: date,
+    valid_through: date, catch_up: { branch_b: codes.map((code) => ({ code, name: code })), branch_a: [] } }] };
+  const analysis = (await pool.query(`INSERT INTO analysis_run(analysis_type,request_json,status,result_json,service_version)
+    VALUES('sector_trend_structure',$1::jsonb,'success',$2::jsonb,'analysis-v3') RETURNING id::text`,
+    [JSON.stringify({ as_of: date }), JSON.stringify(result)])).rows[0];
+  await pool.query(`INSERT INTO chat_message(session_id,seq,role,content)
+    SELECT $1,COALESCE(max(seq),0)+1,'tool',$2::jsonb FROM chat_message WHERE session_id=$1`,
+    [run.session_id, JSON.stringify({ toolName: "analysis_run", details: { items: [{ id: analysis.id, analysis_type: "sector_trend_structure" }] } })]);
+}
 
 async function listNotifications(pool: pg.Pool) {
   return Promise.all((await listNotificationPage(pool)).items.map((item) => getNotification(pool, item.id)));
@@ -37,12 +52,29 @@ async function listNotifications(pool: pg.Pool) {
 
 const prepared = await prepareTestDb();
 
-it("盘中风险观察器只在交易窗口保持 30 秒唤醒", () => {
+it("盘中风险观察器只在交易窗口保持 60 秒唤醒", () => {
   expect(intradayRiskNextDelayMs(new Date("2026-09-29T00:00:00Z"))).toBe(90 * 60_000);
-  expect(intradayRiskNextDelayMs(new Date("2026-09-29T02:00:00Z"))).toBe(30_000);
+  expect(intradayRiskNextDelayMs(new Date("2026-09-29T02:00:00Z"))).toBe(60_000);
   expect(intradayRiskNextDelayMs(new Date("2026-09-29T04:00:00Z"))).toBe(60 * 60_000);
   expect(intradayRiskNextDelayMs(new Date("2026-09-29T07:30:00Z"))).toBe(18 * 60 * 60_000);
   expect(intradayRiskNextDelayMs(new Date("2026-09-29T02:00:00Z"), false)).toBe(23.5 * 60 * 60_000);
+});
+
+it("盘中加减仓要求有效价区间与承接确认，冰点缺证据和过期采样只能等待", () => {
+  const candidate = { code: "990098.SZ", action: "add", emotion: "ice_point", reason: "冰点后缩量止跌并回收日内平台",
+    add_plan: { price_lower: 10.2, price_upper: 10.4, condition: "缩量回踩后放量回收", invalidation: "再次放量下探", status: "triggered" }, reduce_plan: null };
+  const codes = new Set([candidate.code]);
+  const prices = new Map([[candidate.code, 10.3]]);
+  const parse = (item: unknown, readyPrices = prices, sentimentReady = true) => normalizeIntradaySignals({ items: [item] }, codes, readyPrices, sentimentReady)[0]!;
+  const signal = parse(candidate);
+  expect(signal.action).toBe("add");
+  expect(parse(candidate, new Map()).action).toBe("wait");
+  expect(parse(candidate, prices, false)).toMatchObject({ action: "wait", emotion: "unknown", add_plan: { status: "waiting" } });
+  expect(parse(candidate, new Map([[candidate.code, 10.5]])).action).toBe("wait");
+  expect(() => parse({ ...candidate, add_plan: { ...candidate.add_plan, price_lower: 11 } })).toThrow("区间或条件无效");
+  expect(() => parse({ ...candidate, reduce_plan: candidate.add_plan })).toThrow("相反动作");
+  expect(sameIntradaySignal(signal, { ...signal, add_plan: { ...signal.add_plan!, price_lower: 10.21 } })).toBe(true);
+  expect(sameIntradaySignal({ ...signal, action: "wait" }, signal)).toBe(false);
 });
 
 function dailyReadCalls() {
@@ -105,6 +137,16 @@ it("任务完成门禁只接受本次正确日期的工具结果，并按真实�
     result: { details: { documents: [{ code: "portfolio", role: "portfolio" }, { code: "limit_up_board", role: "task" }] } } } });
   expect(boardScan.missing()).toEqual([]);
 
+  boardScan.observe({ type: "tool_start", data: { toolCallId: "pk", name: "strategy_evaluation_query", args: { date: "2026-08-17", phase: "entry" } } });
+  boardScan.observe({ type: "tool_end", data: { toolCallId: "pk", name: "strategy_evaluation_query", isError: false,
+    result: { details: { execution: "executed", run: { status: "success" },
+      result: { selection_method: "stage_pk_v2", signals: [{ code: "600001.SH" }] }, opportunity_write: { replaced: 1 } } } } });
+  expect(boardScan.missing()).toContain("web_search（同高度PK必须实际检索拟选者和竞争者消息）");
+  boardScan.observe({ type: "tool_start", data: { toolCallId: "pk-news", name: "web_search", args: { query: "600001 同高度对手 公告" } } });
+  boardScan.observe({ type: "tool_end", data: { toolCallId: "pk-news", name: "web_search", isError: false,
+    result: { details: { sources: [] } } } });
+  expect(boardScan.missing()).toEqual([]);
+
   const partialBoard = createJobCompletionGate("limit_up_close_scan", "2026-08-17");
   partialBoard.observe({ type: "tool_start", data: { toolCallId: "board-docs", name: "strategy_document_query", args: { codes: ["portfolio", "limit_up_board"] } } });
   partialBoard.observe({ type: "tool_end", data: { toolCallId: "board-docs", name: "strategy_document_query", isError: false,
@@ -165,7 +207,7 @@ it("任务完成门禁只接受本次正确日期的工具结果，并按真实�
   const crossScope = createJobCompletionGate("auction_opportunity_assessment", "2026-08-17");
   crossScope.observe({ type: "tool_start", data: { toolCallId: "context", name: "auction_context_query", args: { date: "2026-08-17" } } });
   crossScope.observe({ type: "tool_end", data: { toolCallId: "context", name: "auction_context_query", isError: false,
-    result: { details: { market_day: { should_run: true }, positions: [{ target_key: "position:600000.SH" }], attentions: [], opportunities: [], candidate_codes: ["600000.SH"], required_strategy_documents: ["daily_plan_strategy"] } } } });
+    result: { details: { market_day: { should_run: true }, attentions: [{ target_key: "attention:1" }], opportunities: [], candidate_codes: ["600000.SH"], required_strategy_documents: ["daily_plan_strategy"] } } } });
   expect(crossScope.missing()).toContain("auction_assessment_write");
 
   const nightly = createJobCompletionGate("nightly_sector_opportunity_scan", "2026-08-17");
@@ -305,7 +347,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       ('600100.SH','精简样本','stock') RETURNING code,id`);
     const ids = Object.fromEntries(instruments.rows.map((row) => [row.code, row.id]));
     await pool.query(`INSERT INTO market_instrument (code,name,kind)
-      SELECT '610' || lpad(n::text,3,'0') || '.SH', '额外持仓' || n::text, 'stock' FROM generate_series(1,8) n
+      SELECT '610' || lpad(n::text,3,'0') || '.SH', '额外持仓' || n::text, 'stock' FROM generate_series(1,80) n
       UNION ALL
       SELECT '003' || lpad(n::text,3,'0') || '.SZ', '额外机会' || n::text, 'stock' FROM generate_series(1,9) n`);
     const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
@@ -321,7 +363,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         (source_job_run_id,target_date,item_kind,instrument_id,code,name,grade,priority,action,trigger_kind,headline,auction_md,intraday_md,evidence_md,missing_md,invalidation_md,risk_md,effective_action,evaluation_status)
         SELECT $1::bigint,'2026-08-17'::date,'position_action',instrument.id,instrument.code,instrument.name,NULL,100+n,'hold','condition',
           repeat('持仓条件预案',20),repeat('竞价观察条件',20),repeat('盘中复核条件',20),NULL,NULL,repeat('持仓失效条件',20),repeat('持仓风险提示',20),'hold','success'
-        FROM generate_series(1,8) n JOIN market_instrument instrument
+        FROM generate_series(1,80) n JOIN market_instrument instrument
           ON instrument.code='610' || lpad(n::text,3,'0') || '.SH'
         UNION ALL
         SELECT $1::bigint,'2026-08-17'::date,'off_pool_opportunity',instrument.id,instrument.code,instrument.name,'B',1+n,'observe','condition',
@@ -349,21 +391,15 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(finished?.status).toBe("success");
     let notices = await listNotifications(pool);
     expect(notices).toHaveLength(1);
-    expect(notices[0].content).toContain("【持仓预案｜10 项】");
-    expect(notices[0].content).toContain("跌破支撑且反抽失败后才评估");
-    expect(notices[0].content).toContain("价格＜10且成交量＞100");
-    expect(notices[0].content).toContain("未触发不得执行");
-    expect(notices[0].content).toContain("精简样本 600100.SH｜退出");
-    expect(notices[0].content).toContain("预案：跌破12.5元清仓");
-    expect(notices[0].content).not.toContain("按完整计划复核");
-    expect(notices[0].content).not.toContain("未提供，执行前需核对");
-    expect(notices[0].content).not.toContain("详见完整计划");
+    expect(notices[0].content).toContain("Stock｜每日交易计划预览");
+    expect(notices[0].content).toContain("关注标的");
+    expect(notices[0].content).toContain("精简样本（600100.SH）｜退出预案");
+    expect(notices[0].content).toContain("持仓样本（600000.SH）｜减仓预案");
+    expect(notices[0].content).toContain("简要说明：精简样本：跌破12.5元清仓；持仓样本：满足条件后减仓");
     expect(notices[0].channel).toBe("personal");
-    expect(notices[0].content).not.toContain("【标的信号");
-    expect(notices[0].content).not.toContain("【打板机会预案");
-    expect(notices[0].content).toContain("不代表信号已触发或交易已执行");
-    expect(notices[0].content).toMatch(/另有 \d+ 项持仓预案/);
-    expect([...notices[0].content].length).toBeLessThanOrEqual(DAILY_PLAN_NOTIFICATION_MAX_CHARS);
+    expect(notices[0].content).not.toMatch(/信号样本|打板样本|竞价|复核|风险提示|数据缺口|生成：|不代表信号/);
+    expect(notices[0].content).toMatch(/另有 \d+ 个标的/);
+    expect([...notices[0].content].length).toBeLessThanOrEqual(TASK_NOTIFICATION_MAX_CHARS);
     await enqueueJobConclusion(pool, notices[0].output_id);
     expect(await listNotifications(pool)).toHaveLength(1);
     const connection = await pool.connect();
@@ -392,7 +428,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const newer = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
     await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => "# 更新计划\n\n## 结论摘要\n继续观察，条件尚未触发。" }, newer.id);
     expect((await previewJobConclusion(pool))?.content).toContain("更新版");
-    expect((await previewJobConclusion(pool))?.content).toContain("条件尚未触发");
+    expect((await previewJobConclusion(pool))?.content).toContain("本次未列出关注标的");
     await deliverNextNotification(pool, fetcher);
     expect((await listNotifications(pool)).find((n) => n.id === notices[0].id)?.status).toBe("cancelled");
     await expect(retryNotification(pool, notices[0].id)).rejects.toThrow("仅可补发");
@@ -407,7 +443,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     await pool.query(`INSERT INTO portfolio_position(account_id,instrument_id,quantity,cost_price,opened_at)
       SELECT 1,id,100,12,$1::date FROM market_instrument WHERE code='600001.SH'
       UNION ALL SELECT $2::bigint,id,200,13,$1::date FROM market_instrument WHERE code IN ('600001.SH','600002.SH')`, [date,account.id]);
-    const finish = async (checked_codes: string[], gaps: string[] = [], summary = "## 结论摘要\n已检索两只持仓，暂无有效新消息；不据此判断涨跌。") => {
+    const finish = async (checked_codes: string[], gaps: string[] = [], summary = "## 结论摘要\n已检索两只持仓，暂无有效新消息；不据此判断涨跌。", marketBias = "unknown") => {
       const run = await queueManualJob(pool, "pre_market_news_scan", date);
       return executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => {
         const tools = buildChatTools({ pool, sessionId: run.session_id, accountId: null }, { kind: "job", jobCode: "pre_market_news_scan" });
@@ -419,7 +455,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         // 消息存储认本次工具记录；检索完成但没有命中新消息是正常结果。
         await pool.query(`INSERT INTO chat_message(session_id,seq,role,content)
           VALUES($1,2,'tool',$2::jsonb)`, [run.session_id,JSON.stringify({ toolName: "web_search", isError: false, details: { sources: [] } })]);
-        await writeMarketNews(pool, validatePoolNewsWriteInput({ target_date: date, checked_codes, gaps, market_bias: "unknown", summary: "检索结果", items: [] }), run.id);
+        await writeMarketNews(pool, validatePoolNewsWriteInput({ target_date: date, checked_codes, gaps, market_bias: marketBias, summary: "检索结果", items: [] }), run.id);
         return "# 完整报告\n大量检索细节仅留工作台。\n" + summary;
       } }, run.id);
     };
@@ -428,11 +464,10 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(partial).toMatchObject({ status: "partial", data_gaps: ["标的未完成消息检索：600002.SH"] });
     const notices = await listNotifications(pool);
     expect(notices).toHaveLength(2);
-    const notice = notices.find((item) => item.content.includes("部分成功"))!;
+    const notice = notices.find((item) => item.content.includes("更新版"))!;
     expect(notice).toMatchObject({ channel: "strategy", status: "pending" });
-    expect(notice.content).toContain("乙尚未完成检索");
-    expect(notice.content).toContain("1 项缺口");
-    expect(notice.content).not.toContain("大量检索细节");
+    expect(notice.content).toContain("关注标的");
+    expect(notice.content).not.toMatch(/部分成功|尚未完成检索|缺口|大量检索细节|生成：/);
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ code: 0 }));
     await deliverNextNotification(pool, fetcher);
     expect(fetcher).toHaveBeenCalledTimes(1);
@@ -440,10 +475,76 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect((await finish(["600001.SH", "600002.SH"], ["市场来源全部无法访问"]))?.status).toBe("partial");
     expect((await finish(["600001.SH", "600002.SH"], ["市场来源全部无法访问"], "## 结论摘要\n暂无结论"))?.status).toBe("partial");
     expect(await listNotifications(pool)).toHaveLength(3);
+    for (const [bias, label] of [["mixed_positive", "mixed 偏多"], ["mixed_negative", "mixed 偏空"]]) {
+      const run = await finish(["600001.SH", "600002.SH"], [], `## 结论摘要\n${label}\n主导因素与反向风险。`, bias);
+      expect(run?.status).toBe("success");
+      expect((await pool.query("SELECT market_bias FROM market_news_snapshot WHERE run_id=$1", [run!.id])).rows[0].market_bias).toBe(bias);
+      expect((await previewJobConclusion(pool, undefined, "pre_market_news_scan"))?.content).toContain(label);
+    }
+    for (const market_bias of ["mixed", "positive", "negative", "neutral"]) {
+      expect(() => validatePoolNewsWriteInput({ target_date: date, checked_codes: [], gaps: [], market_bias, summary: "不能只写多空并存", items: [] }))
+        .toThrow("参数校验失败");
+    }
     const prompt = (await pool.query(`SELECT r.content FROM job_prompt p JOIN job_prompt_revision r ON r.id=p.current_revision_id WHERE p.code='pre_market_news_scan'`)).rows[0].content;
     expect(prompt).toContain("news_targets");
     expect(prompt).toContain("不超过 600");
     expect(prompt).not.toContain("并用 `database_query` 查询当前持仓");
+    expect(prompt).toContain("不按消息条数简单投票");
+    expect(prompt).toContain("结构化字段、正文结论与摘要必须一致");
+  });
+
+  it("统一关注模板取正式清单与有效板块，忽略缺口和T+1验证，旧摘要和风险通知同样简洁", async () => {
+    await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret });
+    await pool.query(`INSERT INTO market_instrument(code,name,kind) VALUES
+      ('603980.SH','吉华集团','stock'),('002696.SZ','百洋股份','stock'),('000668.SZ','荣丰控股','stock'),
+      ('881001.TI','化学制品','board'),('885001.TI','染料','board'),('885002.TI','青岛国资','board'),('881999.TI','过期板块','board')`);
+    await pool.query(`INSERT INTO market_board(instrument_id,board_type)
+      SELECT id,CASE WHEN code LIKE '881%' THEN 'industry' ELSE 'concept' END FROM market_instrument WHERE kind='board'`);
+    await pool.query(`INSERT INTO market_board_membership(board_instrument_id,member_instrument_id,effective_from,effective_to)
+      SELECT b.id,i.id,'2026-01-01',CASE WHEN b.code='881999.TI' THEN '2026-08-01'::date ELSE NULL END
+      FROM market_instrument b CROSS JOIN market_instrument i
+      WHERE (i.code='603980.SH' AND b.code IN ('881001.TI','885001.TI','881999.TI'))
+        OR (i.code='002696.SZ' AND b.code='885002.TI')`);
+    const summary = `## 结论摘要
+总说明：两只标的趋势与晋级表现较强，进入主升路线关注；T+1验证和缺口仅留工作台。
+- 候选全集 62 只，正式信号 2 只，opportunity_write.replaced=2。
+- 吉华集团（染料，首板）：主升分 71.25。
+- 百洋股份（青岛国资，3 板）：主升分 70.82。
+- T+1（下一交易日）09:25 后复核，荣丰控股仅用于验证。
+- 数据缺口：荣丰控股被剔除；两只正式信号 open_count 缺失。`;
+    const run = await queueManualJob(pool, "limit_up_close_scan", "2026-08-17");
+    await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => {
+      await pool.query(`INSERT INTO daily_plan_playbook
+        (source_job_run_id,target_date,item_kind,instrument_id,code,name,priority,action,trigger_kind,headline)
+        SELECT $1,'2026-08-17','off_pool_opportunity',id,code,name,
+          CASE WHEN code='603980.SH' THEN 1 ELSE 2 END,'observe','condition','T+1验证与数据缺口留在工作台'
+        FROM market_instrument WHERE code IN ('603980.SH','002696.SZ')`, [run.id]);
+      return summary;
+    } }, run.id);
+    const notice = (await listNotifications(pool))[0];
+    expect(notice.content).toContain("Stock｜收盘打板机会扫描｜2026-08-17");
+    expect(notice.content).toContain("简要说明：两只标的趋势与晋级表现较强，进入主升路线关注");
+    expect(notice.content).not.toContain("右侧 A");
+    expect(notice.content).toContain("吉华集团（603980.SH）｜染料\n");
+    expect(notice.content).toContain("百洋股份（002696.SZ）｜青岛国资");
+    expect(notice.content).not.toMatch(/荣丰控股|过期板块|候选全集|主升分|T\+1|验证|缺口|open_count|生成：/);
+    expect((await previewJobConclusion(pool, notice.output_id))?.content).toBe(notice.content);
+    const legacy = await queueManualJob(pool, "value_anchor_opportunity_scan", "2026-08-17");
+    await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => summary + "\n### 数据缺口\n荣丰控股需要补近五日收益字段" }, legacy.id);
+    expect((await previewJobConclusion(pool, undefined, "value_anchor_opportunity_scan"))?.content).toContain("吉华集团（603980.SH）｜染料\n");
+    expect((await previewJobConclusion(pool, undefined, "value_anchor_opportunity_scan"))?.content).not.toContain("荣丰控股");
+    const risk = (await pool.query(`INSERT INTO intraday_position_risk
+      (trade_date,code,name,risk,reason,model_key,input_sha256,account_id,action,reduce_plan,emotion)
+      VALUES ('2026-08-17','603980.SH','吉华集团','high','价格跌破支撑；数据缺口与盘面细节','test',repeat('a',64),1,'reduce',$1::jsonb,'weak') RETURNING id::text`,
+      [JSON.stringify({ price_lower: 11.2, price_upper: 11.4, condition: "放量下探后回收失败", invalidation: "回收日内平台且有承接", status: "triggered" })])).rows[0];
+    await enqueueIntradayRiskAlert(pool, risk.id);
+    const riskNotice = (await listNotifications(pool)).find((item) => item.kind === "intraday_risk")!;
+    expect(riskNotice.content).toContain("Stock｜盘中加减仓提醒｜2026-08-17｜默认账户");
+    expect(riskNotice.content).toContain("吉华集团（603980.SH）｜化学制品");
+    expect(riskNotice.content).toContain("依据：价格跌破支撑");
+    expect(riskNotice.content).toContain("减仓触发：11.20～11.40");
+    expect(riskNotice.content).toContain("取消：回收日内平台且有承接");
+    expect(riskNotice.content).not.toMatch(/缺口|盘面细节/);
   });
 
   it("通知租约恢复、有限重试、关闭暂停、过期和更换渠道取消旧通知", async () => {
@@ -487,6 +588,8 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const notifications = await listNotifications(pool);
     expect(notifications.map((item) => item.job_code).sort()).toEqual(["nightly_sector_opportunity_scan", "value_anchor_opportunity_scan"]);
     expect(notifications.every((item) => item.kind === "agent_result")).toBe(true);
+    for (const notification of notifications) expect(notification.content).toContain(`Stock｜${notification.job_name}｜`);
+    expect(notifications.map((item) => item.content).join("\n")).not.toMatch(/左侧 [CD]/);
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({ code: 0 }));
     await updateNotificationSettings(pool, { job_codes: ["nightly_sector_opportunity_scan"] });
     await deliverNextNotification(pool, fetcher);
@@ -514,6 +617,65 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect((await pool.query("SELECT content::text FROM chat_message WHERE role='user' ORDER BY id LIMIT 1")).rows[0].content).toContain("结论摘要");
   });
 
+  it("板块机会筛选通知按板块列出简要原因与板块内标的，其他复核单独收口", async () => {
+    await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret });
+    const date = "2026-08-19";
+    await pool.query(`INSERT INTO market_instrument(code,name,kind) VALUES
+      ('881911.TI','半导体','board'),('881912.TI','工业金属','board'),
+      ('600911.SH','芯片甲','stock'),('600912.SH','芯片乙','stock'),
+      ('600913.SH','金属甲','stock'),('600914.SH','存量乙','stock')`);
+    await pool.query(`INSERT INTO market_board(instrument_id,board_type)
+      SELECT id,'industry' FROM market_instrument WHERE code IN ('881911.TI','881912.TI')`);
+    await pool.query(`INSERT INTO market_board_membership(board_instrument_id,member_instrument_id,effective_from)
+      SELECT board.id,member.id,'2026-01-01' FROM market_instrument board CROSS JOIN market_instrument member
+      WHERE (board.code='881911.TI' AND member.code IN ('600911.SH','600912.SH'))
+         OR (board.code='881912.TI' AND member.code='600913.SH')`);
+    const run = await queueManualJob(pool, "nightly_sector_opportunity_scan", date);
+    const analysis = (await pool.query<{ id: string }>(
+      `INSERT INTO analysis_run(analysis_type,request_json,status,result_json,service_version)
+       VALUES('sector_trend_structure',$1::jsonb,'success',$2::jsonb,'analysis-v3') RETURNING id::text`,
+      [JSON.stringify({ as_of: date }), JSON.stringify({ as_of: date, signals: [
+        { code: "881911.TI", sector: "半导体", as_of: date, trigger: "中期脱离",
+          pattern: "阳包阴", pattern_tier: 1, volume_class: "缩量", valid_through: "2026-09-16",
+          second_bottom: false, contracting: true },
+        { code: "881912.TI", sector: "工业金属", as_of: date, trigger: "新低回升",
+          pattern: null, pattern_tier: null, volume_class: "温和放量", valid_through: "2026-09-18",
+          second_bottom: false, contracting: false },
+      ] })]))
+      .rows[0]!;
+    // 通知原因只认本轮服务端分析；标的只认本轮关注写入。
+    await pool.query(`INSERT INTO strategy_candidate_shortlist
+      (source_job_run_id,strategy_code,target_date,data_date,status,payload,input_hash)
+      VALUES($1,'nightly_sector',$2,$2,'success',$3::jsonb,repeat('a',64))`,
+      [run.id, date, JSON.stringify({ candidates: [], matches: [],
+        source: { analysis_run_id: analysis.id }, status: "success", data_date: date, gaps: [] })]);
+    await pool.query(`INSERT INTO agent_tool_audit(session_id,tool_name,args,status)
+      VALUES($1,'pool_attention_write',$2,'ok')`, [run.session_id, { reason: "本轮关注复核", items: [
+        { action: "mark", code: "600911.SH", attention_status: "approaching", attention_reason: "板块结构信号成立" },
+        { action: "mark", code: "600912.SH", attention_status: "approaching", attention_reason: "板块结构信号成立" },
+        { action: "mark", code: "600913.SH", attention_status: "approaching", attention_reason: "板块结构信号成立" },
+        { action: "mark", code: "600914.SH", attention_status: "approaching", attention_reason: "存量关注复核" },
+      ] }]);
+    const finished = await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () =>
+      "# 板块扫描\n\n## 结论摘要\n总说明：两个板块出现左侧结构信号，个股均待补独立证据。\n- 半导体：板块结构信号成立。" }, run.id);
+    expect(finished?.status).toBe("success");
+    const notice = (await listNotifications(pool)).find((item) => item.job_code === "nightly_sector_opportunity_scan")!;
+    expect(notice.content).toContain("Stock｜板块机会筛选｜2026-08-19");
+    expect(notice.content).toContain("简要说明：两个板块出现左侧结构信号");
+    expect(notice.content).toContain("板块：半导体（881911.TI）");
+    expect(notice.content).toContain("简要原因：脱离60日中期下降趋势｜阳包阴｜缩量｜上下收敛｜观察至09-16");
+    expect(notice.content).toContain("板块内标的：芯片甲（600911.SH）、芯片乙（600912.SH）｜等待条件");
+    expect(notice.content).toContain("板块：工业金属（881912.TI）");
+    // 新低回升为纯口径：不把形态与量比写进原因。
+    expect(notice.content).toContain("简要原因：60日新低后回升｜观察至09-18");
+    expect(notice.content).not.toContain("温和放量");
+    expect(notice.content).toContain("板块内标的：金属甲（600913.SH）｜等待条件");
+    expect(notice.content).toContain("其他复核：存量乙（600914.SH）");
+    expect([...notice.content].length).toBeLessThanOrEqual(TASK_NOTIFICATION_MAX_CHARS);
+    expect(notice.content).not.toMatch(/缺口|数据不足|T\+1|生成：/);
+    expect((await previewJobConclusion(pool, notice.output_id))?.content).toBe(notice.content);
+  });
+
   it("新增Agent任务自动纳入全部订阅，非Agent结果不能借用输出类型触发推送", async () => {
     await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret });
     const template = (await listJobDefinitions(pool)).find((job) => job.code === 'nightly_sector_opportunity_scan')!;
@@ -521,11 +683,45 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const run = await queueManualJob(pool, custom.code, "2026-08-17");
     await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow: async () => "## 结论摘要\n仅在条件满足后调整。" }, run.id);
     expect((await listNotifications(pool))[0]).toMatchObject({ job_code: custom.code, kind: "agent_result" });
+    expect((await listNotifications(pool))[0].content).toContain(`Stock｜${custom.name}｜`);
+    await pool.query("UPDATE job_definition SET name='用户改名后的任务' WHERE id=$1", [custom.id]);
+    expect((await previewJobConclusion(pool, undefined, custom.code))?.content).toContain("Stock｜用户改名后的任务｜");
+    expect((await listNotifications(pool))[0].content).toContain(`Stock｜${custom.name}｜`);
     const dataRun = await queueManualJob(pool, "daily_data_update", "2026-08-17");
     await pool.query("UPDATE job_run SET status='success' WHERE id=$1", [dataRun.id]);
     const output = await pool.query(`INSERT INTO job_run_output(job_id,run_id,output_type,target_date,markdown,sha256,source)
       SELECT job_id,id,'daily_plan',target_date,'## 结论摘要\n不能发送',repeat('a',64),'agent_flow' FROM job_run WHERE id=$1 RETURNING id::text`, [dataRun.id]);
     await enqueueJobConclusion(pool, output.rows[0].id);
+    expect(await listNotifications(pool)).toHaveLength(1);
+  });
+
+  it("统一精选等待当日来源一次，部分来源空结论结构化发布并按新任务订阅推送", async () => {
+    const date = shanghaiDate(new Date());
+    await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret,
+      job_codes: ["cross_strategy_selection"] });
+    const source = await queueManualJob(pool, "swing_signal_scan", date);
+    const run = await queueManualJob(pool, "cross_strategy_selection", date);
+    const agentFlow = vi.fn(async () => {
+      const context = await prepareSelectionContext(pool, run.id, date);
+      await writeSelectionResult(pool, run.id, { target_date: date, input_hash: context.input_hash, reviews: [], gaps: [] });
+      return "## 结论摘要\n自由文本不能新增推荐：999999.SZ";
+    });
+    const first = await executeJobRun({ pool, databaseUrl: prepared!.url, agentFlow }, run.id);
+    expect(first?.status).toBe("queued");
+    expect(agentFlow).not.toHaveBeenCalled();
+    await pool.query("UPDATE job_run SET status='cancelled' WHERE id=$1", [source.id]);
+    const later = new Date(Date.now() + 6 * 60_000);
+    const finished = await executeJobRun({ pool, databaseUrl: prepared!.url, now: () => later, agentFlow }, run.id);
+    expect(finished?.status).toBe("partial");
+    expect(agentFlow).toHaveBeenCalledTimes(1);
+    expect((await pool.query("SELECT status FROM candidate_selection_result WHERE job_run_id=$1", [run.id])).rows[0].status).toBe("generated");
+    const notices = await listNotifications(pool);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].content).toContain("盘后统一标的精选（部分覆盖）");
+    expect(notices[0].content).toContain("不凑数");
+    expect(notices[0].content).not.toContain("999999.SZ");
+    expect([...notices[0].content].length).toBeLessThanOrEqual(600);
+    await enqueueJobConclusion(pool, notices[0].output_id);
     expect(await listNotifications(pool)).toHaveLength(1);
   });
 
@@ -566,7 +762,9 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       "value_monthly_rank",
       "commodity_copper_sync",
       "commodity_copper_inventory_sync",
+      "ultra_short_auction_watch",
       "pre_market_news_scan",
+      "weekly_trading_review",
       "limit_up_close_scan",
       "commodity_copper_macro_sync",
       "copper_left_launch_signal_scan",
@@ -575,6 +773,11 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       "nightly_sector_opportunity_scan",
       "value_anchor_opportunity_scan",
       "two_year_reversal_scan",
+      "evening_plan_preview",
+      "cross_strategy_selection",
+      "position_intraday_watch",
+      "ultra_short_exit_watch",
+      "ultra_short_watch_observe",
       "first_board_intraday_scan",
       "auction_opportunity_assessment",
     ]);
@@ -590,7 +793,9 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(jobs.filter((job) => job.job_type === "agent_flow").map((job) => job.code).sort()).toEqual([
       "auction_opportunity_assessment",
       "copper_left_launch_signal_scan",
+      "cross_strategy_selection",
       "daily_plan_flow",
+      "evening_plan_preview",
       "first_board_intraday_scan",
       "limit_up_close_scan",
       "nightly_sector_opportunity_scan",
@@ -598,24 +803,33 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       "swing_signal_scan",
       "two_year_reversal_scan",
       "value_anchor_opportunity_scan",
+      "weekly_trading_review",
     ]);
     expect(jobs.find((job) => job.code === "auction_opportunity_assessment")?.cron).toBe("26 9 * * 1-5");
+    // 0183：周六全局交易复盘，一次运行覆盖全部 active 账户，不受交易日门禁限制。
+    expect(jobs.find((job) => job.code === "weekly_trading_review")).toMatchObject({
+      name: "每周交易复盘", cron: "0 9 * * 6", job_type: "agent_flow", phase: "周末",
+      priority: 190, trading_day_only: false, execution_scope: "global", enabled: true,
+    });
+    // 0182：用调用间隔控制 token；非持仓观察降频更多。
+    expect(jobs.find((job) => job.code === "position_intraday_watch")?.config).toMatchObject({ interval_seconds: 60 });
+    expect(jobs.find((job) => job.code === "ultra_short_watch_observe")?.config).toMatchObject({ interval_seconds: 120 });
     expect(jobs.find((job) => job.code === "first_board_intraday_scan")).toMatchObject({
       name: "涨停梯队盘中扫描", cron: "45 10 * * 1-5", strategy_code: "first_board_advance",
       agent_role: "strategy_entry_report", enabled: true,
     });
     const nightly = jobs.find((job) => job.code === "nightly_sector_opportunity_scan")!;
-    expect(nightly.cron).toBe("0 23 * * 1-5");
+    expect(nightly.cron).toBe("40 18 * * 1-5");
     expect(nightly.enabled).toBe(true);
     expect(jobs.find((job) => job.code === "value_candidate_sync")?.cron).toBe("40 6 * * 6");
     expect(jobs.find((job) => job.code === "value_monthly_rank")?.cron).toBe("45 17 * * 1-5");
     // 默认仅交易日执行；周维护任务显式豁免，铜库存周报需在休市周五回查本周最后交易日。
     expect(jobs.filter((job) => job.trading_day_only === false).map((job) => job.code).sort())
-      .toEqual(["commodity_copper_inventory_sync", "value_candidate_sync", "weekly_full_market_indicators"]);
+      .toEqual(["commodity_copper_inventory_sync", "value_candidate_sync", "weekly_full_market_indicators", "weekly_trading_review"]);
     expect(jobs.filter((job) => job.code !== "commodity_copper_inventory_sync")
       .filter((job) => job.cron.endsWith("* * 1-5") || job.cron.includes("* 1") || job.cron.includes("* 5"))
       .every((job) => job.trading_day_only)).toBe(true);
-    expect(jobs.find((job) => job.code === "value_anchor_opportunity_scan")?.cron).toBe("30 19 * * 1-5");
+    expect(jobs.find((job) => job.code === "value_anchor_opportunity_scan")?.cron).toBe("0 19 * * 1-5");
     expect(jobs.find((job) => job.code === "commodity_copper_macro_sync")).toMatchObject({
       cron: "20 17 * * 5", agent_role: "data_pipeline", enabled: true,
     });
@@ -627,9 +841,10 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       await expect(queueManualJob(pool, code, "2026-09-17")).rejects.toThrow("未知作业");
     }
     expect(jobs.find((job) => job.code === "swing_signal_scan")).toMatchObject({
-      cron: "45 17 * * 1-5", strategy_code: "swing", agent_role: "strategy_entry_report",
+      cron: "5 18 * * 1-5", strategy_code: "swing", agent_role: "strategy_entry_report",
     });
-    expect(jobs.find((job) => job.code === "two_year_reversal_scan")?.cron).toBe("0 19 * * 1-5");
+    expect(jobs.find((job) => job.code === "two_year_reversal_scan")?.cron).toBe("25 18 * * 1-5");
+    expect(jobs.find((job) => job.code === "cross_strategy_selection")?.cron).toBe("30 19 * * 1-5");
     const nightlyModel = (await pool.query<{ provider_key: string; model_key: string }>(
       `SELECT provider.provider_key, model.model_key
          FROM llm_model model JOIN llm_provider provider ON provider.id = model.provider_id
@@ -660,14 +875,14 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       `SELECT p.code, r.content FROM job_prompt p JOIN job_prompt_revision r ON r.id = p.current_revision_id WHERE p.status='active' ORDER BY p.code`,
     );
     // 三个已退役任务的提示词已删除，波段和两年结构反转均有独立入场提示词。
-    expect(prompts.rows).toHaveLength(10);
+    expect(prompts.rows).toHaveLength(13);
     const valuePrompt = prompts.rows.find((row) => row.code === "value_anchor_opportunity_scan")!.content;
     expect(valuePrompt).toContain("strategy_evaluation_query");
     expect(valuePrompt).toContain("attention_changes");
     expect(valuePrompt).not.toContain("Top50");
-    expect(prompts.rows.filter((row) => !["auction_opportunity_assessment", "value_anchor_opportunity_scan", "copper_left_launch_signal_scan", "daily_plan_flow", "limit_up_close_scan", "two_year_reversal_scan", "pre_market_news_scan"].includes(row.code))
+    expect(prompts.rows.filter((row) => !["auction_opportunity_assessment", "value_anchor_opportunity_scan", "copper_left_launch_signal_scan", "daily_plan_flow", "limit_up_close_scan", "two_year_reversal_scan", "pre_market_news_scan", "weekly_trading_review", "evening_plan_preview"].includes(row.code))
       .every((row) => row.content.includes("当前最终策略"))).toBe(true);
-    expect(prompts.rows.filter((row) => !["auction_opportunity_assessment", "value_anchor_opportunity_scan", "copper_left_launch_signal_scan", "daily_plan_flow", "limit_up_close_scan", "two_year_reversal_scan", "pre_market_news_scan"].includes(row.code))
+    expect(prompts.rows.filter((row) => !["auction_opportunity_assessment", "value_anchor_opportunity_scan", "copper_left_launch_signal_scan", "daily_plan_flow", "limit_up_close_scan", "two_year_reversal_scan", "pre_market_news_scan", "weekly_trading_review", "evening_plan_preview"].includes(row.code))
       .every((row) => row.content.includes("job_run_output"))).toBe(true);
     expect(prompts.rows.every((row) => !row.content.includes(".md"))).toBe(true);
     expect(prompts.rows.every((row) => !row.content.includes("## 策略模拟账户信号"))).toBe(true);
@@ -708,8 +923,9 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(auctionPrompt).toContain("auction_short_term_benchmark");
     expect(auctionPrompt).toContain("auction_snapshot");
     expect(auctionPrompt).toContain('auction_snapshot(stage=final,codes=');
-    expect(auctionPrompt).toContain("打板只取 `limit_up_close_scan` 激活的");
-    expect(auctionPrompt).toContain("`scope_items` 覆盖全部真实持仓、关注来源");
+    expect(auctionPrompt).toContain("打板只取 limit_up_close_scan 激活的");
+    expect(auctionPrompt).toContain("scope_items 只覆盖关注及盘中梯队全部目标键");
+    expect(auctionPrompt).toContain("持仓竞价复核已下线");
     expect((await pool.query("SELECT agent_role,strategy_code FROM job_definition WHERE code='auction_opportunity_assessment'")).rows[0])
       .toEqual({ agent_role: "auction_cross_scope", strategy_code: null });
 
@@ -1052,6 +1268,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
        SELECT id,100,10 FROM market_instrument WHERE code='990089.SZ'`,
     );
     const run = await queueManualJob(pool, "nightly_sector_opportunity_scan", "2026-08-18");
+    await seedNightlyCandidates(pool, run, "2026-08-18", ["990088.SZ", "990089.SZ"]);
     const tools = buildChatTools({ pool, sessionId: run.session_id! }, { kind: "job", jobCode: "nightly_sector_opportunity_scan" });
     const tool = tools.find((item) => item.name === "pool_attention_write")!;
     await tool.execute("tc-attention-mark", {
@@ -1115,7 +1332,8 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       items: [{
         action: "mark",
         code: "990089.SZ",
-        attention_status: "qualified",
+        attention_status: "approaching",
+        missing_signals: ["仍需独立修复确认"],
         attention_reason: "满足信号但已经持仓",
         attention_from: "2026-08-18",
         attention_until: "2026-08-25",
@@ -1180,6 +1398,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       [instrument.rows[0]!.id, indicator.rows[0]!.id, JSON.stringify({ dimensions: {}, key_levels: {} }), JSON.stringify(["阶段：趋势"])],
     );
     const run = await queueManualJob(pool, "nightly_sector_opportunity_scan", "2026-09-18");
+    await seedNightlyCandidates(pool, run, "2026-09-18", ["990090.SZ"]);
     const tool = buildChatTools({ pool, sessionId: run.session_id! }, { kind: "job", jobCode: "nightly_sector_opportunity_scan" })
       .find((item) => item.name === "pool_attention_write")!;
     await tool.execute("tc-nightly-attention", {
@@ -1620,6 +1839,24 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const second = await executeJobRun(deps, run.id);
     expect(second).toMatchObject({ status: "failed", attempt_count: 2 });
     expect(second?.log).toContain("已达到重试上限");
+  });
+
+  it("模型余额不足明确提示并立即失败，不入自动重试队列或记录供应商原文", async () => {
+    const run = await queueManualJob(pool, "daily_plan_flow", "2026-08-17");
+    const agentFlow = vi.fn(async () => {
+      throw new Error('402: {"message":"Insufficient Balance","request_id":"private-request"}');
+    });
+    const deps = { pool, databaseUrl: prepared!.url, agentFlow };
+    const finished = await executeJobRun(deps, run.id);
+    expect(finished).toMatchObject({ status: "failed", attempt_count: 1, next_retry_at: null });
+    expect(finished?.log).toContain("余额不足");
+    expect(finished?.log).toContain("该错误不可重试");
+    expect(finished?.log).not.toContain("private-request");
+    expect(await executeJobRun(deps, run.id)).toBeNull();
+    expect(agentFlow).toHaveBeenCalledTimes(1);
+    const messages = await pool.query("SELECT content::text FROM chat_message WHERE session_id=$1 ORDER BY seq DESC LIMIT 1", [run.session_id]);
+    expect(messages.rows[0].content).toContain("不自动重试");
+    expect(messages.rows[0].content).not.toContain("已达到自动重试上限");
   });
 
   it("agent_flow 自动重试复用同一普通对话，并在对话中保留失败、重试和结果入口", async () => {
@@ -2206,9 +2443,9 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(await listJobRuns(pool,global.id,20)).toMatchObject([{account_id:null}]);
   });
 
-  it("盘中风险采用模型输出容量，超过4096的完整响应可用，截断响应不落库", async () => {
+  it("盘中风险采用模型输出容量，截断、调用失败及无效正文均不覆盖结果", async () => {
     await pool.query(`INSERT INTO llm_model(provider_id,model_key,name,input_modalities,reasoning,context_window,max_tokens)
-      SELECT id,'glm-5.3-flashX','盘中风险测试','["text"]',true,200000,128000 FROM llm_provider WHERE provider_key='deepseek'
+      SELECT id,'GLM-5.3-Flash','盘中风险测试','["text"]',true,200000,128000 FROM llm_provider WHERE provider_key='deepseek'
       ON CONFLICT(provider_id,model_key) DO UPDATE SET max_tokens=128000`);
     await pool.query(`WITH instrument AS (
       INSERT INTO market_instrument(code,name,kind) VALUES('990096.SZ','风险观察样本','stock') RETURNING id)
@@ -2218,21 +2455,143 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     models.setProvider(faux.provider);
     const model=models.getModels("faux")[0]!;
     setAiRuntimeForTests({models,model,provider:"faux",providerName:"Faux",modelId:model.id});
-    const json=JSON.stringify({items:[{code:"990096.SZ",risk:"normal",reason:"完整评估结果"}],analysis:"完整评估证据".repeat(5000)});
+    const json=JSON.stringify({items:[{code:"990096.SZ",action:"wait",add_plan:null,reduce_plan:null,emotion:"unknown",reason:"完整评估结果"}],analysis:"完整评估证据".repeat(5000)});
     const output=fauxAssistantMessage(json);
     const complete=vi.spyOn(models,"completeSimple").mockResolvedValue(output);
     const shared={at:new Date("2026-08-17T02:00:00Z"),quotes:new Map(),gaps:[]};
     try {
       const snapshot=await runIntradayRiskCycle(pool,shared.at,true,"1",shared);
-      expect(snapshot?.positions).toMatchObject([{code:"990096.SZ",risk:"normal",reason:"完整评估结果"}]);
+      expect(snapshot?.positions).toMatchObject([{code:"990096.SZ",action:"wait",add_plan:null,reduce_plan:null,emotion:"unknown"}]);
       expect(complete.mock.calls[0]![0].maxTokens).toBe(128000);
       expect(complete.mock.calls[0]![2]).not.toHaveProperty("maxTokens");
       const stored=(await pool.query("SELECT input_sha256,reason FROM intraday_position_risk")).rows;
       complete.mockResolvedValue(fauxAssistantMessage(JSON.stringify({items:[{code:"990096.SZ",risk:"high",reason:"不可采用的截断结果"}]}),{stopReason:"length"}));
       await expect(runIntradayRiskCycle(pool,shared.at,true,"1",shared)).rejects.toThrow("输出被截断");
       expect((await pool.query("SELECT input_sha256,reason FROM intraday_position_risk")).rows).toEqual(stored);
+      const denied = fauxAssistantMessage("", { stopReason: "error" });
+      // 不可用占位值用于验证供应商错误脱敏，不是真实凭据。
+      denied.errorMessage = "当前订阅套餐暂未开放 deepseek-flash 权限：provider-test-secret-not-a-credential";
+      complete.mockResolvedValue(denied);
+      const failure = await runIntradayRiskCycle(pool,shared.at,true,"1",shared).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ name: "IntradayRiskModelError", retryable: false, message: expect.stringContaining("无访问权限") });
+      expect(String(failure)).not.toMatch(/未返回 JSON|provider-test-secret/);
+      const unavailable = fauxAssistantMessage(JSON.stringify({ items: [{ code: "990096.SZ", risk: "high", reason: "错误响应不可采纳" }] }), { stopReason: "error" });
+      unavailable.errorMessage = "503 service unavailable provider-test-secret-not-a-credential";
+      complete.mockResolvedValue(unavailable);
+      await expect(runIntradayRiskCycle(pool,shared.at,true,"1",shared)).rejects.toMatchObject({ retryable: true, message: "盘中风险模型调用失败，请检查网络及厂商服务状态" });
+      for (const [text, error] of [["", "返回空正文"], ['{"items": broken provider-test-secret-not-a-credential}', "JSON 格式无效"]]) {
+        complete.mockResolvedValue(fauxAssistantMessage(text!));
+        await expect(runIntradayRiskCycle(pool,shared.at,true,"1",shared)).rejects.toThrow(error!);
+      }
+      complete.mockResolvedValue(fauxAssistantMessage(json, { stopReason: "aborted" }));
+      await expect(runIntradayRiskCycle(pool,shared.at,true,"1",shared)).rejects.toThrow("调用已中断");
+      expect((await pool.query("SELECT input_sha256,reason FROM intraday_position_risk")).rows).toEqual(stored);
     } finally {
       complete.mockRestore();
+      setAiRuntimeForTests(null);
+    }
+  });
+
+  it("盘中量价独立于止损和成本，冰点承接触发加仓，转弱触发减仓，失效与过期提醒取消", async () => {
+    await updateNotificationSettings(pool, { enabled: true, webhook: testWebhook, sign_secret: testSecret });
+    await pool.query(`INSERT INTO llm_model(provider_id,model_key,name,input_modalities,reasoning,context_window,max_tokens)
+      SELECT id,'GLM-5.3-Flash','量价测试','["text"]',false,200000,128000 FROM llm_provider WHERE provider_key='deepseek'`);
+    await pool.query(`WITH instrument AS (INSERT INTO market_instrument(code,name,kind) VALUES('990098.SZ','量价样本','stock') RETURNING id)
+      INSERT INTO portfolio_position(instrument_id,quantity,cost_price) SELECT id,100,99 FROM instrument`);
+    const other = await createAccount(pool, "量价隔离账户");
+    const positionsBefore = (await pool.query("SELECT instrument_id,account_id,quantity,cost_price FROM portfolio_position ORDER BY account_id,instrument_id")).rows;
+    const models = createModels(); const faux = fauxProvider(); models.setProvider(faux.provider);
+    const model = models.getModels("faux")[0]!;
+    setAiRuntimeForTests({models,model,provider:"faux",providerName:"Faux",modelId:model.id});
+    const add = { price_lower: 10.2, price_upper: 10.4, condition: "缩量回踩不创新低后放量回收", invalidation: "放量下探且承接消失", status: "triggered" };
+    let item = { code: "990098.SZ", action: "add", emotion: "ice_point", add_plan: add as typeof add | null,
+      reduce_plan: null as typeof add | null, reason: "情绪冰点后个股止跌回收" };
+    const complete = vi.spyOn(models,"completeSimple").mockImplementation(async () => fauxAssistantMessage(JSON.stringify({items:[item]})));
+    vi.useFakeTimers({toFake:["Date"]});
+    try {
+      const at = new Date("2026-08-17T02:00:00Z"); vi.setSystemTime(at);
+      await pool.query(`INSERT INTO intraday_market_sentiment(trade_date,captured_at,status,payload) VALUES('2026-08-17',$1,'ready',$2::jsonb)`,
+        [at,JSON.stringify({ counts:{up:8,down:70,break:60}, source_times:{up:at.toISOString(),down:at.toISOString(),break:at.toISOString()} })]);
+      const cycle = async (offset: number, price: number, volume: number) => {
+        const time = new Date(at.getTime()+offset);vi.setSystemTime(time);
+        return runIntradayRiskCycle(pool,time,true,"1",{at:time,gaps:[],quotes:new Map([[item.code,{code:item.code,timestampMs:time.getTime(),open:10.3,high:10.5,low:10.15,close:price,prevClose:11,volume,turnover:volume*10.3}]])});
+      };
+      expect((await cycle(0,10.3,1000))?.positions[0]?.action).toBe("wait");
+      expect((await cycle(30_000,10.2,1300))?.positions[0]?.action).toBe("wait");
+      expect((await cycle(60_000,10.3,1350))?.positions[0]).toMatchObject({action:"add",emotion:"ice_point",add_plan:{status:"triggered"}});
+      let notices = (await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest');
+      expect(notices).toHaveLength(1);expect(notices[0].content).toContain("加仓触发：10.20～10.40");expect(notices[0].content).toContain("情绪冰点");
+      const payload = JSON.parse(complete.mock.calls[2]![1].messages[0]!.content as string);
+      expect(JSON.stringify(payload)).not.toMatch(/cost_price|strategy_code|daily_bars|key_levels|plan_target_date/);
+      expect(payload.positions[0].intraday.recent.at(-1).volume_delta).toBe(50);
+      expect(payload.market_context.sentiment.ready).toBe(true);
+      item = {...item,add_plan:{...add,price_lower:10.21,price_upper:10.41}};
+      await cycle(90_000,10.3,1400);
+      expect((await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest')).toHaveLength(1);
+      item = {...item,add_plan:{...add,price_lower:10.24,price_upper:10.44}};
+      await cycle(100_000,10.3,1420);
+      expect((await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest')).toHaveLength(2);
+      item = {...item,action:"wait",add_plan:{...add,status:"waiting"}};
+      await cycle(120_000,10.3,1450);
+      expect((await listNotifications(pool)).find((notice)=>notice.kind==='intraday_digest')?.status).toBe("cancelled");
+      item = {...item,action:"reduce",emotion:"weak",add_plan:null,reduce_plan:{...add,condition:"放量下探后回收失败"},reason:"当日平台承接转弱"};
+      await cycle(150_000,10.25,1800);
+      notices = (await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest');
+      expect(notices).toHaveLength(3);expect(notices.find((notice)=>notice.status==='pending')?.content).toContain("减仓触发");
+      const apiResult=await api(server.baseUrl,"GET","/api/intraday-risk?date=2026-08-17&account_id=1");
+      expect(apiResult.json).toMatchObject({positions:[{action:"reduce",reduce_plan:{price_lower:10.2}}]});
+      expect((await api(server.baseUrl,"GET",`/api/intraday-risk?date=2026-08-17&account_id=${other.id}`)).json).toMatchObject({positions:[]});
+      await pool.query("UPDATE intraday_market_sentiment SET payload=jsonb_set(payload,'{source_times}',$1::jsonb)",
+        [JSON.stringify({up:"2026-08-17T01:40:00Z",down:"2026-08-17T01:40:00Z",break:"2026-08-17T01:40:00Z"})]);
+      item={...item,action:"add",emotion:"ice_point",add_plan:add,reduce_plan:null};
+      expect((await cycle(180_000,10.3,1900))?.positions[0]).toMatchObject({action:"wait",emotion:"unknown",add_plan:{status:"waiting"}});
+      expect((await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest').every((notice)=>notice.status==='cancelled')).toBe(true);
+      expect((await pool.query("SELECT instrument_id,account_id,quantity,cost_price FROM portfolio_position ORDER BY account_id,instrument_id")).rows).toEqual(positionsBefore);
+    } finally {vi.useRealTimers();complete.mockRestore();setAiRuntimeForTests(null);}
+  });
+
+  it("盘中风险权限不足只提示一次，厂商配置更新后自动恢复模型分析", async () => {
+    await pool.query(`INSERT INTO llm_model(provider_id,model_key,name,input_modalities,reasoning,context_window,max_tokens)
+      SELECT id,'GLM-5.3-Flash','盘中权限测试','["text"]',false,200000,128000 FROM llm_provider WHERE provider_key='deepseek'`);
+    await pool.query(`WITH instrument AS (
+      INSERT INTO market_instrument(code,name,kind) VALUES('990097.SZ','权限观察样本','stock') RETURNING id)
+      INSERT INTO portfolio_position(instrument_id,quantity,cost_price) SELECT id,100,10 FROM instrument`);
+    const faux = fauxProvider();
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const model = models.getModels("faux")[0]!;
+    setAiRuntimeForTests({ models, model, provider: "faux", providerName: "Faux", modelId: model.id });
+    const denied = fauxAssistantMessage("", { stopReason: "error" });
+    denied.errorMessage = "当前订阅套餐暂未开放模型权限";
+    const complete = vi.spyOn(models, "completeSimple").mockResolvedValue(denied);
+    const fetch = vi.spyOn(hithinkMarket, "fetchSnapshot").mockResolvedValue([]);
+    const sentiment = vi.spyOn(hithinkSpecial, "fetchLimitPoolPage").mockImplementation(async () => ({ timestampMs: Date.now(), page: 1, pages: 0, total: 0, items: [] }));
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const worker = new IntradayRiskWorker(pool);
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(new Date("2026-08-17T02:00:00Z"));
+    try {
+      worker.start();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(() => expect(log).toHaveBeenCalledWith(expect.stringContaining("模型分析已暂停")), { timeout: 5000 });
+      expect(complete).toHaveBeenCalledTimes(1);
+      expect((await pool.query("SELECT count(*)::int AS count FROM intraday_position_risk")).rows[0].count).toBe(0);
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      await vi.waitFor(() => expect(fetch.mock.calls.length).toBeGreaterThanOrEqual(4), { timeout: 5000 });
+      expect(complete).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledTimes(1);
+      complete.mockResolvedValue(fauxAssistantMessage(JSON.stringify({ items: [{ code: "990097.SZ", action: "wait", add_plan: null, reduce_plan: null, emotion: "unknown", reason: "恢复成功" }] })));
+      await pool.query("UPDATE llm_provider SET updated_at=updated_at+interval '1 second' WHERE provider_key='deepseek'");
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(async () => expect((await pool.query("SELECT action FROM intraday_position_risk")).rows).toEqual([{ action: "wait" }]), { timeout: 5000 });
+      expect(complete).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+      await worker.stop();
+      complete.mockRestore();
+      fetch.mockRestore();
+      sentiment.mockRestore();
+      log.mockRestore();
       setAiRuntimeForTests(null);
     }
   });

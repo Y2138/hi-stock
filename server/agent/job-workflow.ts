@@ -2,7 +2,9 @@
 import type { AgentCoreFrame } from "./core/loop.js";
 
 const REQUIRED_READS: Record<string, readonly string[]> = {
+  cross_strategy_selection: ["strategy_document_query", "selection_context_query", "selection_result_write"],
   daily_plan_flow: ["strategy_document_query", "daily_plan_strategy_query"],
+  evening_plan_preview: ["daily_plan_context_query", "evening_preview_write"],
   value_anchor_opportunity_scan: ["strategy_document_query", "strategy_evaluation_query"],
   swing_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
   copper_left_launch_signal_scan: ["strategy_document_query", "strategy_evaluation_query"],
@@ -15,8 +17,12 @@ const REQUIRED_READS: Record<string, readonly string[]> = {
     "analysis_run",
   ],
   pre_market_news_scan: ["pool_context_query", "web_search", "pool_news_write"],
+  // 周复盘必须读取投资总策略作为仓位与纪律评判口径；事实快照由 Runner 在模型运行前注入，
+  // 快照工具不设为硬门禁，避免快照构建失败时无法按缺口产出报告。
+  weekly_trading_review: ["strategy_document_query"],
 };
 const TARGET_DATE_TOOLS = new Set([
+  "selection_context_query",
   "daily_plan_strategy_query", "daily_plan_context_query", "swing_signal_query", "auction_context_query",
   "value_anchor_signal_query", "two_year_reversal_signal_query", "strategy_evaluation_query",
 ]);
@@ -105,10 +111,20 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
         if (context && object(context.market_day).should_run !== false) {
           required.push("strategy_document_query");
           if (Array.isArray(context.candidate_codes) && context.candidate_codes.length > 0) required.push("fetch_hithink_data");
-          if ([context.positions, context.attentions, context.opportunities, context.intraday_ladder_candidates].some((items) => Array.isArray(items) && items.length > 0)) required.push("auction_assessment_write");
+          if ([context.attentions, context.opportunities, context.intraday_ladder_candidates].some((items) => Array.isArray(items) && items.length > 0)) required.push("auction_assessment_write");
         }
       }
       const missing = required.filter((name) => !results.has(name));
+      if (["limit_up_close_scan", "first_board_intraday_scan"].includes(jobCode)) {
+        const native = object(results.get("strategy_evaluation_query")?.result);
+        if (native.selection_method === "stage_pk_v2" && Array.isArray(native.signals) && native.signals.length
+          && !results.has("web_search")) missing.push("web_search（同高度PK必须实际检索拟选者和竞争者消息）");
+      }
+      if (jobCode === "cross_strategy_selection" && results.has("selection_result_write")) {
+        const written = results.get("selection_result_write")!;
+        if (written.target_date !== targetDate || !Array.isArray(written.recommendations))
+          missing.push("selection_result_write（目标日或结构化推荐不完整）");
+      }
       if (jobCode === "daily_plan_flow" && results.has("daily_plan_strategy_query")
         && results.has("strategy_document_query")) {
         const requiredDocs = results.get("daily_plan_strategy_query")?.required_strategy_documents;
@@ -194,6 +210,10 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
             missing.push("daily_plan_scenario_write（情景与做T预案未完成结构化写入）");
           }
         }
+      }
+      if (jobCode === "evening_plan_preview" && results.has("daily_plan_context_query")
+        && !results.has("evening_preview_write")) {
+        missing.push("evening_preview_write（晚间明日预案预览未完成结构化写入）");
       }
       if (jobCode === "auction_opportunity_assessment" && results.has("auction_context_query")
         && object(results.get("auction_context_query")?.market_day).should_run !== false

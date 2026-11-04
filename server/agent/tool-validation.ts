@@ -236,6 +236,12 @@ export type JobContextQueryInput = Static<typeof JobContextQuerySchema>;
 export const AuctionContextQuerySchema = strictObject({ date: DateSchema });
 export type AuctionContextQueryInput = Static<typeof AuctionContextQuerySchema>;
 
+/** 周复盘快照读取：不传 date 时取最新一份；快照只由周复盘任务运行前生成。 */
+export const WeeklyReviewContextQuerySchema = strictObject({
+  date: Type.Optional(DateSchema),
+});
+export type WeeklyReviewContextQueryInput = Static<typeof WeeklyReviewContextQuerySchema>;
+
 export const StrategyDocumentQuerySchema = strictObject({
   codes: Type.Array(IdentifierSchema, { minItems: 1, maxItems: 20 }),
 });
@@ -386,7 +392,9 @@ export const PoolNewsWriteSchema = strictObject({
   target_date: DateSchema,
   checked_codes: Type.Array(CodeSchema, { maxItems: 2000, description: "本次已实际完成检索的当前关注池与跨账户持仓标的；检索无新消息也算完成，遗漏不能当成无消息。" }),
   gaps: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 100, description: "只记录实际未覆盖、检索失败或影响结论的证据缺失。无新消息、剔除旧闻、正常时效说明放正文，不作为缺口；无缺口传空数组。" }),
-  market_bias: Type.Union(["positive", "neutral", "negative", "mixed", "unknown"].map((value) => Type.Literal(value))),
+  market_bias: Type.Union(["mixed_positive", "mixed_negative", "unknown"].map((value) => Type.Literal(value)), {
+    description: "当天A股整体消息面加权偏向：mixed_positive=mixed 偏多，mixed_negative=mixed 偏空；按重要性、影响范围、持续性、可信度与是否已被消化比较，不按利多利空条数投票。仅无有效证据时为unknown。单条消息direction仍独立判断。",
+  }),
   summary: Type.String({ minLength: 1, maxLength: 2000 }),
   items: Type.Array(NewsItemSchema, { maxItems: 100 }),
 });
@@ -436,7 +444,7 @@ export const DailyPlanWriteSchema = strictObject({
 });
 export type DailyPlanWriteRawInput = Static<typeof DailyPlanWriteSchema>;
 
-/** 每日计划情景预案：五情景矩阵 + 做T区间 + 盯防叙述；只引用服务端关键点位，不转抄策略结论。 */
+/** 每日计划情景预案：按概率排序的 2—4 个最可能情景 + 做T区间 + 盯防叙述；只引用服务端关键点位。 */
 const DailyPlanScenarioItemSchema = strictObject({
   scenario_kind: Type.Union([
     Type.Literal("surge_reversal"),
@@ -445,9 +453,30 @@ const DailyPlanScenarioItemSchema = strictObject({
     Type.Literal("strong_continuation"),
     Type.Literal("weak_breakdown"),
   ]),
+  probability: Type.Integer({ minimum: 1, maximum: 99 }),
   observable_md: Type.String({ minLength: 1, maxLength: 600 }),
   response_md: Type.String({ minLength: 1, maxLength: 1_000 }),
   invalidation_md: Type.String({ minLength: 1, maxLength: 600 }),
+});
+const DailyPlanMarketForecastScenarioSchema = strictObject({
+  label: Type.String({ minLength: 1, maxLength: 20 }),
+  probability: Type.Integer({ minimum: 1, maximum: 99 }),
+  view: Type.String({ minLength: 1, maxLength: 300 }),
+  triggers: Type.String({ minLength: 1, maxLength: 300 }),
+  response: Type.String({ minLength: 1, maxLength: 300 }),
+  invalidation: Type.String({ minLength: 1, maxLength: 300 }),
+});
+const DailyPlanMarketForecastLevelSchema = strictObject({
+  name: Type.String({ minLength: 1, maxLength: 40 }),
+  support: Type.Optional(Type.Union([Type.Number({ minimum: 0, maximum: 1_000_000 }), Type.Null()])),
+  resistance: Type.Optional(Type.Union([Type.Number({ minimum: 0, maximum: 1_000_000 }), Type.Null()])),
+  volume_note: Type.Optional(Type.Union([Type.String({ maxLength: 200 }), Type.Null()])),
+});
+export const DailyPlanMarketForecastSchema = strictObject({
+  as_of: DateSchema,
+  summary_md: Type.String({ minLength: 1, maxLength: 2_000 }),
+  scenarios: Type.Array(DailyPlanMarketForecastScenarioSchema, { minItems: 3, maxItems: 4 }),
+  key_levels: Type.Array(DailyPlanMarketForecastLevelSchema, { maxItems: 10 }),
 });
 const DailyPlanTPlanSchema = Type.Union([
   strictObject({
@@ -467,17 +496,49 @@ const DailyPlanScenarioWriteItemSchema = strictObject({
   invalidation_md: Type.Optional(PlaybookTextSchema),
   risk_md: Type.Optional(PlaybookTextSchema),
   t_plan: DailyPlanTPlanSchema,
-  scenarios: Type.Array(DailyPlanScenarioItemSchema, { minItems: 1, maxItems: 5 }),
+  scenarios: Type.Array(DailyPlanScenarioItemSchema, { minItems: 2, maxItems: 4 }),
 });
 export const DailyPlanScenarioWriteSchema = strictObject({
+  market_forecast: DailyPlanMarketForecastSchema,
   items: Type.Array(DailyPlanScenarioWriteItemSchema, { maxItems: 60 }),
 });
 export type DailyPlanScenarioWriteInput = Static<typeof DailyPlanScenarioWriteSchema>;
+
+/** 晚间轻量预览：大盘概率情景 + 每只持仓 2—3 个情景；不写交易、不改持仓。 */
+const EveningPreviewPositionSchema = strictObject({
+  code: CodeSchema,
+  action: Type.Union([
+    Type.Literal("exit"),
+    Type.Literal("reduce"),
+    Type.Literal("buy"),
+    Type.Literal("hold"),
+    Type.Literal("observe"),
+  ]),
+  headline: Type.String({ minLength: 1, maxLength: 300 }),
+  scenarios: Type.Array(strictObject({
+    label: Type.String({ minLength: 1, maxLength: 20 }),
+    probability: Type.Integer({ minimum: 1, maximum: 99 }),
+    trigger: Type.String({ minLength: 1, maxLength: 300 }),
+    response: Type.String({ minLength: 1, maxLength: 300 }),
+    invalidation: Type.String({ minLength: 1, maxLength: 300 }),
+  }), { minItems: 2, maxItems: 3 }),
+  key_levels: Type.Optional(Type.Array(strictObject({
+    label: Type.String({ minLength: 1, maxLength: 40 }),
+    price: Type.Number({ exclusiveMinimum: 0, maximum: 1_000_000 }),
+  }), { maxItems: 8 })),
+});
+export const EveningPreviewWriteSchema = strictObject({
+  as_of: DateSchema,
+  market_forecast: DailyPlanMarketForecastSchema,
+  positions: Type.Array(EveningPreviewPositionSchema, { maxItems: 60 }),
+});
+export type EveningPreviewWriteInput = Static<typeof EveningPreviewWriteSchema>;
 
 const AuctionAssessmentItemSchema = strictObject({
   code: CodeSchema,
   conclusion: Type.Union([
     Type.Literal("signal_passed"),
+    Type.Literal("observe"),
     Type.Literal("give_up"),
     Type.Literal("unavailable"),
   ]),
@@ -503,9 +564,9 @@ const AuctionAssessmentItemSchema = strictObject({
   data_time: Type.Optional(Type.String({ minLength: 20, maxLength: 40 })),
 });
 const AuctionScopeItemSchema = strictObject({
-  target_key: Type.String({ pattern: "^(position:[A-Za-z0-9._-]+|attention:[0-9]+|ladder:[0-9]+)$", maxLength: 80 }),
+  target_key: Type.String({ pattern: "^(attention:[0-9]+|ladder:[0-9]+)$", maxLength: 80 }),
   conclusion: Type.Union([
-    Type.Literal("plan_aligned"), Type.Literal("risk_alert"), Type.Literal("confirmed"),
+    Type.Literal("confirmed"),
     Type.Literal("wait"), Type.Literal("give_up"), Type.Literal("promotion_strong"), Type.Literal("promotion_normal"), Type.Literal("divergence_hold"), Type.Literal("weak_exit"), Type.Literal("unavailable"),
   ]),
   metrics_summary: Type.String({ minLength: 1, maxLength: 1_000 }),
@@ -542,6 +603,7 @@ const AnalysisJobConfigSchema = strictObject({
     Type.Literal("key_levels"),
     Type.Literal("long_valuation"),
     Type.Literal("value_monthly_rank"),
+    Type.Literal("ultra_short_auction"),
   ]),
   request: Type.Optional(strictObject({
     codes: Type.Optional(Type.Array(CodeSchema, { minItems: 1, maxItems: 200 })),
@@ -677,6 +739,7 @@ const AnalysisTypeSchema = Type.Union([
   Type.Literal("long_valuation"),
   Type.Literal("value_monthly_rank"),
   Type.Literal("sector_trend_structure"),
+  Type.Literal("ultra_short_auction"),
 ]);
 export const AnalysisRunSchema = strictObject({
   requests: Type.Array(strictObject({
@@ -874,6 +937,16 @@ export function validateJobContextQueryInput(input: unknown): JobContextQueryInp
     job_codes: uniqueValues(parsed.job_codes, "job_context_query job_codes"),
     prompt_codes: uniqueValues(parsed.prompt_codes, "job_context_query prompt_codes"),
   };
+}
+
+export function validateWeeklyReviewContextQueryInput(input: unknown): WeeklyReviewContextQueryInput {
+  const parsed = validateToolInput<WeeklyReviewContextQueryInput>(
+    "weekly_review_context_query", WeeklyReviewContextQuerySchema, input,
+  );
+  if (parsed.date !== undefined && !isRealDate(parsed.date)) {
+    throw new Error(`weekly_review_context_query date 不是有效日历日期：${parsed.date}`);
+  }
+  return parsed;
 }
 
 export function validateAuctionContextQueryInput(input: unknown): AuctionContextQueryInput {
@@ -1177,6 +1250,23 @@ export function validateDailyPlanScenarioWriteInput(input: unknown): DailyPlanSc
   );
   const codes = parsed.items.map((item) => item.code);
   if (new Set(codes).size !== codes.length) throw new Error("daily_plan_scenario_write 存在重复标的");
+  const forecastLabels = new Set<string>();
+  for (const scenario of parsed.market_forecast.scenarios) {
+    if (forecastLabels.has(scenario.label)) {
+      throw new Error(`daily_plan_scenario_write 大盘情景标签重复：${scenario.label}`);
+    }
+    forecastLabels.add(scenario.label);
+  }
+  const forecastTotal = parsed.market_forecast.scenarios.reduce((sum, scenario) => sum + scenario.probability, 0);
+  if (forecastTotal !== 100) {
+    throw new Error(`daily_plan_scenario_write 大盘情景概率合计必须为 100，当前为 ${forecastTotal}`);
+  }
+  if (!forecastLabels.has("基准")) {
+    throw new Error("daily_plan_scenario_write 大盘情景必须包含“基准”标签");
+  }
+  if (parsed.market_forecast.key_levels.some((level) => level.support == null && level.resistance == null)) {
+    throw new Error("daily_plan_scenario_write 大盘关键位至少给出支撑或压力之一");
+  }
   for (const item of parsed.items) {
     const kinds = new Set<string>();
     for (const scenario of item.scenarios) {
@@ -1184,6 +1274,10 @@ export function validateDailyPlanScenarioWriteInput(input: unknown): DailyPlanSc
         throw new Error(`daily_plan_scenario_write ${item.code} 情景 ${scenario.scenario_kind} 重复；每个情景只允许一行`);
       }
       kinds.add(scenario.scenario_kind);
+    }
+    const total = item.scenarios.reduce((sum, scenario) => sum + scenario.probability, 0);
+    if (total !== 100) {
+      throw new Error(`daily_plan_scenario_write ${item.code} 情景概率合计必须为 100，当前为 ${total}`);
     }
     if ("buy_lower" in item.t_plan) {
       const { buy_lower, buy_upper, sell_lower, sell_upper } = item.t_plan;
@@ -1201,7 +1295,44 @@ export function validateDailyPlanScenarioWriteInput(input: unknown): DailyPlanSc
   return parsed;
 }
 
+export function validateEveningPreviewWriteInput(input: unknown): EveningPreviewWriteInput {
+  const parsed = validateToolInput<EveningPreviewWriteInput>(
+    "evening_preview_write",
+    EveningPreviewWriteSchema,
+    input,
+  );
+  const labels = new Set<string>();
+  for (const scenario of parsed.market_forecast.scenarios) {
+    if (labels.has(scenario.label)) throw new Error(`evening_preview_write 大盘情景标签重复：${scenario.label}`);
+    labels.add(scenario.label);
+  }
+  const marketTotal = parsed.market_forecast.scenarios.reduce((sum, scenario) => sum + scenario.probability, 0);
+  if (marketTotal !== 100) throw new Error(`evening_preview_write 大盘情景概率合计必须为 100，当前为 ${marketTotal}`);
+  if (!labels.has("基准")) throw new Error("evening_preview_write 大盘情景必须包含“基准”标签");
+  if (parsed.market_forecast.key_levels.some((level) => level.support == null && level.resistance == null)) {
+    throw new Error("evening_preview_write 大盘关键位至少给出支撑或压力之一");
+  }
+  const codes = parsed.positions.map((item) => item.code);
+  if (new Set(codes).size !== codes.length) throw new Error("evening_preview_write 持仓代码不能重复");
+  for (const item of parsed.positions) {
+    const positionLabels = new Set<string>();
+    for (const scenario of item.scenarios) {
+      if (positionLabels.has(scenario.label)) throw new Error(`evening_preview_write ${item.code} 情景标签重复：${scenario.label}`);
+      positionLabels.add(scenario.label);
+    }
+    const total = item.scenarios.reduce((sum, scenario) => sum + scenario.probability, 0);
+    if (total !== 100) throw new Error(`evening_preview_write ${item.code} 情景概率合计必须为 100，当前为 ${total}`);
+  }
+  return parsed;
+}
+
 export function validateAuctionAssessmentWriteInput(input: unknown): AuctionAssessmentWriteInput {
+  const rawScope = input && typeof input === "object" && Array.isArray((input as { scope_items?: unknown }).scope_items)
+    ? (input as { scope_items: unknown[] }).scope_items : [];
+  if (rawScope.some((item) => item && typeof item === "object"
+    && String((item as { target_key?: unknown }).target_key ?? "").startsWith("position:"))) {
+    throw new Error("竞价不再复核持仓：scope_items 只接受关注来源与盘中梯队目标键");
+  }
   const parsed = validateToolInput<AuctionAssessmentWriteInput>(
     "auction_assessment_write",
     AuctionAssessmentWriteSchema,
@@ -1212,9 +1343,6 @@ export function validateAuctionAssessmentWriteInput(input: unknown): AuctionAsse
   const scopeKeys = parsed.scope_items.map((item) => item.target_key);
   if (new Set(scopeKeys).size !== scopeKeys.length) throw new Error("auction_assessment_write scope_items 存在重复目标");
   for (const item of parsed.scope_items) {
-    if (item.target_key.startsWith("position:") && !["plan_aligned", "risk_alert", "unavailable"].includes(item.conclusion)) {
-      throw new Error(`${item.target_key} 持仓竞价结论类型不匹配`);
-    }
     if (item.target_key.startsWith("attention:") && !["confirmed", "wait", "give_up", "unavailable"].includes(item.conclusion)) {
       throw new Error(`${item.target_key} 关注竞价结论类型不匹配`);
     }
@@ -1239,11 +1367,14 @@ export function validateAuctionAssessmentWriteInput(input: unknown): AuctionAsse
       throw new Error(`竞价数据未就绪时只能标记数据不足：${item.code}`);
     }
     if (item.conclusion === "signal_passed"
-      && !["one_word_continue", "turnover_advance", "divergence"].includes(item.review_type)) {
-      throw new Error(`信号通过必须对应一字延续、换手晋级或分歧验证：${item.code}`);
+      && !["one_word_continue", "turnover_advance"].includes(item.review_type)) {
+      throw new Error(`信号通过必须对应一字延续或换手晋级；分歧只允许 observe：${item.code}`);
     }
     if (item.conclusion === "give_up" && item.review_type !== "give_up") {
       throw new Error(`放弃结论必须使用 give_up 复核分类：${item.code}`);
+    }
+    if (item.review_type === "divergence" && item.conclusion !== "observe") {
+      throw new Error(`分歧只能观察，不能标为信号通过：${item.code}`);
     }
     if (item.conclusion === "unavailable" && item.review_type !== "data_insufficient") {
       throw new Error(`数据不足结论必须使用 data_insufficient 复核分类：${item.code}`);

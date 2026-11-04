@@ -4,6 +4,7 @@ import { fetchCorporateActions, fetchValuationSnapshots } from "../../datasource
 import { fetchBatchIsolated } from "../../datasource/batch-isolation.js";
 import { syncBoardMembership } from "../../datasource/catalog-service.js";
 import { fetchAndStore, fetchFinancialAndStore, insertFetchRun, storeCorporateActions } from "../../datasource/service.js";
+import { TRADEABLE_STOCK_CODE_PATTERN } from "../market/tradeable.js";
 
 export const VALUE_RANK_VERSION = "value-rank-v2";
 export const VALUE_INDUSTRY_CODES = [
@@ -75,7 +76,9 @@ export async function listValueCandidates(db: Db, asOf: string): Promise<Candida
        LEFT JOIN csi_members ON csi_members.instrument_id=universe.instrument_id
        LEFT JOIN turnover ON turnover.instrument_id=universe.instrument_id
       WHERE instrument.kind='stock' AND instrument.lifecycle_status='active'
-        AND instrument.name !~* '^\\*?ST' ORDER BY instrument.code`,
+        AND instrument.name !~* '^\\*?ST'
+        AND instrument.code ~ '${TRADEABLE_STOCK_CODE_PATTERN}'
+      ORDER BY instrument.code`,
     [[...VALUE_INDUSTRY_CODES], asOf, CSI300_CODE],
   );
   const nonCsiTurnovers = rows.rows.filter((row) => row.in_value && !row.in_csi300 && row.median_turnover_60 !== null && row.turnover_count_60 >= 60)
@@ -413,6 +416,7 @@ export async function queryValueRank(db: Db, options: { asOf?: string; limit?: n
             snapshot.dividend_yield_ttm::float8,snapshot.data_gaps
        FROM value_rank_snapshot snapshot JOIN market_instrument instrument ON instrument.id=snapshot.instrument_id
       WHERE snapshot.analysis_run_id=$1 AND snapshot.rank_overall IS NOT NULL
+        AND instrument.code ~ '${TRADEABLE_STOCK_CODE_PATTERN}'
         AND ($2::text[] IS NULL OR instrument.code=ANY($2::text[]))
       ORDER BY snapshot.rank_overall LIMIT $3`, [run.rows[0].id, options.codes ?? null, limit],
   );

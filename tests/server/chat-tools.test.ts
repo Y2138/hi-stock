@@ -28,6 +28,7 @@ import {
 import { applySwingDailyDepthLimit, evaluateSwingSignal, swingDepthScore, SWING_DAILY_SIGNAL_LIMIT, SWING_DEEP_MA250_DEVIATION, SWING_RSI_OVERSOLD_LIMIT, SWING_VOLUME_DRYNESS_LIMIT } from "../../server/modules/plans/swing-signals.js";
 import { mergeExitEvaluations, queryPositionExitEvaluationBundle } from "../../server/modules/strategy-runtime/exit-evaluators.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
+import { queueManualJob } from "../../server/scheduler/repo.js";
 
 const prepared = await prepareTestDb();
 
@@ -119,10 +120,39 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(data.items[1]).toMatchObject({ code: "123456.SZ", status: "missing" });
     expect(JSON.stringify(data)).not.toContain("private_payload");
     expect((await pool.query("SELECT count(*)::int AS count FROM pool_membership WHERE instrument_id=$1", [id])).rows[0].count).toBe(0);
+    await pool.query(`INSERT INTO fundamental_snapshot(instrument_id,as_of_date,report_period,roe,source)
+      VALUES ($1,'2026-06-20','2026-03-31',99,'test'),($1,'2026-06-18','2026-09-30',88,'test')`, [id]);
+    await pool.query(`INSERT INTO valuation_snapshot(instrument_id,as_of_date,pe_ttm,source)
+      VALUES ($1,'2026-06-20',999,'test')`, [id]);
+    await storeBars(pool, id, "day", [{ date: "2026-06-20", open: 99, high: 100, low: 98, close: 99, volume: 100, adjustment: "forward" }], "test");
+    const historical = textOf(await tool.execute("research-date", { codes: ["990071.SZ"], as_of: "2026-06-19" })) as { items: Record<string, unknown>[] };
+    expect(historical.items[0]).toMatchObject({ quote: { bar_date: "2026-06-19" },
+      fundamental: { as_of_date: "2026-06-19", report_period: "2026-03-31", roe: 12 },
+      valuation: { as_of_date: "2026-06-19", pe_ttm: null } });
+    const noPastData = textOf(await tool.execute("research-empty", { codes: ["990071.SZ"], as_of: "2026-03-01" })) as { items: Record<string, unknown>[] };
+    expect(noPastData.items[0]).toMatchObject({ status: "partial", fundamental: null, valuation: null, quote: { bar_date: null } });
+    const run = await queueManualJob(pool, "cross_strategy_selection", "2026-06-19");
+    await pool.query("UPDATE job_run SET status='running' WHERE id=$1", [run.id]);
+    const taskTool = buildChatTools({ pool, sessionId: run.session_id }).find((item) => item.name === "stock_research_query")!;
+    expect(textOf(await taskTool.execute("research-task", { codes: ["990071.SZ"] }))).toMatchObject({
+      as_of: "2026-06-19", items: [{ fundamental: { roe: 12 }, valuation: { pe_ttm: null } }],
+    });
+    await expect(taskTool.execute("research-wrong-date", { codes: ["990071.SZ"], as_of: "2026-06-20" }))
+      .rejects.toThrow("研究日期必须与任务目标日一致");
     await storeBars(pool, id, "day", [{ ...bars.at(-1)!, close: 11 }], "test");
     const stale = textOf(await tool.execute("research-stale", { codes: ["990071.SZ"] })) as { items: Record<string, unknown>[] };
     expect(stale.items[0]).toMatchObject({ status: "partial", profile_status: "stale" });
     await expect(tool.execute("research-invalid", { codes: ["990071.SZ"], sql: "select 1" } as never)).rejects.toThrow("参数校验失败");
+  });
+
+  it("并发续写使用相同旧序号仍完整保留每条消息", async () => {
+    const session = await createSession(pool, "消息序号并发回归");
+    const rows = await Promise.all(Array.from({ length: 8 }, (_, index) => appendMessage(pool, {
+      session_id: session.id, seq: 1, role: "user",
+      json: { role: "user", content: [{ type: "text", text: String(index) }], timestamp: Date.now() },
+    })));
+    expect(rows.map((row) => row.seq).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(new Set(rows.map((row) => JSON.stringify(row.content))).size).toBe(8);
   });
 
   it("试盘启动按近10日试盘、缩量回调和放量突破逐只确定性匹配", () => {
@@ -375,7 +405,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     }
   });
 
-  it("波段深度评分：合并池按评分降序每日保留前5，挤出标的不进信号清单", () => {
+  it("波段深度评分：正式优先、正式足够忽略接近，原生深度排序不变", () => {
     expect(SWING_DAILY_SIGNAL_LIMIT).toBe(5);
     // 深度评分：MA250 两档、60 日跌幅两档、行业动量为负一档；缺数计 0 分。
     expect(swingDepthScore({ ma250_dev: -0.4, ret60: -0.3, industry_mom20: -0.08 })).toBe(5);
@@ -400,17 +430,17 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(within.signals.map((item) => item.code)).toEqual(["600100.SH", "600101.SH"]);
     expect(within.nearCandidates.map((item) => item.code)).toEqual(["000001.SZ", "000002.SZ"]);
     expect(within.cappedOut).toEqual([]);
-    // 合并池排名：接近候选评分更高可排在正式信号之前；每日只保留前 5。
+    // 正式足够时忽略接近，即使接近原生深度更高；保留前五只正式。
     const cluster = applySwingDailyDepthLimit(
       Array.from({ length: 6 }, (_, index) => member(`600${200 + index}.SH`, 1, -0.1)),
       [member("000009.SZ", 5, -0.5), member("000008.SZ", 4, -0.4)],
     );
-    expect(cluster.nearCandidates.map((item) => item.code)).toEqual(["000009.SZ", "000008.SZ"]);
-    expect(cluster.signals.map((item) => item.code)).toEqual(["600200.SH", "600201.SH", "600202.SH"]);
+    expect(cluster.nearCandidates).toEqual([]);
+    expect(cluster.signals.map((item) => item.code)).toEqual(["600200.SH", "600201.SH", "600202.SH", "600203.SH", "600204.SH"]);
     expect(cluster.cappedOut.map((item) => item.code)).toEqual([
-      "600203.SH", "600204.SH", "600205.SH",
+      "600205.SH", "000009.SZ", "000008.SZ",
     ]);
-    expect(cluster.cappedOut.every((item) => item.signal_status === "qualified")).toBe(true);
+    expect(cluster.cappedOut.map((item) => item.signal_status)).toEqual(["qualified", "approaching", "approaching"]);
     // 同分平手：MA250 更深者优先，再按代码升序。
     const tie = applySwingDailyDepthLimit(
       [member("600300.SH", 3, -0.2), member("600301.SH", 3, -0.36)],
@@ -1025,6 +1055,41 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
         domains: [domain],
       } as never)).rejects.toThrow("参数校验失败");
     }
+  });
+
+  it("搜索余额不足明确提示并停止当前执行的并行及后续请求，其他HTTP错误仍可重试", async () => {
+    let requests = 0;
+    const options = {
+      resolveApiKey: async () => "test-deepseek-key",
+      fetchImpl: async () => {
+        requests += 1;
+        return new Response("供应商正文不可泄漏", { status: 402 });
+      },
+    };
+    const provider = createDeepSeekWebResearchProvider(options);
+    const results = await Promise.allSettled(Array.from({ length: 5 }, (_, index) =>
+      provider.search({ query: `测试${index}`, maxResults: 1 })));
+    expect(requests).toBe(1);
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") {
+        expect(result.reason.message).toContain("余额不足");
+        expect(result.reason.message).toContain("pending");
+        expect(result.reason.message).not.toContain("供应商正文");
+      }
+    }
+    await expect(provider.search({ query: "再次检索", maxResults: 1 })).rejects.toThrow("本次不自动重试");
+    expect(requests).toBe(1);
+    await expect(createDeepSeekWebResearchProvider(options).search({ query: "新执行", maxResults: 1 })).rejects.toThrow("余额不足");
+    expect(requests).toBe(2);
+    let temporaryRequests = 0;
+    const temporary = createDeepSeekWebResearchProvider({ ...options, fetchImpl: async () => {
+      temporaryRequests += 1;
+      return new Response("", { status: 503 });
+    } });
+    await expect(temporary.search({ query: "临时失败", maxResults: 1 })).rejects.toThrow("HTTP 503");
+    await expect(temporary.search({ query: "重试", maxResults: 1 })).rejects.toThrow("HTTP 503");
+    expect(temporaryRequests).toBe(2);
   });
 
   it("web_fetch 安全抓取已有 URL、提取 HTML 正文并隐藏审计中的原始 URL", async () => {

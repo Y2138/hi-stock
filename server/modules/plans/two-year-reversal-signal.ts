@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { strategyAttentionCodes } from "../pools/attention-lifecycle.js";
+import { isTradeableStockCode, TRADEABLE_STOCK_CODE_PATTERN } from "../market/tradeable.js";
 
 type Db = Pick<pg.Pool, "query">;
 type Bar = { code: string; date: string; close: number; low: number; low_raw?: number | null; board_name?: string; volume: number | null };
@@ -60,6 +61,7 @@ async function eligibleIndustryMembers(db: Db, asOf: string, accountId: string |
       WHERE industry.code=ANY($1::text[]) AND membership.effective_from <= $2::date
         AND (membership.effective_to IS NULL OR membership.effective_to > $2::date)
         AND stock.kind='stock' AND stock.lifecycle_status='active' AND stock.name !~* '^\\*?ST'
+        AND stock.code ~ '${TRADEABLE_STOCK_CODE_PATTERN}'
       ORDER BY stock.id,industry.code`, [[...eligible.keys()], asOf, accountId],
   );
   return { completeBoards, completeBoardCodes, eligible, members: members.rows };
@@ -71,7 +73,8 @@ export async function queryTwoYearReversalRawTargetCodes(db: Db, date: string): 
 }
 
 export async function queryTwoYearReversalSignals(db: Db, date: string, accountId: string | null = "1") {
-  const reviewCodes = await strategyAttentionCodes(db, "two_year_reversal");
+  // 已失效权限标的的历史关注不再进入复核，避免把交易权限外的代码当作数据缺口。
+  const reviewCodes = (await strategyAttentionCodes(db, "two_year_reversal")).filter(isTradeableStockCode);
   const selected = await queryTwoYearReversalCoverage(db, date);
   if (!selected) return { status: "unavailable" as const, date, qualified: [], near: [], gaps: ["近30个确认交易日无股票覆盖达近期峰值80%且881一级行业覆盖达80个的共同数据日"] };
   const asOf = selected.date;
@@ -150,6 +153,7 @@ export async function queryTwoYearReversalSignals(db: Db, date: string, accountI
     status: "success" as const, date, data_date: asOf,
     coverage: { stocks: selected.stocks, boards: selected.boards, complete_boards: completeBoards, qualified_boards: eligible.size, members: members.length, completed: observations.length },
     eligible_industries: [...eligible].map(([code, item]) => ({ code, ...item })),
+    all_qualified: qualified, all_near: near,
     qualified: qualified.filter((item, index) => index < 20 || reviewCodes.includes(String(item.code))), qualified_count: qualified.length,
     near: near.filter((item, index) => index < 10 || reviewCodes.includes(String(item.code))), near_count: near.length,
     reviewed_codes: reviewedCodes,

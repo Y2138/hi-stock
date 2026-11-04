@@ -185,7 +185,7 @@ export interface LatestDailyBarRow {
 }
 
 /** 最新日线快照：供 Agent 的兼容 snapshot 工具使用，不读取盘中采样。 */
-export async function listLatestDailyBars(db: Db, codes: string[]): Promise<LatestDailyBarRow[]> {
+export async function listLatestDailyBars(db: Db, codes: string[], asOf?: string): Promise<LatestDailyBarRow[]> {
   const result = await db.query<Omit<LatestDailyBarRow, "change_pct">>(
     `SELECT instrument.code, instrument.name, instrument.kind,
             CASE WHEN instrument.kind = 'futures' THEN 'futures_day' ELSE 'day' END AS freq,
@@ -203,12 +203,13 @@ export async function listLatestDailyBars(db: Db, codes: string[]): Promise<Late
                FROM market_bar bar
               WHERE bar.instrument_id = instrument.id
                 AND bar.freq = CASE WHEN instrument.kind = 'futures' THEN 'futures_day' ELSE 'day' END
+                AND ($2::date IS NULL OR bar.bar_date <= $2::date)
            ) history
           ORDER BY history.bar_date DESC, history.bar_time DESC LIMIT 1
        ) latest ON true
       WHERE instrument.code = ANY($1::text[])
       ORDER BY array_position($1::text[], instrument.code)`,
-    [codes],
+    [codes, asOf ?? null],
   );
   return result.rows.map((row) => ({
     ...row,

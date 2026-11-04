@@ -242,9 +242,12 @@ export async function readPortableManifest(payloadPath: string): Promise<Portabl
 
 const RESET_STATEMENTS = [
   "DELETE FROM daily_plan_market_context",
+  "DELETE FROM intraday_position_signal",
   "DELETE FROM intraday_position_risk",
+  "DELETE FROM intraday_market_sentiment",
   "DELETE FROM intraday_market_sample",
   "DELETE FROM notification_delivery",
+  "DELETE FROM email_delivery",
   "DELETE FROM market_news_snapshot",
   "DELETE FROM auction_scope_assessment",
   "DELETE FROM daily_plan_auction_assessment",

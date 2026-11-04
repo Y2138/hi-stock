@@ -169,15 +169,22 @@ LEFT JOIN LATERAL (
      AND (board_instrument.code LIKE '881%.TI' OR board_instrument.code LIKE '884%.TI')
 ) board_list ON true`;
 
+/**
+ * 当前有效池成员的可见条件：人工管理、特别关注或仍有未过期关注来源。
+ * 列表、行业投影和按需行情必须共用同一口径，避免页面展示与实时取数范围不一致。
+ * 参数固定为 $1=池、$2=基准日。
+ */
+export const POOL_MEMBER_VISIBLE_SQL = `membership.pool = $1 AND membership.effective_to IS NULL
+      AND (membership.management_mode='manual' OR membership.special_attention OR EXISTS (
+        SELECT 1 FROM pool_attention_entry active WHERE active.instrument_id=membership.instrument_id
+          AND (active.source_type='manual' OR (active.valid_from<=$2::date
+            AND (active.valid_until IS NULL OR active.valid_until>=$2::date)))))`;
+
 export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData> {
   const asOfDate = asOf ?? new Date().toISOString().slice(0, 10);
   const members = await db.query<PoolMemberRow>(
     `${MEMBER_SELECT}
-      WHERE membership.pool = $1 AND membership.effective_to IS NULL
-      AND (membership.management_mode='manual' OR membership.special_attention OR EXISTS (
-        SELECT 1 FROM pool_attention_entry active WHERE active.instrument_id=membership.instrument_id
-          AND (active.source_type='manual' OR (active.valid_from<=$2::date
-            AND (active.valid_until IS NULL OR active.valid_until>=$2::date)))))
+      WHERE ${POOL_MEMBER_VISIBLE_SQL}
       ORDER BY instrument.code`,
     [WATCH_POOL, asOfDate],
   );
@@ -207,11 +214,7 @@ export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData>
           WHERE bar.instrument_id = board.instrument_id AND bar.freq = 'day'
           ORDER BY bar.bar_date DESC, bar.bar_time DESC LIMIT 1
        ) latest_close ON true
-      WHERE membership.pool = $1 AND membership.effective_to IS NULL
-      AND (membership.management_mode='manual' OR membership.special_attention OR EXISTS (
-        SELECT 1 FROM pool_attention_entry active WHERE active.instrument_id=membership.instrument_id
-          AND (active.source_type='manual' OR (active.valid_from<=$2::date
-            AND (active.valid_until IS NULL OR active.valid_until>=$2::date)))))
+      WHERE ${POOL_MEMBER_VISIBLE_SQL}
         AND board_instrument.code LIKE '881%.TI'
       GROUP BY board_instrument.id, board.instrument_id, preference.sort,
                latest_close.close, latest_close.prev_close, latest_close.bar_date

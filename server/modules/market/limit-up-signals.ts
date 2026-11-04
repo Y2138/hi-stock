@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type pg from "pg";
+import { compareLimitUpPk, limitUpPkNews, limitUpPkProfile, sameHeightPkGroups, type LimitUpPkProfile } from "./limit-up-pk.js";
 
 type Db = Pick<pg.Pool, "query">;
 
@@ -41,6 +42,9 @@ export interface LimitUpBarInput {
   open: number;
   close: number;
   turnover: number | null;
+  high?: number;
+  low?: number;
+  volume?: number | null;
 }
 
 export interface LimitUpRawFeatures extends Record<LimitUpRankedFeature, number | null> {
@@ -85,6 +89,10 @@ export interface LimitUpSignalCandidate {
   missing_inputs: string[];
   neutral_inputs: string[];
   risk_flags: string[];
+  pk?: LimitUpPkProfile;
+  pk_minute?: number | null;
+  pk_turnover?: number | null;
+  pk_core?: number | null;
 }
 
 export interface LimitUpSignalResult {
@@ -108,6 +116,13 @@ export interface LimitUpSignalResult {
   }>;
   signals: LimitUpSignalCandidate[];
   candidates: LimitUpSignalCandidate[];
+  selection_method?: "stage_pk_v2";
+  score_usage?: "legacy_context_only";
+  same_height_pk?: ReturnType<typeof sameHeightPkGroups>;
+  pk_news?: Awaited<ReturnType<typeof limitUpPkNews>>;
+  route_leaders?: { cluster: string | null; momentum: string | null };
+  pk_market?: { limit_up_count: number; limit_break_count: number | null; limit_down_count: number | null;
+    break_rate: number | null; highest_streak: number; highest_codes: string[]; gaps: string[] };
 }
 
 interface ThemeMember {
@@ -134,6 +149,10 @@ interface DayContext {
 
 const COMPANY_EVENT_WORDS = ["业绩", "回购", "中标", "重组", "增持", "减持", "签订", "收购", "控制权", "股权转让"];
 const THEME_ALIASES: Array<[RegExp, string]> = [
+  [/控制权.*变更|实控人.*变更|股权转让/u, "控制权变更"],
+  [/资产重组|重大.*重组|拟收购|收购.*股权/u, "资产重组"],
+  [/出版发行|图书发行|教科书发行|出版传媒/u, "出版传媒"],
+  [/海上风电|风力发电|风电/u, "风电"],
   [/氢能源?|燃料电池/u, "氢能"],
   [/绿色电力|清洁能源|绿电/u, "绿电"],
   [/液冷/u, "液冷"],
@@ -179,13 +198,17 @@ export function cleanLimitUpThemes(reason: string | null): string[] {
     .replace(/\([^)]*\)|（[^）]*）/gu, "")
     .split(/[+＋/、，,;；|｜]/u)) {
     let value = raw.replace(/概念/gu, "").trim();
-    if (value.length < 2 || COMPANY_EVENT_WORDS.some((word) => value.includes(word))) continue;
+    if (value.length < 2) continue;
+    let aliased = false;
     for (const [pattern, alias] of THEME_ALIASES) {
       if (pattern.test(value)) {
         value = alias;
+        aliased = true;
         break;
       }
     }
+    // 重组、控制权等可形成独立交易叙事；普通公司事项不能当成已核验利好。
+    if (!aliased && COMPANY_EVENT_WORDS.some((word) => value.includes(word))) continue;
     if (!result.includes(value)) result.push(value);
   }
   return result;
@@ -236,8 +259,12 @@ function selectMainTheme(
   tags: string[],
   context: DayContext,
   priorContexts: DayContext[],
+  code: string,
 ): string | null {
   return [...tags].sort((left, right) => {
+    const continuity = (tag: string) => priorContexts.filter((item) => (item.tagsByCode.get(code) ?? []).includes(tag)).length;
+    const continuityDiff = continuity(right) - continuity(left);
+    if (continuityDiff) return continuityDiff;
     const width = (context.themes.get(right)?.width ?? 0) - (context.themes.get(left)?.width ?? 0);
     if (width) return width;
     const rightTop = priorContexts.filter((item) => item.topThemes.has(right)).length;
@@ -311,11 +338,12 @@ export function buildLimitUpFeatureRows(input: {
   mainTheme: string;
   features: LimitUpRawFeatures;
   missingInputs: string[];
+  pk?: LimitUpPkProfile;
 }> {
   const contexts = buildDayContexts(input.events);
   const maps = barMaps(input.bars);
   const sets = eventSets(input.events);
-  const rows: Array<{ event: LimitUpEventInput; mainTheme: string; features: LimitUpRawFeatures; missingInputs: string[] }> = [];
+  const rows: Array<{ event: LimitUpEventInput; mainTheme: string; features: LimitUpRawFeatures; missingInputs: string[]; pk?: LimitUpPkProfile }> = [];
 
   for (const date of input.targetDates) {
     const context = contexts.get(date);
@@ -334,7 +362,7 @@ export function buildLimitUpFeatureRows(input: {
     for (const event of context.upEvents) {
       if (!isMainBoard(event.code) || event.is_st !== false || isStName(event.name) || event.is_new !== false || event.streak_count === null) continue;
       const tags = context.tagsByCode.get(event.code) ?? [];
-      const mainTheme = selectMainTheme(tags, context, mainThemeContexts);
+      const mainTheme = selectMainTheme(tags, context, mainThemeContexts, event.code);
       if (!mainTheme) continue;
       const theme = context.themes.get(mainTheme)!;
       const missingInputs: string[] = [];
@@ -430,7 +458,16 @@ export function buildLimitUpFeatureRows(input: {
       if (event.seal_money === null) missingInputs.push("seal_money");
       if (event.turnover === null || event.turnover <= 0) missingInputs.push("turnover");
       if (sealMinutes === null) missingInputs.push("first_event_time");
-      rows.push({ event, mainTheme, features, missingInputs });
+      const currentBar = maps.byKey.get(`${event.code}:${date}`);
+      const previousBar = priorDate ? maps.byKey.get(`${event.code}:${priorDate}`) : undefined;
+      const oneWord = currentBar?.high !== undefined && currentBar.low !== undefined && currentBar.volume != null && currentBar.volume > 0
+        ? currentBar.open === currentBar.high && currentBar.high === currentBar.low && currentBar.low === currentBar.close : null;
+      rows.push({ event, mainTheme, features, missingInputs, pk: limitUpPkProfile({
+        code: event.code, streak: event.streak_count, seal: event.seal_money, maxSeal: event.max_seal_money,
+        turnover: event.turnover, minute: sealMinutes, core: features.core_position, oneWord, phase: "close",
+        volumeRatio: currentBar?.volume != null && previousBar?.volume != null && previousBar.volume > 0
+          ? currentBar.volume / previousBar.volume : null,
+      }) });
     }
   }
   return rows;
@@ -487,6 +524,7 @@ function scoreFeature(value: number | null): number {
   return clamp01(value) ?? 0.5;
 }
 
+/** 固定基准的背景计算；第二版不使用这里的分数线决定候选成立。 */
 export function scoreLimitUpFeatureRows(
   rows: ReturnType<typeof buildLimitUpFeatureRows>,
   benchmark: LimitUpBenchmark,
@@ -597,6 +635,53 @@ export function scoreLimitUpFeatureRows(
       || right.momentum_score - left.momentum_score
       || left.code.localeCompare(right.code);
   });
+}
+
+/** 旧分数只作背景；新候选按阶段、同高度承接比较，保持两路线最多各两只的观察上限。 */
+export function rankLimitUpPkRows(rows: ReturnType<typeof buildLimitUpFeatureRows>, benchmark: LimitUpBenchmark) {
+  const byCode = new Map(rows.map((row) => [row.event.code, row]));
+  const candidates = scoreLimitUpFeatureRows(rows, benchmark).map((candidate) => {
+    const row = byCode.get(candidate.code)!;
+    const pk = row.pk ?? limitUpPkProfile({ code: candidate.code, streak: candidate.streak_count,
+      seal: candidate.seal_money, maxSeal: row.event.max_seal_money, turnover: candidate.turnover,
+      minute: candidate.features.seal_minutes, volumeRatio: null, oneWord: null,
+      core: candidate.features.core_position, phase: "close" });
+    return { ...candidate, pk, pk_minute: candidate.features.seal_minutes, pk_turnover: candidate.turnover,
+      pk_core: candidate.features.core_position, cluster_rank: 0, momentum_rank: 0,
+      cluster_signal: false, momentum_signal: false, signal_grade: null as LimitUpSignalCandidate["signal_grade"],
+      risk_flags: [...pk.flags, ...(candidate.missing_inputs.length ? [`背景趋势字段缺失：${candidate.missing_inputs.join("、")}`] : [])],
+    };
+  });
+  const stageOrder = { confirmation: 0, first_board: 1, high_board: 2 };
+  const ordered = [...candidates].sort((a, b) => stageOrder[a.pk.stage] - stageOrder[b.pk.stage]
+    || compareLimitUpPk(a, b) || a.code.localeCompare(b.code));
+  const clusterPool = ordered.filter((item) => item.pk.status === "review" && item.streak_count >= 2 && item.pk_core === 1);
+  const momentumPool = ordered.filter((item) => item.pk.status === "review" && item.streak_count <= 3);
+  const balanceStages = (pool: typeof candidates, stages: Array<LimitUpPkProfile["stage"]>) => {
+    const firsts = stages.map((stage) => pool.find((item) => item.pk.stage === stage)).filter((item) => item !== undefined);
+    return [...new Set([...firsts, ...pool])];
+  };
+  // 抱团兼顾确认核心与高位续板；主升保留启动与确认各一席，避免两路线退化为同一份二板榜。
+  const cluster = balanceStages(clusterPool, ["confirmation", "high_board"]);
+  const momentum = balanceStages([...momentumPool].sort((a, b) => Number(a.pk.one_word) - Number(b.pk.one_word)
+    || compareLimitUpPk(a, b) || a.code.localeCompare(b.code)), ["first_board", "confirmation"]);
+  cluster.forEach((item, i) => { item.cluster_rank = i + 1; item.cluster_signal = i < 2; });
+  momentum.forEach((item, i) => { item.momentum_rank = i + 1; item.momentum_signal = i < 2; });
+  candidates.forEach((item) => {
+    item.signal_grade = item.cluster_signal && item.momentum_signal ? "A"
+      : item.cluster_signal ? "B-抱团" : item.momentum_signal ? "B-主升" : null;
+  });
+  // 两路线先展示各自首位，避免把第二名的双风格标签误当成全场第一。
+  const selected = [...new Set([cluster[0], momentum[0], cluster[1], momentum[1]].filter((item) => item !== undefined))];
+  const signals = selected.slice(0, 4);
+  const groups = sameHeightPkGroups(candidates);
+  const uniqueLeader = (list: typeof candidates) => {
+    const first = list[0];
+    return first && !list.slice(1).some((item) => item.pk.stage === first.pk.stage && compareLimitUpPk(first, item) === 0)
+      ? first.code : null;
+  };
+  return { candidates: ordered, signals, same_height_pk: groups,
+    route_leaders: { cluster: uniqueLeader(cluster), momentum: uniqueLeader(momentum) } };
 }
 
 function shiftDate(date: string, days: number): string {
@@ -711,7 +796,7 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
   );
   const bars = await db.query<LimitUpBarInput>(
     `SELECT bar.bar_date::text AS date, instrument.code, bar.open::float8, bar.close::float8,
-            bar.turnover::float8 AS turnover
+            bar.high::float8,bar.low::float8,bar.volume::float8,bar.turnover::float8 AS turnover
        FROM market_bar bar JOIN market_instrument instrument ON instrument.id = bar.instrument_id
       WHERE bar.freq = 'day' AND bar.bar_date BETWEEN $1 AND $2
         AND bar.instrument_id IN (
@@ -730,12 +815,14 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
     ? calendar.rows.map((row) => row.date)
     : [...new Set(bars.rows.map((bar) => bar.date))].sort();
   const featureRows = buildLimitUpFeatureRows({ events: events.rows, bars: bars.rows, tradingDates, targetDates: [date] });
-  const skipped = featureRows.filter((row) => row.missingInputs.length > 0)
+  const criticalMissing = (row: typeof featureRows[number]) => row.missingInputs.some((key) => ["seal_money", "turnover", "first_event_time"].includes(key));
+  const skipped = featureRows.filter(criticalMissing)
     .map((row) => ({ code: row.event.code, missing_inputs: [...new Set(row.missingInputs)] }));
   // 异常标的不能用 0.5 中性排名混进正式信号；只对可完整评估的标的排序。
-  const candidates = scoreLimitUpFeatureRows(featureRows.filter((row) => row.missingInputs.length === 0), benchmark);
+  const ranked = rankLimitUpPkRows(featureRows.filter((row) => !criticalMissing(row)), benchmark);
+  const candidates = ranked.candidates;
   const gaps = featureRows.length > 0 && !candidates.length ? ["本轮候选均缺少必要评分数据"] : [];
-  const signals = candidates.filter((candidate) => candidate.signal_grade !== null).slice(0, 4);
+  const signals = ranked.signals;
   const intradayRows = await db.query<{ code: string; name: string; evidence: Record<string, unknown> }>(
     `SELECT instrument.code,instrument.name,signal.evidence
        FROM strategy_entry_signal signal
@@ -766,6 +853,20 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
   const { distributions: _distributions, ...publicBenchmark } = benchmark;
   const { sha256: _sha256, ...benchmarkPayload } = benchmark;
   if (limitUpBenchmarkSha(benchmarkPayload) !== benchmark.sha256) gaps.push("评分基准哈希校验失败");
+  const asOf = new Date(Math.min(Date.now(), Date.parse(`${date}T23:59:59+08:00`))).toISOString();
+  const pkNews = await limitUpPkNews(db, candidates.map((item) => item.code), asOf);
+  const sync = (await db.query<{ dataset: string; status: string }>(
+    `SELECT DISTINCT ON(dataset) dataset,status FROM market_special_sync_run
+      WHERE target_date=$1::date AND dataset IN ('limit_break','limit_down') ORDER BY dataset,id DESC`, [date])).rows;
+  const currentEvents = events.rows.filter((event) => event.date === date);
+  const upCount = currentEvents.filter((event) => event.event_type === "up").length;
+  const countIfReady = (dataset: string, type: LimitUpEventInput["event_type"]) => sync.some((item) => item.dataset === dataset && item.status === "success")
+    ? currentEvents.filter((event) => event.event_type === type).length : null;
+  const breakCount = countIfReady("limit_break", "break");
+  const downCount = countIfReady("limit_down", "down");
+  const heightEvents = currentEvents.filter((event) => event.event_type === "up" && isMainBoard(event.code)
+    && event.is_st === false && event.is_new === false && !isStName(event.name));
+  const highest = Math.max(0, ...heightEvents.map((event) => event.streak_count ?? 0));
   return {
     date,
     strategy_document_id: documentId,
@@ -780,5 +881,11 @@ export async function queryLimitUpSignals(db: Db, date: string, pinnedRevisionId
     intraday_reviews: intradayReviews,
     signals,
     candidates,
+    selection_method: "stage_pk_v2", score_usage: "legacy_context_only",
+    same_height_pk: ranked.same_height_pk, route_leaders: ranked.route_leaders, pk_news: pkNews,
+    pk_market: { limit_up_count: upCount, limit_break_count: breakCount, limit_down_count: downCount,
+      break_rate: breakCount === null ? null : breakCount / Math.max(1, upCount + breakCount), highest_streak: highest,
+      highest_codes: heightEvents.filter((event) => event.streak_count === highest).map((event) => event.code),
+      gaps: [breakCount === null ? "炸板同步未就绪，情绪覆盖待核实" : "", downCount === null ? "跌停同步未就绪，负反馈待核实" : ""].filter(Boolean) },
   };
 }

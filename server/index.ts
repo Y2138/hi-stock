@@ -5,11 +5,14 @@ import { closePool, getPool } from "./db/client.js";
 import { MigrationConflictError, runMigrations } from "./db/migrate.js";
 import { createApiServer } from "./http/router.js";
 import { NotificationWorker } from "./modules/notifications/service.js";
+import { EmailNotificationWorker } from "./modules/notifications/email.js";
 import { JobScheduler } from "./scheduler/service.js";
 import { IndicatorWorker } from "./indicators/worker.js";
 import { recoverInterruptedAgentSessions } from "./agent/session-runner.js";
 import { importLegacyHithinkApiKey } from "./system-settings.js";
 import { IntradayRiskWorker } from "./modules/intraday-risk/service.js";
+import { UltraShortFastLane } from "./modules/ultra-short/fast-lane.js";
+import { UltraShortWatchObserver } from "./modules/ultra-short/watch-observer.js";
 
 async function main(): Promise<void> {
   let config;
@@ -64,7 +67,10 @@ async function main(): Promise<void> {
   });
   const indicatorWorker = new IndicatorWorker(pool, config.indicatorIntervalMs);
   const notificationWorker = new NotificationWorker(pool);
+  const emailNotificationWorker = new EmailNotificationWorker(pool);
   const intradayRiskWorker = new IntradayRiskWorker(pool);
+  const ultraShortExitWorker = new UltraShortFastLane(pool);
+  const ultraShortWatchWorker = new UltraShortWatchObserver(pool);
   const server = createApiServer({ pool });
   let shuttingDown = false;
   const shutdown = async () => {
@@ -73,6 +79,14 @@ async function main(): Promise<void> {
     console.log("正在停止盘中风险观察器、指标工作器和调度器，并等待当前任务安全退出…");
     await intradayRiskWorker.stop().catch((error) => {
       console.error(`盘中风险观察器停止失败：${(error as Error).message}`);
+      process.exitCode = 1;
+    });
+    await ultraShortExitWorker.stop().catch((error) => {
+      console.error(`超短离场观察器停止失败：${(error as Error).message}`);
+      process.exitCode = 1;
+    });
+    await ultraShortWatchWorker.stop().catch((error) => {
+      console.error(`超短观察器停止失败：${(error as Error).message}`);
       process.exitCode = 1;
     });
     await indicatorWorker.stop().catch((error) => {
@@ -84,6 +98,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
     });
     await notificationWorker.stop();
+    await emailNotificationWorker.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await closePool();
   };
@@ -104,11 +119,14 @@ async function main(): Promise<void> {
     await scheduler.start();
     indicatorWorker.start();
     notificationWorker.start();
+    emailNotificationWorker.start();
     intradayRiskWorker.start();
+    ultraShortExitWorker.start();
+    ultraShortWatchWorker.start();
     console.log("作业调度器已启动：30 秒 tick，时区 Asia/Shanghai。");
     console.log("指标工作器已启动。");
     console.log("统一 Agent session 执行器已启用。");
-    console.log("盘中持仓风险观察器已启用：30 秒采样，非 Agent 会话模式。");
+    console.log("盘中持仓风险观察器已启用：60 秒采样，非 Agent 会话模式。");
   } catch (error) {
     console.error(`作业调度器启动失败：${(error as Error).message}`);
     process.exitCode = 1;

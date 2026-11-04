@@ -1,10 +1,11 @@
 // 任意本地标的的只读研究证据，不要求入池，也不把入池时画像当成当前阶段。
 import { STOCK_CHARACTER_CALCULATION_VERSION } from "../../indicators/formulas.js";
 import { listLatestDailyBars, type Db } from "./repo.js";
+import { shanghaiDate } from "../market-news/repo.js";
 
-export async function queryStockResearch(db: Db, codes: string[]) {
+export async function queryStockResearch(db: Db, codes: string[], asOf = shanghaiDate()) {
   const [quotes, evidence] = await Promise.all([
-    listLatestDailyBars(db, codes),
+    listLatestDailyBars(db, codes, asOf),
     db.query<{
       code: string;
       profile: Record<string, unknown> | null;
@@ -32,29 +33,33 @@ export async function queryStockResearch(db: Db, codes: string[]) {
              JOIN market_indicator_run run ON run.id = metric.indicator_run_id
             WHERE metric.instrument_id = instrument.id AND metric.calculation_version = $2
               AND metric.indicator_run_id = latest_run.id AND run.status = 'success'
+              AND metric.as_of_date <= $3::date
             ORDER BY metric.as_of_date DESC, metric.computed_at DESC LIMIT 1
          ) profile ON true
          LEFT JOIN LATERAL (
            SELECT as_of_date::text, report_period::text, revenue, net_profit, operating_cashflow,
                   roe, gross_margin, debt_ratio, source
              FROM fundamental_snapshot WHERE instrument_id = instrument.id
+              AND as_of_date <= $3::date AND report_period <= $3::date
             ORDER BY as_of_date DESC, report_period DESC NULLS LAST, id DESC LIMIT 1
          ) fundamental ON true
          LEFT JOIN LATERAL (
            SELECT as_of_date::text, pe_ttm, pb, ps_ttm, dividend_yield, market_cap, source
              FROM valuation_snapshot WHERE instrument_id = instrument.id
+              AND as_of_date <= $3::date
             ORDER BY as_of_date DESC, id DESC LIMIT 1
          ) valuation ON true
         WHERE instrument.code = ANY($1::text[])`,
-      [codes, STOCK_CHARACTER_CALCULATION_VERSION],
+      [codes, STOCK_CHARACTER_CALCULATION_VERSION, asOf],
     ),
   ]);
   const quoteByCode = new Map(quotes.map((row) => [row.code, row]));
   const evidenceByCode = new Map(evidence.rows.map((row) => [row.code, row]));
   return {
     source: "PostgreSQL",
+    as_of: asOf,
     writes_business_data: false,
-    instruction: "只读已有数据；各证据日期独立。画像只在 profile_status=ready 时可作行情截止日的正式阶段；财报按报告期比较，缺失不补零。需要更新或本地未知标的时使用扶摇临时查询，不必入池。",
+    instruction: "只读目标日及此前已有数据；各证据日期独立，财报按披露日和报告期双重过滤，估值不得晚于目标日。画像只在 profile_status=ready 时可作行情截止日的正式阶段；缺失不补零。需要更新或本地未知标的时使用扶摇临时查询，不必入池。",
     items: codes.map((code) => {
       const row = evidenceByCode.get(code);
       if (!row) return { code, status: "missing", gaps: ["本地无此标的；先用扶摇 ticker_search 消歧"] };

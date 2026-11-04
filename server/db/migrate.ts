@@ -24,6 +24,9 @@ const LEGACY_APPLIED_HASHES: Readonly<Record<number, readonly string[]>> = {
   // 0150 开发库先应用过包含 management_mode/exit_reason 结构与存量关注复核提示词的等价版本；
   // 文件随后微调措辞，结构效果一致，允许该存量库继续前滚。
   150: ["e21940d9c7a03c442d56126f28e7bdb032f813417b355e7ae57604ee820ea8fb"],
+  // 0183 在本机先应用过等价版本，随后仅补充字段注释与空数组订阅保护；表结构与任务/提示词数据效果一致，
+  // 允许该存量库继续前滚到 0184，新库仍按最终文件执行。
+  183: ["65a89b9782f90ac868d3018df32187f842d48640cfcc6cd1306ff10db289de38"],
 };
 
 export interface MigrationFile {

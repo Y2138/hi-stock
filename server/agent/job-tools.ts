@@ -1,9 +1,10 @@
 // 结构化计划工具属于所有持久化 Agent 会话的共享目录；关联任务运行由会话自动解析。
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
+import { saveNightlyShortlist, saveStrategyShortlist } from "../modules/selection/service.js";
 import { attentionValidUntil, reconcileAttentionRemainder, strategyAttentionCodes } from "../modules/pools/attention-lifecycle.js";
 import { ensureStrategyPoolMemberProfile, WATCH_POOL, setPoolAttentionEntry } from "../modules/pools/repo.js";
-import { replaceDraftAuctionAssessments, replaceDraftPlaybook, replaceDraftScenarios } from "../modules/plans/repo.js";
+import { replaceDraftAuctionAssessments, replaceDraftPlaybook, replaceDraftScenarios, replaceEveningPreview } from "../modules/plans/repo.js";
 import { withAgentMutationLock } from "./mutation-lock.js";
 import { insertToolAudit } from "./repo.js";
 import { sha256Json } from "./hash.js";
@@ -13,10 +14,12 @@ import {
   AuctionAssessmentWriteSchema,
   DailyPlanWriteSchema,
   DailyPlanScenarioWriteSchema,
+  EveningPreviewWriteSchema,
   validateScheduledPoolAttentionInput,
   validateAuctionAssessmentWriteInput,
   validateDailyPlanWriteInput,
   validateDailyPlanScenarioWriteInput,
+  validateEveningPreviewWriteInput,
   PoolNewsWriteSchema,
   validatePoolNewsWriteInput,
   type PoolNewsWriteInput,
@@ -48,10 +51,10 @@ async function associatedRunningJob(
   pool: pg.Pool,
   sessionId: string | null,
   codes: readonly string[],
-): Promise<{ id: string; code: string; strategy_code: string | null; target_date: string }> {
+): Promise<{ id: string; code: string; strategy_code: string | null; target_date: string; started_at: string }> {
   if (!sessionId) throw new Error(`${codes.join("/")} 结构化写入需要持久化 Agent 会话`);
-  const result = await pool.query<{ id: string; code: string; strategy_code: string | null; target_date: string }>(
-    `SELECT run.id::text, definition.code, definition.strategy_code, run.target_date::text
+  const result = await pool.query<{ id: string; code: string; strategy_code: string | null; target_date: string; started_at: string }>(
+    `SELECT run.id::text, definition.code, definition.strategy_code, run.target_date::text, COALESCE(run.started_at,run.created_at)::text AS started_at
        FROM job_run run
        JOIN job_definition definition ON definition.id = run.job_id
       WHERE run.session_id = $1
@@ -109,6 +112,13 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
         if (input.data_date && input.data_date !== date) throw new Error("关注复核数据日必须与任务目标日一致");
         if ((input.reviewed_codes.length || input.items.length) && !input.data_date) throw new Error("实际复核必须提供目标日 data_date");
         if (input.evaluation_status === "failed" && input.items.length) throw new Error("评估失败不能更新或清除信号");
+        const shortlist = input.evaluation_status !== "failed"
+          ? await saveNightlyShortlist(deps.pool, running.id, deps.sessionId!, date, running.started_at)
+          : { candidates: [], deferred_codes: [] };
+        if (input.evaluation_status === "failed") await saveStrategyShortlist(deps.pool, running.id, strategyCode, date,
+          { data_date: date, qualified: [], near: [], shortlist_matches: [] }, {}, "partial", input.review_gaps);
+        const selected = new Set(shortlist.candidates.map((item) => item.code));
+        const native = new Set([...selected, ...shortlist.deferred_codes]);
         const outcome = await withAgentMutationLock(deps.pool, async (client) => {
           await client.query("SELECT pg_advisory_xact_lock(hashtext('pool-attention-lifecycle'))");
           await client.query("SELECT code FROM strategy_definition WHERE code=$1 FOR UPDATE", [strategyCode]);
@@ -116,6 +126,10 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
             WHERE definition.strategy_code=$1 AND run.target_date>$2::date AND run.status IN ('running','success') LIMIT 1`, [strategyCode, date]);
           if (newer.rows.length) throw new Error("已有更新日期的策略任务，拒绝历史运行覆盖关注池");
           const existing = await strategyAttentionCodes(client, strategyCode);
+          if (input.items.some((item) => item.action === "mark" && !native.has(item.code) && !existing.includes(item.code)))
+            throw new Error("新增关注标的不属于本次夜间原生候选");
+          if (input.items.some((item) => item.action === "mark" && item.attention_status !== "approaching"))
+            throw new Error("夜间板块个股只允许接近观察，不得升级正式信号");
           const covered = new Set([...input.reviewed_codes, ...input.items.map((item) => item.code)]);
           if (input.evaluation_status === "success" && (input.review_gaps.length || existing.some((code) => !covered.has(code)))) {
             throw new Error("尚未逐项复核全部存量关注；请补齐 reviewed_codes，缺数时提交 partial 和 review_gaps");
@@ -125,7 +139,7 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
           const validUntil = await attentionValidUntil(client, date);
           for (const item of input.items) {
             if (input.review_gaps.some((gap) => gap.code === item.code)) throw new Error(`${item.code} 缺数据时不能续期或判定失效`);
-            if (item.action === "mark") {
+            if (item.action === "mark" && (selected.has(item.code) || existing.includes(item.code))) {
               if (!input.data_date || item.attention_from !== date) throw new Error("更新关注必须提供目标日 data_date，attention_from 必须与任务日期一致");
               const membership = await client.query(`SELECT 1 FROM pool_membership membership JOIN market_instrument instrument
                 ON instrument.id=membership.instrument_id WHERE instrument.code=$1 AND membership.pool=$2 AND membership.effective_to IS NULL`, [item.code, WATCH_POOL]);
@@ -147,11 +161,11 @@ export function buildJobPoolAttentionTool(deps: { pool: pg.Pool; sessionId: stri
             strategy_code: strategyCode, date, kept,
             reviewed: input.evaluation_status === "failed" ? [] : [...input.reviewed_codes,
               ...input.items.filter((item) => item.action === "clear").map((item) => item.code)],
-            gaps: input.review_gaps, reason: input.reason,
+            gaps: input.review_gaps, deferred: shortlist.deferred_codes, reason: input.reason,
           });
           items.push(...remainder.changes.map((item) => ({ ...item, reconciled: true })));
           const summary = { source_job: jobCode, strategy_code: strategyCode, evaluation_status: input.evaluation_status,
-            total: items.length, items, pool_removed: remainder.removed };
+            total: items.length, items, pool_removed: remainder.removed, shortlist: shortlist.candidates };
           await insertToolAudit(client, {
             session_id: deps.sessionId,
             tool_name: "pool_attention_write",
@@ -217,7 +231,7 @@ export function buildJobDailyPlanScenarioTool(deps: {
     name: "daily_plan_scenario_write",
     label: "写入每日计划情景与做T预案",
     description:
-      "一次性提交每笔持仓的情景预案矩阵（冲高回落/开盘下砸/全天宽幅波动/强势延续/弱势破位按适用取舍）、做T区间与集合竞价、分时盯防、失效改判、风险字段。情景与做T只依据 daily_plan_strategy_query 返回的关键点位、市场与所属板块当日表现和盘前消息面，不以冷却期、止盈核对期等为由缺省；做T默认给低吸/兑现区间，仅一字板、停牌等流动性极端可用 skip_reason 显式说明。全量替换式写入，只能调用一次。",
+      "一次性提交明日大盘预期（3—4 个概率情景、关键指数位）与每笔持仓的 2—4 个最可能情景（按概率排序，概率合计 100）、做T区间、集合竞价、分时盯防、失效改判、风险字段。大盘与个股情景只依据 daily_plan_strategy_query 返回的关键点位、市场与所属板块当日表现和盘前消息面，不固定凑满五类，不以冷却期、止盈核对期等为由缺省；做T默认给低吸/兑现区间，仅一字板、停牌等流动性极端可用 skip_reason 显式说明。全量替换式写入，只能调用一次。",
     parameters: DailyPlanScenarioWriteSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {
@@ -228,6 +242,7 @@ export function buildJobDailyPlanScenarioTool(deps: {
         const outcome = await withAgentMutationLock(deps.pool, async (client) => {
           const write = await replaceDraftScenarios(client, {
             source_job_run_id: runId,
+            market_forecast: input.market_forecast,
             items: input.items,
           });
           await insertToolAudit(client, {
@@ -248,6 +263,47 @@ export function buildJobDailyPlanScenarioTool(deps: {
   };
 }
 
+export function buildJobEveningPreviewTool(deps: {
+  pool: pg.Pool;
+  sessionId: string | null;
+}): AgentTool {
+  return {
+    name: "evening_preview_write",
+    label: "写入晚间明日预案预览",
+    description:
+      "一次性提交下一交易日的大盘概率情景（3—4 个，概率合计 100）与每只持仓 2—3 个最可能情景（概率合计 100）。只读预览，不写持仓、关注或交易；早盘每日计划会覆盖。",
+    parameters: EveningPreviewWriteSchema,
+    executionMode: "sequential",
+    execute: async (_toolCallId, rawInput, signal) => {
+      try {
+        if (signal?.aborted) throw new Error("晚间预览写入已中断");
+        const input = validateEveningPreviewWriteInput(rawInput);
+        const { id: runId } = await associatedRunningJob(deps.pool, deps.sessionId, ["evening_plan_preview"]);
+        const outcome = await withAgentMutationLock(deps.pool, async (client) => {
+          const write = await replaceEveningPreview(client, {
+            source_job_run_id: runId,
+            as_of: input.as_of,
+            market_forecast: input.market_forecast,
+            positions: input.positions,
+          });
+          await insertToolAudit(client, {
+            session_id: deps.sessionId,
+            tool_name: "evening_preview_write",
+            args: input,
+            result_sha256: sha256Json(write),
+            status: "ok",
+          });
+          return write;
+        });
+        return result(outcome);
+      } catch (error) {
+        await auditError(deps.pool, deps.sessionId, "evening_preview_write", rawInput);
+        throw error;
+      }
+    },
+  };
+}
+
 export function buildJobAuctionAssessmentTool(deps: {
   pool: pg.Pool;
   sessionId: string | null;
@@ -256,7 +312,7 @@ export function buildJobAuctionAssessmentTool(deps: {
     name: "auction_assessment_write",
     label: "写入跨域集合竞价研判",
     description:
-      "一次提交三类竞价结果：items 完整覆盖每日计划打板机会；scope_items 按 target_key 完整覆盖全部真实持仓与每条有效关注来源。持仓只作原计划匹配/风险升级/数据不足判断，关注按来源策略补齐条件，打板按打板策略门禁分类。服务端对账后由任务成功统一激活；不成交、不改持仓或关注。",
+      "一次提交两类竞价结果：items 完整覆盖收盘打板机会；scope_items 按 target_key 完整覆盖每条有效关注来源和前一日盘中涨停梯队。关注按来源策略补齐条件，打板按打板策略门禁分类，梯队按原生持有复核；持仓竞价复核已下线，不再提交 position 目标键。服务端对账后由任务成功统一激活；不成交、不改持仓或关注。",
     parameters: AuctionAssessmentWriteSchema,
     executionMode: "sequential",
     execute: async (_toolCallId, rawInput, signal) => {

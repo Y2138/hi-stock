@@ -4,7 +4,6 @@ import type pg from "pg";
 import { apiErrors } from "../../http/router.js";
 import { inServiceTransaction, type TransactionDb } from "../../db/transaction.js";
 import { isWeekdayDate } from "../../scheduler/time.js";
-import { listPositions } from "../positions/repo.js";
 
 export type Db = Pick<pg.Pool, "query">;
 
@@ -33,8 +32,9 @@ export interface AuctionAssessmentInput {
 }
 
 export interface AuctionScopeInput {
+  /** 只接受关注来源与盘中梯队；持仓竞价复核已下线。 */
   target_key: string;
-  conclusion: "plan_aligned" | "risk_alert" | "confirmed" | "wait" | "give_up" | "promotion_strong" | "promotion_normal" | "divergence_hold" | "weak_exit" | "unavailable";
+  conclusion: "confirmed" | "wait" | "give_up" | "promotion_strong" | "promotion_normal" | "divergence_hold" | "weak_exit" | "unavailable";
   metrics_summary: string;
   assessment_summary: string;
   data_status: AuctionDataStatus;
@@ -106,17 +106,92 @@ export type DailyPlanTPlan =
 
 export interface DailyPlanScenarioInput {
   scenario_kind: DailyPlanScenarioKind;
+  probability: number;
   observable_md: string;
   response_md: string;
   invalidation_md: string;
 }
 
-export interface DailyPlanScenarioRow extends DailyPlanScenarioInput {
+export interface DailyPlanScenarioRow extends Omit<DailyPlanScenarioInput, "probability"> {
   id: string;
+  probability: number | null;
+}
+
+export interface DailyPlanMarketForecastScenario {
+  label: string;
+  probability: number;
+  view: string;
+  triggers: string;
+  response: string;
+  invalidation: string;
+}
+
+export interface DailyPlanMarketForecastKeyLevel {
+  name: string;
+  support: number | null;
+  resistance: number | null;
+  volume_note: string | null;
+}
+
+export interface DailyPlanMarketForecastKeyLevelInput {
+  name: string;
+  support?: number | null;
+  resistance?: number | null;
+  volume_note?: string | null;
+}
+
+export interface DailyPlanMarketForecast {
+  target_date: string;
+  as_of: string;
+  scenarios: DailyPlanMarketForecastScenario[];
+  key_levels: DailyPlanMarketForecastKeyLevel[];
+  summary_md: string;
+}
+
+export interface DailyPlanMarketForecastInput {
+  as_of: string;
+  scenarios: DailyPlanMarketForecastScenario[];
+  key_levels: DailyPlanMarketForecastKeyLevelInput[];
+  summary_md: string;
+}
+
+export type EveningPreviewAction = "exit" | "reduce" | "buy" | "hold" | "observe";
+
+export interface EveningPreviewScenario {
+  label: string;
+  probability: number;
+  trigger: string;
+  response: string;
+  invalidation: string;
+}
+
+export interface EveningPreviewPosition {
+  code: string;
+  action: EveningPreviewAction;
+  headline: string;
+  scenarios: EveningPreviewScenario[];
+  key_levels?: Array<{ label: string; price: number }>;
+}
+
+export interface EveningPreviewInput {
+  source_job_run_id: string;
+  as_of: string;
+  market_forecast: DailyPlanMarketForecastInput;
+  positions: EveningPreviewPosition[];
+}
+
+export interface EveningPreviewRow {
+  target_date: string;
+  account_id: string;
+  account_name: string;
+  as_of: string;
+  market_forecast: DailyPlanMarketForecast;
+  position_previews: EveningPreviewPosition[];
 }
 
 export interface ReplaceScenariosInput {
   source_job_run_id: string;
+  market_forecast: DailyPlanMarketForecastInput;
   items: Array<{
     code: string;
     auction_md?: string;
@@ -170,6 +245,7 @@ export interface PlaybookItemRow {
 
 export interface DailyPlanBoard {
   plan: { output_id: string; target_date: string; status: string; created_at: string };
+  market_forecast: DailyPlanMarketForecast | null;
   position_actions: PlaybookItemRow[];
   opportunities: PlaybookItemRow[];
 }
@@ -308,14 +384,15 @@ export async function replaceDraftScenarios(
   input: ReplaceScenariosInput,
 ): Promise<{ replaced_items: number; replaced_scenarios: number }> {
   return inServiceTransaction(db, async (client) => {
-    const run = await client.query<{ code: string; account_id: string | null }>(
-      `SELECT definition.code, run.account_id::text
+    const run = await client.query<{ code: string; account_id: string | null; target_date: string }>(
+      `SELECT definition.code, run.account_id::text, run.target_date::text
          FROM job_run run
          JOIN job_definition definition ON definition.id = run.job_id
         WHERE run.id = $1 AND definition.code = 'daily_plan_flow'`,
       [input.source_job_run_id],
     );
     if (!run.rows[0]) throw apiErrors.badRequest("情景预案只能由每日计划任务提交");
+    const targetDate = run.rows[0].target_date;
     const drafts = await client.query<{ id: string; code: string }>(
       `SELECT id::text, code FROM daily_plan_playbook
         WHERE source_job_run_id = $1 AND item_kind = 'position_action' AND status = 'draft'`,
@@ -331,6 +408,31 @@ export async function replaceDraftScenarios(
       if (unknown.length > 0) parts.push(`不在本次结构化预案中：${unknown.join("、")}`);
       throw apiErrors.badRequest(`情景预案覆盖不完整；${parts.join("；")}`);
     }
+    await client.query(
+      `INSERT INTO daily_plan_market_forecast
+         (target_date, source_job_run_id, status, as_of, scenarios, key_levels, summary_md)
+       VALUES ($1, $2, 'draft', $3::date, $4::jsonb, $5::jsonb, $6)
+       ON CONFLICT (target_date, source_job_run_id) DO UPDATE
+         SET status = 'draft',
+             as_of = EXCLUDED.as_of,
+             scenarios = EXCLUDED.scenarios,
+             key_levels = EXCLUDED.key_levels,
+             summary_md = EXCLUDED.summary_md,
+             updated_at = now()`,
+      [
+        targetDate,
+        input.source_job_run_id,
+        input.market_forecast.as_of,
+        JSON.stringify(input.market_forecast.scenarios),
+        JSON.stringify(input.market_forecast.key_levels.map((level) => ({
+          name: level.name,
+          support: level.support ?? null,
+          resistance: level.resistance ?? null,
+          volume_note: level.volume_note ?? null,
+        }))),
+        input.market_forecast.summary_md.trim(),
+      ],
+    );
     let replacedScenarios = 0;
     for (const item of input.items) {
       const itemId = draftByCode.get(item.code)!;
@@ -356,12 +458,13 @@ export async function replaceDraftScenarios(
       for (const scenario of item.scenarios) {
         await client.query(
           `INSERT INTO daily_plan_scenario
-             (playbook_item_id, source_job_run_id, scenario_kind, observable_md, response_md, invalidation_md)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
+             (playbook_item_id, source_job_run_id, scenario_kind, probability, observable_md, response_md, invalidation_md)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
           [
             itemId,
             input.source_job_run_id,
             scenario.scenario_kind,
+            scenario.probability,
             scenario.observable_md.trim(),
             scenario.response_md.trim(),
             scenario.invalidation_md.trim(),
@@ -374,6 +477,97 @@ export async function replaceDraftScenarios(
   });
 }
 
+/** 晚间轻量预览：按运行目标日自动落到下一交易日，只接受当前账户真实持仓。 */
+export async function replaceEveningPreview(
+  db: TransactionDb,
+  input: EveningPreviewInput,
+): Promise<{ target_date: string; positions: number }> {
+  return inServiceTransaction(db, async (client) => {
+    const run = await client.query<{ target_date: string; account_id: string }>(
+      `SELECT run.target_date::text, COALESCE(run.account_id, 1)::text AS account_id
+         FROM job_run run
+         JOIN job_definition definition ON definition.id = run.job_id
+        WHERE run.id = $1 AND definition.code = 'evening_plan_preview'`,
+      [input.source_job_run_id],
+    );
+    if (!run.rows[0]) throw apiErrors.badRequest("晚间预览只能由 evening_plan_preview 任务提交");
+    const next = await client.query<{ target_date: string | null }>(
+      `SELECT min(trade_date)::text AS target_date
+         FROM market_trading_day
+        WHERE trade_date > $1::date AND is_open`,
+      [run.rows[0].target_date],
+    );
+    const targetDate = next.rows[0]?.target_date;
+    if (!targetDate) throw apiErrors.badRequest("缺少下一交易日，无法保存晚间预览");
+    const held = await client.query<{ code: string }>(
+      `SELECT instrument.code
+         FROM portfolio_position position
+         JOIN market_instrument instrument ON instrument.id = position.instrument_id
+        WHERE position.account_id = $1::bigint AND position.quantity > 0`,
+      [run.rows[0].account_id],
+    );
+    const heldCodes = new Set(held.rows.map((row) => row.code));
+    const unknown = input.positions.filter((item) => !heldCodes.has(item.code));
+    if (unknown.length > 0) {
+      throw apiErrors.badRequest(`晚间预览包含非当前持仓：${unknown.map((item) => item.code).join("、")}`);
+    }
+    const marketForecast = {
+      ...input.market_forecast,
+      as_of: input.as_of,
+      key_levels: input.market_forecast.key_levels.map((level) => ({
+        name: level.name,
+        support: level.support ?? null,
+        resistance: level.resistance ?? null,
+        volume_note: level.volume_note ?? null,
+      })),
+    };
+    await client.query(
+      `INSERT INTO daily_plan_evening_preview
+         (target_date, account_id, source_job_run_id, as_of, market_forecast, position_previews)
+       VALUES ($1::date, $2::bigint, $3, $4::date, $5::jsonb, $6::jsonb)
+       ON CONFLICT (target_date, account_id) DO UPDATE
+         SET source_job_run_id = EXCLUDED.source_job_run_id,
+             as_of = EXCLUDED.as_of,
+             market_forecast = EXCLUDED.market_forecast,
+             position_previews = EXCLUDED.position_previews,
+             updated_at = now()`,
+      [
+        targetDate,
+        run.rows[0].account_id,
+        input.source_job_run_id,
+        input.as_of,
+        JSON.stringify(marketForecast),
+        JSON.stringify(input.positions),
+      ],
+    );
+    return { target_date: targetDate, positions: input.positions.length };
+  });
+}
+
+/** 读取某目标日的全部账户晚间预览；早盘计划生成前供精选报告与邮件使用。 */
+export async function listEveningPreviews(db: Db, targetDate: string): Promise<EveningPreviewRow[]> {
+  const rows = await db.query<Record<string, unknown>>(
+    `SELECT preview.target_date::text, preview.account_id::text,
+            account.name AS account_name, preview.as_of::text,
+            preview.market_forecast, preview.position_previews
+       FROM daily_plan_evening_preview preview
+       JOIN portfolio_account account ON account.id = preview.account_id
+      WHERE preview.target_date = $1::date
+      ORDER BY preview.account_id`,
+    [targetDate],
+  );
+  return rows.rows.map((row) => ({
+    target_date: String(row.target_date),
+    account_id: String(row.account_id),
+    account_name: String(row.account_name),
+    as_of: String(row.as_of),
+    market_forecast: row.market_forecast as DailyPlanMarketForecast,
+    position_previews: Array.isArray(row.position_previews)
+      ? row.position_previews as EveningPreviewPosition[]
+      : [],
+  }));
+}
+
 /** 任务成功后把 draft 行激活并绑定本次输出；更旧的激活行转入 superseded。 */
 export async function activatePlaybookForRun(
   db: TransactionDb,
@@ -382,8 +576,9 @@ export async function activatePlaybookForRun(
 ): Promise<number> {
   return inServiceTransaction(db, async (client) => {
     if (!planOutputId) return 0;
-    const source = await client.query<{ code: string; account_id: string | null }>(
-      `SELECT definition.code,CASE WHEN definition.code='daily_plan_flow' THEN COALESCE(run.account_id,1) ELSE run.account_id END::text AS account_id
+    const source = await client.query<{ code: string; account_id: string | null; target_date: string }>(
+      `SELECT definition.code,CASE WHEN definition.code='daily_plan_flow' THEN COALESCE(run.account_id,1) ELSE run.account_id END::text AS account_id,
+              run.target_date::text
          FROM job_run run
          JOIN job_definition definition ON definition.id = run.job_id
         WHERE run.id = $1`,
@@ -422,6 +617,20 @@ export async function activatePlaybookForRun(
             SELECT item.id FROM daily_plan_playbook item WHERE item.status = 'superseded'
           )`,
     );
+    if (source.rows[0].code === "daily_plan_flow") {
+      await client.query(
+        `UPDATE daily_plan_market_forecast
+            SET status = 'superseded', updated_at = now()
+          WHERE target_date = $1::date AND status = 'active' AND source_job_run_id <> $2`,
+        [source.rows[0].target_date, sourceJobRunId],
+      );
+      await client.query(
+        `UPDATE daily_plan_market_forecast
+            SET status = 'active', updated_at = now()
+          WHERE target_date = $1::date AND source_job_run_id = $2 AND status = 'draft'`,
+        [source.rows[0].target_date, sourceJobRunId],
+      );
+    }
     return activated.rowCount ?? 0;
   });
 }
@@ -431,6 +640,9 @@ export async function replaceDraftAuctionAssessments(
   db: TransactionDb,
   input: { source_job_run_id: string; items: AuctionAssessmentInput[]; scope_items: AuctionScopeInput[] },
 ): Promise<{ replaced: number }> {
+  if (input.items.some((item) => item.review_type === "divergence" && item.conclusion !== "observe")) {
+    throw apiErrors.badRequest("分歧只能观察，不能标为信号通过");
+  }
   return inServiceTransaction(db, async (client) => {
     const run = await client.query<{ id: string; target_date: string; account_id: string }>(
       `SELECT run.id::text,run.target_date::text,COALESCE(run.account_id,1)::text AS account_id
@@ -441,7 +653,7 @@ export async function replaceDraftAuctionAssessments(
     );
     if (!run.rows[0]) throw apiErrors.badRequest("竞价研判只能由 auction_opportunity_assessment 任务提交");
 
-    const context = await queryAuctionAssessmentContext(client, run.rows[0]!.target_date, run.rows[0]!.account_id);
+    const context = await queryAuctionAssessmentContext(client, run.rows[0]!.target_date);
     const opportunities = context.opportunities.map((item) => ({ id: item.target_key.slice("board:".length), code: item.code }));
     const expectedCodes = opportunities.map((item) => item.code).sort();
     const submittedCodes = input.items.map((item) => item.code).sort();
@@ -456,9 +668,7 @@ export async function replaceDraftAuctionAssessments(
     if (!context.market_day.should_run && (input.items.length || input.scope_items.length)) {
       throw apiErrors.badRequest("非交易日不得写入竞价研判");
     }
-    const targets = new Map<string, { code: string; scope_kind: "position" | "attention" | "ladder"; attention_entry_id: string | null; strategy_code: string | null }>([
-      ...context.positions.map((item) => [item.target_key, { code: item.code, scope_kind: "position" as const,
-        attention_entry_id: null, strategy_code: item.strategy_code } ] as const),
+    const targets = new Map<string, { code: string; scope_kind: "attention" | "ladder"; attention_entry_id: string | null; strategy_code: string | null }>([
       ...context.attentions.map((item) => [item.target_key, { code: item.code, scope_kind: "attention" as const,
         attention_entry_id: item.attention_entry_id, strategy_code: item.strategy_code } ] as const),
       ...context.intraday_ladder_candidates.map((item) => [item.target_key, { code: String(item.code), scope_kind: "ladder" as const,
@@ -467,17 +677,15 @@ export async function replaceDraftAuctionAssessments(
     const submittedKeys = input.scope_items.map((item) => item.target_key);
     if (new Set(submittedKeys).size !== submittedKeys.length || targets.size !== submittedKeys.length
       || submittedKeys.some((key) => !targets.has(key))) {
-      throw apiErrors.badRequest(`竞价研判必须完整覆盖持仓和关注来源及盘中梯队：期望 ${[...targets.keys()].join("、") || "无"}，实际 ${submittedKeys.join("、") || "无"}`);
+      throw apiErrors.badRequest(`竞价研判必须完整覆盖关注来源及盘中梯队：期望 ${[...targets.keys()].join("、") || "无"}，实际 ${submittedKeys.join("、") || "无"}`);
     }
     const instrumentIds = await resolveInstruments(client, [...new Set([...targets.values()].map((item) => item.code))]);
     await client.query("DELETE FROM auction_scope_assessment WHERE source_job_run_id=$1 AND status='draft'", [input.source_job_run_id]);
     for (const item of input.scope_items) {
       const target = targets.get(item.target_key)!;
-      const allowed = target.scope_kind === "position"
-        ? ["plan_aligned", "risk_alert", "unavailable"]
-        : target.scope_kind === "ladder"
-          ? ["promotion_strong", "promotion_normal", "divergence_hold", "weak_exit", "unavailable"]
-          : ["confirmed", "wait", "give_up", "unavailable"];
+      const allowed = target.scope_kind === "ladder"
+        ? ["promotion_strong", "promotion_normal", "divergence_hold", "weak_exit", "unavailable"]
+        : ["confirmed", "wait", "give_up", "unavailable"];
       if (!allowed.includes(item.conclusion)) throw apiErrors.badRequest(`${item.target_key} 竞价结论类型与位置不匹配`);
       if (item.data_status !== "ready" && item.conclusion !== "unavailable") {
         throw apiErrors.badRequest(`${item.target_key} 竞价数据未就绪只能标记 unavailable`);
@@ -543,7 +751,7 @@ export async function activateAuctionAssessmentsForRun(
   const isOpen = runRow.is_open ?? isWeekdayDate(runRow.target_date);
   const shouldRun = isOpen;
 
-  const context = await queryAuctionAssessmentContext(db, runRow.target_date, runRow.account_id);
+  const context = await queryAuctionAssessmentContext(db, runRow.target_date);
   const expected = context.opportunities.map((item) => ({ id: item.target_key.slice("board:".length), code: item.code }));
   const drafts = await db.query<{ playbook_item_id: string }>(
     `SELECT playbook_item_id::text
@@ -563,16 +771,16 @@ export async function activateAuctionAssessmentsForRun(
   if (!isOpen && draftIds.length > 0) {
     throw new Error("非交易日不得激活集合竞价判断");
   }
-  const requiredKeys = [...context.positions.map((item) => item.target_key), ...context.attentions.map((item) => item.target_key), ...context.intraday_ladder_candidates.map((item) => item.target_key)].sort();
+  const requiredKeys = [...context.attentions.map((item) => item.target_key), ...context.intraday_ladder_candidates.map((item) => item.target_key)].sort();
   const scopeDrafts = await db.query<{ target_key: string }>(
     "SELECT target_key FROM auction_scope_assessment WHERE source_job_run_id=$1 AND status='draft' ORDER BY target_key",
     [sourceJobRunId],
   );
   if (shouldRun && (requiredKeys.length !== scopeDrafts.rows.length
     || requiredKeys.some((key,index) => key !== scopeDrafts.rows[index]?.target_key))) {
-    throw new Error(`竞价任务未完整回写持仓与关注来源：期望 ${requiredKeys.length}，实际 ${scopeDrafts.rows.length}`);
+    throw new Error(`竞价任务未完整回写关注来源与盘中梯队：期望 ${requiredKeys.length}，实际 ${scopeDrafts.rows.length}`);
   }
-  if (!shouldRun && scopeDrafts.rows.length) throw new Error("非交易日不得激活持仓或关注竞价研判");
+  if (!shouldRun && scopeDrafts.rows.length) throw new Error("非交易日不得激活关注或盘中梯队竞价研判");
   if (draftIds.length === 0 && scopeDrafts.rows.length === 0) return 0;
 
   await db.query(
@@ -741,6 +949,57 @@ export async function getLatestDailyPlanBoard(pool: Db, accountId = "1"): Promis
   const output = outputs.rows[0];
   if (!output) throw apiErrors.notFound("尚无每日交易计划");
 
+  const forecastRows = await pool.query<{
+    target_date: string;
+    as_of: string;
+    scenarios: DailyPlanMarketForecastScenario[];
+    key_levels: DailyPlanMarketForecastKeyLevel[];
+    summary_md: string;
+  }>(
+    `SELECT target_date::text, as_of::text, scenarios, key_levels, summary_md
+       FROM daily_plan_market_forecast
+      WHERE target_date = $1::date AND status = 'active'
+      LIMIT 1`,
+    [output.target_date],
+  );
+  const forecastRow = forecastRows.rows[0];
+  let marketForecast: DailyPlanMarketForecast | null = forecastRow
+    ? {
+        target_date: forecastRow.target_date,
+        as_of: forecastRow.as_of,
+        scenarios: Array.isArray(forecastRow.scenarios) ? forecastRow.scenarios : [],
+        key_levels: Array.isArray(forecastRow.key_levels) ? forecastRow.key_levels : [],
+        summary_md: forecastRow.summary_md,
+      }
+    : null;
+  if (!marketForecast) {
+    // 早盘计划尚未写入时，用前一晚 19:15 的“明日预览”补位；早盘计划一旦生成即优先。
+    const evening = await pool.query<{
+      target_date: string;
+      market_forecast: DailyPlanMarketForecast;
+    }>(
+      `SELECT preview.target_date::text, preview.market_forecast
+         FROM daily_plan_evening_preview preview
+        WHERE preview.target_date = (
+          SELECT min(trade_date) FROM market_trading_day
+           WHERE trade_date > $1::date AND is_open
+        )
+        ORDER BY preview.account_id
+        LIMIT 1`,
+      [output.target_date],
+    );
+    const row = evening.rows[0];
+    if (row) {
+      marketForecast = {
+        target_date: row.target_date,
+        as_of: row.market_forecast.as_of,
+        scenarios: Array.isArray(row.market_forecast.scenarios) ? row.market_forecast.scenarios : [],
+        key_levels: Array.isArray(row.market_forecast.key_levels) ? row.market_forecast.key_levels : [],
+        summary_md: row.market_forecast.summary_md,
+      };
+    }
+  }
+
   const items = await pool.query<Record<string, unknown>>(
     `SELECT item.id, item.item_kind, item.code, item.name, item.grade, item.priority,
             item.action, item.trigger_kind, item.price_lower, item.price_upper,
@@ -772,12 +1031,13 @@ export async function getLatestDailyPlanBoard(pool: Db, accountId = "1"): Promis
     id: string;
     playbook_item_id: string;
     scenario_kind: DailyPlanScenarioKind;
+    probability: number | null;
     observable_md: string;
     response_md: string;
     invalidation_md: string;
   }>(
     `SELECT scenario.id::text, scenario.playbook_item_id::text, scenario.scenario_kind,
-            scenario.observable_md, scenario.response_md, scenario.invalidation_md
+            scenario.probability, scenario.observable_md, scenario.response_md, scenario.invalidation_md
        FROM daily_plan_scenario scenario
        JOIN daily_plan_playbook item ON item.id = scenario.playbook_item_id
       WHERE item.plan_output_id = $1 AND item.account_id = $2 AND item.status = 'active' AND item.item_kind = 'position_action'`,
@@ -800,6 +1060,7 @@ export async function getLatestDailyPlanBoard(pool: Db, accountId = "1"): Promis
       status: output.status,
       created_at: output.created_at,
     },
+    market_forecast: marketForecast,
     position_actions: rows.filter((row) => row.item_kind === "position_action"),
     opportunities: rows.filter((row) => row.item_kind === "off_pool_opportunity"),
   };
@@ -866,7 +1127,7 @@ export async function getLatestLimitUpOpportunities(db: Db) {
 }
 
 /** 集合竞价任务的完整紧凑输入；覆盖候选全集，但不返回无关池属性或历史正文。 */
-export async function queryAuctionAssessmentContext(db: Db, targetDate: string, accountId = "1") {
+export async function queryAuctionAssessmentContext(db: Db, targetDate: string) {
   const calendarResult = await db.query<{ is_open: boolean }>(
       "SELECT is_open FROM market_trading_day WHERE trade_date = $1::date",
       [targetDate],
@@ -877,15 +1138,6 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string, 
         WHERE trade_date < $1::date AND is_open = true`,
       [targetDate],
     );
-  const outputResult = await db.query<{ id: string; target_date: string; status: string; created_at: string }>(
-      `SELECT output.id::text, output.target_date::text, output.status, output.created_at::text
-         FROM job_run_output output
-         JOIN job_definition definition ON definition.id = output.job_id
-        LEFT JOIN job_run run ON run.id=output.run_id
-        WHERE definition.code = 'daily_plan_flow' AND COALESCE(run.account_id,output.account_id,1)=$1
-        ORDER BY output.id DESC LIMIT 1`,
-      [accountId],
-    );
   const opportunityOutputResult = await db.query<{ id: string; target_date: string; status: string; run_status: string }>(
     `SELECT output.id::text,output.target_date::text,output.status,run.status AS run_status
        FROM job_run_output output JOIN job_definition job ON job.id=output.job_id
@@ -893,7 +1145,13 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string, 
        ORDER BY output.id DESC LIMIT 1`,
   );
   const opportunityOutput = opportunityOutputResult.rows[0] ?? null;
-  const positions = await listPositions(db, accountId);
+  // 持仓竞价复核已下线；持仓代码只用于避免关注来源/打板候选与任一账户持仓重复。
+  const holdings = await db.query<{ code: string }>(
+    `SELECT DISTINCT instrument.code
+       FROM portfolio_position position
+       JOIN market_instrument instrument ON instrument.id = position.instrument_id
+      WHERE position.quantity > 0`,
+  );
   const poolResult = await db.query<{
       code: string;
       name: string;
@@ -928,21 +1186,6 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string, 
     : weekday ? "missing_weekday" as const : "missing_weekend" as const;
   const shouldRun = calendarRow?.is_open ?? weekday;
   const previousOpenDate = previousOpenResult.rows[0]?.trade_date ?? null;
-  const output = outputResult.rows[0] ?? null;
-  const itemResult = output
-    ? await db.query<Record<string, unknown>>(
-        `SELECT item.id, item.item_kind, item.code, item.name, item.grade, item.priority,
-                item.action, item.trigger_kind, item.price_lower, item.price_upper,
-                item.headline, item.auction_md, item.intraday_md, item.evidence_md,
-                item.missing_md, item.invalidation_md, item.risk_md, item.target_date::text
-           FROM daily_plan_playbook item
-          WHERE item.plan_output_id = $1 AND item.status = 'active'
-          ORDER BY item.priority, item.id`,
-        [output.id],
-      )
-    : { rows: [] as Record<string, unknown>[] };
-  const playbookItems = itemResult.rows.map(toRow);
-  const positionActions = playbookItems.filter((item) => item.item_kind === "position_action");
   const opportunityRows = opportunityOutput ? await db.query<Record<string, unknown>>(
     `SELECT item.id::text,item.item_kind,item.code,item.name,item.grade,item.priority,item.action,item.trigger_kind,
             item.price_lower,item.price_upper,item.headline,item.auction_md,item.intraday_md,item.evidence_md,
@@ -951,34 +1194,15 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string, 
         AND item.status='active' ORDER BY item.priority,item.id`, [opportunityOutput.id],
   ) : { rows: [] as Record<string, unknown>[] };
   const rawOpportunities = opportunityRows.rows.map(toRow);
-  const positionActionByCode = new Map(positionActions.map((item) => [item.code, item]));
-  const positionCodes = new Set(positions.map((position) => position.code));
+  const positionCodes = new Set(holdings.rows.map((row) => row.code));
   const poolByCode = new Map(poolResult.rows.map((member) => [member.code, member]));
-
-  let planValidity: "valid" | "missing" | "invalid_status" | "not_before_target" | "expired" | "calendar_unresolved" = "missing";
-  if (output) {
-    if (["rejected", "superseded"].includes(output.status)) planValidity = "invalid_status";
-    else if (output.target_date >= targetDate) planValidity = "not_before_target";
-    else if (!previousOpenDate) planValidity = "calendar_unresolved";
-    else if (output.target_date < previousOpenDate) planValidity = "expired";
-    else planValidity = "valid";
-  }
 
   const gaps: Array<{ scope: string; code?: string; reason: string }> = [];
   if (shouldRun && !previousOpenDate) gaps.push({ scope: "calendar", reason: "缺少目标日前一开市日" });
-  if (shouldRun && !output) gaps.push({ scope: "plan", reason: "缺少每日计划" });
   if (shouldRun && (!opportunityOutput || opportunityOutput.run_status !== 'success'
     || opportunityOutput.status === 'rejected' || opportunityOutput.status === 'superseded'
     || !previousOpenDate || opportunityOutput.target_date !== previousOpenDate))
     gaps.push({ scope: "opportunity", reason: "缺少前一开市日的有效收盘打板扫描，不得使用过期候选" });
-  if (shouldRun && output && planValidity !== "valid") {
-    gaps.push({ scope: "plan", reason: `每日计划不可用于本次竞价：${planValidity}` });
-  }
-  for (const position of positions) {
-    if (!positionActionByCode.has(position.code)) {
-      gaps.push({ scope: "position_plan", code: position.code, reason: "当前持仓缺少对应竞价预案" });
-    }
-  }
 
   const opportunities = (opportunityOutput?.target_date === previousOpenDate && opportunityOutput.run_status === 'success' &&
     !['rejected','superseded'].includes(opportunityOutput.status) ? rawOpportunities : []).map((item) => {
@@ -1017,24 +1241,15 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string, 
   const intradayLadderCandidates = intradayLadderResult.rows.map((item) => ({
     ...item, target_key: `ladder:${item.signal_id}`, strategy_code: 'first_board_advance',
   }));
-  const positionItems = positions.map((position) => ({
-    target_key: `position:${position.code}`,
-    code: position.code,
-    name: position.name,
-    strategy_code: position.strategy_code,
-    strategy_name: position.strategy_name,
-    quantity: position.quantity,
-    cost_price: position.cost_price,
-    close: position.close,
-    close_date: position.close_date,
-    plan_action: positionActionByCode.has(position.code)
-      ? compactPlaybookItem(positionActionByCode.get(position.code)!)
-      : null,
-  }));
   const ladderRows = previousOpenDate ? (await db.query<{
-    code: string; name: string; streak_count: number;
-  }>(`SELECT instrument.code,instrument.name,event.streak_count
+    code: string; name: string; streak_count: number; reason: string | null;
+    seal_turnover_ratio: number | null; seal_retention: number | null; turnover: number | null;
+  }>(`SELECT instrument.code,instrument.name,event.streak_count,event.reason,
+        CASE WHEN COALESCE(event.turnover,bar.turnover)>0 THEN event.seal_money/COALESCE(event.turnover,bar.turnover) END::float8 AS seal_turnover_ratio,
+        CASE WHEN event.max_seal_money>0 THEN event.seal_money/event.max_seal_money END::float8 AS seal_retention,
+        COALESCE(event.turnover,bar.turnover)::float8 AS turnover
         FROM market_limit_event event JOIN market_instrument instrument ON instrument.id=event.instrument_id
+        LEFT JOIN market_bar bar ON bar.instrument_id=event.instrument_id AND bar.freq='day' AND bar.bar_date=event.trade_date
        WHERE event.trade_date=$1::date AND event.event_type='up' AND event.streak_count IS NOT NULL
          AND COALESCE(event.is_st,false)=false AND COALESCE(event.is_new,false)=false
          AND instrument.code ~ '^(600|601|603|605|000|001|002|003)'
@@ -1047,22 +1262,26 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string, 
     .map((item) => ({ ...item, source_streak: streakByCode.get(String(item.code)) ?? null,
       target_streak: (streakByCode.get(String(item.code)) ?? 0) + 1 }))
     .filter((item) => item.source_streak !== null);
+  const sameHeightGroups = [...new Set(progressionCandidates.map((item) => item.source_streak!))].sort((a, b) => a - b)
+    .map((height) => ({ source_streak: height, target_streak: height + 1,
+      peers: ladderRows.filter((item) => item.streak_count === height),
+      instruction: "同高度竞争者必须同时读取最终竞价；对比价格、未匹配量/竞价量、竞价量/昨量、题材角色、消息及负反馈，不把未在原候选中的竞争者新增为入场信号。" }));
   const limitLadderPk = {
     data_date: previousOpenDate,
     max_streak: maxStreak,
     highest_board: highestBoard,
     progression_candidates: progressionCandidates,
+    same_height_groups: sameHeightGroups,
     relevant_candidates: progressionCandidates.filter((item) => item.source_streak! >= 3 && item.target_streak >= Math.max(4,maxStreak-1)),
   };
   const candidateCodes = [...new Set([
-    ...positionItems.map((item) => item.code),
     ...attentions.map((item) => item.code),
     ...opportunities.map((item) => item.code),
     ...intradayLadderCandidates.map((item) => String(item.code)),
     ...highestBoard.map((item) => item.code),
+    ...sameHeightGroups.flatMap((group) => group.peers.map((item) => item.code)),
   ])].sort();
   const relevantStrategies = [...new Set([
-    ...positions.map((position) => position.strategy_code),
     ...attentions.map((item) => item.strategy_code),
     ...intradayLadderCandidates.map(() => 'first_board_advance'),
     'limit_up',
@@ -1082,25 +1301,15 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string, 
       should_run: shouldRun,
       previous_open_date: previousOpenDate,
     },
-    plan: output ? {
-      output_id: output.id,
-      target_date: output.target_date,
-      status: output.status,
-      created_at: output.created_at,
-      validity: planValidity,
-    } : null,
     coverage: {
-      position_count: positionItems.length,
-      position_plan_count: positionItems.filter((item) => item.plan_action !== null).length,
       attention_count: attentions.length,
       opportunity_count: opportunities.length,
       intraday_ladder_count: intradayLadderCandidates.length,
-      required_scope_keys: [...positionItems.map((item) => item.target_key), ...attentions.map((item) => item.target_key), ...intradayLadderCandidates.map((item) => item.target_key)],
+      required_scope_keys: [...attentions.map((item) => item.target_key), ...intradayLadderCandidates.map((item) => item.target_key)],
       candidate_count: candidateCodes.length,
     },
     candidate_codes: candidateCodes,
     required_strategy_documents: documents.rows.map((row) => row.code),
-    positions: positionItems,
     attentions,
     opportunities,
     intraday_ladder_candidates: intradayLadderCandidates,
@@ -1109,7 +1318,7 @@ export async function queryAuctionAssessmentContext(db: Db, targetDate: string, 
   };
 }
 
-/** 最新成功竞价任务对持仓和各策略关注来源的结构化研判；打板仍从每日计划机会读取。 */
+/** 最新成功竞价任务对关注来源与盘中梯队的结构化研判；打板仍从收盘打板机会读取，持仓竞价复核已下线。 */
 export async function getLatestAuctionScopeAssessments(db: Db, accountId: string | null = "1") {
   const output = await db.query<{ id: string; target_date: string }>(
     `SELECT output.id::text,output.target_date::text FROM job_run_output output
@@ -1133,7 +1342,7 @@ export async function getLatestAuctionScopeAssessments(db: Db, accountId: string
         JOIN market_instrument instrument ON instrument.id=assessment.instrument_id
         LEFT JOIN strategy_definition strategy ON strategy.code=assessment.strategy_code
        WHERE assessment.assessment_output_id=$1 AND assessment.status='active'
-         AND ($2::boolean = false OR assessment.scope_kind <> 'position')
-       ORDER BY assessment.scope_kind,instrument.code,assessment.target_key`, [output.rows[0].id, accountId === null]);
+         AND assessment.scope_kind <> 'position'
+       ORDER BY assessment.scope_kind,instrument.code,assessment.target_key`, [output.rows[0].id]);
   return { output_id: output.rows[0].id, target_date: output.rows[0].target_date, items: rows.rows };
 }

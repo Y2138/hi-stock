@@ -9,6 +9,7 @@ import { marketRoutes } from "../modules/market/routes.js";
 import { positionRoutes } from "../modules/positions/routes.js";
 import { plansRoutes } from "../modules/plans/routes.js";
 import { clearPoolAttention, listPoolResearch, listPoolView, setPoolSpecialAttention } from "../modules/pools/repo.js";
+import { fetchPoolQuotes, PoolQuoteUnavailableError } from "../modules/pools/quotes.js";
 import { volumeRoutes } from "../volume/routes.js";
 import { chatRoutes } from "../agent/routes.js";
 import { llmConfigRoutes } from "../agent/ai/routes.js";
@@ -22,10 +23,12 @@ import { strategyRuntimeRoutes } from "../modules/strategy-runtime/routes.js";
 import { boardRoutes } from "../modules/boards/routes.js";
 import { memoryRoutes } from "../modules/memory/routes.js";
 import { notificationRoutes } from "../modules/notifications/routes.js";
+import { emailNotificationRoutes } from "../modules/notifications/email-routes.js";
 import { getLatestMarketNews } from "../modules/market-news/repo.js";
 import { systemSettingsRoutes } from "../system-settings-routes.js";
 import { intradayRiskRoutes } from "../modules/intraday-risk/routes.js";
 import { getAccountOverview } from "../modules/accounts/overview.js";
+import { listWatchlist } from "../modules/ultra-short/repo.js";
 import { accountRoutes } from "../modules/accounts/routes.js";
 
 /** 统一 API 错误：携带 HTTP 状态码与稳定错误码 */
@@ -296,6 +299,28 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/positions/changes", positionRoutes.changes),
     route("GET", "/api/positions/realized-pnl", positionRoutes.realizedPnl),
     route("GET", "/api/intraday-risk", intradayRiskRoutes.latest),
+    // 超短关注池只读：页面只读取 03/01/04/05 写好的行，不在这里触发扫描或提醒。
+    route("GET", "/api/ultra-short/watchlist", async ({ pool, query }) => {
+      const requested = query.get("date")?.trim();
+      if (requested && !/^\d{4}-\d{2}-\d{2}$/u.test(requested)) throw apiErrors.badRequest("date 必须是 YYYY-MM-DD");
+      const targetDate = requested ?? (await pool.query<{ target_date: string | null }>(
+        "SELECT max(target_date)::text AS target_date FROM ultra_short_watchlist",
+      )).rows[0]?.target_date ?? null;
+      if (!targetDate) return { data: { target_date: null, items: [] } };
+      const items = await listWatchlist(pool, targetDate);
+      return { data: {
+        target_date: targetDate,
+        counts: {
+          total: items.length,
+          p1: items.filter((row) => row.priority === "P1").length,
+          p2: items.filter((row) => row.priority === "P2").length,
+          p3: items.filter((row) => row.priority === "P3").length,
+          triggered: items.filter((row) => row.intraday_status === "triggered").length,
+          oneWord: items.filter((row) => row.auction_branch === "one_word" || row.tags.includes("一字延续")).length,
+        },
+        items,
+      } };
+    }),
     route("GET", "/api/plans/latest", plansRoutes.latest),
     route("GET", "/api/plans/limit-up/latest", plansRoutes.latestLimitUp),
     route("GET", "/api/auction/latest", plansRoutes.latestAuction),
@@ -303,6 +328,14 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
       const asOf = query.get("date") ?? undefined;
       if (asOf && !/^\d{4}-\d{2}-\d{2}$/u.test(asOf)) throw apiErrors.badRequest("date 必须是 YYYY-MM-DD");
       return { data: await listPoolView(pool, asOf) };
+    }),
+    route("POST", "/api/pools/quotes", async () => {
+      try {
+        return { data: await fetchPoolQuotes(pool) };
+      } catch (error) {
+        if (!(error instanceof PoolQuoteUnavailableError)) throw error;
+        throw new ApiError(502, "QUOTE_UNAVAILABLE", `实时行情获取失败：${error.message}`);
+      }
     }),
     route("GET", "/api/market-news", async ({ query }) => {
       const date = query.get("date") ?? undefined;
@@ -347,6 +380,12 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("PATCH", "/api/llm/models/:id", llmConfigRoutes.updateModel),
     route("DELETE", "/api/llm/models/:id", llmConfigRoutes.deleteModel),
     route("POST", "/api/llm/models/:id/activate", llmConfigRoutes.activateModel),
+    route("GET", "/api/notifications/email/settings", emailNotificationRoutes.settings),
+    route("PATCH", "/api/notifications/email/settings", emailNotificationRoutes.update),
+    route("POST", "/api/notifications/email/test", emailNotificationRoutes.test),
+    route("GET", "/api/notifications/email/deliveries", emailNotificationRoutes.deliveries),
+    route("GET", "/api/notifications/email/deliveries/:id", emailNotificationRoutes.delivery),
+    route("POST", "/api/notifications/email/deliveries/:id/retry", emailNotificationRoutes.retry),
     route("GET", "/api/notifications/settings", notificationRoutes.settings),
     route("PATCH", "/api/notifications/settings", notificationRoutes.update),
     route("GET", "/api/notifications/preview", notificationRoutes.preview),

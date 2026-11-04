@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
+import { insufficientBalanceMessage } from "../agent/ai/errors.js";
+import { loadSelectionContext, selectionReport, SELECTION_JOB } from "../modules/selection/service.js";
 import { enqueueJobConclusion } from "../modules/notifications/service.js";
+import { enqueueEmailForOutput } from "../modules/notifications/email.js";
 import path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
@@ -10,6 +13,14 @@ import { appendMessage, nextMessageSeq, updateSessionStatus } from "../agent/rep
 import { runAgentSessionTurn } from "../agent/session-runner.js";
 import { createJobCompletionGate } from "../agent/job-workflow.js";
 import { querySwingUniverse } from "../modules/plans/swing-signals.js";
+import {
+  buildWeeklyReviewSnapshot,
+  renderWeeklyReviewContext,
+  saveWeeklyReviewSnapshot,
+  WEEKLY_REVIEW_JOB,
+} from "../modules/weekly-review/service.js";
+import { enqueueFirstBoardQueueAlert } from "../modules/market/first-board-advance.js";
+import { buildUltraShortWatchlist, renderUltraShortWatchlist } from "../modules/ultra-short/build.js";
 import { queryTwoYearReversalCoverage } from "../modules/plans/two-year-reversal-signal.js";
 import {
   activateAuctionAssessmentsForRun,
@@ -58,7 +69,7 @@ import type {
   JobStatus,
 } from "./types.js";
 
-const CONCLUSION_INSTRUCTION = "最终正文末尾增加二级标题‘结论摘要’，用 3～6 条、总计不超过 600 字概括本次最终判断，保留前提、触发条件、风险和数据缺口；不要重复推理过程。确实没有结论时仅写‘暂无结论’，不得把执行进度冒充结论。";
+const CONCLUSION_INSTRUCTION = "最终正文末尾增加二级标题‘结论摘要’，总计不超过 600 字；先单独写“总说明：”，用一句不超过 100 字的话概括本轮关注原因或已满足的核心条件，区分已成立与仍待条件，不得将观察说成可立即入场；关注标的逐行写成“标的名称（完整代码）｜所属板块｜简短状态或持仓动作”，未持仓标的注明“条件成立”或“等待条件”，持仓动作注明“预案”。只列本次最终保留的标的，不列剔除项，不凑数。没有关注标的时明确说明；盘前消息另写当天行情整体偏向。数据缺口、T+1 验证、执行统计、详细触发与执行条件及风险保留在完整正文，不放进结论摘要；不要重复推理过程。确实没有结论时仅写‘暂无结论’，不得把执行进度冒充结论。";
 const MAX_LOG_CHARS = 100_000;
 const RESULT_BANNER = "> AI 生成任务结果，已关联本次任务保存；不代表策略发布或交易执行。";
 const AGENT_FLOW_FINALIZE_PROMPT =
@@ -282,12 +293,15 @@ function buildAgentJobPrompt(
   run: JobRunRow,
   definition: JobDefinitionRow,
 ): string {
+  const conclusionInstruction = definition.code === SELECTION_JOB
+    ? "最终结论摘要必须采用 selection_result_write 返回的 summary，保留每只推荐理由、风险和核对条件；不自由增删或改序。"
+    : CONCLUSION_INSTRUCTION;
   if (run.attempt_count > 1) {
     return [
       `系统正在重试作业 ${definition.code}（目标日 ${run.target_date}，第 ${run.attempt_count} 次尝试）。`,
       "请结合本对话第一条任务要求和已有执行记录重新完成任务，并直接输出完整 Markdown。",
       `正文开头必须包含独立一行完成标记：${RESULT_BANNER}`,
-      CONCLUSION_INSTRUCTION,
+      conclusionInstruction,
     ].join("\n\n");
   }
   const capability = "本任务使用受控工具目录及当前确认制/YOLO 设置；已在工具列表中的能力直接调用，缺少定义时才通过 tool_catalog 加载。策略发布仍只能创建待真人审核提案。";
@@ -298,7 +312,7 @@ function buildAgentJobPrompt(
     `请直接输出完整 Markdown。正文开头必须包含独立一行完成标记：${RESULT_BANNER}`,
     "以下是数据库内固化的流程提示词；遵循其读取范围和输出结构：",
     template,
-    CONCLUSION_INSTRUCTION,
+    conclusionInstruction,
   ].join("\n\n");
 }
 
@@ -365,13 +379,17 @@ async function runAgentFlow(
 ): Promise<{ markdown: string; unavailableGaps: unknown[] }> {
   const systemPrompt = await buildSystemPrompt(pool, strategy, accountId);
   const completion = createJobCompletionGate(jobCode, targetDate);
+  const globalTaskSuffix = jobCode === WEEKLY_REVIEW_JOB
+    ? "本任务是全局周复盘：服务端周快照已覆盖全部 active 账户的持仓、成交与净值，不要因会话未绑定账户而认为缺少账户上下文；按快照逐账户分析，不修改任何业务数据。"
+    : "";
   const turn = await runAgentSessionTurn({
     pool,
     sessionId,
     historyMode: "session",
     systemPrompt,
     systemPromptSuffix:
-      "内置任务的固定领域工具已预加载，直接调用即可，无需重复 tool_catalog；其他能力以当前目录为准按需加载。优先完成本次执行的必需读取和条件写入；工具明确失败且再次调用没有意义时，应在完整正文中如实列为数据缺口，不得伪造有效信号或反复盲重试。历史成功记录不能代替本次运行。策略发布仍只能创建待真人审核提案。任务结果由 Runner 关联本次运行保存。",
+      "内置任务的固定领域工具已预加载，直接调用即可，无需重复 tool_catalog；其他能力以当前目录为准按需加载。优先完成本次执行的必需读取和条件写入；工具明确失败且再次调用没有意义时，应在完整正文中如实列为数据缺口，不得伪造有效信号或反复盲重试。历史成功记录不能代替本次运行。策略发布仍只能创建待真人审核提案。任务结果由 Runner 关联本次运行保存。"
+      + globalTaskSuffix,
     manageSessionStatus: false,
     toolScope: { kind: "job", jobCode },
     text: prompt,
@@ -655,9 +673,44 @@ async function executeAgentFlow(
   if (definition.code === "auction_opportunity_assessment" && run.attempt_count > 1) {
     await discardDraftAuctionAssessmentsForRun(deps.pool, run.id);
   }
+  if (definition.code === SELECTION_JOB) {
+    const context = await loadSelectionContext(deps.pool, run.target_date);
+    if (context.pending.length) {
+      if (run.attempt_count < 2) throw new Error(`来源仍在执行：${context.pending.join("、")}`);
+      return { status: "partial", log: "策略来源等待到期，不生成完整推荐", dataGaps: context.gaps,
+        resultMd: `${RESULT_BANNER}\n\n# 盘后统一标的精选\n\n## 结论摘要\n来源策略尚未完成，暂不形成完整推荐：${context.pending.join("、")}。请在来源完成后重新运行。` };
+    }
+  }
   const strategy = await pinJobStrategySnapshot(deps.pool, run);
   const revision = await pinJobPromptRevision(deps.pool, run, definition);
-  const prompt = buildAgentJobPrompt(revision.content, run, definition);
+  let prompt = buildAgentJobPrompt(revision.content, run, definition);
+  // 03：关注池由服务端确定性引擎在模型运行前生成并写表，模型只做复核和消息风险核对。
+  if (definition.code === "limit_up_close_scan") {
+    try {
+      const built = await buildUltraShortWatchlist(deps.pool, {
+        dataDate: run.target_date,
+        now: deps.now?.() ?? new Date(),
+      });
+      prompt += `\n\n## 服务端确定性关注池（只读，已写入 ultra_short_watchlist）\n${renderUltraShortWatchlist(built)}\n\n请按流程提示词逐只复核并调用 ultra_short_review_write；不得新增候选、上调优先级或修改总量/仓位/止损。`;
+    } catch (error) {
+      prompt += `\n\n## 服务端确定性关注池\n生成失败：${(error as Error).message}。请在正文列为数据缺口，不得自行选股或补造候选。`;
+    }
+  }
+  const weeklyReviewGaps: unknown[] = [];
+  if (definition.code === WEEKLY_REVIEW_JOB) {
+    // 周复盘先由服务端确定性生成事实快照并写表，模型只做归因与风险预估；快照缺口进入任务缺口。
+    try {
+      const snapshot = await buildWeeklyReviewSnapshot(deps.pool, run.target_date, {
+        now: deps.now?.() ?? new Date(),
+      });
+      await saveWeeklyReviewSnapshot(deps.pool, run.id, snapshot);
+      weeklyReviewGaps.push(...snapshot.gaps);
+      prompt += `\n\n${renderWeeklyReviewContext(snapshot)}`;
+    } catch (error) {
+      weeklyReviewGaps.push({ scope: "weekly_review_snapshot", reason: (error as Error).message });
+      prompt += `\n\n## 服务端周复盘事实快照\n构建失败：${(error as Error).message}。请在正文列为数据缺口，不得编造行情、持仓或成交事实。`;
+    }
+  }
   if (definition.code === "two_year_reversal_scan") {
     const coverage = await queryTwoYearReversalCoverage(deps.pool, run.target_date);
     if (!coverage) {
@@ -686,10 +739,16 @@ async function executeAgentFlow(
     if (!snapshot) throw new Error("盘前消息未完成结构化快照写入");
     unavailableGaps.push(...snapshot.gaps);
   }
+  if (definition.code === SELECTION_JOB) {
+    const report = await selectionReport(deps.pool, run.id);
+    markdown = `${RESULT_BANNER}\n\n${report.markdown}`;
+    unavailableGaps = report.gaps;
+  }
+  const dataGaps = [...unavailableGaps, ...weeklyReviewGaps];
   return {
-    status: unavailableGaps.length ? "partial" : "success",
+    status: dataGaps.length ? "partial" : "success",
     log: `agent_flow 已生成 ${markdown.length} 字符 Markdown，结果将关联当前任务运行保存。`,
-    dataGaps: unavailableGaps,
+    dataGaps,
     resultMd: markdown,
   };
 }
@@ -765,9 +824,21 @@ async function finishRun(
           [run.id],
         )
       ).rows[0]?.id ?? null;
+      await client.query("UPDATE candidate_selection_result SET status='generated' WHERE job_run_id=$1 AND result IS NOT NULL", [run.id]);
       await activatePlaybookForRun(client, run.id, outputId);
       await activateAuctionAssessmentsForRun(client, run.id, outputId);
       if (outputId) await enqueueJobConclusion(client, outputId);
+      if (outputId) {
+        // 邮件是独立通道：入队失败必须回滚到保存点，不能影响任务结果落库。
+        await client.query("SAVEPOINT email_enqueue");
+        try {
+          await enqueueEmailForOutput(client, outputId);
+          await client.query("RELEASE SAVEPOINT email_enqueue");
+        } catch (error) {
+          await client.query("ROLLBACK TO SAVEPOINT email_enqueue");
+          console.error(`邮件通知入队失败（结果 #${outputId}）：${(error as Error).message}`);
+        }
+      }
     }
     await client.query("COMMIT");
     return { run: finished, outputId };
@@ -785,11 +856,13 @@ async function failOrRetry(
   error: unknown,
   now: Date,
 ): Promise<JobRunRow> {
-  const retry = !(error instanceof NonRetryableJobError) && run.attempt_count < 2;
-  const message = (error as Error).message || String(error);
+  const balanceMessage = insufficientBalanceMessage(error);
+  const nonRetryable = error instanceof NonRetryableJobError || balanceMessage !== null;
+  const retry = !nonRetryable && run.attempt_count < 2;
+  const message = balanceMessage ?? ((error as Error).message || String(error));
   const failureSuffix = retry
     ? "；5 分钟后自动重试一次"
-    : error instanceof NonRetryableJobError ? "；该错误不可重试" : "；已达到重试上限";
+    : nonRetryable ? "；该错误不可重试" : "；已达到重试上限";
   const appended = trimLog(
     run.log +
       logLine(
@@ -838,7 +911,9 @@ async function recordFailureInConversation(
     "assistant",
     retry
       ? `第 ${run.attempt_count} 次执行失败：${message}\n\n任务将在计划时间自动重试，本对话将继续保留执行记录。`
-      : `任务执行失败：${message}\n\n已达到自动重试上限，可在本对话继续追问或重新发起任务。`,
+      : `任务执行失败：${message}\n\n${run.log.includes("该错误不可重试")
+        ? "该错误需处理后手动重新发起任务，不自动重试。"
+        : "已达到自动重试上限，可在本对话继续追问或重新发起任务。"}`,
   ).catch((syncError) => logConversationSyncError(run.id, syncError));
   await publishJobRefresh(deps.pool, run.session_id, retry ? "任务等待自动重试" : "任务执行失败")
     .catch((syncError) => logConversationSyncError(run.id, syncError));
@@ -871,6 +946,11 @@ export async function executeJobRun(deps: RunnerDeps, runId: string): Promise<Jo
       });
     }
     const finished = await finishRun(deps.pool, run, result, finishedAt);
+    // 02 首选排队提醒由确定性结果触发，不依赖模型是否在正文中重复；仅在扫描成功时发。
+    if (detail.job.code === "first_board_intraday_scan" && finished.run.status === "success") {
+      await enqueueFirstBoardQueueAlert(deps.pool, finished.run.target_date)
+        .catch((error) => logConversationSyncError(finished.run.id, error));
+    }
     if (finished.run.session_id && finished.outputId) {
       await appendConversationMessage(
           deps.pool,

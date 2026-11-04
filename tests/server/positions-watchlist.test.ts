@@ -351,6 +351,81 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     expect(boards.json).toMatchObject([{ code: "885001.TI", pool_intersection: 2 }]);
   });
 
+  /** 扶摇快照响应桩：本地请求放行，按资产类型返回给定 item。 */
+  const stubSnapshot = (stockItem: unknown[], etfItem: unknown[]) => {
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn(async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("fuyao.aicubes.cn")) return realFetch(url as string, init);
+      const item = new URL(String(url)).pathname === "/api/a-share/prices/snapshot" ? stockItem : etfItem;
+      return new Response(JSON.stringify({
+        code: 0,
+        message: "success",
+        data: { timestamp: Date.parse("2026-08-18T10:05:00+08:00"), item },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }));
+  };
+
+  it("关注池可按需获取全部标的最新涨跌幅，且不写日线", async () => {
+    stubSnapshot(
+      [{ thscode: "600487.SH", last_price: 66, prev_price: 60, open_price: 61, high_price: 67, low_price: 60 }],
+      [{ thscode: "510500.SH", last_price: 6.6, prev_price: 6.5, open_price: 6.5, high_price: 6.7, low_price: 6.4 }],
+    );
+    try {
+      const before = await pool.query<{ count: string }>("SELECT count(*)::text AS count FROM market_bar");
+      const result = await api(server!.baseUrl, "POST", "/api/pools/quotes");
+      expect(result.status).toBe(200);
+      const data = result.json as unknown as {
+        sampled_at: string;
+        gaps: string[];
+        items: Array<{ code: string; last: number; change_pct: number | null; quote_time: string; captured_at: string }>;
+      };
+      expect(data.gaps).toEqual([]);
+      expect(data.sampled_at).toBe("2026-08-18T02:05:00.000Z");
+      expect(data.items).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "600487.SH", last: 66, quote_time: "2026-08-18", captured_at: "2026-08-18T02:05:00.000Z" }),
+        expect.objectContaining({ code: "510500.SH", last: 6.6, quote_time: "2026-08-18" }),
+      ]));
+      expect(data.items.find((item) => item.code === "600487.SH")!.change_pct).toBeCloseTo(0.1, 10);
+      expect(data.items.find((item) => item.code === "510500.SH")!.change_pct).toBeCloseTo(0.01538, 5);
+      // 按需快照只服务页面展示，不能把盘中价写入日线。
+      const after = await pool.query<{ count: string }>("SELECT count(*)::text AS count FROM market_bar");
+      expect(after.rows[0]!.count).toBe(before.rows[0]!.count);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 20_000);
+
+  it("关注池实时行情对缺失快照显式给出缺口而不冒充成功", async () => {
+    stubSnapshot([{ thscode: "600487.SH", last_price: 66, prev_price: 60 }], []);
+    try {
+      const result = await api(server!.baseUrl, "POST", "/api/pools/quotes");
+      expect(result.status).toBe(200);
+      const data = result.json as unknown as { gaps: string[]; items: Array<{ code: string }> };
+      expect(data.items.map((item) => item.code)).toEqual(["600487.SH"]);
+      expect(data.gaps.join("；")).toContain("510500.SH");
+      expect(data.gaps.join("；")).toContain("快照未返回");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 20_000);
+
+  it("关注池实时行情全部失败时返回明确错误而不是空成功", async () => {
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn(async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("fuyao.aicubes.cn")) return realFetch(url as string, init);
+      return new Response(JSON.stringify({ code: 5001, message: "数据源不可用" }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }));
+    try {
+      const result = await api(server!.baseUrl, "POST", "/api/pools/quotes");
+      expect(result.status).toBe(502);
+      expect(result.json).toMatchObject({ error: { code: "QUOTE_UNAVAILABLE" } });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 20_000);
+
   it("同一生效日重新初始化时更新原角色行而不制造冲突历史", async () => {
     const before = (await pool.query(
       `SELECT membership.id::text

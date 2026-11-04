@@ -45,8 +45,8 @@ const DEFINITIONS: readonly StrategyEvaluatorDefinition[] = [
   ready("swing_entry_v1", "entry", ({ pool, targetDate, accountId }) => querySwingSignals(pool, targetDate, accountId ?? null), 2),
   ready("two_year_reversal_entry_v1", "entry", ({ pool, targetDate, accountId }) => queryTwoYearReversalSignals(pool, targetDate, accountId ?? null), 2),
   ready("limit_up_observation_v1", "entry", ({ pool, targetDate, strategyDocumentId }) =>
-    queryLimitUpSignals(pool, targetDate, strategyDocumentId), 2),
-  ready("first_board_advance_entry_v1", "entry", ({ pool, targetDate }) => queryIntradayLimitLadder(pool, targetDate), 2),
+    queryLimitUpSignals(pool, targetDate, strategyDocumentId), 3),
+  ready("first_board_advance_entry_v1", "entry", ({ pool, targetDate }) => queryIntradayLimitLadder(pool, targetDate), 3),
   ready("value_anchor_entry_v1", "entry", ({ pool, targetDate }) => queryValueAnchorSignals(pool, targetDate), 3),
   ready("copper_left_launch_entry_v1", "entry", ({ pool, targetDate, accountId }) => queryCopperLeftLaunchEntry(pool, targetDate, accountId ?? null), 2),
   ready("copper_left_launch_exit_v1", "exit", ({ pool, targetDate, accountId }) => queryCopperLeftLaunchExit(pool, targetDate, accountId ?? undefined)),

@@ -269,7 +269,7 @@ function compareDepthRank(left: SwingDailyPoolMember, right: SwingDailyPoolMembe
 }
 
 /**
- * 正式信号与接近候选合并为深度池，按评分降序、MA250 更深优先、代码升序，
+ * 正式优先、各组按原生深度排序；至少三只正式时忽略接近候选，
  * 每日只保留前 SWING_DAILY_SIGNAL_LIMIT 个；被挤出但条件仍满足的标的显式单列，
  * 供关注对账保留至到期而不是清退。
  */
@@ -291,9 +291,13 @@ export function applySwingDailyDepthLimit<S extends SwingDailyPoolMember, N exte
   const pool = [
     ...allSignals.map((item) => ({ item, status: "qualified" as const })),
     ...nearCandidates.map((item) => ({ item, status: "approaching" as const })),
-  ].sort((left, right) => compareDepthRank(left.item, right.item));
-  const kept = pool.slice(0, SWING_DAILY_SIGNAL_LIMIT);
-  const rest = pool.slice(SWING_DAILY_SIGNAL_LIMIT);
+  ].sort((left, right) => (left.status === "qualified" ? 0 : 1) - (right.status === "qualified" ? 0 : 1)
+    || compareDepthRank(left.item, right.item));
+  const formal = pool.filter((entry) => entry.status === "qualified");
+  const candidates = formal.length >= 3 ? formal : pool;
+  const kept = candidates.slice(0, SWING_DAILY_SIGNAL_LIMIT);
+  const keptCodes = new Set(kept.map((entry) => entry.item.code));
+  const rest = pool.filter((entry) => !keptCodes.has(entry.item.code));
   return {
     signals: kept.filter((entry) => entry.status === "qualified").map((entry) => entry.item),
     nearCandidates: kept.filter((entry) => entry.status === "approaching").map((entry) => entry.item),
@@ -526,6 +530,8 @@ export async function querySwingSignals(db: Db, date: string, accountId: string 
     industry_headwind_count: industryHeadwind.length,
     industry_headwind: industryHeadwind,
     signals,
+    all_signals: allSignals,
+    all_near: allNearCandidates,
     near_candidates: nearCandidates,
     suppressed_matches: suppressedMatches,
     screened_out: items

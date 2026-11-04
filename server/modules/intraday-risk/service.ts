@@ -3,13 +3,19 @@ import type { Context } from "@earendil-works/pi-ai";
 import { fetchSnapshot, type SnapshotQuote } from "../../datasource/hithink.js";
 import { getLlmConfigByModelKey } from "../../agent/ai/repo.js";
 import { resolveActiveChatModel } from "../../agent/ai/runtime.js";
+import type { ActiveLlmConfig } from "../../agent/ai/types.js";
+import { ApiError } from "../../http/router.js";
 import { sha256Json } from "../../agent/hash.js";
-import { getLatestDailyPlanBoard } from "../plans/repo.js";
 import { listPositions } from "../positions/repo.js";
-import { enqueueIntradayRiskAlert } from "../notifications/service.js";
+import { enqueueBatchAlert } from "../notifications/service.js";
+import { inServiceTransaction } from "../../db/transaction.js";
+import { ACTION_LABELS, normalizeIntradaySignals, tradePlanLabel, type IntradaySignal } from "./signals.js";
+import { readIntradaySentiment, refreshIntradaySentiment } from "./sentiment.js";
+import { listHoldingCodes } from "../ultra-short/repo.js";
+import { isWorkerEnabled, writeWorkerHeartbeat } from "../../scheduler/worker-status.js";
 
-const MODEL_KEY = "glm-5.3-flashX";
-const SAMPLE_INTERVAL_MS = 30_000;
+const MODEL_KEY = "GLM-5.3-Flash";
+const SAMPLE_INTERVAL_MS = 60_000;
 const ERROR_RETRY_INTERVAL_MS = 5 * 60_000;
 const CORE_INDEX_CODES = [
   "000001.SH", "000016.SH", "000300.SH", "000688.SH",
@@ -19,7 +25,7 @@ const CORE_INDEX_CODES = [
 type Db = Pick<pg.Pool, "query">;
 type Risk = "normal" | "watch" | "high";
 
-export interface IntradayRiskRow {
+export interface IntradayRiskRow extends IntradaySignal {
   code: string;
   name: string;
   risk: Risk;
@@ -40,13 +46,14 @@ export interface IntradayRiskSnapshot {
 }
 
 interface BoardRef { code: string; name: string; }
-interface DailyBar { date: string; open: number; high: number; low: number; close: number; volume: number | null; turnover: number | null; }
 interface QuoteContext {
   code: string;
   name: string;
   role: "position" | "industry" | "index";
-  summary: { first: number | null; latest: number | null; high: number | null; low: number | null; samples: number };
-  recent: Array<{ at: string; source_at: string | null; price: number | null; volume: number | null; turnover: number | null; status: string }>;
+  summary: { open: number | null; prev_close: number | null; latest: number | null; high: number | null; low: number | null;
+    volume: number | null; turnover: number | null; samples: number; distinct_quotes: number; source_at: string | null; status: string };
+  recent: Array<{ at: string; source_at: string | null; price: number | null; volume_delta: number | null; turnover_delta: number | null; status: string }>;
+  segments_5m: Array<{ at: string; first: number; last: number; high: number; low: number; volume_delta: number | null }>;
 }
 
 function shanghaiParts(date = new Date()): { day: string; minutes: number } {
@@ -90,24 +97,49 @@ function textContent(message: { content?: unknown }): string {
     .trim();
 }
 
+function modelConfigRevision(config: ActiveLlmConfig | null): string {
+  return config ? sha256Json([config.provider.id, config.provider.updated_at, config.model.id, config.model.updated_at]) : "missing";
+}
+
+class IntradayRiskModelError extends Error {
+  constructor(message: string, readonly retryable: boolean, readonly configRevision: string) {
+    super(message);
+    this.name = "IntradayRiskModelError";
+  }
+}
+
+/** 供应商错误可能包含凭据或请求正文，只返回固定的诊断信息。 */
+function modelFailure(error: string, revision: string): IntradayRiskModelError {
+  if (/\b403\b|权限|permission|forbidden|access.?denied/i.test(error)) {
+    return new IntradayRiskModelError(`盘中风险模型 ${MODEL_KEY} 无访问权限，请检查厂商 API Key 和订阅套餐`, false, revision);
+  }
+  if (/\b401\b|unauthor|authentication|invalid.?api.?key|鉴权|认证失败/i.test(error)) {
+    return new IntradayRiskModelError("盘中风险模型鉴权失败，请更新厂商 API Key", false, revision);
+  }
+  if (/insufficient.?balance|余额不足|欠费|\b402\b[^\n]*balance/i.test(error)) {
+    // 供应商余额不足会自动恢复：保持 5 分钟退避重试，同时在心跳中明确暴露原因。
+    return new IntradayRiskModelError("盘中风险模型供应商余额不足（402），请为厂商账户充值；将每 5 分钟自动重试", true, revision);
+  }
+  if (/insufficient.?quota|额度不足|套餐|subscription/i.test(error)) {
+    return new IntradayRiskModelError("盘中风险模型套餐或额度不可用，请检查厂商配置", false, revision);
+  }
+  if (/\b(?:400|404|422)\b|unsupported|not.?supported|model.?not.?found|模型不存在|不支持|参数错误/i.test(error)) {
+    return new IntradayRiskModelError("盘中风险模型请求配置不被厂商支持，请检查协议、地址和模型参数", false, revision);
+  }
+  return new IntradayRiskModelError("盘中风险模型调用失败，请检查网络及厂商服务状态", true, revision);
+}
+
 function parseModelJson(raw: string): unknown {
+  if (!raw) throw new Error("盘中风险模型返回空正文");
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1] ?? raw;
   const start = fenced.indexOf("{");
   const end = fenced.lastIndexOf("}");
   if (start < 0 || end <= start) throw new Error("盘中风险模型未返回 JSON");
-  return JSON.parse(fenced.slice(start, end + 1));
-}
-
-function validRisk(value: unknown): value is Risk {
-  return value === "normal" || value === "watch" || value === "high";
-}
-
-function normalizeRisk(value: unknown): Risk | null {
-  if (validRisk(value)) return value;
-  if (value === "正常") return "normal";
-  if (value === "关注" || value === "中风险") return "watch";
-  if (value === "风险" || value === "高风险") return "high";
-  return null;
+  try {
+    return JSON.parse(fenced.slice(start, end + 1));
+  } catch {
+    throw new Error("盘中风险模型返回的 JSON 格式无效");
+  }
 }
 
 async function isOpenDay(db: Db, tradeDate: string): Promise<boolean> {
@@ -136,86 +168,39 @@ async function boardRefs(db: Db, codes: string[]): Promise<Map<string, BoardRef[
   return mapped;
 }
 
-async function dailyBars(db: Db, codes: string[], tradeDate: string): Promise<Map<string, DailyBar[]>> {
-  if (codes.length === 0) return new Map();
-  const result = await db.query<{ code: string; date: string; open: number; high: number; low: number; close: number; volume: number | null; turnover: number | null }>(
-    `WITH ranked AS (
-       SELECT instrument.code, bar.bar_date::text AS date, bar.open::float8, bar.high::float8,
-              bar.low::float8, bar.close::float8, bar.volume::float8, bar.turnover::float8,
-              row_number() OVER (PARTITION BY bar.instrument_id ORDER BY bar.bar_date DESC) AS rn
-         FROM market_bar bar JOIN market_instrument instrument ON instrument.id = bar.instrument_id
-        WHERE instrument.code = ANY($1::text[]) AND bar.freq = 'day' AND bar.bar_date <= $2::date
-     ) SELECT code, date, open, high, low, close, volume, turnover FROM ranked WHERE rn <= 20 ORDER BY code, date DESC`,
-    [codes, tradeDate],
-  );
-  const mapped = new Map<string, DailyBar[]>();
-  for (const row of result.rows) mapped.set(row.code, [...(mapped.get(row.code) ?? []), row]);
-  return mapped;
-}
-
-async function strategyContext(db: Db, codes: string[]): Promise<unknown[]> {
-  if (codes.length === 0) return [];
-  const result = await db.query<{ code: string; name: string; document_code: string; title: string; content: string }>(
-    `SELECT definition.code, definition.name, definition.strategy_document_code AS document_code,
-            document.title, document.content
-       FROM strategy_definition definition
-       JOIN strategy_document document ON document.code = definition.strategy_document_code
-      WHERE definition.code = ANY($1::text[])
-      ORDER BY definition.code`,
-    [codes],
-  );
-  return result.rows.map((row) => ({
-    code: row.code,
-    name: row.name,
-    document_code: row.document_code,
-    title: row.title,
-    content: row.content.length > 6000 ? `${row.content.slice(0, 6000)}\n[正文已截断]` : row.content,
-  }));
-}
-
-async function sampleContext(db: Db, tradeDate: string, codes: string[], refs: Map<string, { name: string; role: QuoteContext["role"] }>): Promise<Map<string, QuoteContext>> {
-  if (codes.length === 0) return new Map();
-  const [result, totals] = await Promise.all([
-    db.query<{ code: string; sample_at: string; source_at: string | null; last_price: number | null; volume: number | null; turnover: number | null; data_status: string }>(
-    `WITH ranked AS (
-       SELECT code, sample_at::text, source_at::text, last_price::float8, volume::float8, turnover::float8,
-              data_status, row_number() OVER (PARTITION BY code ORDER BY sample_at DESC) AS rn
-         FROM intraday_market_sample
-        WHERE trade_date = $1 AND code = ANY($2::text[])
-     ) SELECT code, sample_at, source_at, last_price, volume, turnover, data_status
-         FROM ranked WHERE rn <= 20 ORDER BY code, sample_at`,
-    [tradeDate, codes],
-    ),
-    db.query<{ code: string; first_price: number | null; latest_price: number | null; high_price: number | null; low_price: number | null; samples: string }>(
-      `SELECT code,
-              (array_agg(last_price ORDER BY sample_at ASC))[1]::float8 AS first_price,
-              (array_agg(last_price ORDER BY sample_at DESC))[1]::float8 AS latest_price,
-              max(last_price)::float8 AS high_price, min(last_price)::float8 AS low_price,
-              count(*)::text AS samples
-         FROM intraday_market_sample
-        WHERE trade_date = $1 AND code = ANY($2::text[])
-        GROUP BY code`,
-      [tradeDate, codes],
-    ),
-  ]);
-  const grouped = new Map<string, typeof result.rows>();
-  for (const row of result.rows) grouped.set(row.code, [...(grouped.get(row.code) ?? []), row]);
-  const totalsByCode = new Map(totals.rows.map((row) => [row.code, row]));
+async function sampleContext(db: Db, tradeDate: string, codes: string[], refs: Map<string, { name: string; role: QuoteContext["role"] }>, at: Date): Promise<Map<string, QuoteContext>> {
+  const rows = (await db.query<{ code: string; at: string; source_at: string | null; price: number | null; open: number | null; high: number | null;
+    low: number | null; prev_close: number | null; volume: number | null; turnover: number | null; status: string }>(
+    `SELECT code,sample_at::text AS at,source_at::text,last_price::float8 AS price,open_price::float8 AS open,
+      high_price::float8 AS high,low_price::float8 AS low,prev_close::float8,volume::float8,turnover::float8,data_status AS status
+     FROM intraday_market_sample WHERE trade_date=$1 AND code=ANY($2::text[]) AND sample_at<=$3 ORDER BY code,sample_at`, [tradeDate,codes,at],
+  )).rows;
+  const grouped = new Map<string, typeof rows>();
+  for (const row of rows) grouped.set(row.code, [...(grouped.get(row.code) ?? []), row]);
   return new Map(codes.map((code) => {
-    const rows = grouped.get(code) ?? [];
-    const total = totalsByCode.get(code);
-    return [code, {
-      code,
-      name: refs.get(code)?.name ?? code,
-      role: refs.get(code)?.role ?? "index",
-      summary: {
-        first: total?.first_price ?? null,
-        latest: total?.latest_price ?? null,
-        high: total?.high_price ?? null,
-        low: total?.low_price ?? null,
-        samples: Number(total?.samples ?? 0),
-      },
-      recent: rows.map((row) => ({ at: row.sample_at, source_at: row.source_at, price: row.last_price, volume: row.volume, turnover: row.turnover, status: row.data_status })),
+    const samples = grouped.get(code) ?? [];
+    const latest = samples.at(-1);
+    const recent = samples.map((row, index) => {
+      const previous = samples[index - 1];
+      const delta = (field: "volume" | "turnover") => row.status === "ready" && previous?.status === "ready"
+        && row[field] !== null && previous[field] !== null && row[field]! >= previous[field]! ? row[field]! - previous[field]! : null;
+      return { at: row.at, source_at: row.source_at, price: row.price, volume_delta: delta("volume"), turnover_delta: delta("turnover"), status: row.status };
+    });
+    const segments = new Map<number, QuoteContext["segments_5m"][number]>();
+    for (const row of recent) {
+      if (row.status !== "ready" || row.price === null) continue;
+      const bucket = Math.floor(new Date(row.at).getTime() / 300_000) * 300_000;
+      const segment = segments.get(bucket);
+      if (!segment) segments.set(bucket, { at: new Date(bucket).toISOString(), first: row.price, last: row.price, high: row.price, low: row.price, volume_delta: row.volume_delta });
+      else { segment.last = row.price; segment.high = Math.max(segment.high, row.price); segment.low = Math.min(segment.low, row.price);
+        segment.volume_delta = segment.volume_delta === null || row.volume_delta === null ? null : segment.volume_delta + row.volume_delta; }
+    }
+    return [code, { code, name: refs.get(code)?.name ?? code, role: refs.get(code)?.role ?? "index",
+      summary: { open: latest?.open ?? null, prev_close: latest?.prev_close ?? null, latest: latest?.price ?? null,
+        high: latest?.high ?? null, low: latest?.low ?? null, volume: latest?.volume ?? null, turnover: latest?.turnover ?? null,
+        samples: samples.length, distinct_quotes: new Set(samples.filter((row) => row.status === "ready" && row.volume !== null && row.volume > 0).map((row) => row.source_at)).size,
+        source_at: latest?.source_at ?? null, status: latest?.status ?? "missing" }, recent: recent.slice(-20),
+      segments_5m: [...segments.values()],
     } satisfies QuoteContext] as const;
   }));
 }
@@ -229,6 +214,9 @@ async function writeSamples(
 ): Promise<void> {
   for (const item of expected) {
     const quote = quotes.get(item.code);
+    const valid = quote && [quote.open,quote.high,quote.low,quote.close].every((price) => Number.isFinite(price) && price > 0);
+    const fresh = valid && Number.isFinite(quote.timestampMs) && shanghaiParts(new Date(quote.timestampMs)).day === tradeDate
+      && sampleAt.getTime() - quote.timestampMs <= 90_000 && quote.timestampMs <= sampleAt.getTime() + 30_000;
     await db.query(
       `INSERT INTO intraday_market_sample
         (trade_date, sample_at, source_at, code, name, role, open_price, high_price, low_price,
@@ -240,96 +228,102 @@ async function writeSamples(
          volume=EXCLUDED.volume, turnover=EXCLUDED.turnover, data_status=EXCLUDED.data_status`,
       [tradeDate, sampleAt, quote ? new Date(quote.timestampMs) : null, item.code, item.name, item.role,
         quote?.open ?? null, quote?.high ?? null, quote?.low ?? null, quote?.close ?? null,
-        quote?.prevClose ?? null, quote?.volume ?? null, quote?.turnover ?? null, quote ? "ready" : "missing"],
+        quote?.prevClose ?? null, quote?.volume ?? null, quote?.turnover ?? null, fresh ? "ready" : quote ? "stale" : "missing"],
     );
   }
 }
 
-function compactPlan(item: Record<string, unknown> | undefined): Record<string, unknown> | null {
-  if (!item) return null;
-  return {
-    action: item.effective_action ?? item.action ?? null,
-    headline: typeof item.headline === "string" ? item.headline.slice(0, 600) : null,
-    key_levels: Array.isArray(item.key_levels) ? item.key_levels : [],
-    intraday: typeof item.intraday_md === "string" ? item.intraday_md.slice(0, 600) : null,
-    risk: typeof item.risk_md === "string" ? item.risk_md.slice(0, 600) : null,
-    invalidation: typeof item.invalidation_md === "string" ? item.invalidation_md.slice(0, 600) : null,
-  };
-}
-
-function buildPrompt(payload: Record<string, unknown>): Context {
+export function buildIntradayPrompt(payload: Record<string, unknown>): Context {
   return {
     systemPrompt: [
-      "你是盘中持仓风险观察器。只分析当前真实持仓，不执行交易，不修改计划。",
-      "根据持仓事实、当前计划、日线背景、本交易日采样的个股/行业/大盘数据自行判断是否有风险，不预设固定风险模式。",
-      "事实以输入为准；数据缺失或时间过期时不得猜测。没有明确风险时返回 normal。只返回 JSON，不要 Markdown、解释过程或买卖指令。",
-      "核对计划目标日与交易日；计划过期时只作为历史背景，不得把其中动作当成当前指令。",
-      "market_context 是全部持仓共用的行业与大盘背景；每只持仓通过 industry_codes 引用所属行业。",
-      '只返回单个 JSON 对象：{"items":[{"code":"标的代码","risk":"normal|watch|high","key_level":null,"reason":"不超过60字"}]}。每只持仓必须且只能返回一行。',
+      "你是盘中持仓加减仓价位观察器，只生成提醒，不执行交易，不修改持仓或每日计划。",
+      "仅依据本交易日个股量价：开盘、日内高低、分时平台、冲高回落、回收与承接、增量成交量；行业和大盘当日走势辅助判断。输入不提供成本、策略止损或历史计划，不得自行补造或引用固定止损位。",
+      "recent 是60秒采样，volume_delta/turnover_delta是累计成交量/额的增量；segments_5m覆盖当日采样价格分段，不能冒充完整5分钟K线。当天未采到的路径不得推断。",
+      "market_context.sentiment提供当日涨停/跌停/炸板总数及多次快照，结合指数与板块区分冰点、偏弱、平稳、偏热；数据不全或过期时emotion必须unknown，不得把指数下跌直接等同冰点或减仓。",
+      "情绪冰点是反向加仓机会背景：个股不再创新低、缩量止跌或放量回收且有真实承接、板块率先修复时，明确加仓区间与确认条件。持续放量下跌、承接尚未形成时等待，不因冰点直接判已触发。情绪偏热、冲高量价背离、日内平台失守后回收失败时评估减仓区间。",
+      "每只持仓分别给add_plan和reduce_plan，可同时有不同价位的条件预案，无可靠依据时为null；区间必须为正数，lower<=upper，给一句量价触发条件和一句取消条件，禁止拿旧止损位代替当日依据。",
+      "status只有条件已在输入中实际出现且最新价格位于区间才用triggered，否则waiting；当前action为add/reduce/wait，必须与唯一已触发预案一致，不能同时触发加减仓。数据缺失、过期或有效采样不足3次时action=wait且预案不得标已触发。",
+      '只返回一个JSON对象，每个真实持仓必须且只能一行：{"items":[{"code":"标的代码","action":"add|reduce|wait","add_plan":null,"reduce_plan":null,"emotion":"ice_point|weak|neutral|strong|unknown","reason":"60字以内当日量价依据"}]}。非空预案结构为{"price_lower":10.1,"price_upper":10.2,"condition":"量价确认条件","invalidation":"取消条件","status":"waiting|triggered"}，示例价格不可用于实际标的。只返回JSON，不要Markdown。',
     ].join("\n"),
     messages: [{ role: "user", content: JSON.stringify(payload), timestamp: Date.now() }],
   };
 }
 
-async function analyse(pool: pg.Pool, payload: Record<string, unknown>, codes: Set<string>): Promise<Array<{ code: string; risk: Risk; key_level: string | null; reason: string }>> {
+async function analyse(pool: pg.Pool, payload: Record<string, unknown>, codes: Set<string>, samples: Map<string, QuoteContext>, sentimentReady: boolean): Promise<IntradaySignal[]> {
   const config = await getLlmConfigByModelKey(pool, MODEL_KEY);
-  if (!config) throw new Error(`未找到模型 ${MODEL_KEY}，请先在设置中配置`);
-  const runtime = await resolveActiveChatModel(pool, config.model.id);
-  const response = await runtime.models.completeSimple(runtime.model, buildPrompt(payload), {
+  const revision = modelConfigRevision(config);
+  if (!config) throw new IntradayRiskModelError(`未找到可用模型 ${MODEL_KEY}，请先在设置中配置`, false, revision);
+  const runtime = await resolveActiveChatModel(pool, config.model.id).catch((error: unknown) => {
+    if (error instanceof ApiError && ["LLM_NOT_CONFIGURED", "LLM_DISABLED"].includes(error.code)) {
+      throw new IntradayRiskModelError("盘中风险模型配置不可用，请检查厂商启用状态和 API Key", false, revision);
+    }
+    throw error;
+  });
+  const response = await runtime.models.completeSimple(runtime.model, buildIntradayPrompt(payload), {
     reasoning: "minimal",
     temperature: 0,
     sessionId: undefined,
   });
+  if (response.stopReason === "error") throw modelFailure(response.errorMessage ?? "", revision);
+  if (response.stopReason === "aborted") throw new Error("盘中风险模型调用已中断");
   if (response.stopReason === "length") {
     throw new Error(`盘中风险模型输出被截断：已用满 ${response.usage.output} 个输出 token`);
   }
-  const parsed = parseModelJson(textContent(response));
-  const items = (parsed as { items?: unknown })?.items;
-  if (!Array.isArray(items)) throw new Error("盘中风险模型返回缺少 items");
-  const normalized = items.flatMap((raw) => {
-    if (!raw || typeof raw !== "object") return [];
-    const item = raw as Record<string, unknown>;
-    const code = typeof item.code === "string" ? item.code : "";
-    const reason = typeof item.reason === "string" ? item.reason.trim().slice(0, 240) : "";
-    const risk = normalizeRisk(item.risk);
-    if (!codes.has(code) || !risk || !reason) return [];
-    return [{ code, risk, key_level: item.key_level == null ? null : String(item.key_level).slice(0, 80), reason }];
-  });
-  const missing = [...codes].filter((code) => !normalized.some((item) => item.code === code));
-  if (missing.length > 0) throw new Error(`盘中风险模型未覆盖持仓：${missing.join(",")}`);
-  if (new Set(normalized.map((item) => item.code)).size !== normalized.length) throw new Error("盘中风险模型重复返回持仓");
-  return normalized;
+  const prices = new Map<string, number>();
+  for (const code of codes) {
+    const quote = samples.get(code)?.summary;
+    if (quote?.status === "ready" && quote.distinct_quotes >= 3 && quote.latest !== null && Number.isFinite(quote.volume) && quote.volume! > 0 && samples.get(code)!.recent.some((row) => row.volume_delta !== null && row.volume_delta > 0) && quote.source_at
+      && Date.now() - new Date(quote.source_at).getTime() <= 90_000 && new Date(quote.source_at).getTime() <= Date.now() + 30_000) prices.set(code, quote.latest);
+  }
+  return normalizeIntradaySignals(parseModelJson(textContent(response)), codes, prices, sentimentReady);
 }
 
-async function upsertRisks(
+type Judgement = IntradaySignal & { name: string; data_time: string | null; latest_price: number | null };
+
+/** 最新判断覆盖写入 intraday_position_risk；同一轮的每条判断另追加一行历史，供复盘评估。 */
+async function writeJudgements(
   db: Db,
   accountId: string,
   tradeDate: string,
   sampleAt: Date,
   modelKey: string,
   inputHash: string,
-  items: Array<{ code: string; name: string; risk: Risk; key_level: string | null; reason: string }>,
+  items: Judgement[],
 ): Promise<void> {
   for (const item of items) {
+    const risk = item.action === "reduce" ? "high" : item.action === "add" ? "normal" : item.add_plan || item.reduce_plan ? "watch" : "normal";
+    const keyLevel = [item.add_plan ? `加仓 ${tradePlanLabel(item.add_plan)}` : "",item.reduce_plan ? `减仓 ${tradePlanLabel(item.reduce_plan)}` : ""].filter(Boolean).join("；") || null;
+    const addPlan = item.add_plan ? JSON.stringify(item.add_plan) : null;
+    const reducePlan = item.reduce_plan ? JSON.stringify(item.reduce_plan) : null;
     await db.query(
       `INSERT INTO intraday_position_risk
-        (account_id, trade_date, code, name, risk, key_level, reason, sample_at, data_time, model_key, input_sha256)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10)
-       ON CONFLICT (account_id, trade_date, code) DO UPDATE SET
-         name=EXCLUDED.name, risk=EXCLUDED.risk, key_level=EXCLUDED.key_level, reason=EXCLUDED.reason,
-         sample_at=EXCLUDED.sample_at, data_time=EXCLUDED.data_time, model_key=EXCLUDED.model_key,
-         input_sha256=EXCLUDED.input_sha256, updated_at=now()`,
-      [accountId, tradeDate, item.code, item.name, item.risk, item.key_level, item.reason, sampleAt, modelKey, inputHash],
+        (account_id,trade_date,code,name,risk,key_level,reason,sample_at,data_time,model_key,input_sha256,action,add_plan,reduce_plan,emotion)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15)
+       ON CONFLICT(account_id,trade_date,code) DO UPDATE SET
+         name=EXCLUDED.name,risk=EXCLUDED.risk,key_level=EXCLUDED.key_level,reason=EXCLUDED.reason,sample_at=EXCLUDED.sample_at,
+         data_time=EXCLUDED.data_time,model_key=EXCLUDED.model_key,input_sha256=EXCLUDED.input_sha256,
+         action=EXCLUDED.action,add_plan=EXCLUDED.add_plan,reduce_plan=EXCLUDED.reduce_plan,emotion=EXCLUDED.emotion,updated_at=now()`,
+      [accountId,tradeDate,item.code,item.name,risk,keyLevel,item.reason,sampleAt,item.data_time,modelKey,inputHash,
+        item.action,addPlan,reducePlan,item.emotion],
+    );
+    // 同一轮重复执行（相同账户、交易日、采样时刻）不重复记录历史。
+    await db.query(
+      `INSERT INTO intraday_position_signal
+        (account_id,trade_date,sample_at,code,name,action,emotion,risk,key_level,reason,add_plan,reduce_plan,latest_price,model_key,input_sha256)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15)
+       ON CONFLICT(account_id,trade_date,code,sample_at) DO NOTHING`,
+      [accountId,tradeDate,sampleAt,item.code,item.name,item.action,item.emotion,risk,keyLevel,item.reason,
+        addPlan,reducePlan,item.latest_price,modelKey,inputHash],
     );
   }
 }
 
-function riskRank(value: Risk): number { return value === "high" ? 3 : value === "watch" ? 2 : 1; }
-
 export async function runIntradayRiskCycle(pool: pg.Pool, now = new Date(), openDay?: boolean, accountId = "1", sharedSample?: { at: Date; quotes: Map<string,SnapshotQuote>; gaps: string[] }): Promise<IntradayRiskSnapshot | null> {
   const { day: tradeDate } = shanghaiParts(now);
   if (!isTradingSession(now) || !(openDay ?? await isOpenDay(pool, tradeDate))) return null;
-  const positions = (await listPositions(pool, accountId)).filter((position) => position.quantity > 0);
+  const allPositions = (await listPositions(pool, accountId)).filter((position) => position.quantity > 0);
+  const ultraShortCodes = new Set(await listHoldingCodes(pool, tradeDate));
+  const positions = allPositions.filter((position) => !ultraShortCodes.has(position.code));
   if (positions.length === 0) return { trade_date: tradeDate, running: true, sample_at: null, data_status: "ready", positions: [] };
 
   const positionCodes = positions.map((position) => position.code);
@@ -358,67 +352,80 @@ export async function runIntradayRiskCycle(pool: pg.Pool, now = new Date(), open
   }
   await writeSamples(pool, tradeDate, sampleAt, expected, quoteMap);
 
-  const plan = await getLatestDailyPlanBoard(pool, accountId).catch(() => null);
-  const planMap = new Map((plan?.position_actions ?? []).map((item) => [item.code, compactPlan(item as unknown as Record<string, unknown>)]));
   const refs = new Map<string, { name: string; role: QuoteContext["role"] }>();
   for (const item of expected) refs.set(item.code, { name: item.name, role: item.role });
-  const allCodes = expected.map((item) => item.code);
-  const [samples, bars] = await Promise.all([
-    sampleContext(pool, tradeDate, allCodes, refs),
-    dailyBars(pool, allCodes, tradeDate),
+  if (!sharedSample) await refreshIntradaySentiment(pool, tradeDate, sampleAt);
+  const [samples, sentiment] = await Promise.all([
+    sampleContext(pool, tradeDate, expected.map((item) => item.code), refs, sampleAt), readIntradaySentiment(pool, tradeDate, sampleAt),
   ]);
-  const strategyCodes = [...new Set(positions.flatMap((position) => [position.strategy_code, position.fallback_strategy_code].filter((code): code is string => Boolean(code))))];
-  const strategies = await strategyContext(pool, strategyCodes);
-  const samplePayload = Object.fromEntries(samples);
-  const contextPositions = positions.map((position) => ({
-    code: position.code,
-    name: position.name,
-    quantity: position.quantity,
-    cost_price: position.cost_price,
-    entry_signal_type: position.entry_signal_type,
-    strategy_code: position.strategy_code,
-    plan: planMap.get(position.code) ?? null,
-    daily_bars: bars.get(position.code) ?? [],
-    intraday: samplePayload[position.code] ?? null,
-    industry_codes: (boardMap.get(position.code) ?? []).map((board) => board.code),
-  }));
-  const payload = {
-    trade_date: tradeDate,
-    sampled_at: sampleAt.toISOString(),
-    plan_target_date: plan?.plan.target_date ?? null,
-    data_gaps: gaps,
-    strategies,
-    market_context: {
-      industries: boardCodes.map((code) => ({ code, name: nameMap.get(code) ?? code, daily_bars: bars.get(code) ?? [], intraday: samplePayload[code] ?? null })),
-      indices: indexCodes.map((code) => ({ code, name: nameMap.get(code) ?? code, daily_bars: bars.get(code) ?? [], intraday: samplePayload[code] ?? null })),
-    },
-    positions: contextPositions,
+  const payload = { trade_date: tradeDate, sampled_at: sampleAt.toISOString(), data_gaps: gaps,
+    market_context: { sentiment, industries: boardCodes.map((code) => samples.get(code)), indices: indexCodes.map((code) => samples.get(code)) },
+    positions: positions.map((position) => ({ code: position.code, name: position.name, intraday: samples.get(position.code),
+      industry_codes: (boardMap.get(position.code) ?? []).map((board) => board.code) })),
   };
-  const previous = new Map((await listIntradayRisks(pool, tradeDate, accountId)).map((item) => [item.code, item]));
-  const items = await analyse(pool, payload, new Set(positionCodes));
+  const items = await analyse(pool, payload, new Set(positionCodes), samples, sentiment.ready);
   const nameByCode = new Map(positions.map((position) => [position.code, position.name]));
-  await upsertRisks(pool, accountId, tradeDate, sampleAt, MODEL_KEY, sha256Json(payload), items.map((item) => ({ ...item, name: nameByCode.get(item.code) ?? item.code })));
-  for (const item of items) {
-    const before = previous.get(item.code);
-    if (before && riskRank(item.risk) <= riskRank(before.risk) && item.key_level === before.key_level) continue;
-    if (item.risk === "normal") continue;
-    const source = await pool.query<{ id: string }>(
-      "SELECT id::text FROM intraday_position_risk WHERE account_id=$1 AND trade_date=$2 AND code=$3",
-      [accountId, tradeDate, item.code],
-    );
-    const accountName = (await pool.query<{name:string}>("SELECT name FROM portfolio_account WHERE id=$1",[accountId])).rows[0]?.name ?? accountId;
-    const content = `【${accountName}】${nameByCode.get(item.code) ?? item.code}：${item.risk === "high" ? "高风险" : "关注"}\n`+
-      `关键位：${item.key_level ?? "暂无明确关键位"}\n盘面：${item.reason}\n时间：${sampleAt.toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`;
-    if (source.rows[0]) await enqueueIntradayRiskAlert(pool, source.rows[0].id, content);
-  }
-  const latest = await listIntradayRisks(pool, tradeDate, accountId);
-  return { trade_date: tradeDate, running: true, sample_at: sampleAt.toISOString(), data_status: gaps.length ? "partial" : "ready", positions: latest };
+  await inServiceTransaction(pool, async (client) => {
+    await writeJudgements(client, accountId, tradeDate, sampleAt, MODEL_KEY, sha256Json(payload), items.map((item) => ({
+      ...item,
+      name: nameByCode.get(item.code) ?? item.code,
+      data_time: samples.get(item.code)?.summary.source_at ?? null,
+      latest_price: samples.get(item.code)?.summary.latest ?? null,
+    })));
+    // 普通持仓只发一条汇总：出现加仓/减仓时，把所有普通持仓（含观察）一起发出。
+    const actionable = items.some((item) => item.action === "add" || item.action === "reduce");
+    if (!actionable) {
+      await client.query(
+        "UPDATE notification_delivery SET status='cancelled',error='盘中条件已变化' WHERE kind='intraday_digest' AND account_id=$1 AND status IN ('pending','failed')",
+        [accountId],
+      );
+    } else {
+      const content = [
+        `Stock｜普通持仓盘中观察｜${sampleAt.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`,
+        "",
+        ...positions.map((position) => {
+          const item = items.find((signal) => signal.code === position.code);
+          const price = samples.get(position.code)?.summary.latest;
+          const plan = item?.action === "add" ? item.add_plan : item?.action === "reduce" ? item.reduce_plan : null;
+          const range = plan ? `：${plan.price_lower.toFixed(2)}～${plan.price_upper.toFixed(2)}` : "";
+          return `${position.name} ${position.code} ${price === null || price === undefined ? "—" : price.toFixed(2)} ${item ? ACTION_LABELS[item.action] : "待观察"}${range}｜${item?.reason ?? "本轮无有效信号"}`;
+        }),
+      ].join("\n");
+      const signature = positions.map((position) => {
+        const item = items.find((signal) => signal.code === position.code);
+        const plan = item?.action === "add" ? item.add_plan : item?.action === "reduce" ? item.reduce_plan : null;
+        const price = samples.get(position.code)?.summary.latest;
+        return {
+          code: position.code,
+          action: item?.action ?? "wait",
+          price: price === null || price === undefined ? null : Number(price.toFixed(2)),
+          reason: item?.reason ?? null,
+          // 计划区间按 0.02 桶归一，避免 0.01 的微调反复发消息；实际文案仍保留精确区间。
+          plan: plan ? Math.round(((plan.price_lower + plan.price_upper) / 2) * 20) / 20 : null,
+        };
+      });
+      const eventKey = `intraday_digest:${accountId}:${tradeDate}:${sha256Json(signature)}`;
+      await client.query(
+        "UPDATE notification_delivery SET status='cancelled',error='盘中条件已更新' WHERE kind='intraday_digest' AND account_id=$1 AND status IN ('pending','failed') AND event_key<>$2",
+        [accountId, eventKey],
+      );
+      await enqueueBatchAlert(client, {
+        kind: "intraday_digest",
+        event_key: eventKey,
+        content,
+        account_id: accountId,
+      });
+    }
+  });
+  return { trade_date: tradeDate, running: true, sample_at: sampleAt.toISOString(), data_status: gaps.length || !sentiment.ready || expected.some((item) => samples.get(item.code)?.summary.status !== "ready") ? "partial" : "ready", positions: await listIntradayRisks(pool,tradeDate,accountId) };
 }
 
 export async function listIntradayRisks(db: Db, tradeDate = shanghaiParts().day, accountId = "1"): Promise<IntradayRiskRow[]> {
   const result = await db.query<IntradayRiskRow>(
-    `SELECT code, name, risk, key_level, reason, sample_at::text, data_time::text, model_key, updated_at::text
-       FROM intraday_position_risk WHERE account_id = $1 AND trade_date = $2 ORDER BY CASE risk WHEN 'high' THEN 1 WHEN 'watch' THEN 2 ELSE 3 END, code`,
+    `SELECT r.code,r.name,r.risk,r.key_level,r.reason,r.sample_at::text,r.data_time::text,r.model_key,r.updated_at::text,r.action,r.add_plan,r.reduce_plan,r.emotion
+       FROM intraday_position_risk r JOIN market_instrument i ON i.code=r.code
+       JOIN portfolio_position p ON p.instrument_id=i.id AND p.account_id=r.account_id AND p.quantity>0
+       WHERE r.account_id=$1 AND r.trade_date=$2 AND r.action IS NOT NULL ORDER BY CASE r.action WHEN 'reduce' THEN 0 WHEN 'add' THEN 1 ELSE 2 END,r.code`,
     [accountId, tradeDate],
   );
   return result.rows;
@@ -426,18 +433,20 @@ export async function listIntradayRisks(db: Db, tradeDate = shanghaiParts().day,
 
 export async function getIntradayRisk(db: Db, tradeDate = shanghaiParts().day, code?: string, accountId = "1"): Promise<IntradayRiskSnapshot> {
   const rows = await listIntradayRisks(db, tradeDate, accountId);
-  const sample = await db.query<{ sample_at: string | null; status: string }>(
-    `SELECT max(sample_at)::text AS sample_at,
-            CASE WHEN count(*) FILTER (WHERE data_status='missing') > 0 THEN 'partial' ELSE 'ready' END AS status
-       FROM intraday_market_sample WHERE trade_date = $1`,
-    [tradeDate],
-  );
+  const sample = (await db.query<{ sample_at: string | null; status: string; held_count: number }>(
+    `WITH held AS (SELECT i.code FROM portfolio_position p JOIN market_instrument i ON i.id=p.instrument_id WHERE p.account_id=$2 AND p.quantity>0),
+     latest AS (SELECT DISTINCT ON (s.code) s.sample_at,s.source_at,s.data_status FROM intraday_market_sample s JOIN held ON held.code=s.code
+       WHERE s.trade_date=$1 ORDER BY s.code,s.sample_at DESC)
+     SELECT max(sample_at)::text AS sample_at,(SELECT count(*)::int FROM held) AS held_count,
+       CASE WHEN count(*)=0 THEN 'unavailable' WHEN count(*) FILTER(WHERE data_status<>'ready')>0 THEN 'partial' ELSE 'ready' END AS status FROM latest`, [tradeDate,accountId],
+  )).rows[0]!;
+  const stale = rows.some((row) => !row.data_time || Date.now() - new Date(row.data_time).getTime() > 90_000);
   const filtered = code ? rows.filter((row) => row.code === code) : rows;
   return {
     trade_date: tradeDate,
-    running: isTradingSession(),
-    sample_at: sample.rows[0]?.sample_at ?? null,
-    data_status: (sample.rows[0]?.status as IntradayRiskSnapshot["data_status"]) ?? "unavailable",
+    running: tradeDate === shanghaiParts().day && isTradingSession() && await isOpenDay(db, tradeDate),
+    sample_at: sample.sample_at,
+    data_status: sample.held_count === 0 ? "ready" : stale ? "stale" : rows.length < sample.held_count ? "partial" : sample.status as IntradayRiskSnapshot["data_status"],
     positions: filtered,
   };
 }
@@ -448,6 +457,7 @@ export class IntradayRiskWorker {
   private stopped = true;
   private openDay: { day: string; open: boolean } | null = null;
   private readonly accountRetryAt = new Map<string, number>();
+  private readonly accountBlockedRevision = new Map<string, string>();
   constructor(private readonly pool: pg.Pool) {}
   start(): void {
     if (!this.stopped) return;
@@ -470,6 +480,7 @@ export class IntradayRiskWorker {
     this.busy = true;
     let nextDelay = SAMPLE_INTERVAL_MS;
     try {
+      if (!(await isWorkerEnabled(this.pool, "position_intraday_watch"))) return;
       const now = new Date();
       if (!isTradingSession(now)) nextDelay = intradayRiskNextDelayMs(now);
       else {
@@ -477,6 +488,7 @@ export class IntradayRiskWorker {
         if (this.openDay?.day !== day) this.openDay = { day, open: await isOpenDay(this.pool, day) };
         nextDelay = intradayRiskNextDelayMs(now, this.openDay.open);
         if (this.openDay.open) {
+          await writeWorkerHeartbeat(this.pool, "position_intraday_watch", { status: "running", trade_date: day });
           const accounts = await this.pool.query<{ id: string }>(
             "SELECT id::text FROM portfolio_account WHERE status = 'active' ORDER BY id",
           );
@@ -488,27 +500,61 @@ export class IntradayRiskWorker {
           const refs=await boardRefs(this.pool,codes);
           const indices=[...new Set([...CORE_INDEX_CODES,...[...refs.values()].flat().map(ref=>ref.code)])];
           const shared={at:new Date(),quotes:new Map<string,SnapshotQuote>(),gaps:[] as string[]};
+          const revision = this.accountBlockedRevision.size
+            ? modelConfigRevision(await getLlmConfigByModelKey(this.pool, MODEL_KEY)) : null;
           if(codes.length) {
             try { for(const quote of await fetchSnapshot(codes,{db:this.pool,priority:"interactive"},"stock")) shared.quotes.set(quote.code,quote); }
             catch(error) { shared.gaps.push(`持仓快照：${(error as Error).message}`); }
             try { for(const quote of await fetchSnapshot(indices,{db:this.pool,priority:"interactive"},"index")) shared.quotes.set(quote.code,quote); }
             catch(error) { shared.gaps.push(`板块/指数快照：${(error as Error).message}`); }
           }
+          if (codes.length) await refreshIntradaySentiment(this.pool, day, shared.at);
+          const failures: string[] = [];
           for (const account of accounts.rows) {
-            if ((this.accountRetryAt.get(account.id) ?? 0) > now.getTime()) continue;
+            const blocked = this.accountBlockedRevision.get(account.id);
+            if (blocked !== undefined) {
+              if (blocked === revision) {
+                failures.push(`账户 ${account.id}：模型分析已暂停，等待模型或厂商配置更新`);
+                continue;
+              }
+              this.accountBlockedRevision.delete(account.id);
+              this.accountRetryAt.delete(account.id);
+            }
+            if ((this.accountRetryAt.get(account.id) ?? 0) > now.getTime()) {
+              failures.push(`账户 ${account.id}：等待模型调用重试`);
+              continue;
+            }
             try {
               await runIntradayRiskCycle(this.pool, now, true, account.id, shared);
               this.accountRetryAt.delete(account.id);
             } catch(error) {
-              this.accountRetryAt.set(account.id, now.getTime() + ERROR_RETRY_INTERVAL_MS);
-              console.error(`[intraday-risk] 账户 ${account.id}：${(error as Error).message}；5 分钟后重试`);
+              failures.push(`账户 ${account.id}：${(error as Error).message}`);
+              if (error instanceof IntradayRiskModelError && !error.retryable) {
+                this.accountBlockedRevision.set(account.id, error.configRevision);
+                console.error(`[intraday-risk] 账户 ${account.id}：${error.message}；模型分析已暂停，更新模型或厂商配置后自动重试`);
+              } else {
+                this.accountRetryAt.set(account.id, now.getTime() + ERROR_RETRY_INTERVAL_MS);
+                console.error(`[intraday-risk] 账户 ${account.id}：${(error as Error).message}；5 分钟后重试`);
+              }
             }
           }
+          // 心跳必须反映真实失败：之前静默写 success 会让盘中模型停摆看起来像正常运行。
+          await writeWorkerHeartbeat(this.pool, "position_intraday_watch", {
+            status: failures.length > 0 ? "failed" : "success",
+            trade_date: day,
+            summary: failures.length > 0
+              ? `账户 ${accounts.rows.length} 个；${failures.length} 个账户模型分析失败，持仓快照已更新`
+              : `账户 ${accounts.rows.length} 个；持仓快照与模型观察已更新`,
+            error: failures.length > 0 ? failures.join("；").slice(0, 500) : null,
+          }).catch((error) => console.error(`[intraday-risk] 心跳写入失败：${(error as Error).message}`));
         }
       }
     }
     catch (error) {
       nextDelay = Math.max(nextDelay, ERROR_RETRY_INTERVAL_MS);
+      await writeWorkerHeartbeat(this.pool, "position_intraday_watch", {
+        status: "failed", error: (error as Error).message,
+      }).catch(() => {});
       console.error(`[intraday-risk] ${(error as Error).message}；5 分钟后重试`);
     }
     finally {

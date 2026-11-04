@@ -5,6 +5,7 @@ import type pg from "pg";
 import { requireAccount } from "../accounts/repo.js";
 import { apiErrors } from "../../http/router.js";
 import { inServiceTransaction, type TransactionDb } from "../../db/transaction.js";
+import { syncUltraShortFill } from "../ultra-short/repo.js";
 
 export type Db = Pick<pg.Pool | pg.PoolClient, "query">;
 export const DEFAULT_ACCOUNT_ID = "1";
@@ -620,6 +621,24 @@ export async function recordPositionChange(
 
       const rows = await listPositions(client, currentAccountId);
       position = rows.find((p) => p.instrument_id === instrumentId) ?? null;
+      // 05：真实成交回写关注池的持仓生命周期；失败只回滚关联，不影响真实持仓。
+      await client.query("SAVEPOINT ultra_short_fill");
+      try {
+        await syncUltraShortFill(client, {
+          account_id: currentAccountId,
+          code: input.code,
+          kind: input.kind,
+          price: input.price ?? null,
+          quantity: input.quantity ?? null,
+          change_date: input.change_date,
+          strategy_code: attribution?.code ?? existing?.strategy_code ?? null,
+          remaining_quantity: position ? Number(position.quantity) : 0,
+        });
+        await client.query("RELEASE SAVEPOINT ultra_short_fill");
+      } catch (error) {
+        await client.query("ROLLBACK TO SAVEPOINT ultra_short_fill");
+        console.error(`[ultra-short] 成交关联关注池失败：${(error as Error).message}`);
+      }
     }
 
     return {

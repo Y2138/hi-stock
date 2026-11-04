@@ -60,7 +60,8 @@ export class JobScheduler {
     if (this.activeTick) return this.activeTick;
     this.activeTick = (async () => {
       const after = this.lastTickAt ?? new Date(now.getTime() - (this.deps.tickMs ?? DEFAULT_TICK_MS));
-      const jobs = (await listJobDefinitions(this.deps.pool)).filter((job) => job.enabled);
+      const jobs = (await listJobDefinitions(this.deps.pool))
+        .filter((job) => job.enabled && job.job_type !== "worker");
       for (const job of jobs) {
         for (const occurrence of cronOccurrences(job.cron, after, now)) {
           await insertScheduledJobRun(this.deps.pool, job.id, occurrence, "queued");
@@ -109,7 +110,8 @@ export class JobScheduler {
 
   async recoverMissed(now: Date): Promise<number> {
     const through = new Date(now.getTime() - 1);
-    const jobs = (await listJobDefinitions(this.deps.pool)).filter((job) => job.enabled);
+    const jobs = (await listJobDefinitions(this.deps.pool))
+      .filter((job) => job.enabled && job.job_type !== "worker");
     let inserted = 0;
     for (const job of jobs) {
       const latest = await latestScheduledFor(this.deps.pool, job.id);

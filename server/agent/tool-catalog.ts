@@ -29,7 +29,7 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
   },
   {
     title: "策略计算读取",
-    tools: ["daily_plan_strategy_query", "strategy_evaluation_query", "daily_plan_context_query", "swing_signal_query", "limit_up_signal_query", "value_anchor_signal_query", "two_year_reversal_signal_query", "analysis_run", "strategy_screen_query"],
+    tools: ["daily_plan_strategy_query", "strategy_evaluation_query", "selection_context_query", "selection_result_write", "daily_plan_context_query", "swing_signal_query", "limit_up_signal_query", "value_anchor_signal_query", "two_year_reversal_signal_query", "analysis_run", "strategy_screen_query"],
   },
   {
     title: "持久同步",
@@ -48,7 +48,7 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
   },
   {
     title: "任务流程",
-    tools: ["auction_context_query", "auction_assessment_write", "pool_attention_write", "daily_plan_write", "pool_news_write"],
+    tools: ["auction_context_query", "auction_assessment_write", "pool_attention_write", "daily_plan_write", "pool_news_write", "ultra_short_review_write"],
   },
   {
     title: "研究与资料",

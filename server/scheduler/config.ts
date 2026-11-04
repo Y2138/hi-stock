@@ -4,6 +4,7 @@ import {
   type DatasourcePipeline,
   type JobType,
   type ValidatedJobConfig,
+  type WorkerJobConfig,
 } from "./types.js";
 
 function objectOf(value: unknown, field = "config"): Record<string, unknown> {
@@ -31,8 +32,8 @@ const DATASOURCE_PIPELINES = new Set<DatasourcePipeline>([
 ]);
 
 export function assertJobType(value: unknown): JobType {
-  if (value !== "datasource" && value !== "analysis" && value !== "agent_flow") {
-    throw new Error("job_type 必须是 datasource/analysis/agent_flow");
+  if (value !== "datasource" && value !== "analysis" && value !== "agent_flow" && value !== "worker") {
+    throw new Error("job_type 必须是 datasource/analysis/agent_flow/worker");
   }
   return value;
 }
@@ -56,13 +57,21 @@ export function validateJobConfig(jobType: JobType, input: unknown): ValidatedJo
     }
     case "analysis": {
       noUnknownKeys(config, ["analysis_type", "request"]);
-      if (config.analysis_type !== "sector_temperature" && config.analysis_type !== "key_levels" && config.analysis_type !== "long_valuation" && config.analysis_type !== "value_monthly_rank") {
+      if (config.analysis_type !== "sector_temperature" && config.analysis_type !== "key_levels" && config.analysis_type !== "long_valuation" && config.analysis_type !== "value_monthly_rank" && config.analysis_type !== "ultra_short_auction") {
         throw new Error("analysis config.analysis_type 非法");
       }
       if (config.request !== undefined && (!config.request || typeof config.request !== "object" || Array.isArray(config.request))) {
         throw new Error("analysis config.request 必须是对象");
       }
       return { analysis_type: config.analysis_type, ...(config.request ? { request: config.request as AnalysisJobConfig["request"] } : {}) };
+    }
+    case "worker": {
+      noUnknownKeys(config, ["interval_seconds"]);
+      const interval = Number(config.interval_seconds);
+      if (!Number.isInteger(interval) || interval < 5 || interval > 300) {
+        throw new Error("worker config.interval_seconds 必须是 5–300 的整数");
+      }
+      return { interval_seconds: interval } satisfies WorkerJobConfig;
     }
     case "agent_flow": {
       // 兼容迁移前的旧配置；Agent Flow 与普通对话统一使用共享工具目录。

@@ -284,7 +284,7 @@ export async function runAgentSessionTurn(
           role: message.role,
           json: message,
         });
-        nextSeq += 1;
+        nextSeq = Math.max(nextSeq + 1, Number(row.seq) + 1);
         await persistAndPublishSessionEvent(input.pool, {
           session_id: session.id,
           event_type: "message_completed",

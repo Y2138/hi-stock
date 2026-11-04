@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { shortlistEntryResult } from "../selection/service.js";
 import { attentionValidUntil, strategyAttentionCodes } from "../pools/attention-lifecycle.js";
 import type pg from "pg";
 import { inServiceTransaction } from "../../db/transaction.js";
@@ -103,6 +104,8 @@ async function inputFacts(db: Db, input: EnsureStrategyEvaluationInput, binding:
       (SELECT count(*)::int FROM market_indicator_value WHERE bar_date <= $1::date) AS indicator_count,
       (SELECT max(computed_at)::text FROM market_indicator_value WHERE bar_date <= $1::date) AS indicator_computed_at,
       (SELECT max(finished_at)::text FROM market_special_sync_run WHERE target_date <= $1::date) AS special_finished_at,
+      (SELECT max(captured_at)::text FROM market_news_snapshot WHERE target_date <= $1::date
+        AND captured_at <= LEAST(now(),$1::date + interval '1 day')) AS news_captured_at,
       (SELECT count(*)::int FROM market_factor_observation WHERE published_at < $1::date + interval '1 day') AS factor_count,
       (SELECT max(fetched_at)::text FROM market_factor_observation WHERE published_at < $1::date + interval '1 day') AS factor_fetched_at,
       (SELECT max(created_at)::text FROM fundamental_snapshot WHERE as_of_date <= $1::date) AS fundamental_created_at,
@@ -439,9 +442,10 @@ export async function ensureStrategyEvaluation(
   if (claim.mode === "wait") return { execution: "waiting", run: toRun(claim.row), result: null };
   const runId = String(claim.row.id);
   try {
-    const result = await executeStrategyEvaluator(binding.evaluator_code, {
+    const raw = await executeStrategyEvaluator(binding.evaluator_code, {
       pool: db, targetDate: input.target_date, strategyDocumentId: binding.document_id, accountId: input.phase === "entry" ? null : input.account_id ?? "1",
     });
+    const result = input.phase === "entry" ? await shortlistEntryResult(db, binding.code, input.target_date, raw) : raw;
     const status = normalizedStatus(result);
     const persisted = await inServiceTransaction(db, async (client) => {
       await client.query("DELETE FROM strategy_entry_signal WHERE run_id=$1", [runId]);

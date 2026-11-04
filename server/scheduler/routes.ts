@@ -88,6 +88,7 @@ export const jobRoutes = {
       throw apiErrors.badRequest("account_id 必须是数字字符串");
     }
     const definition = await findJobByCode(pool,params.code!);
+    if (definition?.job_type === "worker") throw apiErrors.badRequest("常驻任务不支持手动运行，请在任务中心启停");
     if (definition?.execution_scope === "account" && !value.account_id) throw apiErrors.badRequest("账户任务必须指定 account_id");
     const run = await queueManualJob(pool, params.code!, value.target_date as string | undefined, new Date(), value.account_id as string | undefined);
     wakeScheduler(pool);

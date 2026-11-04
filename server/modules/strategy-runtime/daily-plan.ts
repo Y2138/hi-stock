@@ -4,6 +4,7 @@ import { queryDailyPlanContext } from "../plans/daily-context.js";
 import { getLatestMarketNews, instrumentNews } from "../market-news/repo.js";
 import { replaceDraftPlaybook, type DailyPlanKeyLevel, type PlaybookItemInput } from "../plans/repo.js";
 import { listPositions } from "../positions/repo.js";
+import { EXIT_RULES } from "../ultra-short/exit.js";
 import { mergeExitEvaluations } from "./exit-evaluators.js";
 import { type StrategyAttentionChange } from "./attention.js";
 import { ensureStrategyEvaluation, type EnsureStrategyEvaluationResult } from "./service.js";
@@ -82,11 +83,145 @@ export function buildKeyLevels(levels: PositionTechnicalLevels | undefined): Dai
 }
 
 
+/** 超短关注池持仓事实：05 离场硬规则所需的全部输入，避免每日计划重复调用 limit_up/兜底退出评估器。 */
+export interface UltraShortHoldingFacts {
+  target_date: string;
+  entry_price: number | null;
+  position_opened_at: string | null;
+  key_levels: Record<string, unknown>;
+  tags: string[];
+  risk: Record<string, unknown>;
+}
+
+const ULTRA_SHORT_LOW_BUY_TAGS = ["龙回头", "单阳不破", "N 字结构", "线上阴线买"] as const;
+
+function positivePrice(value: unknown): number | null {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function roundedPrice(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function priceText(value: number | null | undefined): string {
+  return value === null || value === undefined || !Number.isFinite(value) ? "—" : value.toFixed(2);
+}
+
+/**
+ * 超短持仓的每日计划退出判定：只做确定性硬规则，不做 LLM 可放宽的解释。
+ * 硬止损优先；低吸按 +1.5R 减半、+2.5R 清仓；打板不设固定目标，断板/炸板与 D+1 14:50 由盘中监控执行。
+ */
+export function evaluateUltraShortPositionExit(input: {
+  code: string;
+  name: string;
+  close: number | null;
+  close_date: string | null;
+  holding: UltraShortHoldingFacts;
+}): StrategyPositionEvaluation {
+  const { code, name, close, close_date, holding } = input;
+  const line: "board" | "low_buy" = holding.tags.some((tag) =>
+    (ULTRA_SHORT_LOW_BUY_TAGS as readonly string[]).includes(tag)) ? "low_buy" : "board";
+  const entry = positivePrice(holding.entry_price);
+  const invalidation = positivePrice(holding.key_levels.invalidation_price);
+  const stop = positivePrice(holding.key_levels.stop_price) ?? invalidation;
+  const r = entry !== null && stop !== null && entry > stop ? entry - stop : null;
+  const targetOne = line === "low_buy" && entry !== null && r !== null
+    ? roundedPrice(entry + EXIT_RULES.low_buy_first_target_r * r) : null;
+  const targetTwo = line === "low_buy" && entry !== null && r !== null
+    ? roundedPrice(entry + EXIT_RULES.low_buy_second_target_r * r) : null;
+  const timeStop = line === "board"
+    ? "D+1 14:50 仍未封板清仓；开板/炸板按 A–H 分级，弱回封卖一半，炸板或二次开板清仓"
+    : "低吸持有第 3 个交易日（线上阴线第 2 个）仍未涨过买入价 +2% 则清仓";
+  const hardRules = line === "board" ? [
+    "硬止损：收盘跌破止损价即清仓，LLM 不得放宽",
+    "开板/炸板：弱回封卖一半，炸板、尾盘开板或二次开板清仓",
+    "时间止损：D+1 14:50 仍未封板清仓，不把打板做成中线",
+  ] : [
+    "硬止损：收盘跌破结构位/失效位即清仓，LLM 不得放宽",
+    "第一止盈：买入价 +1.5R 卖出一半",
+    "第二止盈：买入价 +2.5R 清仓落袋",
+    "时间止损：D+2/D+3 仍未启动（未涨过买入价 +2%）清仓",
+  ];
+  const evidence: Record<string, unknown> = {
+    line,
+    entry,
+    stop,
+    invalidation,
+    target_1: targetOne,
+    target_2: targetTwo,
+    current_close: close,
+    close_date,
+    target_date: holding.target_date,
+    position_opened_at: holding.position_opened_at,
+    r_multiple: close !== null && entry !== null && r !== null
+      ? Number(((close - entry) / r).toFixed(2)) : null,
+    time_stop: timeStop,
+    hard_rules: hardRules,
+    risk: holding.risk,
+  };
+  const evaluation = (
+    action: StrategyPositionEvaluation["action"],
+    reason: string,
+    triggerKind: string,
+    triggerPrice: number | null,
+    protectionPrice: number | null,
+  ): StrategyPositionEvaluation => ({
+    code, name, strategy_code: "ultra_short", evaluation_role: "primary",
+    action, trigger_kind: triggerKind,
+    trigger_price_lower: triggerPrice, trigger_price_upper: triggerPrice,
+    protection_price: protectionPrice, reason, evidence, missing_items: [],
+  });
+
+  if (entry === null || stop === null) {
+    return evaluation("observe", "超短持仓缺少入场价/止损位", "condition", null, null);
+  }
+  if (entry <= stop) {
+    return evaluation("observe", "超短持仓止损位不低于入场价，无法计算 R 倍数", "condition", null, null);
+  }
+  if (close === null) {
+    return evaluation("observe", "超短持仓缺少最新收盘价，无法按硬规则判定", "condition", null, stop);
+  }
+  if (close <= stop) {
+    return evaluation("exit",
+      `超短硬止损：收盘 ${priceText(close)} 已跌破止损位 ${priceText(stop)}，清仓（硬规则，不得放宽）`,
+      "open", stop, stop);
+  }
+  if (targetTwo !== null && close >= targetTwo) {
+    return evaluation("exit",
+      `低吸第二止盈：收盘 ${priceText(close)} 达到买入价 +${EXIT_RULES.low_buy_second_target_r}R（${priceText(targetTwo)}），清仓落袋`,
+      "price_range", targetTwo, stop);
+  }
+  if (targetOne !== null && close >= targetOne) {
+    return evaluation("reduce",
+      `低吸第一止盈：收盘 ${priceText(close)} 达到买入价 +${EXIT_RULES.low_buy_first_target_r}R（${priceText(targetOne)}），先卖出一半`,
+      "price_range", targetOne, stop);
+  }
+  return evaluation("hold", line === "board"
+    ? `超短打板持仓未跌破硬止损 ${priceText(stop)}；封住持有，断板/炸板与 D+1 14:50 未封板由盘中监控清仓`
+    : `超短低吸持仓未跌破硬止损 ${priceText(stop)}，也未触及 +${EXIT_RULES.low_buy_first_target_r}R/+${EXIT_RULES.low_buy_second_target_r}R 止盈；时间止损由盘中监控执行`,
+  "condition", stop, stop);
+}
+
+/** 每日计划 LLM 只解释超短规则，不得改写结构化动作或放宽硬止损。 */
+function ultraShortPlaybookEvidence(primary: StrategyPositionEvaluation): string {
+  const evidence = resultRecord(primary.evidence);
+  const rules = Array.isArray(evidence.hard_rules) ? evidence.hard_rules.map(String) : [];
+  const price = (value: unknown): string =>
+    typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "—";
+  return [
+    `超短确定性硬规则（服务端计算，LLM 只解释不放宽）：${rules.join("；")}`,
+    `当前判定：${primary.reason}`,
+    `入场 ${price(evidence.entry)}｜止损 ${price(evidence.stop)}｜第一止盈 ${price(evidence.target_1)}｜第二止盈 ${price(evidence.target_2)}｜失效 ${price(evidence.invalidation)}`,
+    `时间止损：${String(evidence.time_stop ?? "—")}`,
+  ].join("\n");
+}
+
 export async function queryDailyPlanStrategyContext(
   pool: pg.Pool,
   input: { date: string; requested_by_job_run_id?: string | null; account_id?: string },
 ) {
-  const [definitions, positions, legacyContext, activeAttentions, newsSnapshot] = await Promise.all([
+  const [definitions, positions, legacyContext, activeAttentions, newsSnapshot, ultraShortHoldings] = await Promise.all([
     listStrategyRuntimeDefinitions(pool),
     listPositions(pool, input.account_id),
     queryDailyPlanContext(pool, input.date, input.account_id),
@@ -105,7 +240,18 @@ export async function queryDailyPlanStrategyContext(
       [input.date],
     ),
     getLatestMarketNews(pool, input.date),
+    // 超短持仓由 05 离场硬规则在每日计划内直接判定；这里只取每代码最新一行持仓事实。
+    pool.query<UltraShortHoldingFacts & { code: string }>(
+      `SELECT DISTINCT ON (code) code, target_date::text AS target_date,
+              entry_price::float8 AS entry_price, position_opened_at::text,
+              key_levels, tags, risk
+         FROM ultra_short_watchlist
+        WHERE exit_status IN ('holding','exit_triggered') AND target_date >= $1::date - 10
+        ORDER BY code, target_date DESC, id DESC`,
+      [input.date],
+    ),
   ]);
+  const ultraShortByCode = new Map(ultraShortHoldings.rows.map((row) => [row.code, row]));
   const byCode = new Map(definitions.map((definition) => [definition.code, definition]));
   const requests = new Map<string, { strategy: StrategyRuntimeDefinition; phase: "entry" | "exit" | "context" }>();
   const add = (strategy: StrategyRuntimeDefinition, phase: "entry" | "exit" | "context") =>
@@ -113,6 +259,8 @@ export async function queryDailyPlanStrategyContext(
 
   const gaps: Record<string, unknown>[] = [];
   for (const position of positions) {
+    // 超短持仓不再调用原 limit_up/兜底退出评估器，避免两套规则重复分析同一持仓。
+    if (ultraShortByCode.has(position.code)) continue;
     if (!position.strategy_code) {
       gaps.push({ code: position.code, scope: "position", reason: "当前持仓尚未归因运行时策略" });
       continue;
@@ -159,6 +307,27 @@ export async function queryDailyPlanStrategyContext(
   const technicalByCode = new Map(legacyContext.positions.items.map((item) => [item.code, item.technical_levels]));
   const boardsByCode = new Map(legacyContext.position_boards.items.map((item) => [item.code, item]));
   const positionEvaluations = positions.map((position) => {
+    const ultraShort = ultraShortByCode.get(position.code);
+    if (ultraShort) {
+      // 超短持仓：05 硬规则直接给出结构化动作，作为 primary，explanation 交给每日计划 LLM。
+      const primary = evaluateUltraShortPositionExit({
+        code: position.code, name: position.name, close: position.close,
+        close_date: position.close_date, holding: ultraShort,
+      });
+      return {
+        code: position.code, name: position.name,
+        strategy_code: position.strategy_code ?? "ultra_short",
+        strategy_name: "超短策略", exit_policy_mode: "dedicated" as const,
+        primary, fallback: null,
+        effective_action: primary.action, effective_source: "primary" as const,
+        effective_reason: primary.reason,
+        primary_evaluation_run_id: null, fallback_evaluation_run_id: null,
+        evaluation_status: "success" as const, data_date: position.close_date,
+        missing_items: [] as string[], strategy_runtime_version: position.strategy_runtime_version ?? null,
+        key_levels: buildKeyLevels(technicalByCode.get(position.code)),
+        boards: boardsByCode.get(position.code) ?? null,
+      };
+    }
     if (!position.strategy_code || !byCode.has(position.strategy_code)) return {
       code: position.code, name: position.name, strategy_code: position.strategy_code, strategy_name: null,
       exit_policy_mode: null, primary: null, fallback: null,
@@ -231,7 +400,9 @@ export async function queryDailyPlanStrategyContext(
         ...(effective?.trigger_price_upper !== null && effective?.trigger_price_upper !== undefined
           ? { price_upper: effective.trigger_price_upper } : {}),
         headline: `${item.strategy_name ?? "待归因"}｜${item.effective_reason}`,
-        evidence_md: `主策略：${item.primary?.reason ?? "无"}；兜底：${item.fallback?.reason ?? "无"}`,
+        evidence_md: item.primary?.strategy_code === "ultra_short" && item.primary
+          ? ultraShortPlaybookEvidence(item.primary)
+          : `主策略：${item.primary?.reason ?? "无"}；兜底：${item.fallback?.reason ?? "无"}`,
         key_levels: item.key_levels,
         ...(item.missing_items.length ? { missing_md: item.missing_items.map((value) => typeof value === "string" ? value : JSON.stringify(value)).join("；") } : {}),
         ...(item.strategy_code ? { strategy_code: item.strategy_code } : {}),

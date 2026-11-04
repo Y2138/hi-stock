@@ -44,8 +44,11 @@ import {
   scoreLimitUpFeatureRows,
   queryLimitUpSignals,
   limitUpBenchmarkSha,
+  cleanLimitUpThemes,
+  rankLimitUpPkRows,
   type LimitUpBenchmark,
 } from "../../server/modules/market/limit-up-signals.js";
+import { limitUpPkProfile, sameHeightPkGroups } from "../../server/modules/market/limit-up-pk.js";
 import indicatorFixture from "../fixtures/指标金样本.json";
 import { fetchFundFlow, fetchSzseCalendarMonth } from "../../server/datasource/akshare.js";
 import {
@@ -131,7 +134,7 @@ describe("打板固定基准评分", () => {
     });
   });
 
-  it("单只停牌股缺基准日K线只剔除该股，不传染同题材或使全任务部分完成", async () => {
+  it("旧趋势基准日缺K线不阻断承接PK，背景缺口仍逐股披露且不传染同题材", async () => {
     const tradingDates = Array.from({ length: 22 }, (_, index) =>
       new Date(Date.UTC(2026, 7, index + 1)).toISOString().slice(0, 10));
     const target = tradingDates.at(-1)!;
@@ -142,7 +145,7 @@ describe("打板固定基准评分", () => {
     })));
     const bars = tradingDates.flatMap((date, index) => ["600001.SH", "600002.SH"]
       .filter((code) => !(code === "600002.SH" && index === tradingDates.length - 7))
-      .map((code) => ({ date, code, open: 10, close: 10 + index / 10, turnover: 100 })));
+      .map((code) => ({ date, code, open: 10, high: 13, low: 9, close: 10 + index / 10, volume: 100, turnover: 100 })));
     const distributions = Object.fromEntries([
       "theme_share", "theme_max_streak", "theme_tier_count", "market_hhi",
       "market_limit_up_count", "theme_turnover_log", "seal_turnover_ratio", "seal_minutes",
@@ -160,12 +163,15 @@ describe("打板固定基准评分", () => {
       if (sql.includes("FROM market_bar bar JOIN market_instrument")) return { rows: bars };
       if (sql.includes("FROM market_trading_day")) return { rows: tradingDates.map((date) => ({ date })) };
       if (sql.includes("FROM strategy_entry_signal signal")) return { rows: [] };
+      if (sql.includes("FROM market_news_item n")) return { rows: [] };
+      if (sql.includes("FROM market_special_sync_run")) return { rows: [] };
       throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
     } } as unknown as Parameters<typeof queryLimitUpSignals>[0];
     const result = await queryLimitUpSignals(db, target);
-    expect(result).toMatchObject({ status: "success", candidate_count: 1, skipped_count: 1, gaps: [] });
-    expect(result.skipped).toEqual([{ code: "600002.SH", missing_inputs: ["stock_pre5_return"] }]);
-    expect(result.candidates.map((item) => item.code)).toEqual(["600001.SH"]);
+    expect(result).toMatchObject({ status: "success", candidate_count: 2, skipped_count: 0, gaps: [], selection_method: "stage_pk_v2" });
+    expect(result.skipped).toEqual([]);
+    expect(result.candidates.find((item) => item.code === "600002.SH")?.missing_inputs).toContain("stock_pre5_return");
+    expect(result.candidates.map((item) => item.code)).toEqual(["600001.SH", "600002.SH"]);
     expect(result.candidates[0]!.features.theme_pre5_return).not.toBeNull();
   });
 
@@ -183,6 +189,62 @@ describe("打板固定基准评分", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.features.seal_minutes).toBe(0);
     expect(rows[0]!.features.persistence_5d).toBe(0);
+  });
+
+  it("同为三板比较承接，历史高分不能盖过巨量弱封，数据并列不凭代码判胜", () => {
+    const input = { code: "600001.SH", streak: 3, seal: 30, maxSeal: 40, turnover: 100,
+      minute: 5, volumeRatio: 1, oneWord: false, core: 1, phase: "close" as const };
+    const make = (code: string, seal: number, volumeRatio = 1) => ({ code, streak_count: 3,
+      pk: limitUpPkProfile({ ...input, code, seal, volumeRatio }), pk_minute: 5, pk_turnover: 100, pk_core: 1 });
+    const weak = make("600001.SH", 8, 3);
+    const strong = make("600002.SH", 30);
+    expect(weak.pk.status).toBe("observe_only");
+    expect(sameHeightPkGroups([weak, strong])[0]).toMatchObject({ data_leader: strong.code,
+      participation_leader: strong.code, peer_codes: [strong.code, weak.code], source_streak: 3, target_streak: 4 });
+    expect(sameHeightPkGroups([strong, make("600003.SH", 30)])[0]?.data_leader).toBeNull();
+    expect(sameHeightPkGroups([weak])[0]?.data_leader).toBeNull();
+  });
+
+  it("一字强度与参与首位分开，盘中不拿累计量冒充全天缩量，缺值保留未知", () => {
+    const base = { code: "600001.SH", streak: 3, seal: 50, maxSeal: 60, turnover: 100,
+      minute: 0, volumeRatio: 3, oneWord: true, core: 1, phase: "intraday" as const };
+    const pk = limitUpPkProfile(base);
+    expect(pk).toMatchObject({ status: "review", volume_ratio_prev: null, execution: "queue_uncertain" });
+    const groups = sameHeightPkGroups([{ code: base.code, streak_count: 3, pk, pk_minute: 0, pk_turnover: 100, pk_core: 1 }]);
+    expect(groups[0]).toMatchObject({ data_leader: base.code, participation_leader: null });
+    expect(limitUpPkProfile({ ...base, seal: null, oneWord: null })).toMatchObject({ status: "insufficient", execution: "unknown", seal_turnover_ratio: null });
+  });
+
+  it("主升顺位由同阶段承接决定，旧分数较高的弱封标的仅观察", () => {
+    const features = Object.fromEntries(["theme_share", "theme_max_streak", "theme_tier_count", "market_hhi",
+      "market_limit_up_count", "theme_turnover_log", "seal_turnover_ratio", "seal_minutes", "theme_pre5_return",
+      "theme_width", "stock_pre5_return", "persistence_5d", "above_ma20", "promotion_rate", "negative_feedback",
+      "first_board_share", "core_position"].map((key) => [key, 1])) as unknown as Parameters<typeof rankLimitUpPkRows>[0][number]["features"];
+    const rows: Parameters<typeof rankLimitUpPkRows>[0] = ["600001.SH", "600002.SH"].map((code, i) => ({
+      event: { date: "2026-08-20", event_type: "up", code, name: code, streak_count: 3, open_count: null,
+        first_event_time: "2026-08-20T01:30:00Z", reason: "机器人", is_st: false, is_new: false,
+        seal_money: i ? 30 : 2, max_seal_money: 40, turnover: 100 }, mainTheme: "机器人", features,
+      missingInputs: [], pk: limitUpPkProfile({ code, streak: 3, seal: i ? 30 : 2, maxSeal: 40, turnover: 100,
+        minute: 0, volumeRatio: 3, oneWord: false, core: 1, phase: "close" }),
+    }));
+    const distributions = Object.fromEntries(Object.keys(features).map((key) => [key, [0, 1]])) as LimitUpBenchmark["distributions"];
+    const result = rankLimitUpPkRows(rows, { code: "test", document_id: "1", training_start: "2025-01-01", training_end: "2025-06-30",
+      methodology: "test", distributions, sample_counts: {}, source_summary: {}, sha256: "0".repeat(64) });
+    expect(result.signals.map((item) => item.code)).toEqual(["600002.SH"]);
+    expect(result.route_leaders).toEqual({ cluster: "600002.SH", momentum: "600002.SH" });
+  });
+
+  it("出版同义与独立事件保留，主标签优先同标的连续驱动而非每日切换", () => {
+    expect(cleanLimitUpThemes("教科书发行+图书发行+控制权拟变更+资产重组+回购"))
+      .toEqual(["出版传媒", "控制权变更", "资产重组"]);
+    const dates = ["2026-08-19", "2026-08-20"];
+    const event = { event_type: "up" as const, code: "600001.SH", name: "样本", streak_count: 2,
+      open_count: null, first_event_time: "2026-08-20T01:30:00Z", reason: "图书发行", is_st: false, is_new: false,
+      seal_money: 100, max_seal_money: 100, turnover: 100 };
+    const events = [{ ...event, date: dates[0]! }, { ...event, date: dates[1]!, reason: "教科书发行+机器人" },
+      ...["600002.SH", "600003.SH"].map((code) => ({ ...event, code, date: dates[1]!, reason: "机器人" }))];
+    const rows = buildLimitUpFeatureRows({ events, bars: [], tradingDates: dates, targetDates: [dates[1]!] });
+    expect(rows.find((row) => row.event.code === "600001.SH")?.mainTheme).toBe("出版传媒");
   });
 });
 

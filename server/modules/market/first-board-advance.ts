@@ -4,6 +4,8 @@ import { fetchBatchIsolated } from "../../datasource/batch-isolation.js";
 import { fetchSnapshot } from "../../datasource/hithink.js";
 import { fetchLimitPoolPage } from "../../datasource/hithink-special.js";
 import { cleanLimitUpThemes } from "./limit-up-signals.js";
+import { compareLimitUpPk, limitUpPkNews, limitUpPkProfile, sameHeightPkGroups } from "./limit-up-pk.js";
+import { notifyQueuePreferred } from "../ultra-short/alerts.js";
 
 type Db = Pick<pg.Pool, "query">;
 type Raw = Record<string, unknown>;
@@ -11,6 +13,7 @@ export type IntradayLadderRole = "theme_leader" | "ladder_middle" | "theme_initi
   | "high_board_follower" | "ladder_replenishment" | "leadership_switch";
 export type IntradayHighBoardState = "none" | "active" | "mixed" | "leader_broken";
 export type IntradayExecutionRisk = "queue_fill_uncertain" | "late_seal" | "normal";
+export type IntradayAuctionStrength = "strong" | "neutral" | "weak" | "unknown";
 
 interface ThemeContext {
   width: number;
@@ -24,7 +27,10 @@ interface ThemeContext {
 function shanghaiDate(ms = Date.now()): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
 }
-function number(value: unknown): number | null { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null; }
+function number(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null;
+}
 function timeMinute(value: unknown): number | null {
   const match = /^(\d{2}):(\d{2})$/.exec(String(value ?? ""));
   return match ? Number(match[1]) * 60 + Number(match[2]) : null;
@@ -69,6 +75,40 @@ export function classifyIntradayBoardForm(input: { hasTheme: boolean; oneWord: b
   };
 }
 
+/**
+ * T 日 09:25 竞价强度只调整候选优先级，不新增候选。
+ * 一字或近涨停、且买方未匹配为正视为强；平开/低开/卖方未匹配为负视为弱。
+ */
+export function classifyAuctionStrength(input: {
+  auctionPct: number | null;
+  unmatchedRatio: number | null;
+  oneWord: boolean;
+}): IntradayAuctionStrength {
+  if (input.auctionPct === null) return "unknown";
+  if (input.oneWord && input.auctionPct >= 9.5) return "strong";
+  if (input.unmatchedRatio !== null && input.unmatchedRatio < 0) return "weak";
+  if (input.auctionPct <= 0) return "weak";
+  if (input.auctionPct >= 3) return "strong";
+  if (input.auctionPct < 1) return "neutral";
+  return "neutral";
+}
+
+/** 竞价强弱进入排序分：强 +10，弱 -10；未知不加分也不扣分。 */
+export function auctionStrengthScore(strength: IntradayAuctionStrength): number {
+  return strength === "strong" ? 10 : strength === "weak" ? -10 : 0;
+}
+
+export interface IntradayPreferredQueue {
+  code: string;
+  name: string;
+  streak_count: number | null;
+  auction_strength: IntradayAuctionStrength;
+  limit_price: number | null;
+  seal_money: number | null;
+  risk_flags: string[];
+  invalidation: string;
+}
+
 export interface IntradayLimitLadderResult {
   date: string;
   data_date: string;
@@ -81,6 +121,10 @@ export interface IntradayLimitLadderResult {
   candidates: Raw[];
   skipped: Array<{ code: string; reason: string }>;
   gaps: string[];
+  preferred?: IntradayPreferredQueue | null;
+  same_height_pk?: ReturnType<typeof sameHeightPkGroups>;
+  pk_news?: Awaited<ReturnType<typeof limitUpPkNews>>;
+  selection_method?: "stage_pk_v2";
 }
 
 /** 10:45 单点前瞻扫描；覆盖完整涨停梯队，只保存独立快照，不写收盘市场结构事实。 */
@@ -169,11 +213,18 @@ export async function queryIntradayLimitLadder(db: Db, date: string): Promise<In
     // 当前涨停池就是点时梯队事实；一字板和10:30后封板只影响排序、成交风险，不应被硬排除。
     const boardForm = classifyIntradayBoardForm({ hasTheme: Boolean(mainTheme), oneWord, limitMinute: minute });
     const auctionVolume = number(auction?.auction_volume); const unmatched = number(auction?.auction_unmatched);
+    const auctionPct = number(auction?.auction_pct);
+    const unmatchedRatio = unmatched !== null && auctionVolume && auctionVolume > 0 ? unmatched / auctionVolume : null;
+    const auctionStrength = classifyAuctionStrength({ auctionPct, unmatchedRatio, oneWord });
     const themeWidth = context?.width ?? 0;
     const sealRetention = seal !== null && maxSeal && maxSeal > 0 ? seal / maxSeal : null;
     const sealFloatRatio = seal !== null && floatCap && floatCap > 0 ? seal / floatCap : null;
     const selectionScore = rolePriority[role] * 100 + Math.min(streakCount, 5) * 10 + Math.min(themeWidth, 10)
-      + (sealRetention ?? 0) * 3 + Math.min((sealFloatRatio ?? 0) * 500, 5) + (oneWord ? 3 : 0);
+      + (sealRetention ?? 0) * 3 + Math.min((sealFloatRatio ?? 0) * 500, 5) + (oneWord ? 3 : 0)
+      + auctionStrengthScore(auctionStrength);
+    const pk = limitUpPkProfile({ code, streak: streakCount, seal, maxSeal, turnover: quote?.turnover ?? null,
+      minute: minute === null ? null : Math.max(0, minute - 570), volumeRatio: null, oneWord: quote ? oneWord : null,
+      core: context?.maxStreak ? streakCount / context.maxStreak : null, phase: "intraday" });
     return {
       code, name: String(item.name ?? code), streak_count: streakCount, next_stage: `${streakCount}进${streakCount + 1}`,
       main_theme: mainTheme, themes, ladder_role: role, high_board_state: highBoardState,
@@ -184,21 +235,27 @@ export async function queryIntradayLimitLadder(db: Db, date: string): Promise<In
       theme_width_1045: Number(themeWidth.toFixed(4)), seal_money: seal, max_seal_money: maxSeal,
       seal_retention: sealRetention === null ? null : Number(sealRetention.toFixed(4)),
       seal_float_ratio: sealFloatRatio === null ? null : Number(sealFloatRatio.toFixed(6)),
-      auction_pct: number(auction?.auction_pct), auction_yesterday_ratio_pct: number(auction?.auction_yesterday_ratio_pct),
-      auction_unmatched_ratio: unmatched !== null && auctionVolume && auctionVolume > 0 ? Number((unmatched / auctionVolume).toFixed(4)) : null,
+      auction_pct: auctionPct, auction_yesterday_ratio_pct: number(auction?.auction_yesterday_ratio_pct),
+      auction_unmatched_ratio: unmatchedRatio === null ? null : Number(unmatchedRatio.toFixed(4)),
+      auction_strength: auctionStrength,
+      current_price: quote?.close ?? null,
       one_word: oneWord,
       intraday_consistency: boardForm.consistency,
       execution_risk: boardForm.executionRisk,
       eligible: boardForm.eligible, selection_score: Number(selectionScore.toFixed(4)),
+      pk, pk_minute: minute, pk_turnover: quote?.turnover ?? null,
+      pk_core: context?.maxStreak ? streakCount / context.maxStreak : null,
       evidence: { captured_at: new Date(sourceTimestamp).toISOString(), current_turnover: quote?.turnover ?? null, current_low: quote?.low ?? null },
       invalidation: "11点前已炸板、收盘未封住，题材高位核心转弱，或次日竞价出现明确卖方未匹配与题材共振转弱",
     };
-  }).sort((left, right) => Number(right.eligible) - Number(left.eligible)
-    || right.selection_score - left.selection_score
-    || (left.limit_minute ?? 9999) - (right.limit_minute ?? 9999)
-    || left.code.localeCompare(right.code));
+  }).sort((left, right) => {
+    const stages = { confirmation: 0, first_board: 1, high_board: 2 };
+    return Number(right.eligible) - Number(left.eligible)
+      || stages[left.pk.stage] - stages[right.pk.stage]
+      || compareLimitUpPk(left, right) || left.code.localeCompare(right.code);
+  });
 
-  const eligibleRows = rows.filter((row) => row.eligible);
+  const eligibleRows = rows.filter((row) => row.eligible && row.pk.status === "review");
   const selected: typeof rows = [];
   const themeCounts = new Map<string, number>();
   const add = (row: typeof rows[number] | undefined) => {
@@ -216,6 +273,19 @@ export async function queryIntradayLimitLadder(db: Db, date: string): Promise<In
     route: row.streak_count === 1 ? "early_first_board" : "intraday_relay",
     reason: `10:45${row.next_stage}候选：${row.main_theme ?? "题材待核"} / ${row.ladder_role}`,
   }));
+  // 只对唯一首选发排队提醒：一字只作强势观察，竞价弱/未知不作首选。
+  const preferredRow = signals.find((row) => !row.one_word
+    && (row.auction_strength === "strong" || row.auction_strength === "neutral")) ?? null;
+  const preferred: IntradayPreferredQueue | null = preferredRow ? {
+    code: preferredRow.code,
+    name: preferredRow.name,
+    streak_count: preferredRow.streak_count,
+    auction_strength: preferredRow.auction_strength,
+    limit_price: preferredRow.current_price,
+    seal_money: preferredRow.seal_money,
+    risk_flags: preferredRow.pk.flags,
+    invalidation: preferredRow.invalidation,
+  } : null;
   const themeContexts = [...themeContext.entries()].map(([theme, context]) => ({
     theme, width_1045: Number(context.width.toFixed(4)), max_streak: context.maxStreak,
     tiers: [...context.tiers].sort((a, b) => a - b), leader_codes: context.leaderCodes,
@@ -223,9 +293,12 @@ export async function queryIntradayLimitLadder(db: Db, date: string): Promise<In
   })).sort((left, right) => right.width_1045 - left.width_1045 || right.max_streak - left.max_streak || left.theme.localeCompare(right.theme, "zh-CN"));
   if (rawCandidates.length > 0 && !usableCandidates.length) gaps.push("全部候选缺少可用的行情或竞价快照");
   const capturedAt = new Date(sourceTimestamp).toISOString();
+  const sameHeightPk = sameHeightPkGroups(rows.filter((row) => row.eligible));
+  const pkNews = await limitUpPkNews(db, rows.map((row) => row.code), capturedAt);
   await db.query(`INSERT INTO first_board_intraday_snapshot
       (scan_date,captured_at,source_timestamp,limit_up_count,limit_break_count,payload)
-    VALUES ($1,now(),$2,$3,$4,$5::jsonb)`, [date, capturedAt, up.total, broken.total, JSON.stringify({ candidates: rows, signals, theme_contexts: themeContexts, skipped })]);
+    VALUES ($1,now(),$2,$3,$4,$5::jsonb)`, [date, capturedAt, up.total, broken.total, JSON.stringify({ candidates: rows, signals, theme_contexts: themeContexts,
+      preferred, same_height_pk: sameHeightPk, pk_news: pkNews, selection_method: "stage_pk_v2", skipped })]);
   return {
     date, data_date: date, status: gaps.length ? "partial" : "success", captured_at: capturedAt,
     coverage: {
@@ -239,6 +312,32 @@ export async function queryIntradayLimitLadder(db: Db, date: string): Promise<In
       break_rate: Number((broken.total / Math.max(1, up.total + broken.total)).toFixed(4)),
       max_streak: rows.reduce((max, row) => Math.max(max, row.streak_count), 0),
     },
-    theme_contexts: themeContexts, signals, candidates: rows, skipped, gaps,
+    theme_contexts: themeContexts, signals, candidates: rows, skipped, gaps, preferred,
+    selection_method: "stage_pk_v2", same_height_pk: sameHeightPk, pk_news: pkNews,
   };
+}
+
+/**
+ * 10:45 扫描成功后只对唯一首选发排队提醒；无首选、一字强票或竞价弱时不发。
+ * 快照 payload 已保存首选，重复执行通过 notification_delivery.event_key 去重。
+ */
+export async function enqueueFirstBoardQueueAlert(db: Db, date: string): Promise<boolean> {
+  const snapshot = (await db.query<{ payload: { preferred?: IntradayPreferredQueue | null } }>(
+    `SELECT payload FROM first_board_intraday_snapshot
+      WHERE scan_date=$1::date ORDER BY captured_at DESC, id DESC LIMIT 1`,
+    [date],
+  )).rows[0];
+  const preferred = snapshot?.payload?.preferred;
+  if (!preferred) return false;
+  return notifyQueuePreferred(db, {
+    trade_date: date,
+    code: preferred.code,
+    name: preferred.name,
+    streak_count: preferred.streak_count,
+    auction_strength: preferred.auction_strength,
+    seal_money: preferred.seal_money,
+    risk_flags: preferred.risk_flags,
+    limit_price: preferred.limit_price,
+    invalidation: preferred.invalidation,
+  }, new Date());
 }

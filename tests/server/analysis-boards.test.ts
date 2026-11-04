@@ -420,14 +420,16 @@ describe.skipIf(!prepared)("板块温度同花顺口径", () => {
 
     await pool.query(`INSERT INTO market_instrument(code,name,kind,lifecycle_status)
       VALUES ('881145.TI','电力','board','active'),('000300.SH','沪深300','index','active'),
-        ('600001.SH','稳定股票','stock','active'),('600002.SH','大盘股票','stock','active')`);
+        ('600001.SH','稳定股票','stock','active'),('600002.SH','大盘股票','stock','active'),
+        ('300001.SZ','创业板股票','stock','active'),('688001.SH','科创板股票','stock','active')`);
     await pool.query(`INSERT INTO market_board(instrument_id,board_type,source,active)
       SELECT id, CASE WHEN code='000300.SH' THEN 'special' ELSE 'industry' END,'hithink',true
         FROM market_instrument WHERE code IN ('881145.TI','000300.SH')`);
     await pool.query(`INSERT INTO market_board_membership(board_instrument_id,member_instrument_id,effective_from)
       SELECT board.id,member.id,'2026-01-01' FROM market_instrument board CROSS JOIN market_instrument member
        WHERE (board.code='881145.TI' AND member.code='600001.SH')
-          OR (board.code='000300.SH' AND member.code='600002.SH')`);
+          OR (board.code='000300.SH' AND member.code IN ('600002.SH','300001.SZ','688001.SH'))`);
+    // 沪深300成员仍须遵守《投资总策略》交易权限：创业板、科创板不得进入候选与排名。
     const candidates = await listValueCandidates(pool, "2026-01-29");
     expect(candidates.map((item) => [item.code, item.formal])).toEqual([
       ["600001.SH", false], ["600002.SH", true],

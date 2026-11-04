@@ -2,9 +2,10 @@ import crypto from "node:crypto";
 import type pg from "pg";
 import { apiErrors } from "../http/router.js";
 import { generateValueMonthlyRank } from "../modules/value-ranking/service.js";
+import { runUltraShortAuctionCycle } from "../modules/ultra-short/auction.js";
 
 export const ANALYSIS_SERVICE_VERSION = "analysis-v3";
-export const ANALYSIS_TYPES = ["sector_temperature", "key_levels", "long_valuation", "value_monthly_rank", "sector_trend_structure"] as const;
+export const ANALYSIS_TYPES = ["sector_temperature", "key_levels", "long_valuation", "value_monthly_rank", "sector_trend_structure", "ultra_short_auction"] as const;
 export type AnalysisType = (typeof ANALYSIS_TYPES)[number];
 type Db = Pick<pg.Pool, "query">;
 
@@ -899,6 +900,17 @@ export async function executeAnalysis(db: Db, raw: AnalysisRequest): Promise<Ana
     else if (request.analysis_type === "sector_trend_structure") outcome = await querySectorTrendStructure(db, request);
     else if (request.analysis_type === "key_levels") outcome = await keyLevels(db, request);
     else if (request.analysis_type === "long_valuation") outcome = await longValuation(db, request);
+    else if (request.analysis_type === "ultra_short_auction") {
+      const target = request.as_of ?? new Date().toISOString().slice(0, 10);
+      // 必须把数据库传到数据源，否则取数层无法读取已配置的扶摇 API Key。
+      const auction = await runUltraShortAuctionCycle(db as unknown as pg.Pool, new Date(), { deps: { db } });
+      // 空池/窗口外是有效跳过，不制造数据缺口；只有取数或判定不完整才计 partial。
+      outcome = {
+        result: { ...auction, status: auction.status, target_date: target },
+        gaps: auction.status === "insufficient" || auction.status === "partial" ? auction.gaps : [],
+        input: { trade_date: auction.trade_date, stage: auction.stage },
+      };
+    }
     else {
       const target = request.as_of ?? new Date().toISOString().slice(0, 10);
       const calendar = await db.query<{ open: boolean | null; next_open: string | null; previous_open: string | null }>(
