@@ -600,7 +600,7 @@ export function buildChatTools(deps: ChatToolDeps, scope: ToolScope = { kind: "c
     {
       name: "analysis_run",
       label: "运行复合分析",
-      description: "批量运行板块温度、板块趋势结构、关键位、长线估值或月度价值排名分析。全部能力由服务读取数据库执行，结果和缺口写入 analysis_run；不调用外部 Python。板块温度与趋势结构的正式口径仅覆盖 881/884 本地日更的行业板块；sector_trend_structure 返回 881 板块左侧趋势信号（三触发线按优先级：中期脱离=脱离60日中期下降趋势、新低回升=触及60日新低后创10日新高、急跌反转=13日急跌反跳；前两级优先，前两线要求止跌形态与量比<1.5，新低回升线为纯口径）、trigger 标签、观察窗口、失效位与板块内补涨候选，口径冻结自回测结论文档；概念/地域/特色板块走势用 hithink index_history 原始 K 线解读，不包装为温度或趋势结构结论。",
+      description: "批量运行板块温度、板块趋势结构、关键位、长线估值或月度价值排名分析。全部能力由服务读取数据库执行，结果和缺口写入 analysis_run；不调用外部 Python。板块温度与趋势结构的正式口径仅覆盖 881/884 本地日更的行业板块；sector_trend_structure 返回 881 板块左侧趋势信号（三触发线：中期脱离=脱离60日中期下降趋势、新低回升=触及60日新低后创10日新高、急跌反转=13日急跌反跳；触发线只决定是否进入观察，不决定优先级，前两线要求止跌形态与量比<1.5，新低回升线为纯口径）、当日确认度分档 confirmation（M1 上涨家数占比、M2 板块涨幅减上证涨幅、M3 涨停家数含20cm、M4 量比、M5 收盘位置与单根脉冲扣分；总分≥6 为 A、3–5 为 B、≤2 为 C，C 档不输出板块内个股、不写关注池）、结构位失效位与距收盘百分比、第二道结构位、trigger 标签、观察窗口与板块内补涨候选（已按证券简称排除 ST/退市风险股），口径冻结自回测结论文档；概念/地域/特色板块走势用 hithink index_history 原始 K 线解读，不包装为温度或趋势结构结论。",
       parameters: AnalysisRunSchema,
       executionMode: "sequential",
       execute: guard<AnalysisRunInput>(deps, "analysis_run", validateAnalysisRunInput, async (params, context) => {

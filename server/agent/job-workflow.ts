@@ -45,6 +45,31 @@ function baseToolName(value: string): string {
   return value.split("（", 1)[0]!;
 }
 
+function isNumber(value: unknown): boolean {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/** 板块当日确认度分档齐全性：档位、总分、五项分项、脉冲标记与结构位失效位缺任一项即不合格。 */
+function sectorTierGap(result: unknown): string | null {
+  const signals = object(result).signals;
+  if (!Array.isArray(signals)) return "结果缺少 signals";
+  for (const raw of signals) {
+    const confirmation = object(object(raw).confirmation);
+    const label = String(object(raw).sector ?? object(raw).code ?? "板块");
+    if (!["A", "B", "C"].includes(String(confirmation.tier))) return `${label} 缺少 A/B/C 档位`;
+    if (!isNumber(confirmation.score)) return `${label} 缺少确认度总分`;
+    const parts = object(confirmation.parts);
+    for (const key of ["m1", "m2", "m3", "m4", "m5"]) {
+      if (!isNumber(parts[key])) return `${label} 缺少 ${key.toUpperCase()} 分项`;
+    }
+    if (typeof object(confirmation.metrics).intraday_pulse !== "boolean") return `${label} 缺少脉冲标记`;
+    const invalidation = object(confirmation.invalidation);
+    if (!isNumber(invalidation.price)) return `${label} 缺少结构位失效位`;
+    if (!isNumber(invalidation.distance_pct)) return `${label} 缺少失效位距收盘百分比`;
+  }
+  return null;
+}
+
 export function createJobCompletionGate(jobCode: string, targetDate: string) {
   const calls = new Map<string, Record<string, unknown>>();
   const results = new Map<string, Record<string, unknown>>();
@@ -184,6 +209,14 @@ export function createJobCompletionGate(jobCode: string, targetDate: string) {
         });
         if (!hasFullSectorScan) {
           missing.push("analysis_run（需要目标日完整 881 一级行业趋势结构扫描或明确缺口）");
+        } else {
+          // 分档表是结论主依据：信号缺档位、分项、脉冲标记或结构位失效位即不合格。
+          const tierGap = (Array.isArray(items) ? items : [])
+            .filter((item) => object(item).analysis_type === "sector_trend_structure"
+              && ["success", "partial"].includes(String(object(item).status)))
+            .map((item) => sectorTierGap(object(item).result))
+            .find((reason) => reason !== null);
+          if (tierGap) missing.push(`analysis_run（板块当日确认度分档不完整：${tierGap}）`);
         }
       }
       if (jobCode === "limit_up_close_scan" && results.has("strategy_evaluation_query")) {

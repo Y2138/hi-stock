@@ -232,9 +232,27 @@ it("任务完成门禁只接受本次正确日期的工具结果，并按真实�
     requests: [{ analysis_type: "sector_trend_structure", as_of: "2026-08-16" }],
   }, { items: [{ analysis_type: "sector_trend_structure", status: "partial" }] });
   expect(nightly.missing().some((name) => name.includes("完整 881"))).toBe(true);
+  // 分档表是结论主依据：缺档位/分项/脉冲标记/结构位失效位即不合格。
   nightlyObserved("analysis_run", {
     requests: [{ analysis_type: "sector_trend_structure", as_of: "2026-08-17" }],
   }, { items: [{ analysis_type: "sector_trend_structure", status: "partial" }] });
+  expect(nightly.missing().some((name) => name.includes("板块当日确认度分档不完整"))).toBe(true);
+  nightlyObserved("analysis_run", {
+    requests: [{ analysis_type: "sector_trend_structure", as_of: "2026-08-17" }],
+  }, { items: [{ analysis_type: "sector_trend_structure", status: "partial",
+    result: { signals: [{ sector: "半导体", confirmation: { tier: "A", score: 7 } }] } }] });
+  expect(nightly.missing().some((name) => name.includes("半导体 缺少 M1 分项"))).toBe(true);
+  nightlyObserved("analysis_run", {
+    requests: [{ analysis_type: "sector_trend_structure", as_of: "2026-08-17" }],
+  }, { items: [{ analysis_type: "sector_trend_structure", status: "partial",
+    result: { signals: [{
+      sector: "半导体",
+      confirmation: {
+        tier: "A", score: 7, parts: { m1: 2, m2: 2, m3: 2, m4: 0, m5: 1 },
+        metrics: { intraday_pulse: false },
+        invalidation: { price: 11663.58, distance_pct: 10.29 },
+      },
+    }] } }] });
   expect(nightly.missing()).toEqual(["pool_attention_write"]);
   // 夜间筛选同样必须把入选标的写入关注池完成对账。
   nightlyObserved("pool_attention_write", { items: [] }, { items: [] });

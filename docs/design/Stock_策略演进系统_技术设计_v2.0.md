@@ -832,7 +832,7 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 - 交易日门禁：入队前按 `job_definition.trading_day_only`（默认开）校验目标日——周末一律不入队，`market_trading_day` 显式休市行不入队，日历未覆盖的工作日按降级口径入队；固定周六执行的周维护任务显式豁免，手动触发不受限。
 - 启动补偿：从每个作业最后 `scheduled_for`（初次为定义创建/更新时间）扫描到启动时刻，插入 `missed` 记录；不补跑，页面提示可手动触发。暂停区间不追记。
 - `runner.ts`：`datasource` → 数据库动态解析真实/模拟持仓、待执行模拟信号、有效标的池、同花顺一、二级官方行业、八个核心指数和期货范围 → `dailyMarketUpdate`（含 MA）→ 执行目标日模拟信号 → scheduled 数据卷导出；`analysis` → 严格校验三类结构化请求并复用 `analysis/`；`agent_flow` → 固化 `job_prompt_revision`，按任务模型创建会话，构造与普通 Agent 同源的权限工具注册表并通过 `tool_catalog` 按需注入 schema；集合竞价任务使用 `auction_context_query`、`fetch_hithink_data` 和 `auction_assessment_write`，Markdown 写 `job_run_output`，结构化判断成功激活后发布仪表盘刷新事件。
-- 板块机会筛选在工作日 23:00 运行，固定使用 DeepSeek V4 Pro。完成门禁要求目标日执行未传 `codes` 的完整 881 一级行业板块温度分析，再通过板块、行情、指标、策略筛选和标的研究只读工具形成 1–3 个板块、每板块最多 2 只标的；完整报告留在任务工作台，飞书只取不超过 600 个中文字符的 `结论摘要`。
+- 板块机会筛选在工作日 18:40（`Asia/Shanghai`）运行，固定使用 DeepSeek V4 Pro。完成门禁要求目标日执行未传 `codes` 的完整 881 一级行业 `sector_trend_structure` 分析，并校验每个信号的分档表齐全（档位、总分、M1–M5 分项、脉冲标记、结构位失效位与距收盘百分比）；三触发线只决定是否进入观察，优先级由当日确认度分档（A ≥6、B 3–5、C ≤2）决定，C 档不输出板块内个股也不写关注池。再由板块、行情、指标、策略筛选和标的研究只读工具形成分档结论与每板块最多 2 只候选；完整报告留在任务工作台，飞书只取不超过 600 个中文字符的 `结论摘要`。
 - 并发：同一 server 固定 3 个独立异步执行槽，每个运行只占自己的槽，不占用 cron 扫描；datasource 最多同时 1 个并继续使用独立 PostgreSQL 市场写锁，其余名额由 analysis/agent_flow 并行使用。Agent 领域写仍由原有 Agent 写锁保护。
 - 失败：日志入 `job_run.log`；第一次失败把同一行恢复 queued 并设置 `next_retry_at=now()+5min`，第二次失败标 failed。`partial` 为有数据缺口的终态，不重试。
 - 生命周期：scheduler 随 server 启动；SIGINT/SIGTERM 先停止新 tick，等待当前 Runner 安全落终态/重试态，再关闭 HTTP 与连接池。
