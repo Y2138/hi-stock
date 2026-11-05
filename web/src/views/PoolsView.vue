@@ -55,11 +55,16 @@ const categoryMembers = computed(() => {
   if (selected.value === "unclassified") return members.filter((member) => member.kind === "stock" && member.boards.length === 0);
   return members.filter((member) => member.boards.some((board) => board.code === selected.value));
 });
+const sortMode = ref<"code" | "latest" | "snapshot">("code");
 const visibleMembers = computed(() => {
   const query = keyword.value.trim().toLocaleLowerCase();
-  return categoryMembers.value.filter((member) =>
+  const filtered = categoryMembers.value.filter((member) =>
     [member.name, member.code, member.role, ...member.tags, ...member.boards.map((board) => board.name)]
       .some((value) => value.toLocaleLowerCase().includes(query)));
+  if (sortMode.value === "code") return filtered;
+  const key = (member: PoolMember) => sortMode.value === "latest" ? member.latest_stage : member.stage;
+  return [...filtered].sort((left, right) => (key(left) ?? "").localeCompare(key(right) ?? "", "zh-CN")
+    || left.code.localeCompare(right.code));
 });
 
 const visibleRows = computed(() => visibleMembers.value.map((member) => {
@@ -83,12 +88,24 @@ const selectedLabel = computed(() => {
   return data.data.value?.boards.find((board) => board.code === selected.value)?.name ?? "行业";
 });
 
+/** 展示以最新画像为主并带 as_of；入池快照只作为并列的第二值。 */
 function memberStage(member: PoolMember): string {
-  return member.stage ?? member.tags.find((tag) => tag.startsWith("阶段："))?.slice(3) ?? "—";
+  const latest = member.latest_stage;
+  const asOf = member.latest_profile_as_of;
+  if (latest && asOf) return `${latest}（${asOf.slice(5)}）`;
+  return latest ?? member.stage ?? member.tags.find((tag) => tag.startsWith("阶段："))?.slice(3) ?? "—";
 }
 
 function memberStockCharacter(member: PoolMember): string {
-  return member.stock_character ?? member.tags.find((tag) => tag.startsWith("股性："))?.slice(3) ?? "—";
+  return member.latest_stock_character ?? member.stock_character
+    ?? member.tags.find((tag) => tag.startsWith("股性："))?.slice(3) ?? "—";
+}
+
+function snapshotLine(member: PoolMember): string {
+  // 股性快照以阶段与画像时间表达；没有快照时不虚构。
+  if (!member.stage && !member.profile_as_of) return "";
+  const stage = member.stage ?? "—";
+  return member.profile_as_of ? `入池时：${stage}（${member.profile_as_of.slice(5)}）` : `入池时：${stage}`;
 }
 
 function goMarket(code: string): void {
@@ -351,6 +368,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
           <div class="list-filter">
             <input v-model="keyword" type="search" aria-label="筛选池内标的" placeholder="筛选池内名称、代码、行业或标签" />
             <span class="list-filter-count" role="status">显示 {{ visibleMembers.length }} / {{ categoryMembers.length }} 只</span>
+            <select v-model="sortMode" class="sort-select" aria-label="池内排序方式">
+              <option value="code">默认顺序</option>
+              <option value="latest">按最新阶段</option>
+              <option value="snapshot">按入池阶段</option>
+            </select>
             <span class="table-scroll-hint">左右滚动查看完整列</span>
             <button v-if="keyword" class="btn compact" type="button" @click="keyword = ''">清空筛选</button>
           </div>
@@ -388,7 +410,15 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
                     </div>
                   </td>
                   <td><span class="badge accent">{{ member.role }}</span></td>
-                  <td><strong class="cell-clamp clamp-1">{{ memberStage(member) }}</strong><div class="muted cell-clamp clamp-2">{{ memberStockCharacter(member) }}</div></td>
+                  <td>
+                    <strong class="cell-clamp clamp-1">{{ memberStage(member) }}</strong>
+                    <div class="muted cell-clamp clamp-2">{{ memberStockCharacter(member) }}</div>
+                    <div class="snapshot-line">
+                      <span v-if="snapshotLine(member)" class="muted">{{ snapshotLine(member) }}</span>
+                      <span v-if="member.latest_stage_changed" class="badge warn">已变化</span>
+                      <span v-if="member.latest_profile_stale" class="badge warn">画像过期</span>
+                    </div>
+                  </td>
                   <td>
                     <button v-for="board in displayIndustries(member)" :key="board.code" class="market-link industry-text" type="button" @click.stop="goMarket(board.code)">{{ board.name }}</button>
                     <span v-if="member.boards.length === 0" class="muted">{{ member.kind === "etf" ? "不适用" : "待同步" }}</span>
@@ -452,7 +482,15 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
         <div class="member-detail-scroll">
           <dl class="detail-overview">
             <div><dt>角色</dt><dd>{{ detailMember.role }}</dd></div>
-            <div><dt>阶段</dt><dd>{{ memberStage(detailMember) }}</dd></div>
+            <div>
+              <dt>阶段</dt>
+              <dd>
+                {{ memberStage(detailMember) }}
+                <span v-if="snapshotLine(detailMember)" class="muted detail-snapshot">{{ snapshotLine(detailMember) }}</span>
+                <span v-if="detailMember.latest_stage_changed" class="badge warn">已变化</span>
+                <span v-if="detailMember.latest_profile_stale" class="badge warn">画像过期</span>
+              </dd>
+            </div>
             <div><dt>行业</dt><dd>{{ displayIndustries(detailMember).map((board) => board.name).join(" · ") || (detailMember.kind === "etf" ? "不适用" : "待同步") }}</dd></div>
             <div class="overview-character"><dt>股性</dt><dd>{{ memberStockCharacter(detailMember) }}</dd></div>
           </dl>
@@ -544,6 +582,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 .data-table th:last-child,.data-table td:last-child{position:sticky;right:0;z-index:1;background:var(--card);box-shadow:-1px 0 var(--line)}
 .data-table th:last-child{z-index:3;background:var(--paper-deep)}
 .data-table tbody tr:hover td:first-child,.data-table tbody tr:hover td:last-child{background:var(--accent-soft)}
+.snapshot-line{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-top:2px;font-size:12px}
+.detail-snapshot{margin-left:6px}
+.sort-select{height:28px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);padding:0 6px;font-size:12px}
 .col-instrument{width:140px}.col-role{width:70px}.col-stage{width:130px}.col-industry{width:150px}.col-news{width:98px}.col-attention{width:280px}.col-action{width:118px}
 .news-cell{vertical-align:top}.news-badge{display:inline-block;width:max-content;border:1px solid currentColor}.news-positive{color:var(--up)}.news-negative{color:var(--down)}.news-mixed{color:var(--warning,#9a6400)}.news-neutral{color:var(--ink-faint)}.news-status{display:block;margin-top:5px;font-size:11px;color:var(--ink-faint)}.news-section-head,.news-item-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.news-section-head h3{margin:0}.news-meta{margin:5px 0 10px!important;font-size:12px}.news-item{padding:10px 0;border-top:1px dashed var(--line)}.news-title{display:block;margin:6px 0;color:var(--accent-ink);font-weight:700;line-height:1.45}.news-title:hover{text-decoration:underline}.news-item p{margin:5px 0!important}.news-impact{color:var(--ink)!important}
 .attention-footer,.member-detail-head,.member-detail-actions{display:flex;align-items:center;justify-content:space-between;gap:8px}.attention-actions,.detail-attention-actions{display:flex;align-items:center;gap:8px}.detail-trigger{flex:none;border:0;background:transparent;padding:0;color:var(--accent-ink);font:600 11px var(--font-body);cursor:pointer}.detail-trigger:hover{text-decoration:underline}.remove-attention{color:var(--bad)}.remove-attention:disabled{cursor:wait;opacity:.55}.quote{display:flex;flex-wrap:wrap;gap:5px 8px;margin-top:5px}.live-flag{flex:none;padding:0 4px;border:1px solid currentColor;border-radius:4px;color:var(--accent);font-size:10px;line-height:1.5}.quote-trend{flex:none;font-size:12px;font-weight:700;line-height:1}.cell-clamp{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.clamp-1{-webkit-line-clamp:1}.clamp-2{-webkit-line-clamp:2}.clamp-3{-webkit-line-clamp:3}.tag-preview{display:grid;gap:4px}.attention-cell{min-width:0}.attention-footer{margin-top:6px}.attention-footer>.muted{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-action-cell{vertical-align:middle!important}.row-action-cell .btn{white-space:nowrap}.data-table tbody tr:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}.market-link{display:block;border:0;background:transparent;padding:0;color:var(--accent-ink);text-align:left;cursor:pointer;font:inherit}.market-link:hover{text-decoration:underline}.industry-text{font-weight:600}.up{color:var(--up)}.down{color:var(--down)}

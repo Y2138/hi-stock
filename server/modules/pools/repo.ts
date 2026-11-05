@@ -33,6 +33,9 @@ export interface PoolAttentionEntry {
   valid_until: string | null;
 }
 
+/** 阶段枚举（values 与 docs/product/关注池股性与阶段展示口径.md 一致）。 */
+export const POOL_STAGE_VALUES = ["下行", "震荡筑底", "调整", "上升", "主升", "箱体观察"] as const;
+
 export interface PoolMemberRow {
   id: string;
   instrument_id: string;
@@ -48,6 +51,15 @@ export interface PoolMemberRow {
   profile_as_of: string | null;
   profile_calculation_version: string | null;
   profile_input_sha256: string | null;
+  /** 最新画像（market_stock_character_metric 最大 as_of_date），展示以此为主。 */
+  latest_stage: string | null;
+  latest_stock_character: string | null;
+  latest_profile_as_of: string | null;
+  /** 最新画像落后目标日的开市日数；>3 标「画像过期」。 */
+  latest_profile_lag_days: number;
+  /** 最新画像与入池快照的 stage 不一致。 */
+  latest_stage_changed: boolean;
+  latest_profile_stale: boolean;
   effective_from: string;
   effective_to: string | null;
   note: string | null;
@@ -118,6 +130,8 @@ const MEMBER_SELECT = `SELECT membership.id::text, instrument.id::text AS instru
   membership.tags,
   membership.stock_character, membership.stock_character_profile, membership.stage, membership.evaluation_summary,
   membership.profile_as_of::text, membership.profile_calculation_version, membership.profile_input_sha256,
+  latest_metric.stage AS latest_stage, latest_metric.stock_character AS latest_stock_character,
+  latest_metric.as_of_date::text AS latest_profile_as_of, COALESCE(latest_metric.lag_days, 0)::int AS latest_profile_lag_days,
   membership.effective_from::text, membership.effective_to::text, membership.note,
   COALESCE(attention_list.entries, '[]'::jsonb) AS attention_entries,
   instrument.code, instrument.name, instrument.kind,
@@ -139,6 +153,17 @@ LEFT JOIN LATERAL (
    WHERE bar.instrument_id = instrument.id AND bar.freq = 'day'
    ORDER BY bar.bar_date DESC, bar.bar_time DESC LIMIT 1
 ) latest_close ON true
+LEFT JOIN LATERAL (
+  -- 取目标日及以前的最新画像；滞后开市日数用于「画像过期」标记。
+  SELECT metric.stage, metric.stock_character, metric.as_of_date,
+         (SELECT count(*) FROM market_trading_day day
+           WHERE day.is_open AND day.trade_date > metric.as_of_date AND day.trade_date <= $2::date) AS lag_days
+    FROM market_stock_character_metric metric
+   WHERE metric.instrument_id = membership.instrument_id
+     AND metric.as_of_date <= $2::date
+   ORDER BY metric.as_of_date DESC
+   LIMIT 1
+) latest_metric ON true
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(jsonb_build_object(
            'id', entry.id::text, 'source_type', entry.source_type,
@@ -222,7 +247,12 @@ export async function listPoolView(db: Db, asOf?: string): Promise<PoolViewData>
     [WATCH_POOL, asOfDate],
   );
   const news = await getLatestMarketNews(db, asOf);
-  const enrichedMembers = members.rows.map((row) => ({ ...row, news: instrumentNews(news, row.code) }));
+  const enrichedMembers = members.rows.map((row) => ({
+    ...row,
+    news: instrumentNews(news, row.code),
+    latest_stage_changed: row.latest_stage !== null && row.stage !== null && row.latest_stage !== row.stage,
+    latest_profile_stale: (row.latest_profile_lag_days ?? 0) > 3,
+  }));
   return {
     pool: WATCH_POOL,
     members: enrichedMembers,
@@ -541,6 +571,11 @@ export async function applyPoolChange(
     if (role !== WATCH_POOL_ROLE) throw new Error(`池统一后入池角色固定为“${WATCH_POOL_ROLE}”`);
     const stockCharacter = requiredText(input.stock_character ?? before?.stock_character, "stock_character");
     const stage = requiredText(input.stage ?? before?.stage, "stage");
+    // 阶段只允许六个枚举值：历史数据里混入过描述句，写入侧拦截。
+    // 只校验本次显式传入的值；继承既有快照不校验，避免旧脏数据堵死正常更新与修复路径。
+    if (input.stage !== undefined && !POOL_STAGE_VALUES.includes(stage as (typeof POOL_STAGE_VALUES)[number])) {
+      throw new Error(`stage 只允许：${POOL_STAGE_VALUES.join("、")}`);
+    }
     const evaluationSummary = requiredText(input.evaluation_summary ?? before?.evaluation_summary, "evaluation_summary");
     const stockCharacterProfile = input.stock_character_profile ?? before?.stock_character_profile ?? {};
     const profileAsOf = input.profile_as_of ?? before?.profile_as_of ?? null;

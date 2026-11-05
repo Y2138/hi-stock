@@ -627,6 +627,13 @@ export interface PoolMember {
   profile_as_of: string | null;
   profile_calculation_version: string | null;
   profile_input_sha256: string | null;
+  /** 最新画像：页面默认展示，入池快照并列。 */
+  latest_stage: string | null;
+  latest_stock_character: string | null;
+  latest_profile_as_of: string | null;
+  latest_profile_lag_days: number;
+  latest_stage_changed: boolean;
+  latest_profile_stale: boolean;
   effective_from: string;
   effective_to: string | null;
   note: string | null;

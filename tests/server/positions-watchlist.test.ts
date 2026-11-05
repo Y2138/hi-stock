@@ -564,4 +564,57 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     await expect(recordPositionChange(pool,{...buy,account_id:first.id})).rejects.toThrow("已归档");
   });
 
+  it("股性双值：最新画像优先、快照并列、画像过期标记，并拒绝非法阶段枚举", async () => {
+    try {
+      const indicatorId = (await pool.query<{ id: string }>(
+        `INSERT INTO market_indicator_run
+           (instrument_id, freq, calculation_version, input_sha256, input_row_count,
+            input_start_date, input_end_date, status, finished_at)
+         SELECT id, 'day', 'test-v1', $1, 252, '2025-09-18', '2026-08-19', 'success', now()
+           FROM market_instrument WHERE code = '600487.SH' RETURNING id::text`,
+        ["1".repeat(64)],
+      )).rows[0]!.id;
+      await pool.query(
+        `INSERT INTO market_stock_character_metric
+           (instrument_id, as_of_date, calculation_version, indicator_run_id, input_row_count,
+            defense_break_count, defense_recovered_count, stock_character, stage)
+         SELECT id, '2026-08-19', 'test-v1', $1, 252, 10, 6,
+                '洗盘恢复中·拉升中·假突破风险低·护盘中·波动中', '震荡筑底'
+           FROM market_instrument WHERE code = '600487.SH'`,
+        [indicatorId],
+      );
+      await pool.query(
+        `INSERT INTO market_trading_day (trade_date, is_open, source)
+         SELECT date '2026-08-20' + n, true, 'test' FROM generate_series(0, 6) n
+         ON CONFLICT DO NOTHING`,
+      );
+      const view = await api(server!.baseUrl, "GET", "/api/pools?date=2026-08-26");
+      const member = (view.json as unknown as {
+        members: Array<{
+          code: string; stage: string | null; latest_stage: string | null;
+          latest_profile_as_of: string | null; latest_profile_lag_days: number;
+          latest_stage_changed: boolean; latest_profile_stale: boolean;
+        }>;
+      }).members.find((item) => item.code === "600487.SH")!;
+      // 入池快照保留（右侧确认），展示取最新画像（震荡筑底），两者不一致标已变化。
+      expect(member.stage).toBe("右侧确认");
+      expect(member.latest_stage).toBe("震荡筑底");
+      expect(member.latest_profile_as_of).toBe("2026-08-19");
+      expect(member.latest_stage_changed).toBe(true);
+      // 目标日 2026-08-26 距画像日 2026-08-19 已超过 3 个开市日。
+      expect(member.latest_profile_lag_days).toBeGreaterThan(3);
+      expect(member.latest_profile_stale).toBe(true);
+      await expect(applyPoolChange(pool, {
+        action: "update", code: "600487.SH", pool: "watch", tags: ["CPO"],
+        stage: "③主升加速：收盘173.14距MA20 +22.17%…", effective_from: "2026-08-18",
+      })).rejects.toThrow("stage 只允许");
+    } finally {
+      await pool.query(`DELETE FROM market_stock_character_metric
+        WHERE instrument_id=(SELECT id FROM market_instrument WHERE code='600487.SH')`);
+      await pool.query(`DELETE FROM market_indicator_run
+        WHERE instrument_id=(SELECT id FROM market_instrument WHERE code='600487.SH')`);
+      await pool.query("DELETE FROM market_trading_day WHERE source='test'");
+    }
+  });
+
 });
