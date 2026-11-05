@@ -4,9 +4,9 @@ import crypto from "node:crypto";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import type pg from "pg";
-import { resolveActiveChatModel } from "./ai/runtime.js";
+import { resolveActiveChatModel, resolveFallbackChatModel } from "./ai/runtime.js";
 import { compactSessionContext } from "./context-compaction.js";
-import { runAgentTurn, type AgentCoreFrame, type AgentTurnResult } from "./core/loop.js";
+import { runAgentTurn, type AgentCoreFrame, type AgentTurnResult, type ModelFailureKind } from "./core/loop.js";
 import { persistAndPublishSessionEvent } from "./events.js";
 import { AgentRunMetricRecorder } from "./metrics.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -95,10 +95,63 @@ export interface AgentSessionTurnInput {
   maxContinuationTurns?: number | null;
   /** 自动任务可取消执行段数量限制，改用总耗时上限防止失控。 */
   maxDurationMs?: number;
+  /** 看门狗阈值；缺省 600 秒，测试可注入更小值。 */
+  modelWatchdogMs?: number;
+}
+
+/** 降级运行事件：写入指标、任务缺口与报告首行标注。 */
+export interface ModelDegradation {
+  from: string;
+  to: string;
+  kind: ModelFailureKind;
+  at: string;
 }
 
 export interface AgentSessionTurnResult extends AgentTurnResult {
   freshMessages: AgentMessage[];
+  /** 非 null 表示本次运行发生过模型降级。 */
+  degradation: ModelDegradation | null;
+}
+
+/** 降级标注文案（spec 第六节）：报告与消息首行必须给出原模型、目标模型、触发类别与时间。 */
+export function renderModelDegradationNotice(degradation: ModelDegradation): string {
+  const labels: Record<ModelFailureKind, string> = {
+    zero_token: "零 token 终止", stream_interrupted: "流中断", watchdog: "看门狗超时",
+  };
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(new Date(degradation.at));
+  const pick = (type: string) => parts.find((part) => part.type === type)?.value ?? "00";
+  const hour = pick("hour") === "24" ? "00" : pick("hour");
+  const stamp = `${pick("year")}-${pick("month")}-${pick("day")} ${hour}:${pick("minute")}`;
+  return `> 降级运行：${degradation.from} → ${degradation.to}（原因：${labels[degradation.kind] ?? degradation.kind}，${stamp}）`;
+}
+
+/** 允许模型降级的任务（specs/模型降级与首token兜底/状态.md 第四节）；本轮只开板块机会筛选。 */
+export const MODEL_FALLBACK_JOBS = new Set(["nightly_sector_opportunity_scan"]);
+/** 盘前类任务：09:15 之后不再降级，避免产出过期报告。 */
+const PRE_MARKET_JOBS = new Set(["pre_market_news_scan", "daily_plan_flow", "evening_plan_preview"]);
+export const PRE_MARKET_FALLBACK_CUTOFF = "09:15";
+
+function shanghaiClock(at: Date): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(at);
+  const hour = parts.find((part) => part.type === "hour")?.value ?? "00";
+  const minute = parts.find((part) => part.type === "minute")?.value ?? "00";
+  return `${hour === "24" ? "00" : hour}:${minute}`;
+}
+
+/** 任务级降级开关：默认关闭，只对白名单任务开启；盘前任务检查 09:15 时效窗口。 */
+export function isWithinFallbackWindow(jobCode: string | null, at = new Date()): boolean {
+  if (!jobCode || !PRE_MARKET_JOBS.has(jobCode)) return true;
+  return shanghaiClock(at) < PRE_MARKET_FALLBACK_CUTOFF;
+}
+
+export function isModelFallbackAllowed(jobCode: string | null, at = new Date()): boolean {
+  if (!jobCode || !MODEL_FALLBACK_JOBS.has(jobCode)) return false;
+  return isWithinFallbackWindow(jobCode, at);
 }
 
 const INTERRUPTED_SESSION_ERROR = "服务重启：上一进程中的 Agent 运行已中断";
@@ -163,7 +216,7 @@ export async function runAgentSessionTurn(
     if (!session) throw new Error(`Agent session 不存在：${input.sessionId}`);
     const manageStatus = input.manageSessionStatus ?? true;
     const historyRows = input.historyMode === "empty" ? [] : await listMessages(input.pool, session.id);
-    const runtime = await resolveActiveChatModel(input.pool, session.model_id);
+    let runtime = await resolveActiveChatModel(input.pool, session.model_id);
     const basePrompt = input.systemPrompt ?? (await buildSystemPrompt(input.pool, undefined, session.account_id));
     const fullPrompt = input.systemPromptSuffix
       ? `${basePrompt}\n\n${input.systemPromptSuffix}`
@@ -305,6 +358,10 @@ export async function runAgentSessionTurn(
       let messages = context.messages;
       let continuationTurns = 0;
       let turn: AgentTurnResult;
+      const jobCode = input.toolScope?.kind === "job" ? input.toolScope.jobCode : null;
+      const fallbackEnabled = isModelFallbackAllowed(jobCode);
+      let degradation: ModelDegradation | null = null;
+      let fallbackAttempted = false;
       while (true) {
         turn = await runAgentTurn({
           pool: input.pool,
@@ -319,7 +376,27 @@ export async function runAgentSessionTurn(
           prepareToolsForNextTurn: toolSet.syncContext,
           onFrame: onCoreFrame,
           onMessageCompleted,
+          watchdogMs: input.modelWatchdogMs,
+          // 白名单任务关闭模型内连接重试：失败后立即切目标模型，不再同模型等待重试。
+          maxRetries: fallbackEnabled ? 0 : undefined,
         });
+        // 模型层失败：只切一次，不级联；第一次没有产出可用正文时从头重跑同一轮输入。
+        if (turn.modelFailure && fallbackEnabled && !fallbackAttempted) {
+          fallbackAttempted = true;
+          const fallback = await resolveFallbackChatModel(input.pool, runtime.modelId)
+            .catch(() => null);
+          if (fallback) {
+            degradation = {
+              from: runtime.modelId, to: fallback.modelId, kind: turn.modelFailure,
+              at: new Date().toISOString(),
+            };
+            runtime = fallback;
+            messages = context.messages;
+            nextText = input.text;
+            continuationTurns = 0;
+            continue;
+          }
+        }
         const stopReason = turn.lastAssistant?.role === "assistant"
           ? turn.lastAssistant.stopReason
           : undefined;
@@ -415,8 +492,9 @@ export async function runAgentSessionTurn(
         turn.aborted ? "cancelled" : turn.toolLoopError || turn.llmError ||
           (turn.lastAssistant?.role === "assistant" && turn.lastAssistant.stopReason === "error") ? "failed" : "complete",
         freshMessages,
+        degradation,
       );
-      return { ...turn, messages: redactedMessages, lastAssistant, freshMessages };
+      return { ...turn, messages: redactedMessages, lastAssistant, freshMessages, degradation };
     } catch (error) {
       flushToolUpdates();
       await frameChain.catch(() => {});

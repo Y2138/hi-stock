@@ -22,6 +22,12 @@ export interface AgentCoreFrame {
   data: Record<string, unknown>;
 }
 
+/** 模型层失败分类（specs/模型降级与首token兜底/状态.md 第二节）：只有这三类触发降级。 */
+export type ModelFailureKind = "zero_token" | "stream_interrupted" | "watchdog";
+
+/** 看门狗：600 秒没有任何文本增量即判连接卡死（600 = 观测到的最长成功首字 562 秒 + 余量）。 */
+export const MODEL_WATCHDOG_MS = 600_000;
+
 export interface AgentTurnResult {
   runId: string;
   messages: AgentMessage[];
@@ -29,6 +35,9 @@ export interface AgentTurnResult {
   llmError: string | null;
   toolLoopError: string | null;
   aborted: boolean;
+  /** 非 null 表示本次模型调用属于模型层失败，可触发任务级降级。 */
+  modelFailure: ModelFailureKind | null;
+  failureMessage: string | null;
 }
 
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS = 3;
@@ -52,6 +61,10 @@ export async function runAgentTurn(deps: {
   prepareToolsForNextTurn?: (context: AgentContext) => AgentContext | undefined;
   onFrame: (frame: AgentCoreFrame) => void;
   onMessageCompleted?: (message: AgentMessage) => Promise<void> | void;
+  /** 看门狗阈值；缺省 600 秒，测试可注入更小值。 */
+  watchdogMs?: number;
+  /** 模型内连接重试次数；降级任务传 0，保证失败后立即切目标模型。 */
+  maxRetries?: number;
 }): Promise<AgentTurnResult> {
   const runId = deps.runId ?? crypto.randomUUID();
   let lastToolSignature: string | null = null;
@@ -65,7 +78,7 @@ export async function runAgentTurn(deps: {
       tools: deps.tools ?? buildChatTools({ pool: deps.pool, sessionId: deps.sessionId }),
       messages: deps.messages,
     },
-    streamFn: resilientChatStream(deps.runtime),
+    streamFn: resilientChatStream(deps.runtime, deps.maxRetries),
     beforeToolCall: async ({ toolCall, args }) => {
       const signature = sha256Json({ name: toolCall.name, args });
       consecutiveIdenticalToolCalls = signature === lastToolSignature
@@ -89,6 +102,10 @@ export async function runAgentTurn(deps: {
   });
 
   let llmError: string | null = null;
+  let promptError: string | null = null;
+  let sawTextDelta = false;
+  let lastTextDeltaAt = Date.now();
+  let watchdogTriggered = false;
   let lastActivity = "";
   let lastActivityAt = 0;
   let activityStartedAt = 0;
@@ -116,6 +133,11 @@ export async function runAgentTurn(deps: {
       case "message_update": {
         const update = event.assistantMessageEvent;
         if (update.type === "text_delta") {
+          // 只有非空文本增量才算"已出字"；空增量仍归零 token 终止。
+          if (String(update.delta ?? "").length > 0) {
+            sawTextDelta = true;
+            lastTextDeltaAt = Date.now();
+          }
           activity("writing");
           deps.onFrame({ type: "text", data: { delta: update.delta } });
         } else if (update.type === "thinking_delta") {
@@ -200,22 +222,50 @@ export async function runAgentTurn(deps: {
   const unregister = registerAgentRun(activeRun);
   deps.onFrame({ type: "run_started", data: { run_id: runId } });
 
+  const watchdogMs = deps.watchdogMs && deps.watchdogMs > 0 ? deps.watchdogMs : MODEL_WATCHDOG_MS;
+  const watchdogTimer = setInterval(() => {
+    if (watchdogTriggered || sawTextDelta) return;
+    if (Date.now() - lastTextDeltaAt < watchdogMs) return;
+    watchdogTriggered = true;
+    activeRun.abortRequested = true;
+    agent.abort();
+  }, Math.min(5_000, Math.max(10, Math.floor(watchdogMs / 4))));
+
   try {
-    await agent.prompt(deps.text, deps.images?.length ? deps.images : undefined);
+    try {
+      await agent.prompt(deps.text, deps.images?.length ? deps.images : undefined);
+    } catch (error) {
+      promptError = (error as Error).message || String(error);
+    }
     const messages = [...agent.state.messages];
     const lastAssistant =
       [...messages].reverse().find((message) => message.role === "assistant") ?? null;
+    const aborted =
+      activeRun.abortRequested ||
+      (lastAssistant?.role === "assistant" && lastAssistant.stopReason === "aborted");
+    const assistantError = lastAssistant?.role === "assistant" && lastAssistant.stopReason === "error"
+      ? (lastAssistant.errorMessage ?? "LLM 调用失败")
+      : null;
+    const failureMessage = watchdogTriggered
+      ? `模型 ${Math.round(watchdogMs / 1000)} 秒内没有任何文本增量（看门狗）`
+      : promptError ?? llmError ?? assistantError;
+    // 用户主动中断不算模型层失败；只有模型自身在出字前/出字后被掐断才归类。
+    const modelFailure: ModelFailureKind | null = !failureMessage || (aborted && !watchdogTriggered)
+      ? null
+      : watchdogTriggered ? "watchdog"
+        : sawTextDelta ? "stream_interrupted" : "zero_token";
     return {
       runId,
       messages,
       lastAssistant,
-      llmError,
+      llmError: failureMessage,
       toolLoopError,
-      aborted:
-        activeRun.abortRequested ||
-        (lastAssistant?.role === "assistant" && lastAssistant.stopReason === "aborted"),
+      aborted,
+      modelFailure,
+      failureMessage: modelFailure ? failureMessage : null,
     };
   } finally {
+    clearInterval(watchdogTimer);
     unregister();
     unsubscribe();
   }

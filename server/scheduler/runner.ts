@@ -12,6 +12,7 @@ import { buildSystemPrompt } from "../agent/prompt.js";
 import { appendMessage, nextMessageSeq, updateSessionStatus } from "../agent/repo.js";
 import { runAgentSessionTurn } from "../agent/session-runner.js";
 import { createJobCompletionGate } from "../agent/job-workflow.js";
+import { renderModelDegradationNotice, type ModelDegradation } from "../agent/session-runner.js";
 import { querySwingUniverse } from "../modules/plans/swing-signals.js";
 import {
   buildWeeklyReviewSnapshot,
@@ -376,7 +377,7 @@ async function runAgentFlow(
   jobCode: string,
   targetDate: string,
   accountId?: string | null,
-): Promise<{ markdown: string; unavailableGaps: unknown[] }> {
+): Promise<{ markdown: string; unavailableGaps: unknown[]; degradation: ModelDegradation | null }> {
   const systemPrompt = await buildSystemPrompt(pool, strategy, accountId);
   const completion = createJobCompletionGate(jobCode, targetDate);
   const globalTaskSuffix = jobCode === WEEKLY_REVIEW_JOB
@@ -401,6 +402,12 @@ async function runAgentFlow(
   });
   if (turn.aborted) throw new AgentRunAbortedError();
   if (turn.toolLoopError) throw new Error(turn.toolLoopError);
+  // 模型层失败：降级已由 session-runner 处理（含一次切换）；仍失败则不再等 5 分钟重试同模型。
+  if (turn.modelFailure) {
+    throw new NonRetryableJobError(
+      `模型层失败（${turn.modelFailure}）：${turn.failureMessage ?? "模型调用失败"}；不再同模型自动重试`,
+    );
+  }
   if (turn.llmError) throw new Error(turn.llmError);
   const stopReason = turn.lastAssistant?.role === "assistant" ? turn.lastAssistant.stopReason : undefined;
   if (stopReason === "error") {
@@ -412,7 +419,7 @@ async function runAgentFlow(
 
 ${rawMarkdown}` : null);
   if (!markdown) throw new Error("agent_flow 未产生完整最终 Markdown");
-  return { markdown, unavailableGaps: completion.unavailableGaps() };
+  return { markdown, unavailableGaps: completion.unavailableGaps(), degradation: turn.degradation };
 }
 
 /**
@@ -733,6 +740,20 @@ async function executeAgentFlow(
     const result = await runAgentFlow(deps.pool, prompt, run.session_id, strategy, definition.code, run.target_date, run.account_id);
     markdown = result.markdown;
     unavailableGaps = result.unavailableGaps;
+    if (result.degradation) {
+      // 降级轮必须显式标注（spec 第六节）：报告首行 + 任务缺口，供周报统计。
+      const line = renderModelDegradationNotice(result.degradation);
+      markdown = markdown.startsWith(RESULT_BANNER)
+        ? `${RESULT_BANNER}\n\n${line}${markdown.slice(RESULT_BANNER.length)}`
+        : `${line}\n\n${markdown}`;
+      unavailableGaps.push({
+        scope: "model_fallback",
+        from: result.degradation.from,
+        to: result.degradation.to,
+        reason: result.degradation.kind,
+        at: result.degradation.at,
+      });
+    }
   }
   if (definition.code === "pre_market_news_scan") {
     const snapshot = (await deps.pool.query<{ gaps: unknown[] }>("SELECT gaps FROM market_news_snapshot WHERE run_id=$1", [run.id])).rows[0];

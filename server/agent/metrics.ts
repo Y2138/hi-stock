@@ -181,7 +181,11 @@ export class AgentRunMetricRecorder {
     }
   }
 
-  async finish(status: RunMetricStatus, freshMessages: AgentMessage[] = []): Promise<void> {
+  async finish(
+    status: RunMetricStatus,
+    freshMessages: AgentMessage[] = [],
+    degradation: { from: string; to: string; kind: string; at: string } | null = null,
+  ): Promise<void> {
     if (!this.metricId) return;
     const finishedAt = Date.now();
     const unfinishedStatus: ToolMetricStatus = status === "cancelled" ? "cancelled" : "error";
@@ -199,7 +203,9 @@ export class AgentRunMetricRecorder {
         `UPDATE agent_run_metric SET
            input_tokens=$2, output_tokens=$3, cache_read_tokens=$4, cache_write_tokens=$5,
            reasoning_tokens=$6, cost_amount=$7, first_text_ms=$8, total_ms=$9,
-           status=$10, finished_at=to_timestamp($11 / 1000.0)
+           status=$10, finished_at=to_timestamp($11 / 1000.0),
+           fallback_from_model_key=$12, fallback_target_model_key=$13,
+           fallback_reason=$14, fallback_at=to_timestamp($15 / 1000.0)
          WHERE id=$1`,
         [
           this.metricId,
@@ -213,6 +219,10 @@ export class AgentRunMetricRecorder {
           Math.max(0, finishedAt - this.startedAt),
           status,
           finishedAt,
+          degradation?.from ?? null,
+          degradation?.to ?? null,
+          degradation?.kind ?? null,
+          degradation ? Date.parse(degradation.at) : null,
         ],
       );
     } catch (error) {
