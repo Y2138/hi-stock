@@ -146,7 +146,7 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
       name: "pool_context_query",
       label: "查询标的池业务上下文",
       description:
-        "返回关注池成员全集。未传 codes 时每只成员只返回角色、阶段、关注、行情和一级行业摘要；传 codes 时才返回对应标的完整研究属性。date 指定关注有效性的判定日（缺省为今天）。strategy_attentions 返回全部策略存量关注（含过期条目），策略任务必须按 strategy_code 取全复核；当前展示成员与复核集合分开。只有需要板块总览时才开启 include_boards。",
+        "返回关注池成员全集。未传 codes 时每只成员返回角色、入池快照（stage 与 stage_as_of）、最新画像（latest_stage、latest_stock_character、latest_profile_as_of、latest_stage_changed、latest_profile_stale）、关注、行情和一级行业摘要；stage 是入池时快照，回答“现在”一律用 latest_*，两者不一致时并列展示并标“已变化”，latest_profile_stale 为真标“画像过期”且不得用快照顶替。传 codes 时才返回对应标的完整研究属性。date 指定关注有效性的判定日（缺省为今天）。strategy_attentions 返回全部策略存量关注（含过期条目），策略任务必须按 strategy_code 取全复核；当前展示成员与复核集合分开。只有需要板块总览时才开启 include_boards。",
       parameters: PoolContextQuerySchema,
       execute: async (_id, raw) => audited<PoolContextQueryInput>(
         deps, "pool_context_query", raw, validatePoolContextQueryInput, async (input) => {
@@ -163,6 +163,12 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
                 kind: member.kind,
                 role: member.role,
                 stage: member.stage,
+                stage_as_of: member.profile_as_of,
+                latest_stage: member.latest_stage,
+                latest_stock_character: member.latest_stock_character,
+                latest_profile_as_of: member.latest_profile_as_of,
+                latest_stage_changed: member.latest_stage_changed,
+                latest_profile_stale: member.latest_profile_stale,
                 attention_entries: member.attention_entries,
                 last: member.last,
                 change_pct: member.change_pct,

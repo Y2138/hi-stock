@@ -892,6 +892,11 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(poolSummary.detail_level).toBe("summary");
     expect(poolSummary.members[0]).toMatchObject({ detail_available: true });
     expect(poolSummary.members[0]).not.toHaveProperty("evaluation_summary");
+    // 摘要必须同时给入池快照与最新画像，Agent 才能按口径回答“现在”。
+    for (const key of ["stage", "stage_as_of", "latest_stage", "latest_stock_character",
+      "latest_profile_as_of", "latest_stage_changed", "latest_profile_stale"]) {
+      expect(poolSummary.members[0]).toHaveProperty(key);
+    }
 
     const jobs = textOf(await tools.find((tool) => tool.name === "job_context_query")!
       .execute("tc-job-context", { job_codes: ["daily_plan_flow"], recent_runs_per_job: 2 })) as {
