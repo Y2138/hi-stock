@@ -5,7 +5,7 @@ import type pg from "pg";
 import { inServiceTransaction } from "../../db/transaction.js";
 import { apiErrors } from "../../http/router.js";
 import { executeStrategyEvaluator, getStrategyEvaluatorDefinition } from "./registry.js";
-import { upsertSignalEvent } from "./signal-events.js";
+import { shadowSignalEventsEnabled, upsertSignalEvent } from "./signal-events.js";
 import type {
   StrategyEvaluationPhase,
   StrategyEvaluationRunSummary,
@@ -330,23 +330,26 @@ async function persistEntrySignals(
        `${strategyCode} ${status === "qualified" ? "正式信号" : "接近候选"}`,
        JSON.stringify(item), JSON.stringify(missing), targetDate, validUntil],
     );
+    // 影子事件映射：仅在显式开启时写入，默认不写——旧链路继续是唯一业务写入方。
     // 风险对象映射回事件：initial_stop / signal_low / T+1 突破价 / 追高上限不再只依赖顶层 invalidation。
-    await upsertSignalEvent(client, {
-      strategyCode,
-      sourceKind: "strategy",
-      instrumentId,
-      instrumentCode: code,
-      triggerKind,
-      signalStatus: status,
-      validFrom: targetDate,
-      validUntil,
-      item,
-      missingSignals: missing,
-      producerCode: evaluatorCode,
-      producerVersion: evaluatorVersion,
-      runId,
-      dataAsOf: targetDate,
-    });
+    if (shadowSignalEventsEnabled()) {
+      await upsertSignalEvent(client, {
+        strategyCode,
+        sourceKind: "strategy",
+        instrumentId,
+        instrumentCode: code,
+        triggerKind,
+        signalStatus: status,
+        validFrom: targetDate,
+        validUntil,
+        item,
+        missingSignals: missing,
+        producerCode: evaluatorCode,
+        producerVersion: evaluatorVersion,
+        runId,
+        dataAsOf: targetDate,
+      });
+    }
   }
 }
 
