@@ -719,6 +719,67 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     expect(stored.rows[0]!.result).toMatchObject({ counterfactual: true, basis_date: "2026-08-04" });
   });
 
+  it("波段来源端到端：策略产物经同一 service 落事件、出计划、算结果，无策略名分支", async () => {
+    const instrument = (await pool.query<{ id: string }>(
+      `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
+       VALUES ('990127.SZ', '波段来源样本', 'stock', 'active') RETURNING id::text`,
+    )).rows[0]!.id;
+    for (const day of ["2026-09-01", "2026-09-02", "2026-09-03"]) {
+      await pool.query(
+        `INSERT INTO market_trading_day (trade_date, is_open, source) VALUES ($1::date, true, 'test')
+         ON CONFLICT (trade_date) DO NOTHING`, [day],
+      );
+    }
+    for (const [date, open, close] of [["2026-09-01", 12.0, 12.6], ["2026-09-02", 12.6, 13.2], ["2026-09-03", 13.2, 12.9]] as Array<[string, number, number]>) {
+      await pool.query(
+        `INSERT INTO market_bar (instrument_id, freq, bar_date, bar_time, open, high, low, close, adjustment, channel)
+         VALUES ($1::bigint, 'day', $2::date, ($2::date)::timestamp AT TIME ZONE 'UTC', $3, $3, $3, $4, '前复权', 'test')`,
+        [instrument, date, open, close],
+      );
+    }
+    // 波段评估器产物：初始风险线、T+1 突破价、追高上限都由策略自己算好。
+    const produced = {
+      code: "990127.SZ", name: "波段来源样本", signal: "箱体突破",
+      trigger_price_lower: 12.4, trigger_price_upper: 13.1,
+      evidence: { initial_stop: 11.6, confirmation_must_exceed: 12.4, confirmation_price_cap: 13.1, signal: "箱体突破" },
+    };
+    const event = await upsertSignalEvent(pool, {
+      strategyCode: "swing", sourceKind: "strategy",
+      instrumentId: instrument, instrumentCode: "990127.SZ", triggerKind: "price_range",
+      signalStatus: "qualified", validFrom: "2026-08-31", validUntil: "2026-09-04",
+      item: produced, producerCode: "swing_entry_v1", producerVersion: 3,
+      runId: null, dataAsOf: "2026-08-31", availableAt: "2026-08-31T16:00:00+08:00",
+      ruleHash: "swing-rule-v3",
+    });
+    expect(event.first).toBe(true);
+    const mapped = await pool.query<{ initial_stop: string; confirmation_must_exceed: string; confirmation_price_cap: string; risk_source: string }>(
+      `SELECT initial_stop::text, confirmation_must_exceed::text, confirmation_price_cap::text, risk_source
+         FROM strategy_signal_event WHERE id=$1::bigint`, [event.id],
+    );
+    expect(mapped.rows[0]).toMatchObject({
+      initial_stop: "11.6", confirmation_must_exceed: "12.4", confirmation_price_cap: "13.1", risk_source: "evaluator",
+    });
+    const plan = await createObservationPlan(pool, {
+      eventId: event.id, sourceKind: "strategy", strategyCode: "swing",
+      producerCode: "swing_entry_v1", producerVersion: 3,
+      trigger: {
+        rule: "次日突破 12.4，追高上限 13.1", window: "2026-09-01..2026-09-04",
+        price_basis: "前复权", comparison: "close_above",
+      },
+      risk: { initial_stop: 11.6, confirmation_price_cap: 13.1 },
+      actionable: true, dataAsOf: "2026-08-31", requestKey: "swing-e2e-1",
+    });
+    expect(plan).toMatchObject({ actionable: true, lifecycleStatus: "published" });
+    const evaluated = await evaluateShadowOutcome(pool, {
+      eventId: event.id, planId: plan.id, planRevision: plan.revision,
+      horizons: [1], entryBasis: "next_open", roundTripFeeBps: 0,
+      producerCode: "swing_evaluator", producerVersion: 1,
+    });
+    // 次日开 12.0、次日收 12.6 = +5%，与手工来源走同一条计算链。
+    expect(evaluated.rows[0]).toMatchObject({ status: "evaluated", entryPrice: 12.0, exitPrice: 12.6 });
+    expect(evaluated.rows[0]!.returnPct).toBeCloseTo(5.0, 4);
+  });
+
   it("手工计划端到端：提交→发布→触发→按行情算 outcome", async () => {
     const instrument = (await pool.query<{ id: string }>(
       `INSERT INTO market_instrument (code, name, kind, lifecycle_status)

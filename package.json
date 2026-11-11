@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx server/db/migrate.ts",
     "check:push": "tsx scripts/check-push-runtime-data.ts",
+    "shadow:coverage": "tsx scripts/shadow-replay-coverage.ts",
     "server": "tsx server/index.ts",
     "market:fetch": "tsx scripts/fetch-market.ts",
     "web:dev": "vite --config web/vite.config.ts",
