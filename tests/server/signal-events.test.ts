@@ -10,7 +10,9 @@ import {
   conditionHash,
   createObservationPlan,
   initialEventStatus,
+  evaluateShadowOutcome,
   missingPlanParts,
+  ObservationPlanRevisionConflict,
   riskObjectFromItem,
   shadowComparison,
   shadowSignalEventsEnabled,
@@ -22,23 +24,19 @@ import { prepareTestDb, resetSchema } from "./helpers.js";
 const prepared = await prepareTestDb();
 
 /**
- * 真实样本（artifacts/signal-export-20261111 冻结的 908 条里的原始 6 行）：
- * two_year_reversal / 001309.SZ 德明利，跨 2026-10-13～10-19 五个连续交易日，10-14 同一天有两条。
- * valid_until 逐日顺延、signal_low 逐日漂移，正好用来验证「不续窗口、不覆盖风险锚」。
+ * 合成样本：五个连续工作日、同一触发条件、窗口逐日推进、事件低点逐日漂移。
+ * 不含任何本机运行数据；真实 908 条回放另有用例，只读 ignored 的 artifacts。
  */
-const REAL_FIVE_DAY_SAMPLE = [
-  { id: "493", validFrom: "2026-10-13", validUntil: "2026-10-14", signalLow: 218.03, signalLowRaw: 218.03 },
-  { id: "510", validFrom: "2026-10-14", validUntil: "2026-10-15", signalLow: 223.3, signalLowRaw: 223.3 },
-  { id: "515", validFrom: "2026-10-14", validUntil: "2026-10-15", signalLow: 223.3, signalLowRaw: 223.3 },
-  { id: "533", validFrom: "2026-10-15", validUntil: "2026-10-16", signalLow: 208.61, signalLowRaw: 208.61 },
-  { id: "557", validFrom: "2026-10-16", validUntil: "2026-10-19", signalLow: 204.5, signalLowRaw: 204.5 },
-  { id: "580", validFrom: "2026-10-19", validUntil: "2026-10-20", signalLow: 206.64, signalLowRaw: 206.64 },
+const SYNTHETIC_FIVE_DAY = [
+  { validFrom: "2026-03-02", validUntil: "2026-03-03", signalLow: 10.5 },
+  { validFrom: "2026-03-03", validUntil: "2026-03-04", signalLow: 10.8 },
+  { validFrom: "2026-03-04", validUntil: "2026-03-05", signalLow: 10.2 },
+  { validFrom: "2026-03-05", validUntil: "2026-03-06", signalLow: 9.9 },
+  { validFrom: "2026-03-06", validUntil: "2026-03-09", signalLow: 10.1 },
 ];
-
 describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
   let pool: pg.Pool;
   let instrumentId: string;
-  let realInstrumentId: string;
 
   beforeAll(async () => {
     pool = prepared!.pool;
@@ -47,10 +45,6 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     instrumentId = (await pool.query<{ id: string }>(
       `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
        VALUES ('990121.SZ', '契约测试股份', 'stock', 'active') RETURNING id::text`,
-    )).rows[0]!.id;
-    realInstrumentId = (await pool.query<{ id: string }>(
-      `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
-       VALUES ('001309.SZ', '德明利', 'stock', 'active') RETURNING id::text`,
     )).rows[0]!.id;
   });
 
@@ -88,6 +82,7 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     sourceKind?: "strategy" | "manual";
     triggerKind?: string;
     resetVerified?: boolean;
+    producerCode?: string;
   }) {
     const kind = input.sourceKind ?? "strategy";
     return upsertSignalEvent(pool, {
@@ -101,7 +96,7 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
       validUntil: input.validUntil ?? null,
       item: input.item,
       missingSignals: [],
-      producerCode: kind === "manual" ? "manual" : `${input.strategyCode}_entry_v1`,
+      producerCode: input.producerCode ?? (kind === "manual" ? "manual" : `${input.strategyCode}_entry_v1`),
       producerVersion: 1,
       runId: null,
       dataAsOf: input.validFrom ?? "2026-11-11",
@@ -137,28 +132,15 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     expect(changed).not.toBe(base);
   });
 
-  it("真实 908 条样本回放：连续五个交易日只留一条事件与一次首发，窗口不顺延、风险锚不覆盖", async () => {
+  it("连续五个工作日命中（合成样本）：只留一条事件与一次首发，窗口不顺延、风险锚不覆盖", async () => {
     let firsts = 0;
     let eventId = "";
-    for (const row of REAL_FIVE_DAY_SAMPLE) {
-      const result = await upsertSignalEvent(pool, {
-        strategyCode: "two_year_reversal",
-        sourceKind: "strategy",
-        instrumentId: realInstrumentId,
-        instrumentCode: "001309.SZ",
-        triggerKind: "condition",
-        signalStatus: "qualified",
+    for (const row of SYNTHETIC_FIVE_DAY) {
+      const result = await writeEvent({
+        strategyCode: "synthetic_replay",
+        item: { code: "990121.SZ", evidence: { signal_low: row.signalLow, signal_low_raw: row.signalLow } },
         validFrom: row.validFrom,
         validUntil: row.validUntil,
-        item: {
-          code: "001309.SZ",
-          name: "德明利",
-          evidence: { signal_low: row.signalLow, signal_low_raw: row.signalLowRaw, industry_code: "881121.TI" },
-        },
-        producerCode: "two_year_reversal_entry_v1",
-        producerVersion: 1,
-        runId: null,
-        dataAsOf: row.validFrom,
       });
       if (result.first) firsts += 1;
       eventId = result.id;
@@ -166,18 +148,101 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     const events = await pool.query(
       `SELECT id::text, status, valid_from::text AS valid_from, valid_until::text AS valid_until,
               signal_low, signal_low_raw
-         FROM strategy_signal_event WHERE instrument_id=$1::bigint`,
-      [realInstrumentId],
+         FROM strategy_signal_event WHERE strategy_code='synthetic_replay'`,
     );
     expect(firsts).toBe(1);
     expect(events.rows).toHaveLength(1);
-    expect(events.rows[0]).toMatchObject({ id: eventId, status: "observing", valid_from: "2026-10-13" });
-    // 六条原始记录的 valid_until 逐日顺延到 2026-10-20，事件只保留最早的 2026-10-14。
-    expect(String(events.rows[0]!.valid_until).slice(0, 10)).toBe("2026-10-14");
-    // signal_low 逐日漂移 218.03→223.3→208.61→204.5→206.64，只保留首次的价基。
-    expect(Number(events.rows[0]!.signal_low)).toBe(218.03);
-    expect(Number(events.rows[0]!.signal_low_raw)).toBe(218.03);
+    expect(events.rows[0]).toMatchObject({ id: eventId, status: "observing", valid_from: SYNTHETIC_FIVE_DAY[0]!.validFrom });
+    // 窗口逐日推进到最后一个交易日，事件只保留最早的窗口终点。
+    expect(String(events.rows[0]!.valid_until).slice(0, 10)).toBe(SYNTHETIC_FIVE_DAY[0]!.validUntil);
+    // 事件低点逐日漂移，只保留首次写入的价基。
+    expect(Number(events.rows[0]!.signal_low)).toBe(SYNTHETIC_FIVE_DAY[0]!.signalLow);
   });
+
+  const replayFile = path.join(process.cwd(), "artifacts/signal-export-20261111/strategy_entry_signal.jsonl");
+  it.skipIf(!fs.existsSync(replayFile))(
+    "真实样本回放（只读本机 artifacts，报告写回 artifacts）：连续命中只留一条事件", async () => {
+      type ReplayRow = {
+        id: string; strategy_code: string; instrument_code: string; instrument_name: string;
+        trigger_kind: string; valid_from: string; valid_until: string | null; evidence: Record<string, unknown>;
+      };
+      const rows = fs.readFileSync(replayFile, "utf8").split("\n").filter(Boolean)
+        .map((line) => JSON.parse(line) as ReplayRow);
+      // 按「同策略 + 同标的 + 同条件指纹」分组，取命中交易日最多的一组做回放。
+      const groups = new Map<string, ReplayRow[]>();
+      for (const row of rows) {
+        const digest = conditionHash(row.strategy_code, row.instrument_code, row.trigger_kind, { evidence: row.evidence });
+        const key = `${row.strategy_code}|${row.instrument_code}|${digest}`;
+        const list = groups.get(key) ?? [];
+        list.push(row);
+        groups.set(key, list);
+      }
+      const picked = [...groups.entries()]
+        .map(([key, list]) => ({ key, list, days: new Set(list.map((row) => row.valid_from)).size }))
+        .filter((group) => group.days >= 5)
+        .sort((a, b) => b.days - a.days)[0];
+      expect(picked).toBeTruthy();
+      const sample = picked!.list.sort((a, b) => a.valid_from.localeCompare(b.valid_from));
+      const head = sample[0]!;
+
+      const existing = await pool.query<{ id: string }>(
+        "SELECT id::text FROM market_instrument WHERE code=$1", [head.instrument_code],
+      );
+      const instrument = existing.rows[0]?.id ?? (await pool.query<{ id: string }>(
+        `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
+         VALUES ($1,$2,'stock','active') RETURNING id::text`,
+        [head.instrument_code, head.instrument_name],
+      )).rows[0]!.id;
+      await pool.query("DELETE FROM strategy_signal_event WHERE instrument_id=$1::bigint", [instrument]);
+
+      let firsts = 0;
+      for (const row of sample) {
+        const result = await upsertSignalEvent(pool, {
+          strategyCode: row.strategy_code,
+          sourceKind: "strategy",
+          instrumentId: instrument,
+          instrumentCode: row.instrument_code,
+          triggerKind: row.trigger_kind,
+          signalStatus: "qualified",
+          validFrom: row.valid_from,
+          validUntil: row.valid_until,
+          item: { code: row.instrument_code, name: row.instrument_name, evidence: row.evidence },
+          producerCode: `${row.strategy_code}_entry_v1`,
+          producerVersion: 1,
+          runId: null,
+          dataAsOf: row.valid_from,
+        });
+        if (result.first) firsts += 1;
+      }
+      const events = await pool.query<{ id: string; valid_until: string; signal_low: string | null }>(
+        `SELECT id::text, valid_until::text AS valid_until, signal_low::text AS signal_low
+           FROM strategy_signal_event WHERE instrument_id=$1::bigint`,
+        [instrument],
+      );
+      expect(firsts).toBe(1);
+      expect(events.rows).toHaveLength(1);
+      // 原始数据窗口逐日顺延，事件必须停在首次窗口终点。
+      expect(String(events.rows[0]!.valid_until).slice(0, 10)).toBe(String(head.valid_until).slice(0, 10));
+
+      const reportDir = path.join(process.cwd(), "artifacts/shadow-replay");
+      fs.mkdirSync(reportDir, { recursive: true });
+      const reportPath = path.join(reportDir, "signal-replay-latest.json");
+      fs.writeFileSync(reportPath, JSON.stringify({
+        generated_at: new Date().toISOString(),
+        source: path.relative(process.cwd(), replayFile),
+        sample: {
+          strategy_code: head.strategy_code, instrument_code: head.instrument_code,
+          rows: sample.length, trading_days: picked!.days,
+          first_valid_from: head.valid_from,
+          last_valid_until: sample[sample.length - 1]!.valid_until,
+        },
+        result: {
+          events: events.rows.length, first_emissions: firsts,
+          kept_valid_until: events.rows[0]!.valid_until, kept_signal_low: events.rows[0]!.signal_low,
+        },
+      }, null, 2));
+      console.log(`[shadow-replay] 报告写入 ${path.relative(process.cwd(), reportPath)}`);
+    });
 
   it("连续命中不重置状态：计划已推进到 pending 后，再命中只更新证据不强拉回 observing", async () => {
     const first = await writeEvent({ strategyCode: "swing", item: swingItem, validFrom: "2026-11-11", validUntil: "2026-11-13" });
@@ -185,8 +250,11 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     const plan = await createObservationPlan(pool, {
       eventId: first.id, sourceKind: "strategy", strategyCode: "swing", producerCode: "swing_entry_v1",
       producerVersion: 1,
-      trigger: { rule: "次日突破", must_exceed: 12.4, window: "2026-11-12..2026-11-13" },
-      risk: { initial_stop: 11.6 }, actionable: true,
+      trigger: {
+        rule: "次日突破", must_exceed: 12.4, window: "2026-11-12..2026-11-13",
+        price_basis: "前复权", comparison: "close_above",
+      },
+      risk: { initial_stop: 11.6 }, actionable: true, dataAsOf: "2026-11-11",
     });
     expect(plan.actionable).toBe(true);
     const before = await pool.query<{ status: string; first_seen_at: Date }>(
@@ -210,39 +278,46 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
   });
 
   it("事件终结后直接再命中不算新机会，必须带复位证明", async () => {
-    const closed = await pool.query<{ id: string }>(
-      `SELECT id::text FROM strategy_signal_event WHERE strategy_code='swing'`,
-    );
+    const seeded = await writeEvent({ strategyCode: "close_test", item: swingItem, validFrom: "2026-11-10" });
+    await createObservationPlan(pool, {
+      eventId: seeded.id, sourceKind: "strategy", strategyCode: "close_test", producerCode: "close_test_entry_v1",
+      producerVersion: 1,
+      trigger: {
+        rule: "次日突破", must_exceed: 12.4, window: "2026-11-11..2026-11-12",
+        price_basis: "前复权", comparison: "close_above",
+      },
+      risk: { initial_stop: 11.6 }, actionable: true, dataAsOf: "2026-11-10",
+    });
     const moved = await appendEventTransition(pool, {
-      eventId: closed.rows[0]!.id, fromStatus: "pending", toStatus: "invalidated",
-      reason: "跌破初始风险线", factAt: new Date("2026-11-17T02:00:00Z"), idempotencyKey: "swing-inv-1",
+      eventId: seeded.id, fromStatus: "pending", toStatus: "invalidated",
+      reason: "跌破初始风险线", factAt: new Date("2026-11-17T02:00:00Z"), idempotencyKey: "close-test-inv-1",
     });
     expect(moved).toMatchObject({ applied: true, moved: 1, logged: 1 });
     const row = await pool.query<{ status: string; closed_at: Date | null }>(
-      `SELECT status, closed_at FROM strategy_signal_event WHERE id=$1::bigint`, [closed.rows[0]!.id],
+      `SELECT status, closed_at FROM strategy_signal_event WHERE id=$1::bigint`, [seeded.id],
     );
     expect(row.rows[0]!.status).toBe("invalidated");
     expect(row.rows[0]!.closed_at).not.toBeNull();
 
-    const noProof = await writeEvent({ strategyCode: "swing", item: swingItem, validFrom: "2026-11-18" });
+    const noProof = await writeEvent({ strategyCode: "close_test", item: swingItem, validFrom: "2026-11-18" });
     expect(noProof.first).toBe(false);
     expect(noProof.suppressed).toBe("no_reset_proof");
     const active = await pool.query<{ n: number }>(
       `SELECT count(*)::int n FROM strategy_signal_event
-        WHERE strategy_code='swing' AND status IN ('observing','pending','triggered')`,
+        WHERE strategy_code='close_test' AND status IN ('observing','pending','triggered')`,
     );
     expect(active.rows[0]!.n).toBe(0);
 
     const reopened = await writeEvent({
-      strategyCode: "swing", item: swingItem, validFrom: "2026-11-18", resetVerified: true,
+      strategyCode: "close_test", item: swingItem, validFrom: "2026-11-18", resetVerified: true,
     });
     expect(reopened.first).toBe(true);
-    expect(reopened.id).not.toBe(closed.rows[0]!.id);
+    expect(reopened.id).not.toBe(seeded.id);
   });
 
   it("状态转移原子：错位的前置状态不覆盖，重复幂等键只记一条", async () => {
     const event = await writeEvent({
-      strategyCode: null, sourceKind: "manual", triggerKind: "condition",
+      strategyCode: null, sourceKind: "manual", triggerKind: "condition", producerCode: "manual_atomic",
       item: { code: "990121.SZ", invalidation: 9.5, note: "转移原子性" },
     });
     const stale = await appendEventTransition(pool, {
@@ -283,6 +358,7 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
       signalStatus: "qualified",
       sourceKind: "manual",
       triggerKind: "condition",
+      producerCode: "manual_discovery_a",
     });
     const manualWithRisk = await writeEvent({
       strategyCode: null,
@@ -290,6 +366,7 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
       signalStatus: "qualified",
       sourceKind: "manual",
       triggerKind: "condition",
+      producerCode: "manual_discovery_b",
     });
     const rows = await pool.query<{ id: string; source_kind: string; risk_source: string; invalidation: string | null }>(
       `SELECT id::text, source_kind, risk_source, invalidation FROM strategy_signal_event
@@ -330,9 +407,25 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
       trigger: { rule: "突破" }, risk: { initial_stop: 11.6 },
     })).toContain("window");
     expect(missingPlanParts({
-      trigger: { rule: "突破", window: "2026-11-12..2026-11-18" },
+      trigger: {
+        rule: "突破", window: "2026-11-12..2026-11-18",
+        price_basis: "前复权", comparison: "close_above",
+      },
       risk: { initial_stop: 11.6 },
+      dataAsOf: "2026-11-11",
     })).toEqual([]);
+    // 只有追高上限、没有失效条件：不能算有风险口径。
+    expect(missingPlanParts({
+      trigger: { rule: "突破", window: "2026-11-12..2026-11-18", price_basis: "前复权", comparison: "close_above" },
+      risk: { confirmation_price_cap: 13.1 },
+      dataAsOf: "2026-11-11",
+    })).toEqual(expect.arrayContaining(["risk", "cancel_rule"]));
+    // 空对象与空数组不能冒充规则。
+    expect(missingPlanParts({
+      trigger: { rule: {}, window: [] },
+      risk: { initial_stop: 11.6 },
+      dataAsOf: "",
+    })).toEqual(expect.arrayContaining(["trigger_rule", "window", "as_of"]));
   });
 
   it("影子计划：完整计划发布可执行，缺项只留草案；零写池零通知", async () => {
@@ -344,19 +437,22 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     });
     const before = await snapshot();
     const event = await writeEvent({
-      strategyCode: null, sourceKind: "manual", triggerKind: "condition",
+      strategyCode: null, sourceKind: "manual", triggerKind: "condition", producerCode: "manual_plan",
       item: { code: "990121.SZ", note: "完整手工计划：突破 12 买入，跌破 9.5 取消", invalidation: 9.5 },
     });
     const full = await createObservationPlan(pool, {
       eventId: event.id, sourceKind: "manual", strategyCode: null,
       producerCode: "manual", producerVersion: 1,
-      trigger: { rule: "突破 12 买入", window: "2026-11-12..2026-11-18" },
+      trigger: {
+        rule: "突破 12 买入", window: "2026-11-12..2026-11-18",
+        price_basis: "前复权", comparison: "close_above",
+      },
       risk: { invalidation: 9.5, kind: "close_below" },
-      actionable: true,
+      actionable: true, dataAsOf: "2026-11-11",
     });
     expect(full).toMatchObject({ lifecycleStatus: "published", actionable: true });
     const draftEvent = await writeEvent({
-      strategyCode: null, sourceKind: "manual", triggerKind: "condition",
+      strategyCode: null, sourceKind: "manual", triggerKind: "condition", producerCode: "manual_draft",
       item: { code: "990121.SZ", note: "缺项手工计划：只说了形态不错" },
     });
     const draft = await createObservationPlan(pool, {
@@ -368,8 +464,11 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     const halfPlan = await createObservationPlan(pool, {
       eventId: draftEvent.id, revision: 2, sourceKind: "manual", strategyCode: null,
       producerCode: "manual", producerVersion: 1,
-      trigger: { rule: "突破 12 买入", window: "2026-11-12..2026-11-18" },
-      risk: { foo: 1 }, actionable: true,
+      trigger: {
+        rule: "突破 12 买入", window: "2026-11-12..2026-11-18",
+        price_basis: "前复权", comparison: "close_above",
+      },
+      risk: { foo: 1 }, actionable: true, dataAsOf: "2026-11-11",
     });
     expect(halfPlan.actionable).toBe(false);
     const eventStatus = await pool.query<{ status: string }>(
@@ -419,5 +518,115 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     expect(horizons).toEqual([1, 3, 5, 10]);
     const oneDay = rows.rows.find((row) => JSON.parse(row.horizon_key).days === 1)!;
     expect(oneDay).toMatchObject({ status: "not_executable", result: null });
+  });
+
+  it("条件演化不算新机会：同来源同标的条件变化只更新指纹与证据，不产生第二次首发", async () => {
+    const before = await writeEvent({
+      strategyCode: "cond_evo", validFrom: "2026-04-01",
+      item: { code: "990121.SZ", note: "条件A：回撤达标" },
+    });
+    expect(before.first).toBe(true);
+    const changed = await writeEvent({
+      strategyCode: "cond_evo", validFrom: "2026-04-02",
+      item: { code: "990121.SZ", note: "条件A：回撤不再达标" },
+    });
+    expect(changed.first).toBe(false);
+    expect(changed.id).toBe(before.id);
+    const rows = await pool.query<{ condition_hash: string }>(
+      `SELECT condition_hash FROM strategy_signal_event WHERE strategy_code='cond_evo'`,
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]!.condition_hash)
+      .toBe(conditionHash("cond_evo", "990121.SZ", "condition", { note: "条件A：回撤不再达标" }));
+  });
+
+  it("规则版本变化算新机会：ruleHash 进入事件身份，续写不覆盖", async () => {
+    const base = {
+      strategyCode: "rule_ver", sourceKind: "strategy" as const,
+      instrumentId, instrumentCode: "990121.SZ", triggerKind: "condition",
+      signalStatus: "qualified" as const, validFrom: "2026-04-10", validUntil: null,
+      item: { code: "990121.SZ", note: "同一形态" },
+      producerCode: "rule_ver_entry_v1", producerVersion: 1, runId: null,
+    };
+    const first = await upsertSignalEvent(pool, { ...base, ruleHash: "rule-v1" });
+    const again = await upsertSignalEvent(pool, { ...base, ruleHash: "rule-v1" });
+    const bumped = await upsertSignalEvent(pool, { ...base, ruleHash: "rule-v2" });
+    expect(first.first).toBe(true);
+    expect(again.first).toBe(false);
+    expect(again.id).toBe(first.id);
+    expect(bumped.first).toBe(true);
+    expect(bumped.id).not.toBe(first.id);
+    const firstRow = await pool.query<{ rule_hash: string }>(
+      `SELECT rule_hash FROM strategy_signal_event WHERE id=$1::bigint`, [first.id],
+    );
+    expect(firstRow.rows[0]!.rule_hash).toBe("rule-v1");
+  });
+
+  it("计划请求幂等与修订冲突：同 requestKey 复用同一计划，修订号不对直接拒绝", async () => {
+    const event = await writeEvent({
+      strategyCode: null, sourceKind: "manual", triggerKind: "condition", producerCode: "manual_idem",
+      item: { code: "990121.SZ", invalidation: 9.5, note: "幂等计划" },
+    });
+    const plan = {
+      eventId: event.id, sourceKind: "manual" as const, strategyCode: null,
+      producerCode: "manual_idem", producerVersion: 1,
+      trigger: { rule: "突破 12 买入", window: "2026-11-12..2026-11-18", price_basis: "前复权", comparison: "close_above" },
+      risk: { invalidation: 9.5 }, actionable: true, dataAsOf: "2026-11-11",
+    };
+    const created = await createObservationPlan(pool, { ...plan, requestKey: "req-plan-1" });
+    const replayed = await createObservationPlan(pool, { ...plan, requestKey: "req-plan-1" });
+    expect(replayed.id).toBe(created.id);
+    expect(replayed.revision).toBe(created.revision);
+    const plans = await pool.query<{ n: number }>(
+      `SELECT count(*)::int n FROM observation_plan WHERE event_id=$1::bigint`, [event.id],
+    );
+    expect(plans.rows[0]!.n).toBe(1);
+    await expect(createObservationPlan(pool, { ...plan, revision: 99 }))
+      .rejects.toBeInstanceOf(ObservationPlanRevisionConflict);
+  });
+
+  it("结果按计划与行情算出来：下一交易日开盘起算、扣费用、未走完记 pending", async () => {
+    const instrument = (await pool.query<{ id: string }>(
+      `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
+       VALUES ('990123.SZ', '结果计算样本', 'stock', 'active') RETURNING id::text`,
+    )).rows[0]!.id;
+    const bars: Array<[string, number, number]> = [
+      ["2026-05-06", 10.0, 10.2], ["2026-05-07", 10.2, 10.6],
+      ["2026-05-08", 10.6, 10.4], ["2026-05-11", 10.4, 11.0],
+    ];
+    for (const [date, open, close] of bars) {
+      await pool.query(
+        `INSERT INTO market_bar (instrument_id, freq, bar_date, bar_time, open, high, low, close, channel)
+         VALUES ($1::bigint, 'day', $2::date, ($2::date)::timestamp AT TIME ZONE 'UTC', $3, $3, $3, $4, 'test')`,
+        [instrument, date, open, close],
+      );
+    }
+    const event = await pool.query<{ id: string }>(
+      `INSERT INTO strategy_signal_event
+         (source_kind, scope, strategy_code, instrument_id, condition_hash, trigger_kind,
+          signal_status, status, valid_from, producer_code, producer_version, evidence)
+       VALUES ('strategy','personal','outcome_calc',$1::bigint,$2,'condition','qualified','observing','2026-05-05',
+               'outcome_calc_entry_v1',1,'{}'::jsonb) RETURNING id::text`,
+      [instrument, conditionHash("outcome_calc", "990123.SZ", "condition", {})],
+    );
+    const evaluated = await evaluateShadowOutcome(pool, {
+      eventId: event.rows[0]!.id, horizons: [1, 2, 3, 5],
+      entryBasis: "next_open", feeBps: 10,
+      producerCode: "outcome_calc_evaluator", producerVersion: 1,
+    });
+    const one = evaluated.rows.find((row) => row.horizon === 1)!;
+    // 下一交易日开盘 10.00，第 1 日收盘 10.60，扣 10bp = +5.9%。
+    expect(one).toMatchObject({ status: "evaluated", entryPrice: 10, exitPrice: 10.6, returnPct: 5.9 });
+    const two = evaluated.rows.find((row) => row.horizon === 2)!;
+    expect(two).toMatchObject({ status: "evaluated", exitPrice: 10.4, returnPct: 3.9 });
+    const five = evaluated.rows.find((row) => row.horizon === 5)!;
+    expect(five).toMatchObject({ status: "pending", returnPct: null });
+    const stored = await pool.query<{ n: number; status: string }>(
+      `SELECT count(*) OVER ()::int AS n, status FROM strategy_signal_outcome WHERE event_id=$1::bigint ORDER BY horizon_key`,
+      [event.rows[0]!.id],
+    );
+    expect(stored.rows).toHaveLength(4);
+    expect(stored.rows.filter((row) => row.status === "evaluated")).toHaveLength(3);
+    expect(stored.rows.filter((row) => row.status === "pending")).toHaveLength(1);
   });
 });

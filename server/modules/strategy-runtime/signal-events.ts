@@ -141,11 +141,12 @@ export interface UpsertResult {
 
 /**
  * 写入或续存信号事件。
- * 唯一键与 0196 索引一致：source_kind + COALESCE(strategy_code, producer_code) + instrument_id
- *   + condition_hash + scope + COALESCE(account_id, 0)，只对存续态生效。
+ * 身份与 0197 索引一致：source_kind + COALESCE(strategy_code, producer_code) + instrument_id
+ *   + COALESCE(rule_hash, '') + scope + COALESCE(account_id, 0)，只对存续态生效。
  * 单条 INSERT ... ON CONFLICT DO UPDATE 完成，避免并发 SELECT 后 INSERT 撞唯一键。
- * 命中存续事件时只更新证据、last_seen 与补充缺失风险项；status / first_seen_at / first_emitted_at /
- * valid_from 不重置，valid_until 取更早者（不续窗口），已写入的风险锚不覆盖。
+ * 条件指纹变化只更新证据与指纹，不新开机会；规则版本变化才换事件身份。
+ * 命中存续事件时 status / first_seen_at / first_emitted_at / valid_from 不重置，
+ * valid_until 取更早者（不续窗口），已写入的风险锚不覆盖。
  */
 export async function upsertSignalEvent(db: Db, input: UpsertSignalEventInput): Promise<UpsertResult> {
   const risk = riskObjectFromItem(input.item, input.sourceKind);
@@ -153,17 +154,18 @@ export async function upsertSignalEvent(db: Db, input: UpsertSignalEventInput): 
   const scope = input.scope ?? "personal";
   const accountId = scope === "account" ? input.accountId ?? null : null;
   const hash = conditionHash(input.strategyCode, input.instrumentCode, input.triggerKind, input.item);
+  const producer = input.strategyCode ?? input.producerCode;
 
   if (input.resetVerified !== true) {
     const closed = await db.query<{ id: string }>(
       `SELECT id::text FROM strategy_signal_event
-        WHERE source_kind=$1 AND COALESCE(strategy_code, producer_code)=COALESCE($2::text, producer_code)
-          AND instrument_id=$3::bigint AND condition_hash=$4 AND scope=$5
-          AND COALESCE(account_id, 0)=COALESCE($6::bigint, 0)
+        WHERE source_kind=$1 AND COALESCE(strategy_code, producer_code)=$2
+          AND instrument_id=$3::bigint AND COALESCE(rule_hash, '')=COALESCE($4::text, '')
+          AND scope=$5 AND COALESCE(account_id, 0)=COALESCE($6::bigint, 0)
           AND status IN ('invalidated', 'expired')
         ORDER BY closed_at DESC NULLS LAST, id DESC
         LIMIT 1`,
-      [input.sourceKind, input.strategyCode ?? input.producerCode, input.instrumentId, hash, scope, accountId],
+      [input.sourceKind, producer, input.instrumentId, input.ruleHash ?? null, scope, accountId],
     );
     if (closed.rows[0]) {
       return { id: closed.rows[0].id, first: false, status: "invalidated", conditionHash: hash, suppressed: "no_reset_proof" };
@@ -181,10 +183,13 @@ export async function upsertSignalEvent(db: Db, input: UpsertSignalEventInput): 
              $9,$10,now(),$11::date,$12::date,
              $13,$14,$15,$16,$17,$18,$19,$20,$21,$22::date,$23::timestamptz,
              $24,$25,$26::jsonb,$27::jsonb,$28::jsonb,$29::jsonb,$30::bigint,1)
-     ON CONFLICT (source_kind, COALESCE(strategy_code, producer_code), instrument_id, condition_hash, scope, COALESCE(account_id, 0))
+     ON CONFLICT (source_kind, COALESCE(strategy_code, producer_code), instrument_id,
+                  COALESCE(rule_hash, ''), scope, COALESCE(account_id, 0))
        WHERE status IN ('observing','pending','triggered')
      DO UPDATE SET
        last_seen_at=now(),
+       condition_hash=EXCLUDED.condition_hash,
+       trigger_kind=EXCLUDED.trigger_kind,
        signal_status=EXCLUDED.signal_status,
        valid_until=LEAST(strategy_signal_event.valid_until, EXCLUDED.valid_until),
        initial_stop=COALESCE(strategy_signal_event.initial_stop, EXCLUDED.initial_stop),
@@ -204,7 +209,6 @@ export async function upsertSignalEvent(db: Db, input: UpsertSignalEventInput): 
        data_as_of=COALESCE(EXCLUDED.data_as_of, strategy_signal_event.data_as_of),
        available_at=COALESCE(EXCLUDED.available_at, strategy_signal_event.available_at),
        input_fingerprint=COALESCE(EXCLUDED.input_fingerprint, strategy_signal_event.input_fingerprint),
-       rule_hash=COALESCE(EXCLUDED.rule_hash, strategy_signal_event.rule_hash),
        updated_at=now()
      RETURNING id::text, (xmax = 0) AS inserted, status`,
     [input.sourceKind, input.sourceRef ?? null, scope, accountId, input.strategyCode, input.instrumentId, hash,
@@ -298,6 +302,8 @@ export interface CreateObservationPlanInput {
   actionable: boolean;
   dataAsOf?: string | null;
   availableAt?: string | null;
+  /** 请求幂等键：同事件同键重试返回同一份计划，不新建修订。 */
+  requestKey?: string | null;
 }
 
 export interface CreateObservationPlanResult {
@@ -308,17 +314,25 @@ export interface CreateObservationPlanResult {
   missing: string[];
 }
 
-function hasValue(value: unknown): boolean {
-  return value !== null && value !== undefined && value !== "";
+/** 非空判定：空对象、空数组、空串都不算有值，避免 {} 冒充触发规则。 */
+function nonEmpty(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return value.trim() !== "";
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value as Record<string, unknown>).length > 0;
+  return true;
 }
 
 /**
- * 计划完整性校验：actionable 必须同时具备触发规则、观察窗口、取消规则与至少一个有效风险价位。
- * 只看对象非空不够——risk:{foo:1} 不能算有风险口径。
+ * 计划完整性校验：actionable 必须同时具备
+ * 触发规则、观察窗口、取消规则、真实风险价位、价格口径、判定方式与数据截止时间。
+ * 只看对象非空不够——risk:{foo:1} 不能算有风险口径；
+ * 追高上限与 T+1 突破价属于执行价格，顶替不了失效条件。
  */
 export function missingPlanParts(input: Pick<
   CreateObservationPlanInput,
-  "trigger" | "risk" | "observationPolicy" | "priceLevels"
+  "trigger" | "risk" | "observationPolicy" | "priceLevels" | "dataAsOf"
 >): string[] {
   const trigger = record(input.trigger);
   const risk = record(input.risk);
@@ -327,26 +341,46 @@ export function missingPlanParts(input: Pick<
 
   const triggerRule = trigger.rule ?? trigger.condition ?? trigger.conditions ?? trigger.signal
     ?? trigger.price ?? trigger.price_range ?? trigger.threshold ?? trigger.must_exceed;
-  if (!hasValue(triggerRule) && !(Array.isArray(input.priceLevels) && input.priceLevels.length > 0)) {
-    missing.push("trigger_rule");
-  }
+  if (!nonEmpty(triggerRule) && !nonEmpty(input.priceLevels)) missing.push("trigger_rule");
 
   const window = trigger.window ?? trigger.valid_until ?? trigger.validUntil ?? trigger.until
     ?? policy.window ?? policy.window_days ?? policy.max_wait_days ?? policy.expires_at;
-  if (!hasValue(window)) missing.push("window");
+  if (!nonEmpty(window)) missing.push("window");
 
   const cancelRule = trigger.cancel_rule ?? trigger.cancelRule ?? trigger.cancel
     ?? risk.invalidation ?? risk.initial_stop ?? risk.cancel_rule;
-  if (!hasValue(cancelRule)) missing.push("cancel_rule");
+  if (!nonEmpty(cancelRule)) missing.push("cancel_rule");
 
-  const levels = [risk.initial_stop, risk.signal_low, risk.signal_low_raw,
-    risk.confirmation_must_exceed, risk.confirmation_price_cap, risk.invalidation];
-  if (!levels.some((value) => positive(value) !== null)) missing.push("risk");
+  // 只有失效价、初始风险线与事件低点算风险价位；突破价和追高上限不算。
+  const riskLevels = [risk.initial_stop, risk.signal_low, risk.signal_low_raw, risk.invalidation];
+  if (!riskLevels.some((value) => positive(value) !== null)) missing.push("risk");
+
+  const priceBasis = trigger.price_basis ?? trigger.priceBasis ?? risk.price_basis
+    ?? (Array.isArray(input.priceLevels) ? record(input.priceLevels[0]).basis : null);
+  if (!nonEmpty(priceBasis)) missing.push("price_basis");
+
+  const comparison = trigger.comparison ?? trigger.kind ?? trigger.operator
+    ?? risk.comparison ?? risk.kind;
+  if (!nonEmpty(comparison)) missing.push("comparison");
+
+  if (!nonEmpty(input.dataAsOf)) missing.push("as_of");
 
   return missing;
 }
 
-/** 影子计划：execution_mode 固定 shadow；缺触发/风险项只能保存为草案且不可执行。 */
+/** 修订号冲突：调用方指定的 revision 不是下一个可用修订时抛出，不做静默覆盖。 */
+export class ObservationPlanRevisionConflict extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ObservationPlanRevisionConflict";
+  }
+}
+
+/**
+ * 影子计划：execution_mode 固定 shadow；缺触发/风险项只能保存为草案且不可执行。
+ * 插入计划与推进事件状态用同一语句完成；requestKey 相同直接复用，
+ * 显式指定 revision 时必须等于下一个修订号，避免并发覆盖。
+ */
 export async function createObservationPlan(
   db: Db,
   input: CreateObservationPlanInput,
@@ -354,34 +388,72 @@ export async function createObservationPlan(
   const missing = missingPlanParts(input);
   const actionable = input.actionable && missing.length === 0;
   const lifecycleStatus = actionable ? "published" : "draft";
-  const revision = input.revision ?? 1;
+  const revision = input.revision ?? null;
   const scope = input.scope ?? "personal";
   const accountId = scope === "account" ? input.accountId ?? null : null;
-  const inserted = await db.query<{ id: string }>(
-    `INSERT INTO observation_plan
-       (event_id, revision, source_kind, source_ref, scope, account_id, strategy_code, lifecycle_status, actionable,
-        producer_code, producer_version, trigger, risk, observation_policy, evaluation_policy,
-        price_levels, data_as_of, available_at, generated_at)
-     VALUES ($1::bigint,$2,$3,$4,$5,$6::bigint,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,
-             $16::jsonb,$17::date,$18::timestamptz,now())
-     RETURNING id::text`,
+
+  if (input.requestKey) {
+    const existing = await db.query<{ id: string; revision: number; lifecycle_status: string; actionable: boolean }>(
+      `SELECT id::text, revision, lifecycle_status, actionable
+         FROM observation_plan WHERE event_id=$1::bigint AND request_key=$2`,
+      [input.eventId, input.requestKey],
+    );
+    if (existing.rows[0]) {
+      return {
+        id: existing.rows[0].id, revision: existing.rows[0].revision,
+        lifecycleStatus: existing.rows[0].lifecycle_status as "draft" | "published",
+        actionable: existing.rows[0].actionable, missing,
+      };
+    }
+  }
+
+  const inserted = await db.query<{ id: string; revision: number; lifecycle_status: string; actionable: boolean }>(
+    `WITH next AS (
+       SELECT COALESCE(MAX(revision), 0) + 1 AS revision
+         FROM observation_plan WHERE event_id=$1::bigint
+     ), allowed AS (
+       SELECT revision FROM next
+        WHERE $2::int IS NULL OR next.revision = $2::int
+     ), inserted AS (
+       INSERT INTO observation_plan
+         (event_id, revision, source_kind, source_ref, scope, account_id, strategy_code, lifecycle_status,
+          actionable, producer_code, producer_version, trigger, risk, observation_policy, evaluation_policy,
+          price_levels, data_as_of, available_at, request_key, generated_at)
+       SELECT $1::bigint, allowed.revision, $3, $4, $5, $6::bigint, $7, $8, $9, $10, $11,
+              $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb,
+              $17::date, $18::timestamptz, $19, now()
+         FROM allowed
+       ON CONFLICT (event_id, revision) DO NOTHING
+       RETURNING id, revision, lifecycle_status, actionable
+     ), touched AS (
+       UPDATE strategy_signal_event event SET
+         plan_id=inserted.id,
+         current_revision=inserted.revision,
+         status=CASE WHEN $9::boolean AND event.status='observing' THEN 'pending' ELSE event.status END,
+         updated_at=now()
+       FROM inserted
+       WHERE event.id=$1::bigint
+     )
+     SELECT id::text, revision, lifecycle_status, actionable FROM inserted`,
     [input.eventId, revision, input.sourceKind, input.sourceRef ?? null, scope, accountId,
       input.strategyCode, lifecycleStatus, actionable, input.producerCode, input.producerVersion,
       JSON.stringify(input.trigger), JSON.stringify(input.risk),
       JSON.stringify(input.observationPolicy ?? {}),
       input.evaluationPolicy ? JSON.stringify(input.evaluationPolicy) : null,
       JSON.stringify(input.priceLevels ?? []),
-      input.dataAsOf ?? null, input.availableAt ?? null],
+      input.dataAsOf ?? null, input.availableAt ?? null, input.requestKey ?? null],
   );
-  const planId = inserted.rows[0]!.id;
-  await db.query(
-    `UPDATE strategy_signal_event SET plan_id=$2::bigint, current_revision=$3,
-       status=CASE WHEN $4::boolean AND status='observing' THEN 'pending' ELSE status END,
-       updated_at=now()
-     WHERE id=$1::bigint`,
-    [input.eventId, planId, revision, actionable],
-  );
-  return { id: planId, revision, lifecycleStatus, actionable, missing };
+  const row = inserted.rows[0];
+  if (!row) {
+    throw new ObservationPlanRevisionConflict(
+      `计划修订冲突：事件 ${input.eventId} 的下一个修订号已不是 ${revision ?? "(自动)"}，未写入任何计划`,
+    );
+  }
+  return {
+    id: row.id, revision: row.revision,
+    lifecycleStatus: row.lifecycle_status as "draft" | "published",
+    actionable: row.actionable, missing,
+  };
 }
 
 export interface UpsertOutcomeInput {
@@ -434,6 +506,130 @@ export async function upsertSignalOutcome(db: Db, input: UpsertOutcomeInput): Pr
       JSON.stringify(input.benchmarkCoverage ?? {}), input.status, input.notEvaluableReason ?? null],
   );
   return { id: result.rows[0]!.id };
+}
+
+export interface ShadowOutcomeInput {
+  eventId: string;
+  planId?: string | null;
+  planRevision?: number | null;
+  /** 固定前瞻期限（交易日数）。 */
+  horizons: number[];
+  /** 起算口径：next_open=下一交易日开盘；signal_close=信号日收盘。 */
+  entryBasis?: "next_open" | "signal_close";
+  /** 单边费用与滑点合计，单位 bp。 */
+  feeBps?: number;
+  producerCode: string;
+  producerVersion: number;
+}
+
+export interface ShadowOutcomeRow {
+  horizon: number;
+  status: "pending" | "unavailable" | "evaluated";
+  entryPrice: number | null;
+  exitPrice: number | null;
+  returnPct: number | null;
+}
+
+/**
+ * 影子结果计算：按事件、日线行情、起算口径与费用算固定前瞻收益，并落 outcome。
+ * 未到下一交易日或期限未走完记 pending，缺价基记 unavailable，两者都不写 0 收益。
+ * 基准超额本轮不计算，benchmark_coverage 显式留空，不谎报复盖。
+ */
+export async function evaluateShadowOutcome(
+  db: Db,
+  input: ShadowOutcomeInput,
+): Promise<{ rows: ShadowOutcomeRow[] }> {
+  const event = await db.query<{ instrument_id: string; valid_from: string }>(
+    `SELECT instrument_id::text, valid_from::text FROM strategy_signal_event WHERE id=$1::bigint`,
+    [input.eventId],
+  );
+  const subject = event.rows[0];
+  if (!subject) throw new Error(`信号事件不存在: ${input.eventId}`);
+
+  const entryBasis = input.entryBasis ?? "next_open";
+  const feeBps = input.feeBps ?? 0;
+  const bars = await db.query<{ bar_date: string; open: string; close: string }>(
+    `SELECT bar_date::text, open::text, close::text
+       FROM market_bar
+      WHERE instrument_id=$1::bigint AND freq='day' AND bar_date >= $2::date
+      ORDER BY bar_date`,
+    [subject.instrument_id, subject.valid_from],
+  );
+  const series = bars.rows;
+  // next_open 用信号日之后的第一个交易日；signal_close 直接用信号日收盘。
+  const signalBar = entryBasis === "signal_close" ? series.find((bar) => bar.bar_date === subject.valid_from) : undefined;
+  const holding = entryBasis === "signal_close"
+    ? series.filter((bar) => bar.bar_date > subject.valid_from)
+    : series.filter((bar) => bar.bar_date > subject.valid_from);
+
+  const rows: ShadowOutcomeRow[] = [];
+  for (const horizon of input.horizons) {
+    let status: ShadowOutcomeRow["status"] = "pending";
+    let entryPrice: number | null = null;
+    let exitPrice: number | null = null;
+    let returnPct: number | null = null;
+    let reason: string | null = null;
+    let sampleStart: string | null = null;
+    let sampleEnd: string | null = null;
+
+    if (entryBasis === "signal_close") {
+      entryPrice = signalBar ? Number(signalBar.close) : null;
+      sampleStart = signalBar?.bar_date ?? null;
+      const exit = holding[horizon - 1];
+      if (entryPrice === null) {
+        status = "unavailable";
+        reason = "信号日缺少日线收盘价";
+      } else if (!exit) {
+        status = "pending";
+        reason = `持有 ${horizon} 个交易日尚未走完`;
+      } else {
+        exitPrice = Number(exit.close);
+        sampleEnd = exit.bar_date;
+      }
+    } else {
+      const entryBar = holding[0];
+      const exitBar = holding[horizon];
+      entryPrice = entryBar ? Number(entryBar.open) : null;
+      sampleStart = entryBar?.bar_date ?? null;
+      if (!entryBar) {
+        status = "pending";
+        reason = "信号日之后还没有交易日行情";
+      } else if (!exitBar) {
+        status = "pending";
+        reason = `持有 ${horizon} 个交易日尚未走完`;
+      } else {
+        exitPrice = Number(exitBar.close);
+        sampleEnd = exitBar.bar_date;
+      }
+    }
+
+    if (entryPrice !== null && exitPrice !== null && entryPrice > 0) {
+      returnPct = Number((((exitPrice / entryPrice) - 1) * 100 - feeBps / 100).toFixed(4));
+      status = "evaluated";
+      reason = null;
+    }
+
+    await upsertSignalOutcome(db, {
+      eventId: input.eventId,
+      planId: input.planId ?? null,
+      planRevision: input.planRevision ?? null,
+      assessmentKind: "forward_diagnostic",
+      producerCode: input.producerCode,
+      producerVersion: input.producerVersion,
+      sampleStart,
+      sampleEnd,
+      entryBasis: { kind: entryBasis },
+      tradability: status === "evaluated" ? "tradable" : null,
+      feeAssumption: { bps: feeBps },
+      horizon: { days: horizon },
+      result: status === "evaluated" ? { return_pct: returnPct, entry_price: entryPrice, exit_price: exitPrice } : null,
+      benchmarkCoverage: {},
+      status,
+      notEvaluableReason: status === "evaluated" ? null : reason,
+    });
+    rows.push({ horizon, status, entryPrice, exitPrice, returnPct });
+  }
+  return { rows };
 }
 
 export interface ShadowComparison {
