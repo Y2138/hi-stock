@@ -585,49 +585,65 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
       .rejects.toBeInstanceOf(ObservationPlanRevisionConflict);
   });
 
-  it("结果按计划与行情算出来：下一交易日开盘起算、扣费用、未走完记 pending", async () => {
+  it("结果按计划与行情算出来：次日开 10 收 11 再下一日收 12，1 日必须 10% 不是 20%", async () => {
     const instrument = (await pool.query<{ id: string }>(
       `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
        VALUES ('990123.SZ', '结果计算样本', 'stock', 'active') RETURNING id::text`,
     )).rows[0]!.id;
+    for (const day of ["2026-05-06", "2026-05-07", "2026-05-08", "2026-05-11"]) {
+      await pool.query(
+        `INSERT INTO market_trading_day (trade_date, is_open, source) VALUES ($1::date, true, 'test')
+         ON CONFLICT (trade_date) DO NOTHING`, [day],
+      );
+    }
     const bars: Array<[string, number, number]> = [
-      ["2026-05-06", 10.0, 10.2], ["2026-05-07", 10.2, 10.6],
-      ["2026-05-08", 10.6, 10.4], ["2026-05-11", 10.4, 11.0],
+      ["2026-05-06", 10.0, 11.0], ["2026-05-07", 11.0, 12.0],
+      ["2026-05-08", 12.0, 10.5], ["2026-05-11", 10.5, 13.0],
     ];
     for (const [date, open, close] of bars) {
       await pool.query(
-        `INSERT INTO market_bar (instrument_id, freq, bar_date, bar_time, open, high, low, close, channel)
-         VALUES ($1::bigint, 'day', $2::date, ($2::date)::timestamp AT TIME ZONE 'UTC', $3, $3, $3, $4, 'test')`,
+        `INSERT INTO market_bar (instrument_id, freq, bar_date, bar_time, open, high, low, close, adjustment, channel)
+         VALUES ($1::bigint, 'day', $2::date, ($2::date)::timestamp AT TIME ZONE 'UTC', $3, $3, $3, $4, '前复权', 'test')`,
         [instrument, date, open, close],
       );
     }
     const event = await pool.query<{ id: string }>(
       `INSERT INTO strategy_signal_event
          (source_kind, scope, strategy_code, instrument_id, condition_hash, trigger_kind,
-          signal_status, status, valid_from, producer_code, producer_version, evidence)
+          signal_status, status, valid_from, producer_code, producer_version, evidence,
+          created_at, available_at)
        VALUES ('strategy','personal','outcome_calc',$1::bigint,$2,'condition','qualified','observing','2026-05-05',
-               'outcome_calc_entry_v1',1,'{}'::jsonb) RETURNING id::text`,
+               'outcome_calc_entry_v1',1,'{}'::jsonb,'2026-05-05T08:00:00+08:00','2026-05-05T16:00:00+08:00')
+       RETURNING id::text`,
       [instrument, conditionHash("outcome_calc", "990123.SZ", "condition", {})],
     );
     const evaluated = await evaluateShadowOutcome(pool, {
       eventId: event.rows[0]!.id, horizons: [1, 2, 3, 5],
-      entryBasis: "next_open", feeBps: 10,
+      entryBasis: "next_open", roundTripFeeBps: 10,
       producerCode: "outcome_calc_evaluator", producerVersion: 1,
     });
     const one = evaluated.rows.find((row) => row.horizon === 1)!;
-    // 下一交易日开盘 10.00，第 1 日收盘 10.60，扣 10bp = +5.9%。
-    expect(one).toMatchObject({ status: "evaluated", entryPrice: 10, exitPrice: 10.6, returnPct: 5.9 });
+    // 次日开盘 10 → 次日收盘 11 = +10%，扣往返 10bp = +9.9%。取成 12 就会变成 20%，是错的。
+    expect(one).toMatchObject({ status: "evaluated", entryPrice: 10, exitPrice: 11 });
+    expect(one.returnPct).toBeCloseTo(9.9, 4);
     const two = evaluated.rows.find((row) => row.horizon === 2)!;
-    expect(two).toMatchObject({ status: "evaluated", exitPrice: 10.4, returnPct: 3.9 });
+    expect(two).toMatchObject({ status: "evaluated", exitPrice: 12 });
+    expect(two.returnPct).toBeCloseTo(19.9, 4);
     const five = evaluated.rows.find((row) => row.horizon === 5)!;
-    expect(five).toMatchObject({ status: "pending", returnPct: null });
-    const stored = await pool.query<{ n: number; status: string }>(
-      `SELECT count(*) OVER ()::int AS n, status FROM strategy_signal_outcome WHERE event_id=$1::bigint ORDER BY horizon_key`,
-      [event.rows[0]!.id],
+    expect(five.status).toBe("pending");
+    expect(five.returnPct).toBeNull();
+    // 价基不符时不得混用：要求原始价而行情是前复权，记缺数。
+    const mismatched = await evaluateShadowOutcome(pool, {
+      eventId: event.rows[0]!.id, horizons: [1], entryBasis: "next_open",
+      roundTripFeeBps: 10, priceBasis: "原始价",
+      producerCode: "outcome_calc_evaluator", producerVersion: 1,
+    });
+    expect(mismatched.rows[0]).toMatchObject({ status: "unavailable", returnPct: null });
+    // 固定前瞻诊断没有成交证据，可成交性一律未知。
+    const tradability = await pool.query<{ tradability: string }>(
+      `SELECT DISTINCT tradability FROM strategy_signal_outcome WHERE event_id=$1::bigint`, [event.rows[0]!.id],
     );
-    expect(stored.rows).toHaveLength(4);
-    expect(stored.rows.filter((row) => row.status === "evaluated")).toHaveLength(3);
-    expect(stored.rows.filter((row) => row.status === "pending")).toHaveLength(1);
+    expect(tradability.rows.map((row) => row.tradability)).toEqual(["unknown"]);
   });
 
   it("手工计划端到端：提交→发布→触发→按行情算 outcome", async () => {
@@ -635,10 +651,16 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
       `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
        VALUES ('990124.SZ', '端到端样本', 'stock', 'active') RETURNING id::text`,
     )).rows[0]!.id;
-    for (const [date, open, close] of [["2026-06-02", 20.0, 20.4], ["2026-06-03", 20.4, 21.2]] as Array<[string, number, number]>) {
+    for (const day of ["2026-06-02", "2026-06-03"]) {
       await pool.query(
-        `INSERT INTO market_bar (instrument_id, freq, bar_date, bar_time, open, high, low, close, channel)
-         VALUES ($1::bigint, 'day', $2::date, ($2::date)::timestamp AT TIME ZONE 'UTC', $3, $3, $3, $4, 'test')`,
+        `INSERT INTO market_trading_day (trade_date, is_open, source) VALUES ($1::date, true, 'test')
+         ON CONFLICT (trade_date) DO NOTHING`, [day],
+      );
+    }
+    for (const [date, open, close] of [["2026-06-02", 20.0, 21.0], ["2026-06-03", 21.0, 22.0]] as Array<[string, number, number]>) {
+      await pool.query(
+        `INSERT INTO market_bar (instrument_id, freq, bar_date, bar_time, open, high, low, close, adjustment, channel)
+         VALUES ($1::bigint, 'day', $2::date, ($2::date)::timestamp AT TIME ZONE 'UTC', $3, $3, $3, $4, '前复权', 'test')`,
         [instrument, date, open, close],
       );
     }
@@ -648,7 +670,8 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
       instrumentId: instrument, instrumentCode: "990124.SZ", triggerKind: "price_range",
       signalStatus: "qualified", validFrom: "2026-06-01", validUntil: "2026-06-05",
       item: { code: "990124.SZ", invalidation: 18.5, note: "突破 20 买入，跌破 18.5 取消" },
-      producerCode: "manual_e2e", producerVersion: 1, runId: null, dataAsOf: "2026-06-01",
+      producerCode: "manual_e2e", producerVersion: 1, runId: null,
+      dataAsOf: "2026-06-01", availableAt: "2026-06-01T15:00:00+08:00",
     });
     expect(event.first).toBe(true);
     // 2) 计划发布：完整计划把事件推进到 pending。
@@ -677,17 +700,17 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     // 4) 结果计算：按计划与行情算 1 日收益并落 outcome。
     const evaluated = await evaluateShadowOutcome(pool, {
       eventId: event.id, planId: plan.id, planRevision: plan.revision,
-      horizons: [1], entryBasis: "next_open", feeBps: 0,
+      horizons: [1], entryBasis: "next_open", roundTripFeeBps: 0,
       producerCode: "manual_e2e_evaluator", producerVersion: 1,
     });
-    expect(evaluated.rows[0]).toMatchObject({ horizon: 1, status: "evaluated", entryPrice: 20.0, exitPrice: 21.2 });
-    expect(evaluated.rows[0]!.returnPct).toBeCloseTo(6.0, 4);
+    expect(evaluated.rows[0]).toMatchObject({ horizon: 1, status: "evaluated", entryPrice: 20.0, exitPrice: 21.0 });
+    expect(evaluated.rows[0]!.returnPct).toBeCloseTo(5.0, 4);
     const stored = await pool.query<{ status: string; plan_id: string; result: Record<string, unknown> | null }>(
       `SELECT status, plan_id::text, result FROM strategy_signal_outcome WHERE event_id=$1::bigint`, [event.id],
     );
     expect(stored.rows).toHaveLength(1);
     expect(stored.rows[0]).toMatchObject({ status: "evaluated", plan_id: plan.id });
-    expect(Number((stored.rows[0]!.result as { return_pct: number }).return_pct)).toBeCloseTo(6.0, 4);
+    expect(Number((stored.rows[0]!.result as { return_pct: number }).return_pct)).toBeCloseTo(5.0, 4);
     // 全程没有写池、没有产生通知或邮件。
     expect((await pool.query<{ n: number }>("SELECT count(*)::int n FROM notification_delivery")).rows[0]!.n).toBe(0);
     expect((await pool.query<{ n: number }>("SELECT count(*)::int n FROM email_delivery")).rows[0]!.n).toBe(0);
