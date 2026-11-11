@@ -396,6 +396,9 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     const source = fs.readFileSync(file, "utf8");
     expect(source).not.toMatch(/strategyCode\s*===\s*["'](swing|two_year_reversal|limit_up|value_anchor)/);
     expect(source).not.toMatch(/["']nightly_sector["']\s*===|===\s*["']nightly_sector["']/);
+    // 成熟度必须按上海时区与当日收盘判断，不能退回数据库 CURRENT_DATE。
+    expect(source).toContain("AT TIME ZONE 'Asia/Shanghai'");
+    expect(source).not.toMatch(/CURRENT_DATE/);
   });
 
   it("计划完整性：只有对象非空不算完整，risk:{foo:1} 与缺窗口都只能是草案", () => {
@@ -619,7 +622,7 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     );
     const evaluated = await evaluateShadowOutcome(pool, {
       eventId: event.rows[0]!.id, horizons: [1, 2, 3, 5],
-      entryBasis: "next_open", roundTripFeeBps: 10,
+      entryBasis: "next_open", roundTripFeeBps: 10, priceBasis: "前复权",
       producerCode: "outcome_calc_evaluator", producerVersion: 1,
     });
     const one = evaluated.rows.find((row) => row.horizon === 1)!;
@@ -644,6 +647,76 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
       `SELECT DISTINCT tradability FROM strategy_signal_outcome WHERE event_id=$1::bigint`, [event.rows[0]!.id],
     );
     expect(tradability.rows.map((row) => row.tradability)).toEqual(["unknown"]);
+  });
+
+  it("费用或价基缺失一律拒算：不默认免费、不混用价基", async () => {
+    const instrument = (await pool.query<{ id: string }>(
+      `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
+       VALUES ('990125.SZ', '拒算样本', 'stock', 'active') RETURNING id::text`,
+    )).rows[0]!.id;
+    const eventId = (await pool.query<{ id: string }>(
+      `INSERT INTO strategy_signal_event
+         (source_kind, scope, strategy_code, instrument_id, condition_hash, trigger_kind,
+          signal_status, status, valid_from, producer_code, producer_version, evidence, created_at, available_at)
+       VALUES ('strategy','personal','refuse_calc',$1::bigint,$2,'condition','qualified','observing','2026-07-01',
+               'refuse_calc_entry_v1',1,'{}'::jsonb,'2026-07-01T08:00:00+08:00','2026-07-01T16:00:00+08:00')
+       RETURNING id::text`,
+      [instrument, conditionHash("refuse_calc", "990125.SZ", "condition", {})],
+    )).rows[0]!.id;
+    // 费用缺失：不能默认 0 后声称已扣费。
+    const noFee = await evaluateShadowOutcome(pool, {
+      eventId, horizons: [1], entryBasis: "next_open", priceBasis: "前复权",
+      producerCode: "refuse_calc_evaluator", producerVersion: 1,
+    } as never);
+    expect(noFee.rows[0]).toMatchObject({ status: "not_configured", returnPct: null });
+    expect(noFee.rows[0]!.reason).toContain("round_trip_fee_bps");
+    // 价基缺失：不能放行任意口径的行情。
+    const noBasis = await evaluateShadowOutcome(pool, {
+      eventId, horizons: [1], entryBasis: "next_open", roundTripFeeBps: 10,
+      producerCode: "refuse_calc_evaluator", producerVersion: 1,
+    });
+    expect(noBasis.rows[0]).toMatchObject({ status: "not_configured", returnPct: null });
+    expect(noBasis.rows[0]!.reason).toContain("price_basis");
+  });
+
+  it("迟到信号按可得时点起算：signal_close 不吃生成前收盘，并标注反事实", async () => {
+    const instrument = (await pool.query<{ id: string }>(
+      `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
+       VALUES ('990126.SZ', '迟到样本', 'stock', 'active') RETURNING id::text`,
+    )).rows[0]!.id;
+    for (const day of ["2026-08-03", "2026-08-04", "2026-08-05"]) {
+      await pool.query(
+        `INSERT INTO market_trading_day (trade_date, is_open, source) VALUES ($1::date, true, 'test')
+         ON CONFLICT (trade_date) DO NOTHING`, [day],
+      );
+    }
+    for (const [date, close] of [["2026-08-03", 9.0], ["2026-08-04", 10.0], ["2026-08-05", 10.5]] as Array<[string, number]>) {
+      await pool.query(
+        `INSERT INTO market_bar (instrument_id, freq, bar_date, bar_time, open, high, low, close, adjustment, channel)
+         VALUES ($1::bigint, 'day', $2::date, ($2::date)::timestamp AT TIME ZONE 'UTC', $3, $3, $3, $3, '前复权', 'test')`,
+        [instrument, date, close],
+      );
+    }
+    // 信号有效日 08-03，但实际 08-04 才可得：起点必须是 08-04，不能用 08-03 的收盘。
+    const eventId = (await pool.query<{ id: string }>(
+      `INSERT INTO strategy_signal_event
+         (source_kind, scope, strategy_code, instrument_id, condition_hash, trigger_kind,
+          signal_status, status, valid_from, producer_code, producer_version, evidence, created_at, available_at)
+       VALUES ('strategy','personal','late_calc',$1::bigint,$2,'condition','qualified','observing','2026-08-03',
+               'late_calc_entry_v1',1,'{}'::jsonb,'2026-08-03T08:00:00+08:00','2026-08-04T16:00:00+08:00')
+       RETURNING id::text`,
+      [instrument, conditionHash("late_calc", "990126.SZ", "condition", {})],
+    )).rows[0]!.id;
+    const evaluated = await evaluateShadowOutcome(pool, {
+      eventId, horizons: [1], entryBasis: "signal_close", roundTripFeeBps: 0, priceBasis: "前复权",
+      producerCode: "late_calc_evaluator", producerVersion: 1,
+    });
+    expect(evaluated.rows[0]).toMatchObject({ status: "evaluated", entryPrice: 10.0, exitPrice: 10.5 });
+    expect(evaluated.rows[0]!.returnPct).toBeCloseTo(5.0, 4);
+    const stored = await pool.query<{ result: Record<string, unknown> }>(
+      `SELECT result FROM strategy_signal_outcome WHERE event_id=$1::bigint`, [eventId],
+    );
+    expect(stored.rows[0]!.result).toMatchObject({ counterfactual: true, basis_date: "2026-08-04" });
   });
 
   it("手工计划端到端：提交→发布→触发→按行情算 outcome", async () => {

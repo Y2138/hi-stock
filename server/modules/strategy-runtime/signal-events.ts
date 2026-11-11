@@ -516,9 +516,9 @@ export interface ShadowOutcomeInput {
   horizons: number[];
   /** 起算口径：next_open=下一交易日开盘；signal_close=信号日收盘。 */
   entryBasis?: "next_open" | "signal_close";
-  /** 往返总费用（买入+卖出，含滑点），单位 bp；必须显式给出，不为 0 才不扣费。 */
-  roundTripFeeBps?: number;
-  /** 行情价格口径；缺省从计划 trigger.price_basis 读取，不一致记缺数而不是混用。 */
+  /** 往返总费用（买入+卖出，含滑点），单位 bp；必须显式给出，缺失不按免费计算。 */
+  roundTripFeeBps: number;
+  /** 行情价格口径；缺省从计划 trigger.price_basis 读取，缺失或与行情不一致都不计算。 */
   priceBasis?: string | null;
   producerCode: string;
   producerVersion: number;
@@ -526,7 +526,7 @@ export interface ShadowOutcomeInput {
 
 export interface ShadowOutcomeRow {
   horizon: number;
-  status: "pending" | "unavailable" | "evaluated";
+  status: "pending" | "unavailable" | "not_configured" | "evaluated";
   entryPrice: number | null;
   exitPrice: number | null;
   returnPct: number | null;
@@ -555,11 +555,13 @@ export async function evaluateShadowOutcome(
     start_from: string;
     plan_id: string | null;
     today: string;
+    now_time: string;
   }>(
     `SELECT instrument_id::text, valid_from::text,
             GREATEST(valid_from, (COALESCE(available_at, created_at) AT TIME ZONE 'Asia/Shanghai')::date)::text AS start_from,
             plan_id::text,
-            (CURRENT_DATE)::text AS today
+            (now() AT TIME ZONE 'Asia/Shanghai')::date::text AS today,
+            (now() AT TIME ZONE 'Asia/Shanghai')::time::text AS now_time
        FROM strategy_signal_event WHERE id=$1::bigint`,
     [input.eventId],
   );
@@ -576,7 +578,48 @@ export async function evaluateShadowOutcome(
   }
 
   const entryBasis = input.entryBasis ?? "next_open";
-  const feeBps = input.roundTripFeeBps ?? 0;
+  const feeBps = input.roundTripFeeBps;
+  const rows: ShadowOutcomeRow[] = [];
+  const persist = async (row: ShadowOutcomeRow, extra: {
+    sampleStart: string | null; sampleEnd: string | null; result: Record<string, unknown> | null; reason: string | null;
+  }) => {
+    await upsertSignalOutcome(db, {
+      eventId: input.eventId,
+      planId: planId ?? null,
+      planRevision: input.planRevision ?? null,
+      assessmentKind: "forward_diagnostic",
+      producerCode: input.producerCode,
+      producerVersion: input.producerVersion,
+      sampleStart: extra.sampleStart,
+      sampleEnd: extra.sampleEnd,
+      entryBasis: { kind: entryBasis, price_basis: priceBasis },
+      // 固定前瞻诊断没有成交约束证据，可成交性一律未知。
+      tradability: "unknown",
+      feeAssumption: { kind: "round_trip", bps: Number.isFinite(feeBps) ? feeBps : null },
+      horizon: { days: row.horizon },
+      result: extra.result,
+      benchmarkCoverage: {},
+      status: row.status === "not_configured" ? "not_configured" : row.status,
+      notEvaluableReason: extra.reason,
+    });
+    rows.push(row);
+  };
+
+  // 费用与价基必须显式确定：缺失不按免费计算、不混用价格口径。
+  const setupMissing: string[] = [];
+  if (!Number.isFinite(feeBps) || feeBps < 0) setupMissing.push("round_trip_fee_bps");
+  if (!priceBasis) setupMissing.push("price_basis");
+  if (setupMissing.length > 0) {
+    for (const horizon of input.horizons) {
+      const reason = `未配置：${setupMissing.join(", ")}`;
+      await persist(
+        { horizon, status: "not_configured", entryPrice: null, exitPrice: null, returnPct: null, reason },
+        { sampleStart: null, sampleEnd: null, result: null, reason },
+      );
+    }
+    return { rows };
+  }
+  const basis = priceBasis as string;
 
   // 交易日历：起点之后已开市的交易日，按时间顺序。
   const tradingDays = (await db.query<{ trade_date: string }>(
@@ -585,25 +628,27 @@ export async function evaluateShadowOutcome(
       ORDER BY trade_date`,
     [subject.start_from],
   )).rows.map((row) => row.trade_date);
-  // 行情：只取同一价格口径的日线，口径不符不混用。
-  const bars = await db.query<{ bar_date: string; open: string; close: string; adjustment: string | null }>(
-    `SELECT bar_date::text, open::text, close::text, adjustment
+  // 行情：只取同一价格口径的日线，口径不符记缺数而不是混用。
+  const bars = await db.query<{ bar_date: string; open: string; close: string }>(
+    `SELECT bar_date::text, open::text, close::text
        FROM market_bar
       WHERE instrument_id=$1::bigint AND freq='day' AND bar_date > $2::date
-        AND ($3::text IS NULL OR adjustment = $3::text)`,
-    [subject.instrument_id, subject.start_from, priceBasis],
+        AND adjustment = $3::text`,
+    [subject.instrument_id, subject.start_from, basis],
   );
   const barByDate = new Map(bars.rows.map((bar) => [bar.bar_date, bar]));
+  // signal_close 的起算日同样取可得时点：valid_from 早于可得日时不冒充原信号价。
   const signalBar = entryBasis === "signal_close"
-    ? (await db.query<{ close: string; adjustment: string | null }>(
-      `SELECT close::text, adjustment FROM market_bar
-        WHERE instrument_id=$1::bigint AND freq='day' AND bar_date=$2::date
-          AND ($3::text IS NULL OR adjustment = $3::text)`,
-      [subject.instrument_id, subject.valid_from, priceBasis],
+    ? (await db.query<{ close: string }>(
+      `SELECT close::text FROM market_bar
+        WHERE instrument_id=$1::bigint AND freq='day' AND bar_date=$2::date AND adjustment = $3::text`,
+      [subject.instrument_id, subject.start_from, basis],
     )).rows[0]
     : undefined;
+  const counterfactual = entryBasis === "signal_close" && subject.start_from !== subject.valid_from;
+  // 上海时间 15:00 之后才算当日收盘，避免未收盘就被判成已评估。
+  const todayClosed = subject.now_time >= "15:00:00";
 
-  const rows: ShadowOutcomeRow[] = [];
   for (const horizon of input.horizons) {
     let status: ShadowOutcomeRow["status"] = "pending";
     let entryPrice: number | null = null;
@@ -613,19 +658,20 @@ export async function evaluateShadowOutcome(
     let sampleStart: string | null = null;
     let sampleEnd: string | null = null;
 
-    // 第 horizon 个交易日；目标日还没到（或日历未覆盖）记未成熟。
     const targetDay = tradingDays[horizon - 1];
     const entryDay = tradingDays[0];
-    if (!targetDay || targetDay > subject.today) {
+    if (!targetDay || targetDay > subject.today || (targetDay === subject.today && !todayClosed)) {
       status = "pending";
-      reason = `第 ${horizon} 个交易日尚未走完`;
+      reason = targetDay === subject.today && !todayClosed
+        ? `第 ${horizon} 个交易日（${targetDay}）尚未收盘`
+        : `第 ${horizon} 个交易日尚未走完`;
     } else if (entryBasis === "signal_close") {
       if (!signalBar) {
         status = "unavailable";
-        reason = priceBasis ? `信号日缺少「${priceBasis}」口径的日线` : "信号日缺少日线";
+        reason = `起算日（${subject.start_from}）缺少「${basis}」口径的日线`;
       } else {
         entryPrice = Number(signalBar.close);
-        sampleStart = subject.valid_from;
+        sampleStart = subject.start_from;
       }
     } else if (!entryDay) {
       status = "pending";
@@ -634,7 +680,7 @@ export async function evaluateShadowOutcome(
       const entryBar = barByDate.get(entryDay);
       if (!entryBar) {
         status = "unavailable";
-        reason = "下一交易日缺少行情";
+        reason = `下一交易日（${entryDay}）缺少「${basis}」口径行情`;
       } else {
         entryPrice = Number(entryBar.open);
         sampleStart = entryDay;
@@ -648,7 +694,7 @@ export async function evaluateShadowOutcome(
       const exitBar = barByDate.get(targetDay!);
       if (!exitBar) {
         status = "unavailable";
-        reason = `第 ${horizon} 个交易日（${targetDay}）缺少行情`;
+        reason = `第 ${horizon} 个交易日（${targetDay}）缺少「${basis}」口径行情`;
       } else {
         exitPrice = Number(exitBar.close);
         sampleEnd = targetDay!;
@@ -658,28 +704,21 @@ export async function evaluateShadowOutcome(
       }
     }
 
-    await upsertSignalOutcome(db, {
-      eventId: input.eventId,
-      planId: planId ?? null,
-      planRevision: input.planRevision ?? null,
-      assessmentKind: "forward_diagnostic",
-      producerCode: input.producerCode,
-      producerVersion: input.producerVersion,
-      sampleStart,
-      sampleEnd,
-      entryBasis: { kind: entryBasis, price_basis: priceBasis },
-      // 固定前瞻诊断没有成交约束证据，可成交性一律未知。
-      tradability: "unknown",
-      feeAssumption: { kind: "round_trip", bps: feeBps },
-      horizon: { days: horizon },
-      result: status === "evaluated"
-        ? { return_pct: returnPct, entry_price: entryPrice, exit_price: exitPrice, price_basis: priceBasis }
-        : null,
-      benchmarkCoverage: {},
-      status,
-      notEvaluableReason: status === "evaluated" ? null : reason,
-    });
-    rows.push({ horizon, status, entryPrice, exitPrice, returnPct, reason });
+    await persist(
+      { horizon, status, entryPrice, exitPrice, returnPct, reason },
+      {
+        sampleStart,
+        sampleEnd,
+        result: status === "evaluated"
+          ? {
+            return_pct: returnPct, entry_price: entryPrice, exit_price: exitPrice,
+            price_basis: basis, basis_date: sampleStart,
+            counterfactual, signal_valid_from: subject.valid_from,
+          }
+          : null,
+        reason,
+      },
+    );
   }
   return { rows };
 }
