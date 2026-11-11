@@ -5,6 +5,7 @@ import type pg from "pg";
 import { inServiceTransaction } from "../../db/transaction.js";
 import { apiErrors } from "../../http/router.js";
 import { executeStrategyEvaluator, getStrategyEvaluatorDefinition } from "./registry.js";
+import { upsertSignalEvent } from "./signal-events.js";
 import type {
   StrategyEvaluationPhase,
   StrategyEvaluationRunSummary,
@@ -299,6 +300,8 @@ async function persistEntrySignals(
   strategyCode: string,
   targetDate: string,
   result: unknown,
+  evaluatorCode: string,
+  evaluatorVersion: number,
 ): Promise<void> {
   const items = entryItems(strategyCode, result);
   if (!items.length) return;
@@ -315,18 +318,35 @@ async function persistEntrySignals(
     const evidence = record(item.evidence);
     const lower = evidence.confirmation_must_exceed ?? item.trigger_price_lower ?? null;
     const upper = evidence.confirmation_price_cap ?? item.trigger_price_upper ?? null;
+    const triggerKind = lower != null || upper != null ? "price_range" : "condition";
     const missing = describeEntryMissingSignals(strategyCode, item, status);
     await client.query(
       `INSERT INTO strategy_entry_signal
          (run_id,strategy_code,instrument_id,signal_status,trigger_kind,trigger_price_lower,
           trigger_price_upper,invalidation,reason,evidence,missing_signals,valid_from,valid_until)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13)`,
-      [runId, strategyCode, instrumentId, status,
-       lower !== null || upper !== null ? "price_range" : "condition",
+      [runId, strategyCode, instrumentId, status, triggerKind,
        lower, upper, item.invalidation ?? null,
        `${strategyCode} ${status === "qualified" ? "正式信号" : "接近候选"}`,
        JSON.stringify(item), JSON.stringify(missing), targetDate, validUntil],
     );
+    // 风险对象映射回事件：initial_stop / signal_low / T+1 突破价 / 追高上限不再只依赖顶层 invalidation。
+    await upsertSignalEvent(client, {
+      strategyCode,
+      sourceKind: "strategy",
+      instrumentId,
+      instrumentCode: code,
+      triggerKind,
+      signalStatus: status,
+      validFrom: targetDate,
+      validUntil,
+      item,
+      missingSignals: missing,
+      producerCode: evaluatorCode,
+      producerVersion: evaluatorVersion,
+      runId,
+      dataAsOf: targetDate,
+    });
   }
 }
 
@@ -450,7 +470,7 @@ export async function ensureStrategyEvaluation(
     const persisted = await inServiceTransaction(db, async (client) => {
       await client.query("DELETE FROM strategy_entry_signal WHERE run_id=$1", [runId]);
       await client.query("DELETE FROM strategy_position_evaluation WHERE run_id=$1", [runId]);
-      if (input.phase === "entry") await persistEntrySignals(client, runId, binding.code, input.target_date, result);
+      if (input.phase === "entry") await persistEntrySignals(client, runId, binding.code, input.target_date, result, binding.evaluator_code, binding.evaluator_version);
       if (input.phase === "exit") await persistPositionEvaluations(client, runId, binding.code, result);
       const updated = await client.query<JsonRecord>(
         `UPDATE strategy_evaluation_run SET status=$2,data_date=$3,result=$4::jsonb,coverage=$5::jsonb,gaps=$6::jsonb,
