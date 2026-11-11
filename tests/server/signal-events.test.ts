@@ -629,4 +629,67 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     expect(stored.rows.filter((row) => row.status === "evaluated")).toHaveLength(3);
     expect(stored.rows.filter((row) => row.status === "pending")).toHaveLength(1);
   });
+
+  it("手工计划端到端：提交→发布→触发→按行情算 outcome", async () => {
+    const instrument = (await pool.query<{ id: string }>(
+      `INSERT INTO market_instrument (code, name, kind, lifecycle_status)
+       VALUES ('990124.SZ', '端到端样本', 'stock', 'active') RETURNING id::text`,
+    )).rows[0]!.id;
+    for (const [date, open, close] of [["2026-06-02", 20.0, 20.4], ["2026-06-03", 20.4, 21.2]] as Array<[string, number, number]>) {
+      await pool.query(
+        `INSERT INTO market_bar (instrument_id, freq, bar_date, bar_time, open, high, low, close, channel)
+         VALUES ($1::bigint, 'day', $2::date, ($2::date)::timestamp AT TIME ZONE 'UTC', $3, $3, $3, $4, 'test')`,
+        [instrument, date, open, close],
+      );
+    }
+    // 1) 手工来源提交发现：给出标的与失效价。
+    const event = await upsertSignalEvent(pool, {
+      strategyCode: null, sourceKind: "manual", scope: "personal",
+      instrumentId: instrument, instrumentCode: "990124.SZ", triggerKind: "price_range",
+      signalStatus: "qualified", validFrom: "2026-06-01", validUntil: "2026-06-05",
+      item: { code: "990124.SZ", invalidation: 18.5, note: "突破 20 买入，跌破 18.5 取消" },
+      producerCode: "manual_e2e", producerVersion: 1, runId: null, dataAsOf: "2026-06-01",
+    });
+    expect(event.first).toBe(true);
+    // 2) 计划发布：完整计划把事件推进到 pending。
+    const plan = await createObservationPlan(pool, {
+      eventId: event.id, sourceKind: "manual", strategyCode: null,
+      producerCode: "manual_e2e", producerVersion: 1,
+      trigger: {
+        rule: "突破 20 买入", window: "2026-06-02..2026-06-05",
+        price_basis: "前复权", comparison: "close_above",
+      },
+      risk: { invalidation: 18.5 },
+      actionable: true, dataAsOf: "2026-06-01", requestKey: "e2e-plan-1",
+    });
+    expect(plan).toMatchObject({ actionable: true, lifecycleStatus: "published" });
+    const pending = await pool.query<{ status: string }>(
+      `SELECT status FROM strategy_signal_event WHERE id=$1::bigint`, [event.id],
+    );
+    expect(pending.rows[0]!.status).toBe("pending");
+    // 3) 观测触发：pending → triggered，触发不等于成交。
+    const triggered = await appendEventTransition(pool, {
+      eventId: event.id, fromStatus: "pending", toStatus: "triggered",
+      reason: "下一交易日收盘突破 20", factAt: new Date("2026-06-02T07:00:00Z"),
+      idempotencyKey: "e2e-trigger-1",
+    });
+    expect(triggered).toMatchObject({ applied: true, moved: 1 });
+    // 4) 结果计算：按计划与行情算 1 日收益并落 outcome。
+    const evaluated = await evaluateShadowOutcome(pool, {
+      eventId: event.id, planId: plan.id, planRevision: plan.revision,
+      horizons: [1], entryBasis: "next_open", feeBps: 0,
+      producerCode: "manual_e2e_evaluator", producerVersion: 1,
+    });
+    expect(evaluated.rows[0]).toMatchObject({ horizon: 1, status: "evaluated", entryPrice: 20.0, exitPrice: 21.2 });
+    expect(evaluated.rows[0]!.returnPct).toBeCloseTo(6.0, 4);
+    const stored = await pool.query<{ status: string; plan_id: string; result: Record<string, unknown> | null }>(
+      `SELECT status, plan_id::text, result FROM strategy_signal_outcome WHERE event_id=$1::bigint`, [event.id],
+    );
+    expect(stored.rows).toHaveLength(1);
+    expect(stored.rows[0]).toMatchObject({ status: "evaluated", plan_id: plan.id });
+    expect(Number((stored.rows[0]!.result as { return_pct: number }).return_pct)).toBeCloseTo(6.0, 4);
+    // 全程没有写池、没有产生通知或邮件。
+    expect((await pool.query<{ n: number }>("SELECT count(*)::int n FROM notification_delivery")).rows[0]!.n).toBe(0);
+    expect((await pool.query<{ n: number }>("SELECT count(*)::int n FROM email_delivery")).rows[0]!.n).toBe(0);
+  });
 });
