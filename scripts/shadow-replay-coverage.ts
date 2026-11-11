@@ -41,68 +41,36 @@ interface AdapterOutput {
   priceLevels?: unknown[];
 }
 
-/** 策略适配器：按策略编码给出计划构造口径，只在回放侧使用，不在通用运行时里分支。 */
+/**
+ * 策略适配器：只用证据里明确存在的字段。
+ *
+ * 冻结证据里没有「入场窗口」「触发条件」「价格口径」「数据截至日」这几类字段，
+ * 所以适配器不拿 valid_until 充当窗口、不拿 valid_from 充当数据时间、
+ * 也不根据有没有低点字段反推价基——宁可标缺项草案，不把推定写成规则。
+ * 事件低点只是风险依据，不能反推成入场确认条件。
+ */
 const ADAPTERS: Record<string, (row: ExportRow) => AdapterOutput> = {
   swing: (row) => {
     const evidence = row.evidence ?? {};
-    const initialStop = evidence.initial_stop;
+    // 只映射策略自己给出的风险线；历史导出里没有就不填，不编造。
     return {
-      trigger: {
-        rule: String(evidence.signal ?? row.trigger_kind ?? "箱体突破"),
-        must_exceed: evidence.confirmation_must_exceed ?? null,
-        cap: evidence.confirmation_price_cap ?? null,
-        window: row.valid_until,
-        price_basis: "前复权",
-        comparison: "close_above",
-      },
-      risk: { initial_stop: initialStop ?? null },
+      trigger: {},
+      risk: { initial_stop: evidence.initial_stop ?? null },
     };
   },
   two_year_reversal: (row) => {
     const evidence = row.evidence ?? {};
     return {
-      trigger: {
-        rule: "两年结构反转后企稳",
-        window: row.valid_until,
-        price_basis: evidence.signal_low_raw != null ? "原始价" : "前复权",
-        comparison: "close_above_signal_low",
-        // 两年反转的取消规则来自策略自己算的事件低点，不是模型临时编的止损。
-        cancel_rule: evidence.signal_low != null ? "close_below_signal_low" : null,
-      },
+      trigger: {},
       risk: {
         signal_low: evidence.signal_low ?? null,
         signal_low_raw: evidence.signal_low_raw ?? null,
       },
     };
   },
-  value_anchor: (row) => ({
-    trigger: {
-      rule: "低估值锚定",
-      window: row.valid_until,
-      price_basis: "前复权",
-      comparison: "valuation_band",
-    },
-    // 价值策略没有明确取消价，只能出草案，不让模型临时编止损。
-    risk: {},
-  }),
-  limit_up: (row) => ({
-    trigger: {
-      rule: "涨停次日承接",
-      window: row.valid_until,
-      price_basis: "前复权",
-      comparison: "open_above_prev_close",
-    },
-    risk: {},
-  }),
-  first_board_advance: (row) => ({
-    trigger: {
-      rule: "首板晋级",
-      window: row.valid_until,
-      price_basis: "前复权",
-      comparison: "open_above_prev_close",
-    },
-    risk: {},
-  }),
+  value_anchor: () => ({ trigger: {}, risk: {} }),
+  limit_up: () => ({ trigger: {}, risk: {} }),
+  first_board_advance: () => ({ trigger: {}, risk: {} }),
   // copper_left_launch 尚未注册适配器，按未适配处理，而不是套用别的策略口径。
 };
 
@@ -151,7 +119,8 @@ for (const row of rows) {
         trigger: adapted.trigger,
         risk: adapted.risk,
         priceLevels: adapted.priceLevels ?? [],
-        dataAsOf: row.valid_from,
+        // 冻结证据没有数据截至时间，不用 valid_from 冒充。
+        dataAsOf: null,
       });
       if (missing.length === 0) {
         verdict = "actionable";
