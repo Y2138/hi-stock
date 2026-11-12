@@ -111,6 +111,7 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "portfolio_position_change",
       "portfolio_realized_pnl_baseline",
       "schema_migrations",
+      "signal_live_route",
       "strategy_candidate_shortlist",
       "strategy_definition",
       "strategy_document",

@@ -5,7 +5,7 @@ import type pg from "pg";
 import { inServiceTransaction } from "../../db/transaction.js";
 import { apiErrors } from "../../http/router.js";
 import { executeStrategyEvaluator, getStrategyEvaluatorDefinition } from "./registry.js";
-import { shadowSignalEventsEnabled, upsertSignalEvent } from "./signal-events.js";
+import { resolveLiveRoute, shouldWriteSignalEvents, upsertSignalEvent } from "./signal-events.js";
 import type {
   StrategyEvaluationPhase,
   StrategyEvaluationRunSummary,
@@ -330,9 +330,10 @@ async function persistEntrySignals(
        `${strategyCode} ${status === "qualified" ? "正式信号" : "接近候选"}`,
        JSON.stringify(item), JSON.stringify(missing), targetDate, validUntil],
     );
-    // 影子事件映射：仅在显式开启时写入，默认不写——旧链路继续是唯一业务写入方。
+    // 事件映射：影子开关打开、或该策略路由切到 events_only/full 时写入；
+    // 其余情况保持旧链路唯一写入。events_only 不碰池与通知，由旧链路继续写。
     // 风险对象映射回事件：initial_stop / signal_low / T+1 突破价 / 追高上限不再只依赖顶层 invalidation。
-    if (shadowSignalEventsEnabled()) {
+    if (shouldWriteSignalEvents(await resolveLiveRoute(client, strategyCode))) {
       await upsertSignalEvent(client, {
         strategyCode,
         sourceKind: "strategy",

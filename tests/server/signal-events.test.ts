@@ -11,7 +11,11 @@ import {
   createObservationPlan,
   initialEventStatus,
   evaluateShadowOutcome,
+  LiveRouteConflict,
   missingPlanParts,
+  resolveLiveRoute,
+  setLiveRoute,
+  shouldWriteSignalEvents,
   ObservationPlanRevisionConflict,
   riskObjectFromItem,
   shadowComparison,
@@ -388,7 +392,7 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     expect(shadowSignalEventsEnabled({ HISTOCK_SHADOW_SIGNAL_EVENTS: "1" } as NodeJS.ProcessEnv)).toBe(true);
     const file = path.join(process.cwd(), "server/modules/strategy-runtime/service.ts");
     const source = fs.readFileSync(file, "utf8");
-    expect(source).toMatch(/if \(shadowSignalEventsEnabled\(\)\) \{\s*\n\s*await upsertSignalEvent/);
+    expect(source).toMatch(/if \(shouldWriteSignalEvents\(await resolveLiveRoute\(client, strategyCode\)\)\) \{\s*\n\s*await upsertSignalEvent/);
   });
 
   it("通用运行时事件路径不按策略名称分支", () => {
@@ -778,6 +782,47 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     // 次日开 12.0、次日收 12.6 = +5%，与手工来源走同一条计算链。
     expect(evaluated.rows[0]).toMatchObject({ status: "evaluated", entryPrice: 12.0, exitPrice: 12.6 });
     expect(evaluated.rows[0]!.returnPct).toBeCloseTo(5.0, 4);
+  });
+
+  it("写入路由三档：默认 legacy，events_only 可切可回滚，full 未实现被拒", async () => {
+    expect(await resolveLiveRoute(pool, "two_year_reversal")).toMatchObject({ mode: "legacy" });
+    expect((await resolveLiveRoute(pool, "swing")).mode).toBe("legacy");
+    const switched = await setLiveRoute(pool, {
+      strategyCode: "two_year_reversal", mode: "events_only", reason: "主管批准切事件写入",
+    });
+    expect(switched.mode).toBe("events_only");
+    expect(switched.generation).toBeGreaterThan(1);
+    expect(shouldWriteSignalEvents(switched)).toBe(true);
+    // 代次不对时拒绝，避免两个操作互相覆盖。
+    await expect(setLiveRoute(pool, {
+      strategyCode: "two_year_reversal", mode: "events_only", reason: "旧代次",
+      expectedGeneration: switched.generation - 1,
+    })).rejects.toBeInstanceOf(LiveRouteConflict);
+    // full 要求池与通知一起切，本轮未实现，默认拒绝。
+    await expect(setLiveRoute(pool, {
+      strategyCode: "two_year_reversal", mode: "full", reason: "想直接全切",
+    })).rejects.toBeInstanceOf(LiveRouteConflict);
+    // 回滚同样是一条 UPDATE，代次继续递增。
+    const rolled = await setLiveRoute(pool, {
+      strategyCode: "two_year_reversal", mode: "legacy", reason: "回滚到旧链路",
+    });
+    expect(rolled).toMatchObject({ mode: "legacy", generation: switched.generation + 1 });
+    expect(shouldWriteSignalEvents(rolled)).toBe(false);
+  });
+
+  it("events_only 下写事件不影响池与通知：四张表逐行不变", async () => {
+    const snapshot = async () => ({
+      membership: (await pool.query("SELECT * FROM pool_membership ORDER BY id")).rows,
+      attention: (await pool.query("SELECT * FROM pool_attention_entry ORDER BY id")).rows,
+      notification: (await pool.query("SELECT * FROM notification_delivery ORDER BY id")).rows,
+      email: (await pool.query("SELECT * FROM email_delivery ORDER BY id")).rows,
+    });
+    await setLiveRoute(pool, { strategyCode: "route_check", mode: "events_only", reason: "零副作用校验" });
+    const before = await snapshot();
+    const route = await resolveLiveRoute(pool, "route_check");
+    expect(shouldWriteSignalEvents(route)).toBe(true);
+    await writeEvent({ strategyCode: "route_check", item: swingItem, validFrom: "2026-10-30" });
+    expect(await snapshot()).toEqual(before);
   });
 
   it("手工计划端到端：提交→发布→触发→按行情算 outcome", async () => {

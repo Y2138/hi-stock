@@ -55,6 +55,87 @@ export interface UpsertSignalEventInput {
 
 type Db = Pick<pg.Pool, "query">;
 
+/** 单策略写入链路档位：legacy=只走旧链路，events_only=事件/计划/结果写新表，full=池与通知也给新链路。 */
+export type LiveRouteMode = "legacy" | "events_only" | "full";
+
+export interface LiveRoute {
+  strategyCode: string;
+  mode: LiveRouteMode;
+  generation: number;
+}
+
+/** 切换代次冲突：调用方拿到的代次已过期，说明这一轮已经被别人切过。 */
+export class LiveRouteConflict extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LiveRouteConflict";
+  }
+}
+
+/**
+ * 读取策略路由。没有记录或迁移尚未应用时一律按 legacy 处理，
+ * 不因为开关表缺失而改变旧链路行为。
+ */
+export async function resolveLiveRoute(db: Db, strategyCode: string): Promise<LiveRoute> {
+  try {
+    const row = await db.query<{ mode: LiveRouteMode; generation: string }>(
+      "SELECT mode, generation::text FROM signal_live_route WHERE strategy_code=$1",
+      [strategyCode],
+    );
+    const found = row.rows[0];
+    if (!found) return { strategyCode, mode: "legacy", generation: 0 };
+    return { strategyCode, mode: found.mode, generation: Number(found.generation) };
+  } catch {
+    // 0198 未应用时保持旧行为，不让开关表成为旧链路的硬依赖。
+    return { strategyCode, mode: "legacy", generation: 0 };
+  }
+}
+
+/**
+ * 切换或回滚：一条 UPSERT，generation 加 1。传 expectedGeneration 时做乐观校验，
+ * 避免两个操作互相覆盖。full 仍由调用方把关，这里不额外放行。
+ */
+export async function setLiveRoute(
+  db: Db,
+  input: {
+    strategyCode: string;
+    mode: LiveRouteMode;
+    reason: string;
+    expectedGeneration?: number | null;
+    /** full 需要先把池与通知也切到新链路；本轮未实现，默认拒绝，防止「开了 full 却还是旧链路写池」。 */
+    allowFull?: boolean;
+  },
+): Promise<LiveRoute> {
+  if (input.mode === "full" && input.allowFull !== true) {
+    throw new LiveRouteConflict("full 档尚未实现池与通知切换，本轮只允许 events_only");
+  }
+  const current = await resolveLiveRoute(db, input.strategyCode);
+  if (input.expectedGeneration != null && input.expectedGeneration !== current.generation) {
+    throw new LiveRouteConflict(
+      `路由代次冲突：期望第 ${input.expectedGeneration} 代，当前已是第 ${current.generation} 代`,
+    );
+  }
+  const updated = await db.query<{ mode: LiveRouteMode; generation: string }>(
+    `INSERT INTO signal_live_route (strategy_code, mode, generation, reason, updated_at)
+     VALUES ($1, $2, 1, $3, now())
+     ON CONFLICT (strategy_code) DO UPDATE SET
+       mode=EXCLUDED.mode,
+       generation=signal_live_route.generation + 1,
+       reason=EXCLUDED.reason,
+       updated_at=now()
+     RETURNING mode, generation::text`,
+    [input.strategyCode, input.mode, input.reason],
+  );
+  const row = updated.rows[0]!;
+  return { strategyCode: input.strategyCode, mode: row.mode, generation: Number(row.generation) };
+}
+
+/** 新链路写事件的条件：显式影子开关，或该策略路由已切到 events_only/full。 */
+export function shouldWriteSignalEvents(route: LiveRoute, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (shadowSignalEventsEnabled(env)) return true;
+  return route.mode === "events_only" || route.mode === "full";
+}
+
 /** 新链路默认关闭：旧生产落库路径不因应用 0195/0196 而自动写影子事件。 */
 export function shadowSignalEventsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.HISTOCK_SHADOW_SIGNAL_EVENTS === "1";
