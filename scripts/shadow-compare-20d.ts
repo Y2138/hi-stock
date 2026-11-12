@@ -44,9 +44,13 @@ interface SignalRow {
 
 const pool = new pg.Pool({ connectionString: databaseUrl() });
 try {
+  // 只取已收盘的交易日：今天 15:00 前不计入，避免把未完成的当日当成已完成样本。
   const days = (await pool.query<{ trade_date: string }>(
     `SELECT trade_date::text FROM market_trading_day
-      WHERE is_open AND trade_date <= (now() AT TIME ZONE 'Asia/Shanghai')::date
+      WHERE is_open AND trade_date <= CASE
+        WHEN (now() AT TIME ZONE 'Asia/Shanghai')::time >= '15:00:00'
+          THEN (now() AT TIME ZONE 'Asia/Shanghai')::date
+        ELSE (now() AT TIME ZONE 'Asia/Shanghai')::date - 1 END
       ORDER BY trade_date DESC LIMIT $1`,
     [lookbackDays],
   )).rows.map((row) => row.trade_date);
@@ -130,10 +134,14 @@ try {
       distinct_days: new Set(rows.map((row) => row.valid_from)).size,
     },
     new_path: {
-      events: events.size,
-      first_emissions: events.size,
-      risk_complete_events: riskCompleteEvents,
-      risk_complete_rate: events.size === 0 ? null : Number((riskCompleteEvents / events.size * 100).toFixed(2)),
+      // 这是候选事件数：按「同标的 + 同条件指纹」归并，未判定旧事件是否已结束再复位，
+      // 因此不能当作独立机会数。
+      candidate_events: events.size,
+      independent_events: "未判定（缺复位证据）",
+      risk_anchor_events: riskCompleteEvents,
+      risk_anchor_coverage: events.size === 0 ? null : Number((riskCompleteEvents / events.size * 100).toFixed(2)),
+      // 完整 risk 对象还要求价基、数据时间与证据来源，本轮未保留这些字段。
+      full_risk_coverage: "未评估（价基/数据时间/证据来源未完整保留）",
       actionable_events: actionableEvents,
       draft_events: events.size - actionableEvents,
     },
@@ -158,7 +166,8 @@ try {
 
   console.log(`[shadow:compare] ${strategyCode} ${from}~${to}（${days.length} 个交易日）`);
   console.log(`[shadow:compare] 旧链路 ${report.old_path.rows} 行（正式 ${report.old_path.qualified} / 接近 ${report.old_path.approaching}），覆盖 ${report.old_path.distinct_instruments} 只标的、${report.old_path.distinct_days} 个交易日`);
-  console.log(`[shadow:compare] 新契约 ${report.new_path.events} 个事件，风险完整 ${report.new_path.risk_complete_events}（${report.new_path.risk_complete_rate ?? "-"}%），可行动 ${report.new_path.actionable_events}、草案 ${report.new_path.draft_events}`);
+  console.log(`[shadow:compare] 新契约 ${report.new_path.candidate_events} 个候选事件（独立机会数未判定），风险锚覆盖率 ${report.new_path.risk_anchor_events}/${report.new_path.candidate_events} = ${report.new_path.risk_anchor_coverage ?? "-"}%，可行动 ${report.new_path.actionable_events}、草案 ${report.new_path.draft_events}`);
+  console.log(`[shadow:compare] 完整 risk 覆盖率：${report.new_path.full_risk_coverage}`);
   console.log(`[shadow:compare] 合并 ${report.differences.merged_events} 个事件、涉及 ${report.differences.merged_rows} 行（多行归一个事件）`);
   console.log(`[shadow:compare] 报告写入 ${path.relative(process.cwd(), OUT_FILE)}`);
 } finally {

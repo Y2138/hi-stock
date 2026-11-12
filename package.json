@@ -10,6 +10,7 @@
     "check:push": "tsx scripts/check-push-runtime-data.ts",
     "shadow:coverage": "tsx scripts/shadow-replay-coverage.ts",
     "shadow:compare": "tsx scripts/shadow-compare-20d.ts",
+    "shadow:snapshot": "tsx scripts/shadow-pool-snapshot.ts",
     "server": "tsx server/index.ts",
     "market:fetch": "tsx scripts/fetch-market.ts",
     "web:dev": "vite --config web/vite.config.ts",
