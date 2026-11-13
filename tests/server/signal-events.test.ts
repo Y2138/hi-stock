@@ -392,7 +392,12 @@ describe.skipIf(!prepared)("信号事件与观察计划（边界 1）", () => {
     expect(shadowSignalEventsEnabled({ HISTOCK_SHADOW_SIGNAL_EVENTS: "1" } as NodeJS.ProcessEnv)).toBe(true);
     const file = path.join(process.cwd(), "server/modules/strategy-runtime/service.ts");
     const source = fs.readFileSync(file, "utf8");
-    expect(source).toMatch(/if \(shouldWriteSignalEvents\(await resolveLiveRoute\(client, strategyCode\)\)\) \{\s*\n\s*await upsertSignalEvent/);
+    expect(source).toMatch(/if \(shouldWriteSignalEvents\(await resolveLiveRoute\(client, strategyCode\)\)\) \{/);
+    // 事件写入后必须接着写一份草案计划：幂等键稳定、actionable 恒为 false。
+    expect(source).toMatch(/const event = await upsertSignalEvent/);
+    expect(source).toMatch(/requestKey: `event:\$\{event\.id\}:v1`/);
+    expect(source).toMatch(/actionable: false/);
+    expect(source).toMatch(/UPDATE observation_plan SET gaps=/);
   });
 
   it("通用运行时事件路径不按策略名称分支", () => {

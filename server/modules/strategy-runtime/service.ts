@@ -5,7 +5,14 @@ import type pg from "pg";
 import { inServiceTransaction } from "../../db/transaction.js";
 import { apiErrors } from "../../http/router.js";
 import { executeStrategyEvaluator, getStrategyEvaluatorDefinition } from "./registry.js";
-import { resolveLiveRoute, shouldWriteSignalEvents, upsertSignalEvent } from "./signal-events.js";
+import {
+  createObservationPlan,
+  missingPlanParts,
+  resolveLiveRoute,
+  riskObjectFromItem,
+  shouldWriteSignalEvents,
+  upsertSignalEvent,
+} from "./signal-events.js";
 import type {
   StrategyEvaluationPhase,
   StrategyEvaluationRunSummary,
@@ -334,7 +341,7 @@ async function persistEntrySignals(
     // 其余情况保持旧链路唯一写入。events_only 不碰池与通知，由旧链路继续写。
     // 风险对象映射回事件：initial_stop / signal_low / T+1 突破价 / 追高上限不再只依赖顶层 invalidation。
     if (shouldWriteSignalEvents(await resolveLiveRoute(client, strategyCode))) {
-      await upsertSignalEvent(client, {
+      const event = await upsertSignalEvent(client, {
         strategyCode,
         sourceKind: "strategy",
         instrumentId,
@@ -350,6 +357,38 @@ async function persistEntrySignals(
         runId,
         dataAsOf: targetDate,
       });
+      // 观察计划：证据里没有入场窗口、可执行触发规则和价基，只能出草案。
+      // 不推断这些字段，缺什么就写进 gaps，actionable 恒为 false。
+      const risk = riskObjectFromItem(item, "strategy");
+      const planRisk = {
+        initial_stop: risk.initial_stop,
+        signal_low: risk.signal_low,
+        signal_low_raw: risk.signal_low_raw,
+        invalidation: risk.invalidation,
+      };
+      const planMissing = missingPlanParts({
+        trigger: {}, risk: planRisk, priceLevels: [], dataAsOf: targetDate,
+      });
+      const plan = await createObservationPlan(client, {
+        eventId: event.id,
+        sourceKind: "strategy",
+        strategyCode,
+        producerCode: evaluatorCode,
+        producerVersion: evaluatorVersion,
+        trigger: {},
+        risk: planRisk,
+        actionable: false,
+        dataAsOf: targetDate,
+        // 稳定键：每个事件一份首版计划，重跑不会产生第二条。
+        requestKey: `event:${event.id}:v1`,
+      });
+      if (planMissing.length > 0) {
+        await client.query(
+          `UPDATE observation_plan SET gaps=$2::jsonb, updated_at=now()
+            WHERE id=$1::bigint AND gaps='[]'::jsonb`,
+          [plan.id, JSON.stringify(planMissing)],
+        );
+      }
     }
   }
 }
