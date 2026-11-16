@@ -223,6 +223,12 @@ export const marketRoutes = {
     }
     const start = parseDateOpt(query.get("start"), "start");
     const end = parseDateOpt(query.get("end"), "end");
+    const storedOnlyRaw = query.get("stored_only");
+    if (storedOnlyRaw !== null && !["1", "true", "0", "false"].includes(storedOnlyRaw)) {
+      throw apiErrors.badRequest("stored_only 必须是 true/false 或 1/0");
+    }
+    const storedOnly = storedOnlyRaw === "1" || storedOnlyRaw === "true";
+    if (storedOnly && (!start || !end)) throw apiErrors.badRequest("stored_only 模式必须提供 start、end");
     if (start && end && start > end) throw apiErrors.badRequest("start 不能晚于 end");
     let instrument: InstrumentRow | OnDemandInstrument | null = await findInstrumentByCode(pool, code);
     const include = new Set((query.get("include") ?? "").split(",").filter(Boolean));
@@ -239,7 +245,7 @@ export const marketRoutes = {
         })
       : [];
     if (!instrument && freqRaw !== "day") throw apiErrors.notFound(`未知标的代码：${code}`);
-    if (freqRaw === "day" && (!instrument || storedBars.length === 0)) {
+    if (!storedOnly && freqRaw === "day" && (!instrument || storedBars.length === 0)) {
       try {
         instrument ??= await resolveOnDemandInstrument(pool, code);
         if (!instrument) throw apiErrors.notFound(`未知标的代码：${code}`);
