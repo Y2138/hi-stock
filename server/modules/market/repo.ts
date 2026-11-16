@@ -33,6 +33,7 @@ export interface BarRow {
   low: number;
   close: number;
   volume: number | null;
+  volume_unit: string | null;
   turnover: number | null;
   ma5: number | null;
   ma10: number | null;
@@ -126,7 +127,7 @@ export async function listBars(
   }
   const r = await db.query<BarRow>(
     `SELECT bar.bar_date::text, bar.bar_time, bar.open::float, bar.high::float,
-            bar.low::float, bar.close::float, bar.volume::float, bar.turnover::float,
+            bar.low::float, bar.close::float, bar.volume::float, bar.volume_unit, bar.turnover::float,
             CASE WHEN $3 THEN indicator.ma5::float ELSE bar.ma5::float END AS ma5,
             CASE WHEN $3 THEN indicator.ma10::float ELSE bar.ma10::float END AS ma10,
             CASE WHEN $3 THEN indicator.ma20::float ELSE bar.ma20::float END AS ma20,

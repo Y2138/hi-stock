@@ -110,6 +110,7 @@ export function buildOnDemandBars(bars: Bar[]): BarRow[] {
     low: bar.low,
     close: bar.close,
     volume: bar.volume ?? null,
+    volume_unit: bar.volumeUnit ?? null,
     turnover: bar.turnover ?? null,
     ma5: ma5[index]!,
     ma10: ma10[index]!,
