@@ -19,6 +19,7 @@ export const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
     { to: "/ultra-short", icon: "⚡", label: "超短关注池" },
     { to: "/market-structure", icon: "▦", label: "市场结构" },
     { to: "/market-news", icon: "📰", label: "市场消息" },
+    { to: "/futures", icon: "📉", label: "期货行情" },
     { to: "/strategies", icon: "📜", label: "当前策略" },
     { action: "market", icon: "📈", label: "行情" },
   ] },

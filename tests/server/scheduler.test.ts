@@ -771,6 +771,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     const jobs = await listJobDefinitions(pool);
     // 清单按 priority 升序：数据链路 → 收盘/夜间研判 → 盘中复核 → 低频研究。
     expect(jobs.map((job) => job.code)).toEqual([
+      "futures_daily_sync",
       "market_catalog_sync",
       "board_membership_sync",
       "weekly_full_market_indicators",

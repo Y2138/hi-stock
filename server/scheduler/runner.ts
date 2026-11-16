@@ -543,6 +543,14 @@ async function executeDatasource(
           `30分钟 ${summary.minute30Rows} 行，缺口 ${gaps.length} 项。`,
         dataGaps: gaps,
       };
+    } else if (config.pipeline === "futures_daily_sync") {
+      const { syncFuturesDaily } = await import("../datasource/futures-service.js");
+      const summary = await syncFuturesDaily(deps.pool, run.target_date);
+      result = {
+        status: summary.status === "success" ? "success" : "partial",
+        log: `期货日更：${summary.products.length} 品种，覆盖状态 ${summary.status}；详见期货覆盖清单。`,
+        dataGaps: summary.products.flatMap((row) => row.gaps),
+      };
     } else if (config.pipeline === "commodity_copper_sync") {
       const summary = deps.commodityCopperSync
         ? await deps.commodityCopperSync(run.target_date, run.id)

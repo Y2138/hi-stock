@@ -20,6 +20,7 @@ function noUnknownKeys(value: Record<string, unknown>, allowed: readonly string[
 }
 
 const DATASOURCE_PIPELINES = new Set<DatasourcePipeline>([
+  "futures_daily_sync",
   "daily_market_update",
   "market_catalog_sync",
   "board_membership_sync",

@@ -59,6 +59,8 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "email_notification_setting",
       "first_board_intraday_snapshot",
       "fundamental_snapshot",
+      "futures_receipt_observation",
+      "futures_sync_coverage",
       "hithink_dataset_snapshot",
       "intraday_market_sample",
       "intraday_market_sentiment",

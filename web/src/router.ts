@@ -2,6 +2,7 @@
 // 历史模式由 server 侧 SPA fallback 配合（server/public/app/ 缺失时给构建引导）。
 import { createRouter, createWebHistory } from "vue-router";
 import DashboardView from "./views/DashboardView.vue";
+import FuturesView from "./views/FuturesView.vue";
 import StrategiesView from "./views/StrategiesView.vue";
 import PoolsView from "./views/PoolsView.vue";
 import PositionsView from "./views/PositionsView.vue";
@@ -18,6 +19,7 @@ import { openMarket } from "./composables/useMarketDrawer";
 export const router = createRouter({
   history: createWebHistory("/"),
   routes: [
+    { path: "/futures", name: "futures", component: FuturesView, meta: { title: "期货行情" } },
     { path: "/", name: "dashboard", component: DashboardView, meta: { title: "仪表盘" } },
     { path: "/chat", redirect: { path: "/", query: { chat: "1" } } },
     {

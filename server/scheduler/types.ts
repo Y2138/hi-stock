@@ -90,6 +90,7 @@ export interface JobDefinitionWithLatest extends JobDefinitionRow {
 }
 
 export type DatasourcePipeline =
+  | "futures_daily_sync"
   | "daily_market_update"
   | "market_catalog_sync"
   | "board_membership_sync"
