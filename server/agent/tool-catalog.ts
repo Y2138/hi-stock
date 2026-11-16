@@ -23,6 +23,7 @@ const TOOL_GROUP_REGISTRY: ReadonlyArray<{ title: string; tools: readonly string
       "stock_research_query",
       "board_query",
       "market_event_query",
+      "macro_factor_query",
       "indicator_query",
       "value_rank_query",
     ],

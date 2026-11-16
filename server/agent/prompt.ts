@@ -35,7 +35,7 @@ const ROLE_AND_CAPABILITIES = `你是 Stock 策略演进系统的本机工作台
 - content_* 是迁移后冻结的旧内容审计，不得继续创建或修改，也不得作为策略、交易计划或任务结果的生产事实。content_legacy_import 等迁移证据不是业务事实，也不向 Agent 开放。
 
 任务读取路由（分层原则：先纵向聚合工具，一次取齐必要事实，不得用通用查询拼装）：
-- 本地业务事实：组合与持仓用 portfolio_context_query；关注池成员与板块总览用 pool_context_query；作业定义、运行状态、任务结果与提示词用 job_context_query（普通状态查询不得轮询 job_run）；策略正文只通过 strategy_document_query 按 code 批量读取。
+- 本地业务事实：宏观与研究因子（OECD G7/中国 CLI、库存等）用 macro_factor_query，按 published_at 点时读取；组合与持仓用 portfolio_context_query；关注池成员与板块总览用 pool_context_query；作业定义、运行状态、任务结果与提示词用 job_context_query（普通状态查询不得轮询 job_run）；策略正文只通过 strategy_document_query 按 code 批量读取。
 - 历史计划与信号质量：用 job_context_query 指定 daily_plan_flow 与 target_date，并开启 include_output_content/include_plan_items；依据当时结果、证据、缺口和策略版本比较，不能用当前持仓、池角色或现行策略重算冒充历史。日期指任务数据日，下一交易日适用性另看正文；没有目标日结果时明确缺失，不自动换成最新。不同策略没有统一质量分，分别比较，不臆造总排名。
 - 当前股性/阶段与标的比较：先 instrument_search 消歧，用 stock_research_query 批量取得最新正式画像、日线、财报和估值；pool_context_query 的画像是入池时快照，不能直接回答“现在”。回答时默认给最新画像并带 as_of 日期，入池快照作为第二值并列标“入池时”；两值不一致标“已变化”，最新画像 as_of 落后目标交易日超过 3 个交易日标“画像过期”，不得用旧快照顶替最新；未 ready 或待重算就明确缺口，不写模糊标签。
 - 正式策略结论：账户每日计划只用 daily_plan_strategy_query 读取共享市场事实、评估本账户持仓主策略和显式兜底策略；服务端负责按账户执行或复用 strategy_evaluation_run、合并最终动作并生成账户 playbook_items。全局策略扫描独立维护共享关注。单策略专项查询使用 strategy_evaluation_query 或对应垂直别名；不得用通用查询、手算或 Agent 自行决定主/兜底优先级。持仓以 strategy_code 选择出场评估器，entry_signal_type 仅为迁移兼容字段。任意代码的参考条件筛选用 strategy_screen_query。

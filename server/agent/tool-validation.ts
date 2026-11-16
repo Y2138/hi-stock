@@ -233,6 +233,21 @@ export const JobContextQuerySchema = strictObject({
 });
 export type JobContextQueryInput = Static<typeof JobContextQuerySchema>;
 
+/** 宏观/研究因子读取：series_code 允许点号（如 oecd.chn.cli），语义见 modules/macro/service.ts。 */
+const SeriesCodeSchema = Type.String({
+  minLength: 3,
+  maxLength: 120,
+  pattern: "^[a-z0-9][a-z0-9._-]{2,119}$",
+});
+
+export const MacroFactorQuerySchema = strictObject({
+  series_codes: Type.Optional(Type.Array(SeriesCodeSchema, { minItems: 1, maxItems: 20 })),
+  start_date: Type.Optional(DateSchema),
+  end_date: Type.Optional(DateSchema),
+  as_of: Type.Optional(DateSchema),
+});
+export type MacroFactorQueryInput = Static<typeof MacroFactorQuerySchema>;
+
 export const AuctionContextQuerySchema = strictObject({ date: DateSchema });
 export type AuctionContextQueryInput = Static<typeof AuctionContextQuerySchema>;
 
@@ -937,6 +952,18 @@ export function validateJobContextQueryInput(input: unknown): JobContextQueryInp
     job_codes: uniqueValues(parsed.job_codes, "job_context_query job_codes"),
     prompt_codes: uniqueValues(parsed.prompt_codes, "job_context_query prompt_codes"),
   };
+}
+
+export function validateMacroFactorQueryInput(input: unknown): MacroFactorQueryInput {
+  const parsed = validateToolInput<MacroFactorQueryInput>("macro_factor_query", MacroFactorQuerySchema, input);
+  for (const field of ["start_date", "end_date", "as_of"] as const) {
+    const value = parsed[field];
+    if (value !== undefined && !isRealDate(value)) throw new Error(`macro_factor_query ${field} 不是有效日历日期：${value}`);
+  }
+  if (parsed.start_date && parsed.end_date && parsed.end_date < parsed.start_date) {
+    throw new Error("macro_factor_query end_date 不得早于 start_date");
+  }
+  return { ...parsed, series_codes: uniqueValues(parsed.series_codes, "macro_factor_query series_codes") };
 }
 
 export function validateWeeklyReviewContextQueryInput(input: unknown): WeeklyReviewContextQueryInput {

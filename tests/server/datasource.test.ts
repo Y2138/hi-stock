@@ -1183,6 +1183,77 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     ]);
   });
 
+  it("铜宏观因子新月份按首次观测时间落库，上游修订保留历史版本", async () => {
+    await pool.query(
+      `DELETE FROM market_factor_observation WHERE series_id IN
+         (SELECT id FROM market_factor_series WHERE series_code=ANY($1::text[]))`,
+      [["oecd.g7.cli", "oecd.chn.cli"]],
+    );
+    const csvOf = (months: string[], revisedJune = false) => [
+      "REF_AREA,TIME_PERIOD,OBS_VALUE,OBS_STATUS",
+      ...months.flatMap((month, index) => {
+        const g7 = 99 + index / 10;
+        const chn = 98 + index / 10 + (revisedJune && month === "2026-06" ? 0.5 : 0);
+        return [`G7,${month},${g7},A`, `CHN,${month},${chn},A`];
+      }),
+    ].join("\n");
+    const firstMonths = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"];
+    const first = await syncCopperMacroFactors(pool, "2026-09-20", {
+      fetchImpl: (async () => textResponse(csvOf(firstMonths))) as typeof fetch,
+      now: new Date("2026-09-20T10:00:00Z"),
+    });
+    expect(first).toMatchObject({ rowsWritten: 12, gaps: [], upstreamLatestPeriod: "2026-06" });
+    // 首次建库没有真实发布日期，全部按文档化的「月末+45 天」合成并标记。
+    const synthetic = await pool.query<{ total: number; synthetic_total: number }>(
+      `SELECT count(*)::int total,
+              count(*) FILTER (WHERE (observation.raw_summary->>'synthetic_initial_published_at')::boolean)::int synthetic_total
+         FROM market_factor_observation observation
+         JOIN market_factor_series series ON series.id=observation.series_id
+        WHERE series.series_code=ANY($1::text[])`,
+      [["oecd.g7.cli", "oecd.chn.cli"]],
+    );
+    expect(synthetic.rows[0]).toEqual({ total: 12, synthetic_total: 12 });
+
+    // 第二批：上游新增 07、08 两期并修订 06。新期次必须用首次观测时间，不能再被门槛跳过。
+    const secondMonths = [...firstMonths, "2026-07", "2026-08"];
+    const second = await syncCopperMacroFactors(pool, "2026-11-10", {
+      fetchImpl: (async () => textResponse(csvOf(secondMonths, true))) as typeof fetch,
+      now: new Date("2026-11-10T05:00:00Z"),
+    });
+    expect(second).toMatchObject({
+      rowsWritten: 5, gaps: [], upstreamLatestPeriod: "2026-08", skipped: expect.any(Array),
+    });
+    expect(new Set(second.seriesUpdated)).toEqual(new Set(["oecd.g7.cli", "oecd.chn.cli"]));
+    expect(second.skipped).toHaveLength(11);
+    const detail = await pool.query<{
+      series_code: string; period_end: string; value: number; published_cst: string;
+      revision_no: number; synthetic: boolean;
+    }>(
+      `SELECT series.series_code,observation.period_end::text period_end,observation.value::float8 value,
+              to_char(observation.published_at AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD HH24:MI:SS') published_cst,
+              observation.revision_no,
+              (observation.raw_summary->>'synthetic_initial_published_at')::boolean synthetic
+         FROM market_factor_observation observation
+         JOIN market_factor_series series ON series.id=observation.series_id
+        WHERE series.series_code='oecd.chn.cli'
+          AND observation.period_end IN ('2026-06-30','2026-07-31')
+        ORDER BY observation.period_end,observation.revision_no`,
+    );
+    expect(detail.rows).toEqual([
+      { series_code: "oecd.chn.cli", period_end: "2026-06-30", value: 98.5, published_cst: "2026-08-14 09:00:00", revision_no: 0, synthetic: true },
+      { series_code: "oecd.chn.cli", period_end: "2026-06-30", value: 99, published_cst: "2026-11-10 13:00:00", revision_no: 1, synthetic: false },
+      { series_code: "oecd.chn.cli", period_end: "2026-07-31", value: 98.6, published_cst: "2026-11-10 13:00:00", revision_no: 0, synthetic: false },
+    ]);
+
+    const third = await syncCopperMacroFactors(pool, "2026-11-10", {
+      fetchImpl: (async () => textResponse(csvOf(secondMonths, true))) as typeof fetch,
+      now: new Date("2026-11-10T05:00:00Z"),
+    });
+    expect(third).toMatchObject({ rowsWritten: 0, gaps: [], upstreamLatestPeriod: "2026-08" });
+    expect(third.skipped).toHaveLength(16);
+    expect(new Set(third.skipped.map((item) => item.reason))).toEqual(new Set(["上游值未变化"]));
+  });
+
   it("上期所铜库存周报兼容历史JSON和当前HTML并按发布时间落库", async () => {
     const legacy = {
       o_tradingday: "20260911", o_issueno: "35", update_date: "20260911 16:20:00",

@@ -71,8 +71,11 @@ it("盘中加减仓要求有效价区间与承接确认，冰点缺证据和过�
   expect(parse(candidate, new Map()).action).toBe("wait");
   expect(parse(candidate, prices, false)).toMatchObject({ action: "wait", emotion: "unknown", add_plan: { status: "waiting" } });
   expect(parse(candidate, new Map([[candidate.code, 10.5]])).action).toBe("wait");
-  expect(() => parse({ ...candidate, add_plan: { ...candidate.add_plan, price_lower: 11 } })).toThrow("区间或条件无效");
-  expect(() => parse({ ...candidate, reduce_plan: candidate.add_plan })).toThrow("相反动作");
+  // 宽松边界：非法预案丢预案并降级为 wait；相反预案同时触发则双双降级。
+  expect(parse({ ...candidate, add_plan: { ...candidate.add_plan, price_lower: 11 } })).toMatchObject({ action: "wait", add_plan: null });
+  expect(parse({ ...candidate, reduce_plan: candidate.add_plan })).toMatchObject({
+    action: "wait", add_plan: { status: "waiting" }, reduce_plan: { status: "waiting" },
+  });
   expect(sameIntradaySignal(signal, { ...signal, add_plan: { ...signal.add_plan!, price_lower: 10.21 } })).toBe(true);
   expect(sameIntradaySignal({ ...signal, action: "wait" }, signal)).toBe(false);
 });
@@ -1794,7 +1797,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
         databaseUrl: prepared!.url,
         commodityCopperMacroSync: async (targetDate) => ({
           targetDate, rowsWritten: 12, seriesUpdated: ["oecd.g7.cli", "oecd.chn.cli", "cn.pmi.new_orders"],
-          fetchRunId: "33", gaps: [],
+          fetchRunId: "33", gaps: [], upstreamLatestPeriod: "2026-08", skipped: [],
         }),
       }, macroRun.id);
       expect(macro).toMatchObject({ status: "success", artifacts: [{ kind: "market_fetch_run", id: "33" }] });
@@ -2537,7 +2540,9 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       };
       expect((await cycle(0,10.3,1000))?.positions[0]?.action).toBe("wait");
       expect((await cycle(30_000,10.2,1300))?.positions[0]?.action).toBe("wait");
-      expect((await cycle(60_000,10.3,1350))?.positions[0]).toMatchObject({action:"add",emotion:"ice_point",add_plan:{status:"triggered"}});
+      // 第 3 轮模型给出可触发 add；展示去抖要求连续两轮才确认。
+      expect((await cycle(60_000,10.3,1350))?.positions[0]).toMatchObject({action:"wait",emotion:"ice_point",add_plan:{status:"triggered"}});
+      expect((await cycle(90_000,10.3,1360))?.positions[0]).toMatchObject({action:"add",emotion:"ice_point",add_plan:{status:"triggered"}});
       let notices = (await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest');
       expect(notices).toHaveLength(1);expect(notices[0].content).toContain("加仓触发：10.20～10.40");expect(notices[0].content).toContain("情绪冰点");
       const payload = JSON.parse(complete.mock.calls[2]![1].messages[0]!.content as string);
@@ -2545,16 +2550,21 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       expect(payload.positions[0].intraday.recent.at(-1).volume_delta).toBe(50);
       expect(payload.market_context.sentiment.ready).toBe(true);
       item = {...item,add_plan:{...add,price_lower:10.21,price_upper:10.41}};
-      await cycle(90_000,10.3,1400);
+      await cycle(120_000,10.3,1400);
       expect((await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest')).toHaveLength(1);
       item = {...item,add_plan:{...add,price_lower:10.24,price_upper:10.44}};
-      await cycle(100_000,10.3,1420);
+      await cycle(150_000,10.3,1420);
       expect((await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest')).toHaveLength(2);
+      // wait 也要连续两轮才撤销已确认的 add。
       item = {...item,action:"wait",add_plan:{...add,status:"waiting"}};
-      await cycle(120_000,10.3,1450);
+      expect((await cycle(180_000,10.3,1450))?.positions[0]?.action).toBe("add");
+      expect((await cycle(210_000,10.3,1460))?.positions[0]?.action).toBe("wait");
       expect((await listNotifications(pool)).find((notice)=>notice.kind==='intraday_digest')?.status).toBe("cancelled");
+      // reduce 同样需要连续确认+hold 结束。
       item = {...item,action:"reduce",emotion:"weak",add_plan:null,reduce_plan:{...add,condition:"放量下探后回收失败"},reason:"当日平台承接转弱"};
-      await cycle(150_000,10.25,1800);
+      expect((await cycle(240_000,10.25,1800))?.positions[0]?.action).toBe("wait");
+      expect((await cycle(270_000,10.25,1810))?.positions[0]?.action).toBe("wait");
+      expect((await cycle(300_000,10.25,1820))?.positions[0]?.action).toBe("reduce");
       notices = (await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest');
       expect(notices).toHaveLength(3);expect(notices.find((notice)=>notice.status==='pending')?.content).toContain("减仓触发");
       const apiResult=await api(server.baseUrl,"GET","/api/intraday-risk?date=2026-08-17&account_id=1");
@@ -2563,7 +2573,12 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       await pool.query("UPDATE intraday_market_sentiment SET payload=jsonb_set(payload,'{source_times}',$1::jsonb)",
         [JSON.stringify({up:"2026-08-17T01:40:00Z",down:"2026-08-17T01:40:00Z",break:"2026-08-17T01:40:00Z"})]);
       item={...item,action:"add",emotion:"ice_point",add_plan:add,reduce_plan:null};
-      expect((await cycle(180_000,10.3,1900))?.positions[0]).toMatchObject({action:"wait",emotion:"unknown",add_plan:{status:"waiting"}});
+      // 情绪过期时冰点 add 只能落库为 wait；展示先保持已确认 reduce，随后按确认轮切到 wait。
+      expect((await cycle(330_000,10.3,1900))?.positions[0]?.action).toBe("reduce");
+      expect((await pool.query<{ action: string }>("SELECT action FROM intraday_position_risk WHERE code=$1", ["990098.SZ"])).rows)
+        .toEqual([{ action: "wait" }]);
+      await cycle(360_000,10.3,1910);
+      expect((await cycle(390_000,10.3,1920))?.positions[0]).toMatchObject({action:"wait",emotion:"unknown",add_plan:{status:"waiting"}});
       expect((await listNotifications(pool)).filter((notice)=>notice.kind==='intraday_digest').every((notice)=>notice.status==='cancelled')).toBe(true);
       expect((await pool.query("SELECT instrument_id,account_id,quantity,cost_price FROM portfolio_position ORDER BY account_id,instrument_id")).rows).toEqual(positionsBefore);
     } finally {vi.useRealTimers();complete.mockRestore();setAiRuntimeForTests(null);}

@@ -13,6 +13,7 @@ import { findJobPrompt, listJobPrompts } from "../modules/job-prompts/repo.js";
 import { listJobDefinitions, listJobOutputs, listJobRuns } from "../scheduler/repo.js";
 import { queryAuctionAssessmentContext, queryHistoricalPlanItems } from "../modules/plans/repo.js";
 import { loadWeeklyReviewSnapshot } from "../modules/weekly-review/service.js";
+import { queryMacroFactors } from "../modules/macro/service.js";
 import { sha256Json } from "./hash.js";
 import { marketNewsTargets, shanghaiDate } from "../modules/market-news/repo.js";
 import { insertToolAudit } from "./repo.js";
@@ -22,18 +23,21 @@ import {
   PoolContextQuerySchema,
   PortfolioContextQuerySchema,
   StrategyDocumentQuerySchema,
+  MacroFactorQuerySchema,
   WeeklyReviewContextQuerySchema,
   validateJobContextQueryInput,
   validateAuctionContextQueryInput,
   validatePoolContextQueryInput,
   validatePortfolioContextQueryInput,
   validateStrategyDocumentQueryInput,
+  validateMacroFactorQueryInput,
   validateWeeklyReviewContextQueryInput,
   type JobContextQueryInput,
   type AuctionContextQueryInput,
   type PoolContextQueryInput,
   type PortfolioContextQueryInput,
   type StrategyDocumentQueryInput,
+  type MacroFactorQueryInput,
   type WeeklyReviewContextQueryInput,
 } from "./tool-validation.js";
 
@@ -101,6 +105,7 @@ function summarizeRun(run: Awaited<ReturnType<typeof listJobRuns>>[number]) {
     attempt_count: run.attempt_count,
     next_retry_at: run.next_retry_at,
     data_gaps: run.data_gaps,
+    artifacts: run.artifacts,
     started_at: run.started_at,
     finished_at: run.finished_at,
     created_at: run.created_at,
@@ -212,9 +217,25 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
               listJobRuns(deps.pool, job.id, input.recent_runs_per_job ?? 3, input.target_date, deps.accountId === null ? "0" : deps.accountId ?? "1"),
               listJobOutputs(deps.pool, job.id, input.recent_runs_per_job ?? 3, input.target_date, deps.accountId === null ? "0" : deps.accountId ?? "1"),
             ]);
+            const runSummaries: Array<ReturnType<typeof summarizeRun> & { fetch_runs?: unknown[] }> = runs.map(summarizeRun);
+            // 数据链路任务没有 job_run_output，补上抓取行数与缺口，避免「success」被读成没有输出。
+            if (job.job_type === "datasource" && runs.length) {
+              const fetchRuns = (await deps.pool.query<{ job_run_id: string; channel: string; rows_written: number; gaps: unknown }>(
+                `SELECT job_run_id::text,channel,rows_written::int,gaps
+                   FROM market_fetch_run WHERE job_run_id=ANY($1::bigint[]) ORDER BY id`,
+                [runs.map((run) => run.id)],
+              )).rows;
+              const byRun = new Map<string, unknown[]>();
+              for (const row of fetchRuns) {
+                const list = byRun.get(row.job_run_id) ?? [];
+                list.push({ channel: row.channel, rows_written: row.rows_written, gaps: row.gaps });
+                byRun.set(row.job_run_id, list);
+              }
+              for (const summary of runSummaries) summary.fetch_runs = byRun.get(summary.id) ?? [];
+            }
             return {
               definition: job,
-              runs: runs.map(summarizeRun),
+              runs: runSummaries,
               outputs: await Promise.all(outputs.map(async (output) => ({
                 id: output.id,
                 run_id: output.run_id,
@@ -255,6 +276,27 @@ export function buildBusinessContextTools(deps: { pool: pg.Pool; sessionId: stri
           }));
           return { jobs: jobRows, prompts: promptRows };
         },
+      ),
+    },
+    {
+      name: "macro_factor_query",
+      label: "查询宏观与研究因子",
+      description:
+        "按发布时点读取宏观与研究因子序列（如 oecd.g7.cli 全球增长、oecd.chn.cli 中国需求、shfe.cu.inventory.total 库存）。只返回 as_of 当天结束前已发布的版本，同一报告期保留修订历史，不会把后来修订回填到更早时点；省略 as_of 取今天，省略 series_codes 返回全部 active 序列。用于需求侧判断，不能替代行情、持仓或策略评估。",
+      parameters: MacroFactorQuerySchema,
+      execute: async (_id, raw) => audited<MacroFactorQueryInput>(
+        deps, "macro_factor_query", raw, validateMacroFactorQueryInput, async (input) => ({
+          ...await queryMacroFactors(deps.pool, {
+            seriesCodes: input.series_codes,
+            start: input.start_date,
+            end: input.end_date,
+            asOf: input.as_of,
+          }),
+          semantics: {
+            as_of: "只包含该日结束前 published_at 的观测；同一报告期取最新可见修订。",
+            synthetic_initial_published_at: "true 表示历史回补使用「月末+45 天」合成发布时间，不是上游真实发布日期。",
+          },
+        }),
       ),
     },
     {

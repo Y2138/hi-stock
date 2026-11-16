@@ -16,6 +16,7 @@ import {
   searchInstruments,
   INSTRUMENT_KINDS,
   MARKET_FREQS,
+  listTradingCalendar,
   type BarRow,
   type InstrumentRow,
   type InstrumentKind,
@@ -32,7 +33,8 @@ interface Ctx {
 /** query 参数日期（YYYY-MM-DD），非法抛 400 */
 function parseDateOpt(raw: string | null, label: string): string | undefined {
   if (raw === null) return undefined;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || Number.isNaN(Date.parse(`${raw}T00:00:00Z`))) {
+  const parsed = new Date(`${raw}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== raw) {
     throw apiErrors.badRequest(`${label} 非法：${raw}`);
   }
   return raw;
@@ -312,6 +314,18 @@ export const marketRoutes = {
         },
       },
     };
+  },
+
+  /** GET /api/market/calendar：交易日历只读查询。 */
+  async calendar({ pool, query }: Ctx) {
+    const start = parseDateOpt(query.get("start"), "start");
+    const end = parseDateOpt(query.get("end"), "end");
+    if (!start || !end) throw apiErrors.badRequest("start、end 均为必填参数，格式为 YYYY-MM-DD");
+    if (start > end) throw apiErrors.badRequest("start 不能晚于 end");
+    const maxEnd = new Date(`${start}T00:00:00Z`);
+    maxEnd.setUTCFullYear(maxEnd.getUTCFullYear() + 3);
+    if (new Date(`${end}T00:00:00Z`) > maxEnd) throw apiErrors.badRequest("日期区间跨度不能超过 3 年");
+    return { data: await listTradingCalendar(pool, { start, end }) };
   },
 
   async structure({ pool, query }: Ctx) {

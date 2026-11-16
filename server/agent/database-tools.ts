@@ -29,6 +29,8 @@ const READABLE_TABLES = [
   "market_board",
   "market_board_membership",
   "market_dragon_tiger_entry",
+  "market_factor_observation",
+  "market_factor_series",
   "market_fetch_run",
   "market_indicator_run",
   "market_indicator_value",

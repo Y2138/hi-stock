@@ -18,6 +18,7 @@ import { createSafeWebFetchProvider, WEB_FETCH_CONTRACT_LIMITS } from "../../ser
 import zlib from "node:zlib";
 import { readFileSync } from "node:fs";
 import { storeBars } from "../../server/datasource/service.js";
+import { recordCommodityFetchRun, storeMarketFactorObservation, upsertMarketFactorSeries } from "../../server/datasource/commodity-service.js";
 import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
 import {
   evaluateRightSideSignal,
@@ -28,7 +29,7 @@ import {
 import { applySwingDailyDepthLimit, evaluateSwingSignal, swingDepthScore, SWING_DAILY_SIGNAL_LIMIT, SWING_DEEP_MA250_DEVIATION, SWING_RSI_OVERSOLD_LIMIT, SWING_VOLUME_DRYNESS_LIMIT } from "../../server/modules/plans/swing-signals.js";
 import { mergeExitEvaluations, queryPositionExitEvaluationBundle } from "../../server/modules/strategy-runtime/exit-evaluators.js";
 import { prepareTestDb, resetSchema, seedTestStrategy } from "./helpers.js";
-import { queueManualJob } from "../../server/scheduler/repo.js";
+import { createJobDefinition, queueManualJob } from "../../server/scheduler/repo.js";
 
 const prepared = await prepareTestDb();
 
@@ -455,6 +456,7 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       "portfolio_context_query",
       "pool_context_query",
       "job_context_query",
+      "macro_factor_query",
       "strategy_document_query",
       "hithink_catalog",
       "hithink_query",
@@ -904,6 +906,25 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
       };
     expect(jobs.jobs.map((job) => job.definition.code)).toEqual(["daily_plan_flow"]);
 
+    // 数据链路任务没有 job_run_output，必须补抓取行数与 artifacts，避免 success 被读成「没有输出」。
+    const macroJob = await createJobDefinition(pool, {
+      code: "macro_probe", name: "宏观探针", cron: "0 0 * * *", job_type: "datasource",
+      config: { pipeline: "commodity_copper_macro_sync", export_volume: false },
+    });
+    const macroRun = await queueManualJob(pool, macroJob.code, "2026-08-17");
+    await recordCommodityFetchRun(pool, {
+      channel: "public_macro", scope: { dataset: "copper_macro" }, rowsWritten: 4, gaps: [], jobRunId: macroRun.id,
+    });
+    const datasourceJob = textOf(await tools.find((tool) => tool.name === "job_context_query")!
+      .execute("tc-job-datasource", { job_codes: ["macro_probe"], recent_runs_per_job: 1 })) as {
+        jobs: Array<{ runs: Array<Record<string, unknown>> }>;
+      };
+    expect(datasourceJob.jobs[0]!.runs[0]).toMatchObject({
+      status: "queued",
+      artifacts: [],
+      fetch_runs: [{ channel: "public_macro", rows_written: 4, gaps: [] }],
+    });
+
     const strategy = textOf(await tools.find((tool) => tool.name === "strategy_document_query")!
       .execute("tc-strategy-context", { codes: ["test_strategy"] })) as {
         documents: Array<{ code: string; content: string }>;
@@ -917,6 +938,42 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
     expect(await queryLimitUpSignals(pool, "2026-08-18", null)).toMatchObject({
       status: "unavailable", strategy_document_id: null, signals: [],
     });
+  });
+
+  it("宏观因子工具按 as_of 返回当时可见的修订版本", async () => {
+    await upsertMarketFactorSeries(pool, {
+      seriesCode: "oecd.chn.cli", market: "CN", metricCode: "leading_indicator",
+      frequency: "monthly", unit: "index", source: "oecd_sdmx", revisionPolicy: "revisable",
+    });
+    const base = {
+      seriesCode: "oecd.chn.cli", periodStart: "2026-08-01", periodEnd: "2026-08-31",
+      sourceRef: "test://oecd", rawSummary: { synthetic_initial_published_at: false },
+    };
+    await storeMarketFactorObservation(pool, { ...base, publishedAt: "2026-10-15T01:00:00Z", revisionNo: 0, value: 97.636 });
+    await storeMarketFactorObservation(pool, { ...base, publishedAt: "2026-11-09T01:00:00Z", revisionNo: 1, value: 97.663 });
+
+    const tool = buildChatTools({ pool, sessionId: null }).find((item) => item.name === "macro_factor_query")!;
+    const asOf = async (value: string) => textOf(await tool.execute(`tc-macro-${value}`, {
+      series_codes: ["oecd.chn.cli"], as_of: value,
+    })) as { as_of: string; series: Array<{ observations: Array<Record<string, unknown>> }> };
+
+    const beforePublish = await asOf("2026-10-14");
+    expect(beforePublish.as_of).toBe("2026-10-14");
+    expect(beforePublish.series[0]!.observations).toEqual([]);
+
+    const firstRelease = await asOf("2026-10-20");
+    expect(firstRelease.series[0]!.observations).toEqual([
+      expect.objectContaining({ period_end: "2026-08-31", value: 97.636, revision_no: 0 }),
+    ]);
+
+    const revised = await asOf("2026-11-10");
+    expect(revised.series[0]!.observations).toEqual([
+      expect.objectContaining({ period_end: "2026-08-31", value: 97.663, revision_no: 1 }),
+    ]);
+
+    await expect(tool.execute("tc-macro-bad", {
+      series_codes: ["oecd.chn.cli"], start_date: "2026-09-01", end_date: "2026-08-01",
+    })).rejects.toThrow("不得早于");
   });
 
   it("打板策略正文更新后评分基准继续生效，基准绑定策略文档而非修订", async () => {

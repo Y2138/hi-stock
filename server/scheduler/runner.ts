@@ -586,9 +586,10 @@ async function executeDatasource(
       const summary = deps.commodityCopperMacroSync
         ? await deps.commodityCopperMacroSync(run.target_date, run.id)
         : await syncCopperMacroFactors(deps.pool, run.target_date, { jobRunId: run.id, now: deps.now?.() });
+      const skipReasons = [...new Set(summary.skipped.map((item) => item.reason))];
       result = {
         status: summary.gaps.length > 0 ? "partial" : "success",
-        log: `铜宏观因子同步完成：写入 ${summary.rowsWritten} 条，更新序列 ${summary.seriesUpdated.length} 个，缺口 ${summary.gaps.length}。`,
+        log: `铜宏观因子同步完成：写入 ${summary.rowsWritten} 条，更新序列 ${summary.seriesUpdated.length} 个，上游最新期 ${summary.upstreamLatestPeriod ?? "无"}，跳过 ${summary.skipped.length} 期${skipReasons.length ? `（${skipReasons.join("；")}）` : ""}，缺口 ${summary.gaps.length}。`,
         artifacts: [{ kind: "market_fetch_run", id: summary.fetchRunId }],
         dataGaps: summary.gaps,
       };

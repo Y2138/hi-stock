@@ -1,4 +1,5 @@
 // 迁移运行器测试：幂等、篡改检测（设计契约 §10.1）
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -348,6 +349,27 @@ describe.skipIf(!prepared)("迁移运行器", () => {
     );
     expect(retiredTables.rows.every((row) => row.name === null)).toBe(true);
   }, 15_000);
+
+  it("策略状态哈希与策略正文一致，覆盖铜左侧策略正文更新", async () => {
+    const documents = (await pool.query<{ code: string; sha256: string }>(
+      `SELECT code,sha256 FROM strategy_document
+        WHERE code NOT IN ('copper_inventory_strategy','lithium_warehouse_strategy')
+        ORDER BY injection_order,id`,
+    )).rows;
+    const expected = createHash("sha256")
+      .update(documents.map((row) => `${row.code}:${row.sha256}`).join("\n"), "utf8")
+      .digest("hex");
+    const state = (await pool.query<{ current_hash: string }>(
+      "SELECT current_hash FROM strategy_state WHERE singleton=1",
+    )).rows[0]!;
+    expect(state.current_hash).toBe(expected);
+    // 铜左侧策略：0191 改正文、0192 刷状态，两步必须一起生效。
+    const copper = (await pool.query<{ content: string; sha256: string }>(
+      "SELECT content,sha256 FROM strategy_document WHERE code='copper_left_launch_strategy'",
+    )).rows[0]!;
+    expect(copper.content).toContain("synthetic_initial_published_at");
+    expect(copper.sha256).toBe(createHash("sha256").update(copper.content, "utf8").digest("hex"));
+  });
 
   it("策略运行时约束固定策略、任务角色和评估结果归属", async () => {
     const definitions = await pool.query<{ code: string }>("SELECT code FROM strategy_definition ORDER BY code");

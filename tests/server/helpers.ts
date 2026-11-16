@@ -76,8 +76,10 @@ export async function seedTestStrategy(pool: pg.Pool, content = "# 测试当前�
     const stateHash = crypto.createHash("sha256")
       .update(manifest.rows.map((row) => `${row.code}:${row.sha256}`).join("\n"), "utf8")
       .digest("hex");
+    // 全量迁移（0192）后空库已有 strategy_state 单例行，这里按当前清单覆盖哈希。
     await client.query(
-      "INSERT INTO strategy_state (singleton, change_seq, current_hash) VALUES (1, 0, $1)",
+      `INSERT INTO strategy_state (singleton, change_seq, current_hash) VALUES (1, 0, $1)
+       ON CONFLICT (singleton) DO UPDATE SET current_hash=EXCLUDED.current_hash, updated_at=now()`,
       [stateHash],
     );
     await client.query("COMMIT");

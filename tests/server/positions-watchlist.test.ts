@@ -64,6 +64,10 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
        SELECT id, 'day', '2026-08-14', '2026-08-14T00:00:00Z', 10, 11, 9, 10, 'test'
          FROM market_instrument WHERE code IN ('510500.SH', '885999.TI', '000001.SH')`,
     );
+    await pool.query(
+      `INSERT INTO market_trading_day (trade_date, is_open, source)
+       VALUES ('2026-08-13', true, 'test'), ('2026-08-14', true, 'test')`,
+    );
     sessionId = (await pool.query<{ id: string }>("INSERT INTO chat_session (title) VALUES ('成交归因测试') RETURNING id::text")).rows[0]!.id;
     server = await startTestServer(pool);
   });
@@ -79,6 +83,12 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
     const bars = await api(server!.baseUrl, "GET", "/api/market/bars?code=600487.SH&freq=day&start=2026-08-13&end=2026-08-14");
     expect(bars.status).toBe(200);
     expect((bars.json as unknown as { bars: Array<{ close: number }> }).bars.map((bar) => bar.close)).toEqual([57.2, 62.98]);
+    const calendar = await api(server!.baseUrl, "GET", "/api/market/calendar?start=2026-08-13&end=2026-08-14");
+    expect(calendar.status).toBe(200);
+    expect(calendar.json).toEqual([{ trade_date: "2026-08-13", is_open: true }, { trade_date: "2026-08-14", is_open: true }]);
+    expect((await api(server!.baseUrl, "GET", "/api/market/calendar")).status).toBe(400);
+    expect((await api(server!.baseUrl, "GET", "/api/market/calendar?start=2026-08-14&end=2026-08-13")).status).toBe(400);
+    expect((await api(server!.baseUrl, "GET", "/api/market/calendar?start=2020-01-01&end=2024-01-02")).status).toBe(400);
     const coverage = await api(server!.baseUrl, "GET", "/api/market/coverage");
     expect(coverage.json).toMatchObject([{
       freq: "day",
@@ -204,10 +214,16 @@ describe.skipIf(!prepared)("行情、策略池与成交归因（stock_test 真�
       {
         code: "600487.SH", kind: "buy", source: "chat", decision_origin: "strategy_signal",
         execution_compliance: "matched", source_session_id: sessionId,
-        strategy_change_seq: "0", attribution_note: "按当日已确认信号记录",
+        strategy_change_seq: expect.any(String), attribution_note: "按当日已确认信号记录",
       },
     ]);
-    expect((changes.json as unknown as Array<{ strategy_snapshot_hash: string }>)[0]!.strategy_snapshot_hash).toMatch(/^[a-f0-9]{64}$/);
+    const strategyState = (await pool.query<{ change_seq: string; current_hash: string }>(
+      "SELECT change_seq::text, current_hash FROM strategy_state WHERE singleton = 1",
+    )).rows[0]!;
+    const buyChange = (changes.json as unknown as Array<{ strategy_change_seq: string; strategy_snapshot_hash: string }>)[2]!;
+    expect(buyChange.strategy_change_seq).toBe(strategyState.change_seq);
+    expect(buyChange.strategy_snapshot_hash).toBe(strategyState.current_hash);
+    expect(buyChange.strategy_snapshot_hash).toMatch(/^[a-f0-9]{64}$/);
     const summary = await api(server!.baseUrl, "GET", "/api/positions/realized-pnl");
     expect(summary).toMatchObject({ status: 200, json: {
       baseline_pnl: 0, event_pnl: -1000, realized_pnl: -1000,

@@ -23,6 +23,7 @@ import { strategyRoutes } from "../modules/strategy/routes.js";
 import { strategyRuntimeRoutes } from "../modules/strategy-runtime/routes.js";
 import { boardRoutes } from "../modules/boards/routes.js";
 import { memoryRoutes } from "../modules/memory/routes.js";
+import { macroRoutes } from "../modules/macro/routes.js";
 import { notificationRoutes } from "../modules/notifications/routes.js";
 import { emailNotificationRoutes } from "../modules/notifications/email-routes.js";
 import { getLatestMarketNews } from "../modules/market-news/repo.js";
@@ -295,8 +296,10 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/futures", futuresRoutes.list),
     route("GET", "/api/futures/:code", futuresRoutes.detail),
     route("GET", "/api/market/bars", marketRoutes.bars),
+    route("GET", "/api/market/calendar", marketRoutes.calendar),
     route("GET", "/api/market/structure", marketRoutes.structure),
     route("GET", "/api/market/coverage", marketRoutes.coverage),
+    route("GET", "/api/macro/factors", macroRoutes.factors),
     // 持仓与关注池。
     route("GET", "/api/positions", positionRoutes.list),
     route("GET", "/api/positions/changes", positionRoutes.changes),

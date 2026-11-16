@@ -46,6 +46,11 @@ export interface BarRow {
   channel: string;
 }
 
+export interface TradingCalendarRow {
+  trade_date: string;
+  is_open: boolean;
+}
+
 export interface CoverageRow {
   freq: MarketFreq;
   instrument_count: number;
@@ -217,6 +222,21 @@ export async function listLatestDailyBars(db: Db, codes: string[], asOf?: string
       ? (row.close / row.prev_close - 1) * 100
       : null,
   }));
+}
+
+/** 交易日历只读查询：按日期升序返回区间内已登记日期。 */
+export async function listTradingCalendar(
+  db: Db,
+  opts: { start: string; end: string },
+): Promise<TradingCalendarRow[]> {
+  const result = await db.query<TradingCalendarRow>(
+    `SELECT trade_date::text, is_open
+       FROM market_trading_day
+      WHERE trade_date BETWEEN $1::date AND $2::date
+      ORDER BY trade_date`,
+    [opts.start, opts.end],
+  );
+  return result.rows;
 }
 
 /** 行情覆盖摘要：按 freq 分组的标的数量、最早/最晚 bar_date、总行数 */

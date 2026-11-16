@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { fetchLimitPoolPage } from "../../datasource/hithink-special.js";
+import { shanghaiClock } from "./time.js";
 
 type Db = Pick<pg.Pool, "query">;
 const MAX_AGE_MS = 5 * 60_000;
@@ -32,8 +33,17 @@ export async function readIntradaySentiment(db: Db, date: string, at: Date) {
   const rows = (await db.query<{ captured_at: string; status: string; payload: Record<string, unknown> }>(
     "SELECT captured_at::text,status,payload FROM intraday_market_sentiment WHERE trade_date=$1 AND captured_at<=$2 ORDER BY captured_at DESC LIMIT 6", [date, at],
   )).rows;
-  const sourceTimes = rows[0]?.payload.source_times as Record<string, string | null> | undefined;
+  const firstPayload = rows[0]?.payload;
+  const sourceTimes = firstPayload?.source_times as Record<string, string | null> | undefined;
   return { ready: Boolean(rows[0] && rows[0].status === "ready" && at.getTime() - new Date(rows[0].captured_at).getTime() <= MAX_AGE_MS
     && ["up", "down", "break"].every((key) => sourceTimes?.[key] && at.getTime() - new Date(sourceTimes[key]!).getTime() <= MAX_AGE_MS && new Date(sourceTimes[key]!).getTime() <= at.getTime() + 30_000)),
-    samples: rows.reverse(), note: "涨跌停与炸板为全市场点时总数；仅判断当日情绪，缺数或过期不得判定冰点" };
+    // 给 AI 的时间一律北京墙钟；库内仍存 UTC 事实。
+    samples: rows.reverse().map((row) => ({
+      captured_at: shanghaiClock(new Date(row.captured_at)),
+      status: row.status,
+      counts: row.payload.counts ?? null,
+      source_times: Object.fromEntries(Object.entries((row.payload.source_times as Record<string, string | null>) ?? {})
+        .map(([key, value]) => [key, value === null ? null : shanghaiClock(new Date(value))])),
+    })),
+    note: "涨跌停与炸板为全市场点时总数；仅判断当日情绪，缺数或过期不得判定冰点" };
 }

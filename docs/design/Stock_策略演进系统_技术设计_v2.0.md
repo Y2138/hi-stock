@@ -854,8 +854,9 @@ UI 先以用户消息为轮次边界，把中间由工具调用产生的连续 a
 |-----------|------|
 | `GET /api/instruments?kind=&q=` | 标的检索（命令面板/选择器） |
 | `GET /api/market/bars?code=&freq=&start=&end=` | K 线数据（读库） |
+| `GET /api/market/calendar?start=YYYY-MM-DD&end=YYYY-MM-DD` | 交易日历只读查询；`start`、`end` 必填，区间不得超过 3 年，返回区间内已登记的 `trade_date`、`is_open` |
 | `GET /api/market/structure?date=&dataset=&page=&size=` | 市场结构按日分页查询；只返回七类结构条目与同步覆盖，不再内联涨停确定性评分（评分唯一由 `limit_up_signal_query` 和每日计划生成） |
-| `GET /api/market/coverage` | 行情覆盖对账摘要 |
+| `GET /api/market/coverage` | 行情覆盖对账摘要；无参数返回全库按频率汇总，不按代码过滤；该接口不接受 `code` 参数，按代码查行情请使用 `/api/market/bars?code=&freq=&start=&end=` |
 | 旧行情 quotes/realtime 路由 | 0033 后不再注册并返回 404；Agent `market_snapshot_query` 改读最新日线 |
 | `GET /api/pools/short`、`GET /api/pools/long` | 短线/长线池的成员、研究属性、近期关注、板块偏好与行情投影，只读 |
 | `DELETE /api/pools/:pool/:code/attention` | 真实用户直接移除当前池成员的近期关注；只清空关注原因、有效期和信号状态，不改变池角色与研究属性 |

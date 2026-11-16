@@ -9,13 +9,27 @@ import { sha256Json } from "../../agent/hash.js";
 import { listPositions } from "../positions/repo.js";
 import { enqueueBatchAlert } from "../notifications/service.js";
 import { inServiceTransaction } from "../../db/transaction.js";
-import { ACTION_LABELS, normalizeIntradaySignals, tradePlanLabel, type IntradaySignal } from "./signals.js";
+import { ACTION_LABELS, normalizeIntradaySignals, tradePlanLabel, type IntradayAction, type IntradaySignal } from "./signals.js";
+import {
+  applyIntradayDebounceRound,
+  initialIntradayDebounceState,
+  type IntradayDebounceState,
+} from "./debounce.js";
+import { shanghaiClock, shanghaiPayloadTexts, shanghaiStamp } from "./time.js";
 import { readIntradaySentiment, refreshIntradaySentiment } from "./sentiment.js";
 import { listHoldingCodes } from "../ultra-short/repo.js";
 import { isWorkerEnabled, writeWorkerHeartbeat } from "../../scheduler/worker-status.js";
 
 const MODEL_KEY = "GLM-5.3-Flash";
 const SAMPLE_INTERVAL_MS = 60_000;
+/**
+ * 单轮模型调用上限。实测正常轮次约 30 秒内完成，长尾会出现约 290 秒的挂起；
+ * 挂起会顺延下一条 60 秒定时，单个交易日最多丢十几轮。120 秒约为 p50 的 4 倍、
+ * 足以覆盖正常调用，同时把长尾截断到可接受范围。
+ */
+const INTRADAY_MODEL_TIMEOUT_MS = 120_000;
+/** 展示去抖回放所需的历史视野：30 轮 > 确认 2 轮 + 最短保持 2 轮，进程重启可重建。 */
+const INTRADAY_SIGNAL_HISTORY_LIMIT = 30;
 const ERROR_RETRY_INTERVAL_MS = 5 * 60_000;
 const CORE_INDEX_CODES = [
   "000001.SH", "000016.SH", "000300.SH", "000688.SH",
@@ -180,18 +194,20 @@ async function sampleContext(db: Db, tradeDate: string, codes: string[], refs: M
   return new Map(codes.map((code) => {
     const samples = grouped.get(code) ?? [];
     const latest = samples.at(-1);
+    // rawAt 保留数据库 UTC 原值供分桶计算；对 AI 输出的 at/source_at 一律换为北京墙钟。
     const recent = samples.map((row, index) => {
       const previous = samples[index - 1];
       const delta = (field: "volume" | "turnover") => row.status === "ready" && previous?.status === "ready"
         && row[field] !== null && previous[field] !== null && row[field]! >= previous[field]! ? row[field]! - previous[field]! : null;
-      return { at: row.at, source_at: row.source_at, price: row.price, volume_delta: delta("volume"), turnover_delta: delta("turnover"), status: row.status };
+      return { rawAt: row.at, at: shanghaiClock(new Date(row.at)), source_at: row.source_at === null ? null : shanghaiClock(new Date(row.source_at)),
+        price: row.price, volume_delta: delta("volume"), turnover_delta: delta("turnover"), status: row.status };
     });
     const segments = new Map<number, QuoteContext["segments_5m"][number]>();
     for (const row of recent) {
       if (row.status !== "ready" || row.price === null) continue;
-      const bucket = Math.floor(new Date(row.at).getTime() / 300_000) * 300_000;
+      const bucket = Math.floor(new Date(row.rawAt).getTime() / 300_000) * 300_000;
       const segment = segments.get(bucket);
-      if (!segment) segments.set(bucket, { at: new Date(bucket).toISOString(), first: row.price, last: row.price, high: row.price, low: row.price, volume_delta: row.volume_delta });
+      if (!segment) segments.set(bucket, { at: shanghaiClock(new Date(bucket)), first: row.price, last: row.price, high: row.price, low: row.price, volume_delta: row.volume_delta });
       else { segment.last = row.price; segment.high = Math.max(segment.high, row.price); segment.low = Math.min(segment.low, row.price);
         segment.volume_delta = segment.volume_delta === null || row.volume_delta === null ? null : segment.volume_delta + row.volume_delta; }
     }
@@ -199,7 +215,7 @@ async function sampleContext(db: Db, tradeDate: string, codes: string[], refs: M
       summary: { open: latest?.open ?? null, prev_close: latest?.prev_close ?? null, latest: latest?.price ?? null,
         high: latest?.high ?? null, low: latest?.low ?? null, volume: latest?.volume ?? null, turnover: latest?.turnover ?? null,
         samples: samples.length, distinct_quotes: new Set(samples.filter((row) => row.status === "ready" && row.volume !== null && row.volume > 0).map((row) => row.source_at)).size,
-        source_at: latest?.source_at ?? null, status: latest?.status ?? "missing" }, recent: recent.slice(-20),
+        source_at: latest?.source_at ?? null, status: latest?.status ?? "missing" }, recent: recent.slice(-20).map(({ rawAt, ...row }) => row),
       segments_5m: [...segments.values()],
     } satisfies QuoteContext] as const;
   }));
@@ -237,13 +253,15 @@ export function buildIntradayPrompt(payload: Record<string, unknown>): Context {
   return {
     systemPrompt: [
       "你是盘中持仓加减仓价位观察器，只生成提醒，不执行交易，不修改持仓或每日计划。",
+      "输入中所有时间均为北京时间（Asia/Shanghai）当日墙钟：sampled_at 是本轮采样时刻，09:30–11:30 为早盘、13:00–15:00 为午盘。行情叙事必须与 sampled_at 所在时段一致，禁止在早盘把当日已走行情表述为午后或尾盘；针对未来时段的条件可以用「午后若……」表述。",
       "仅依据本交易日个股量价：开盘、日内高低、分时平台、冲高回落、回收与承接、增量成交量；行业和大盘当日走势辅助判断。输入不提供成本、策略止损或历史计划，不得自行补造或引用固定止损位。",
       "recent 是60秒采样，volume_delta/turnover_delta是累计成交量/额的增量；segments_5m覆盖当日采样价格分段，不能冒充完整5分钟K线。当天未采到的路径不得推断。",
       "market_context.sentiment提供当日涨停/跌停/炸板总数及多次快照，结合指数与板块区分冰点、偏弱、平稳、偏热；数据不全或过期时emotion必须unknown，不得把指数下跌直接等同冰点或减仓。",
       "情绪冰点是反向加仓机会背景：个股不再创新低、缩量止跌或放量回收且有真实承接、板块率先修复时，明确加仓区间与确认条件。持续放量下跌、承接尚未形成时等待，不因冰点直接判已触发。情绪偏热、冲高量价背离、日内平台失守后回收失败时评估减仓区间。",
       "每只持仓分别给add_plan和reduce_plan，可同时有不同价位的条件预案，无可靠依据时为null；区间必须为正数，lower<=upper，给一句量价触发条件和一句取消条件，禁止拿旧止损位代替当日依据。",
+      "previous是同一账户、同一标的上一轮已发布的判断；方向变化必须有本轮新增量价证据，没有新证据时保持与上一轮方向一致，不得每轮重新拍板。历史仅作参照，不得因为上一轮是add就忽略本轮触发条件。",
       "status只有条件已在输入中实际出现且最新价格位于区间才用triggered，否则waiting；当前action为add/reduce/wait，必须与唯一已触发预案一致，不能同时触发加减仓。数据缺失、过期或有效采样不足3次时action=wait且预案不得标已触发。",
-      '只返回一个JSON对象，每个真实持仓必须且只能一行：{"items":[{"code":"标的代码","action":"add|reduce|wait","add_plan":null,"reduce_plan":null,"emotion":"ice_point|weak|neutral|strong|unknown","reason":"60字以内当日量价依据"}]}。非空预案结构为{"price_lower":10.1,"price_upper":10.2,"condition":"量价确认条件","invalidation":"取消条件","status":"waiting|triggered"}，示例价格不可用于实际标的。只返回JSON，不要Markdown。',
+      '只返回一个JSON对象，每个真实持仓必须且只能一行：{"items":[{"code":"标的代码","action":"add|reduce|wait","add_plan":null,"reduce_plan":null,"emotion":"ice_point|weak|neutral|strong|unknown","reason":"100字以内当日量价依据"}]}。非空预案结构为{"price_lower":10.1,"price_upper":10.2,"condition":"量价确认条件","invalidation":"取消条件","status":"waiting|triggered"}，示例价格不可用于实际标的。只返回JSON，不要Markdown。',
     ].join("\n"),
     messages: [{ role: "user", content: JSON.stringify(payload), timestamp: Date.now() }],
   };
@@ -259,11 +277,21 @@ async function analyse(pool: pg.Pool, payload: Record<string, unknown>, codes: S
     }
     throw error;
   });
-  const response = await runtime.models.completeSimple(runtime.model, buildIntradayPrompt(payload), {
-    reasoning: "minimal",
-    temperature: 0,
-    sessionId: undefined,
-  });
+  let response;
+  try {
+    response = await runtime.models.completeSimple(runtime.model, buildIntradayPrompt(payload), {
+      reasoning: "minimal",
+      temperature: 0,
+      sessionId: undefined,
+      timeoutMs: INTRADAY_MODEL_TIMEOUT_MS,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/timeout|timed?\s?out|aborted|abort/i.test(message)) {
+      throw new IntradayRiskModelError(`盘中风险模型调用超过 ${INTRADAY_MODEL_TIMEOUT_MS / 1000} 秒，本轮跳过`, true, revision);
+    }
+    throw error;
+  }
   if (response.stopReason === "error") throw modelFailure(response.errorMessage ?? "", revision);
   if (response.stopReason === "aborted") throw new Error("盘中风险模型调用已中断");
   if (response.stopReason === "length") {
@@ -291,7 +319,7 @@ async function writeJudgements(
   items: Judgement[],
 ): Promise<void> {
   for (const item of items) {
-    const risk = item.action === "reduce" ? "high" : item.action === "add" ? "normal" : item.add_plan || item.reduce_plan ? "watch" : "normal";
+    const risk = riskOf(item.action, item.add_plan, item.reduce_plan);
     const keyLevel = [item.add_plan ? `加仓 ${tradePlanLabel(item.add_plan)}` : "",item.reduce_plan ? `减仓 ${tradePlanLabel(item.reduce_plan)}` : ""].filter(Boolean).join("；") || null;
     const addPlan = item.add_plan ? JSON.stringify(item.add_plan) : null;
     const reducePlan = item.reduce_plan ? JSON.stringify(item.reduce_plan) : null;
@@ -316,6 +344,95 @@ async function writeJudgements(
         addPlan,reducePlan,item.latest_price,modelKey,inputHash],
     );
   }
+}
+
+interface SignalHistoryRow {
+  code: string;
+  action: IntradayAction;
+  emotion: string;
+  add_plan: unknown;
+  reduce_plan: unknown;
+  key_level: string | null;
+  reason: string;
+  sample_at: string;
+  latest_price: number | null;
+}
+
+/** 模块内去抖状态：按 账户:标的 记住已确认方向与最后一次处理到的采样时刻；跨交易日整体重置。 */
+const debounceMemo = new Map<string, { at: number; state: IntradayDebounceState }>();
+let debounceMemoDate: string | null = null;
+
+function resetDebounceMemo(tradeDate: string): void {
+  if (debounceMemoDate === tradeDate) return;
+  debounceMemo.clear();
+  debounceMemoDate = tradeDate;
+}
+
+/** 读同一账户、同一交易日、单标的最近若干轮判断；before 为空表示包含最新一轮。 */
+async function loadSignalHistory(
+  db: Db, accountId: string, tradeDate: string, codes: string[], before: Date | null,
+): Promise<Map<string, SignalHistoryRow[]>> {
+  if (codes.length === 0) return new Map();
+  const rows = (await db.query<SignalHistoryRow & { rn: number }>(
+    `SELECT code,action,emotion,add_plan,reduce_plan,key_level,reason,
+            sample_at::text AS sample_at,latest_price::float8 AS latest_price
+       FROM (
+         SELECT code,action,emotion,add_plan,reduce_plan,key_level,reason,sample_at,latest_price,
+                row_number() OVER(PARTITION BY code ORDER BY sample_at DESC) rn
+           FROM intraday_position_signal
+          WHERE account_id=$1 AND trade_date=$2 AND code=ANY($3::text[])
+            AND ($4::timestamptz IS NULL OR sample_at < $4::timestamptz)
+       ) ranked WHERE rn<=$5 ORDER BY code,sample_at`,
+    [accountId, tradeDate, codes, before ? before.toISOString() : null, INTRADAY_SIGNAL_HISTORY_LIMIT],
+  )).rows;
+  const grouped = new Map<string, SignalHistoryRow[]>();
+  for (const row of rows) grouped.set(row.code, [...(grouped.get(row.code) ?? []), row]);
+  return grouped;
+}
+
+/**
+ * 回放历史得到当前展示方向。优先从模块内状态增量续算；重启或状态缺失时整段回放，
+ * 因此展示结果不依赖进程是否重启。历史里 latest_price 为空视为当轮采样不足。
+ */
+function resolveDebouncedState(
+  accountId: string, tradeDate: string, code: string, history: SignalHistoryRow[],
+): { state: IntradayDebounceState; displayAction: IntradayAction } {
+  resetDebounceMemo(tradeDate);
+  const key = `${accountId}:${code}`;
+  const memo = debounceMemo.get(key);
+  let state = initialIntradayDebounceState();
+  let start = 0;
+  if (memo) {
+    const index = history.findIndex((row) => Date.parse(row.sample_at) === memo.at);
+    if (index >= 0) {
+      state = memo.state;
+      start = index + 1;
+    }
+  }
+  for (let index = start; index < history.length; index++) {
+    const row = history[index]!;
+    state = applyIntradayDebounceRound(state, { action: row.action, dataUsable: row.latest_price !== null }).state;
+  }
+  const last = history.at(-1);
+  if (last) debounceMemo.set(key, { at: Date.parse(last.sample_at), state });
+  return { state, displayAction: state.confirmed };
+}
+
+function promptPrevious(row: SignalHistoryRow | undefined): Record<string, unknown> | null {
+  if (!row) return null;
+  return {
+    action: row.action,
+    emotion: row.emotion,
+    add_plan: row.add_plan,
+    reduce_plan: row.reduce_plan,
+    key_level: row.key_level,
+    reason: row.reason,
+    sampled_at: row.sample_at,
+  };
+}
+
+function riskOf(action: IntradayAction, addPlan: unknown, reducePlan: unknown): Risk {
+  return action === "reduce" ? "high" : action === "add" ? "normal" : addPlan || reducePlan ? "watch" : "normal";
 }
 
 export async function runIntradayRiskCycle(pool: pg.Pool, now = new Date(), openDay?: boolean, accountId = "1", sharedSample?: { at: Date; quotes: Map<string,SnapshotQuote>; gaps: string[] }): Promise<IntradayRiskSnapshot | null> {
@@ -358,12 +475,24 @@ export async function runIntradayRiskCycle(pool: pg.Pool, now = new Date(), open
   const [samples, sentiment] = await Promise.all([
     sampleContext(pool, tradeDate, expected.map((item) => item.code), refs, sampleAt), readIntradaySentiment(pool, tradeDate, sampleAt),
   ]);
-  const payload = { trade_date: tradeDate, sampled_at: sampleAt.toISOString(), data_gaps: gaps,
+  // 上一轮判断：同一账户、同一标的、同一交易日的最后一条历史，供模型保持方向一致性。
+  const signalHistory = await loadSignalHistory(pool, accountId, tradeDate, positionCodes, sampleAt);
+  const payload = shanghaiPayloadTexts({ trade_date: tradeDate, sampled_at: shanghaiStamp(sampleAt), data_gaps: gaps,
     market_context: { sentiment, industries: boardCodes.map((code) => samples.get(code)), indices: indexCodes.map((code) => samples.get(code)) },
     positions: positions.map((position) => ({ code: position.code, name: position.name, intraday: samples.get(position.code),
+      previous: promptPrevious(signalHistory.get(position.code)?.at(-1)),
       industry_codes: (boardMap.get(position.code) ?? []).map((board) => board.code) })),
-  };
+  });
   const items = await analyse(pool, payload, new Set(positionCodes), samples, sentiment.ready);
+  // 展示去抖：落库仍是模型原始判断，只有提醒和 API 展示使用已确认方向。
+  const displayActions = new Map<string, IntradayAction>();
+  for (const item of items) {
+    const { state } = resolveDebouncedState(accountId, tradeDate, item.code, signalHistory.get(item.code) ?? []);
+    const decision = applyIntradayDebounceRound(state, { action: item.action, dataUsable: item.data_usable !== false });
+    displayActions.set(item.code, decision.displayAction);
+    debounceMemo.set(`${accountId}:${item.code}`, { at: sampleAt.getTime(), state: decision.state });
+  }
+  const displayedItems = items.map((item) => ({ ...item, action: displayActions.get(item.code) ?? item.action }));
   const nameByCode = new Map(positions.map((position) => [position.code, position.name]));
   await inServiceTransaction(pool, async (client) => {
     await writeJudgements(client, accountId, tradeDate, sampleAt, MODEL_KEY, sha256Json(payload), items.map((item) => ({
@@ -373,7 +502,7 @@ export async function runIntradayRiskCycle(pool: pg.Pool, now = new Date(), open
       latest_price: samples.get(item.code)?.summary.latest ?? null,
     })));
     // 普通持仓只发一条汇总：出现加仓/减仓时，把所有普通持仓（含观察）一起发出。
-    const actionable = items.some((item) => item.action === "add" || item.action === "reduce");
+    const actionable = displayedItems.some((item) => item.action === "add" || item.action === "reduce");
     if (!actionable) {
       await client.query(
         "UPDATE notification_delivery SET status='cancelled',error='盘中条件已变化' WHERE kind='intraday_digest' AND account_id=$1 AND status IN ('pending','failed')",
@@ -384,7 +513,7 @@ export async function runIntradayRiskCycle(pool: pg.Pool, now = new Date(), open
         `Stock｜普通持仓盘中观察｜${sampleAt.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`,
         "",
         ...positions.map((position) => {
-          const item = items.find((signal) => signal.code === position.code);
+          const item = displayedItems.find((signal) => signal.code === position.code);
           const price = samples.get(position.code)?.summary.latest;
           const plan = item?.action === "add" ? item.add_plan : item?.action === "reduce" ? item.reduce_plan : null;
           const range = plan ? `：${plan.price_lower.toFixed(2)}～${plan.price_upper.toFixed(2)}` : "";
@@ -392,7 +521,7 @@ export async function runIntradayRiskCycle(pool: pg.Pool, now = new Date(), open
         }),
       ].join("\n");
       const signature = positions.map((position) => {
-        const item = items.find((signal) => signal.code === position.code);
+        const item = displayedItems.find((signal) => signal.code === position.code);
         const plan = item?.action === "add" ? item.add_plan : item?.action === "reduce" ? item.reduce_plan : null;
         const price = samples.get(position.code)?.summary.latest;
         return {
@@ -428,7 +557,16 @@ export async function listIntradayRisks(db: Db, tradeDate = shanghaiParts().day,
        WHERE r.account_id=$1 AND r.trade_date=$2 AND r.action IS NOT NULL ORDER BY CASE r.action WHEN 'reduce' THEN 0 WHEN 'add' THEN 1 ELSE 2 END,r.code`,
     [accountId, tradeDate],
   );
-  return result.rows;
+  if (result.rows.length === 0) return result.rows;
+  // 展示去抖：API 返回已确认方向；原始判断仍以历史表为准，不覆盖 intraday_position_risk。
+  const history = await loadSignalHistory(db, accountId, tradeDate, result.rows.map((row) => row.code), null);
+  const adjusted = result.rows.map((row) => {
+    const displayAction = resolveDebouncedState(accountId, tradeDate, row.code, history.get(row.code) ?? []).displayAction;
+    if (displayAction === row.action) return row;
+    return { ...row, action: displayAction, risk: riskOf(displayAction, row.add_plan, row.reduce_plan) };
+  });
+  const order: Record<IntradayAction, number> = { reduce: 0, add: 1, wait: 2 };
+  return adjusted.sort((a, b) => (order[a.action] - order[b.action]) || a.code.localeCompare(b.code));
 }
 
 export async function getIntradayRisk(db: Db, tradeDate = shanghaiParts().day, code?: string, accountId = "1"): Promise<IntradayRiskSnapshot> {
