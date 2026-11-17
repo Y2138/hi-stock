@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { marketRoutes } from "../modules/market/routes.js";
 import { futuresRoutes } from "../modules/market/futures-routes.js";
+import { researchObservationRoutes } from "../modules/market/research-observation.js";
 import { positionRoutes } from "../modules/positions/routes.js";
 import { plansRoutes } from "../modules/plans/routes.js";
 import { clearPoolAttention, listPoolResearch, listPoolView, setPoolSpecialAttention } from "../modules/pools/repo.js";
@@ -293,6 +294,7 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/instruments/search", marketRoutes.searchV2),
     route("GET", "/api/boards", boardRoutes.list),
     route("GET", "/api/boards/:code/constituents", boardRoutes.constituents),
+    route("GET", "/api/research/observations", researchObservationRoutes.list),
     route("GET", "/api/futures", futuresRoutes.list),
     route("GET", "/api/futures/:code", futuresRoutes.detail),
     route("GET", "/api/market/bars", marketRoutes.bars),

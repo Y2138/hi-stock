@@ -113,6 +113,8 @@ describe.skipIf(!prepared)("迁移运行器", () => {
       "portfolio_position",
       "portfolio_position_change",
       "portfolio_realized_pnl_baseline",
+      "research_observation_sample",
+      "research_observation_subscription",
       "schema_migrations",
       "signal_live_route",
       "strategy_candidate_shortlist",

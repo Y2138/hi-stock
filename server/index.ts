@@ -13,6 +13,7 @@ import { importLegacyHithinkApiKey } from "./system-settings.js";
 import { IntradayRiskWorker } from "./modules/intraday-risk/service.js";
 import { UltraShortFastLane } from "./modules/ultra-short/fast-lane.js";
 import { UltraShortWatchObserver } from "./modules/ultra-short/watch-observer.js";
+import { ResearchObservationWorker } from "./modules/market/research-observation.js";
 
 async function main(): Promise<void> {
   let config;
@@ -71,6 +72,7 @@ async function main(): Promise<void> {
   const intradayRiskWorker = new IntradayRiskWorker(pool);
   const ultraShortExitWorker = new UltraShortFastLane(pool);
   const ultraShortWatchWorker = new UltraShortWatchObserver(pool);
+  const researchObservationWorker = new ResearchObservationWorker(pool);
   const server = createApiServer({ pool });
   let shuttingDown = false;
   const shutdown = async () => {
@@ -89,6 +91,7 @@ async function main(): Promise<void> {
       console.error(`超短观察器停止失败：${(error as Error).message}`);
       process.exitCode = 1;
     });
+    await researchObservationWorker.stop();
     await indicatorWorker.stop().catch((error) => {
       console.error(`指标工作器停止失败：${(error as Error).message}`);
       process.exitCode = 1;
@@ -123,6 +126,7 @@ async function main(): Promise<void> {
     intradayRiskWorker.start();
     ultraShortExitWorker.start();
     ultraShortWatchWorker.start();
+    researchObservationWorker.start();
     console.log("作业调度器已启动：30 秒 tick，时区 Asia/Shanghai。");
     console.log("指标工作器已启动。");
     console.log("统一 Agent session 执行器已启用。");
