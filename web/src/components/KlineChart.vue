@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 日线 K 线：价格统一用元，成交量统一用手，Tooltip 使用中文业务口径。
+// 日线 K 线：股票默认元/手；期货可显式传入价格与成交量单位，Tooltip 使用中文口径。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import * as echarts from "echarts/core";
 import { CandlestickChart, BarChart, LineChart } from "echarts/charts";
@@ -41,6 +41,9 @@ const props = withDefaults(
     /** MA 开关（缺省 MA5/MA20 开） */
     maVisible?: Record<(typeof MA_DEFS)[number]["key"], boolean>;
     macdVisible?: boolean;
+    priceUnit?: string;
+    volumeUnit?: string;
+    priceDigits?: number;
   }>(),
   {
     bars: undefined,
@@ -48,6 +51,9 @@ const props = withDefaults(
     title: "",
     maVisible: () => ({ ma5: true, ma10: false, ma20: true, ma60: false }),
     macdVisible: false,
+    priceUnit: "元",
+    volumeUnit: "手",
+    priceDigits: 2,
   },
 );
 
@@ -106,7 +112,7 @@ function formatValue(value: number, unit: string, digits = 2, minimumDigits = 0)
 }
 
 function formatPrice(value: number): string {
-  return formatValue(value, "元", 2, Math.abs(value) < 10_000 ? 2 : 0);
+  return formatValue(value, props.priceUnit, props.priceDigits, Math.abs(value) < 10_000 ? props.priceDigits : 0);
 }
 
 function tooltipHtml(bars: KlineBar[], index: number): string {
@@ -121,7 +127,7 @@ function tooltipHtml(bars: KlineBar[], index: number): string {
     ["最高", formatPrice(bar.high)],
     ["最低", formatPrice(bar.low)],
     ["涨跌幅", changeText],
-    ...(bar.volume == null ? [] : [["成交量", formatValue(bar.volume, "手")]]),
+    ...(bar.volume == null ? [] : [["成交量", formatValue(bar.volume, props.volumeUnit)]]),
     ...MA_DEFS.filter((def) => props.maVisible[def.key] && bar[def.key] != null)
       .map((def) => [def.name, formatPrice(bar[def.key] as number)]),
     ...(props.macdVisible
@@ -217,7 +223,7 @@ function render(): void {
           scale: true,
           gridIndex: 0,
           splitLine: { lineStyle: { color: cssVar("--line"), type: "dashed" } },
-          axisLabel: { color: cssVar("--ink-faint"), fontSize: 11, formatter: (value: number) => formatValue(value, "元") },
+          axisLabel: { color: cssVar("--ink-faint"), fontSize: 11, formatter: (value: number) => formatValue(value, props.priceUnit) },
         },
         ...(vol
           ? [
@@ -225,7 +231,7 @@ function render(): void {
                 scale: true,
                 gridIndex: 1,
                 splitLine: { show: false },
-                axisLabel: { color: cssVar("--ink-faint"), fontSize: 10, formatter: (value: number) => formatValue(value, "手") },
+                axisLabel: { color: cssVar("--ink-faint"), fontSize: 10, formatter: (value: number) => formatValue(value, props.volumeUnit) },
               },
             ]
           : []),
@@ -234,7 +240,7 @@ function render(): void {
               scale: true,
               gridIndex: macdAxisIndex,
               splitLine: { show: false },
-              axisLabel: { color: cssVar("--ink-faint"), fontSize: 10, formatter: (value: number) => formatValue(value, "元") },
+              axisLabel: { color: cssVar("--ink-faint"), fontSize: 10, formatter: (value: number) => formatValue(value, props.priceUnit) },
             }]
           : []),
       ],
@@ -329,7 +335,7 @@ onMounted(() => {
   window.addEventListener(THEME_CHANGED_EVENT, render);
 });
 
-watch([effectiveBars, () => props.maVisible, hasVolume, () => props.macdVisible], render, { deep: true });
+watch([effectiveBars, () => props.maVisible, hasVolume, () => props.macdVisible, () => props.priceUnit, () => props.volumeUnit, () => props.priceDigits], render, { deep: true });
 
 onBeforeUnmount(() => {
   window.removeEventListener(THEME_CHANGED_EVENT, render);
