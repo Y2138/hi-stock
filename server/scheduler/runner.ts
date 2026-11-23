@@ -546,6 +546,7 @@ async function executeDatasource(
     } else if (config.pipeline === "futures_daily_sync") {
       const { syncFuturesDaily } = await import("../datasource/futures-service.js");
       const summary = await syncFuturesDaily(deps.pool, run.target_date);
+      if (summary.status === "failed") throw new Error("期货核心行情全部缺失或失败；详见逐品种覆盖清单，未标记成功");
       result = {
         status: summary.status === "success" ? "success" : "partial",
         log: `期货日更：${summary.products.length} 品种，覆盖状态 ${summary.status}；详见期货覆盖清单。`,

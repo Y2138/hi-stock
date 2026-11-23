@@ -12,7 +12,7 @@ describe('期货目录与日线解析',()=>{
   expect(bars[0]).toMatchObject({date:'2026-11-16',volume:0,interest:0,adjustment:'none'});
  });
  it('拒绝缺价及错误高低价，不补零价格',()=>{
-  expect(()=>futuresBars({item:[{timestamp:0,open_price:null,high_price:10,low_price:9,close_price:10}]},'2026-11-16')).toThrow();
-  expect(()=>futuresBars({item:[{timestamp:0,open_price:10,high_price:9,low_price:8,close_price:11}]},'2026-11-16')).toThrow();
+  expect(()=>futuresBars({item:[{timestamp:Date.parse('2026-11-16T00:00:00+08:00'),open_price:null,high_price:10,low_price:9,close_price:10}]},'2026-11-16')).toThrow();
+  expect(()=>futuresBars({item:[{timestamp:Date.parse('2026-11-16T00:00:00+08:00'),open_price:10,high_price:9,low_price:8,close_price:11}]},'2026-11-16')).toThrow();
  });
 });

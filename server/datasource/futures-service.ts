@@ -1,5 +1,5 @@
 import type pg from 'pg';
-import { hithinkGet, type HithinkDeps } from './hithink.js';
+import { hithinkGet, HithinkEnvelopeError, HithinkHttpError, type HithinkDeps } from './hithink.js';
 import { storeBars } from './service.js';
 import { upsertFuturesContract, storeFuturesDailyDetail, storeFuturesRoll } from './commodity-service.js';
 import type { Bar } from './types.js';
@@ -26,20 +26,53 @@ export function futuresMonth(row: Row): string | null {
  throw new Error('目录日期与合约月份不一致');
 }
 export function futuresBars(data: unknown, target: string): Array<Bar & { interest: number | null }> {
- return items(data).map(r=>{
+ return items(data).filter(r=>r.timestamp!=null&&Number.isFinite(Number(r.timestamp))&&day(Number(r.timestamp))===target).map(r=>{
   const date=day(Number(r.timestamp));
   const [open,high,low,close]=[r.open_price,r.high_price,r.low_price,r.close_price].map(Number);
   if([r.open_price,r.high_price,r.low_price,r.close_price].some(x=>x==null)||![open,high,low,close].every(x=>x!==undefined&&Number.isFinite(x)&&x>0)||high!<Math.max(open!,close!,low!)||low!>Math.min(open!,close!))throw new Error('期货OHLC无效');
   return {date,open:open!,high:high!,low:low!,close:close!,volume:r.volume==null?undefined:Number(r.volume),turnover:r.turnover==null?undefined:Number(r.turnover),adjustment:'none' as const,interest:r.open_interest==null?null:Number(r.open_interest)};
- }).filter(r=>r.date<=target);
+ });
+}
+
+/** 只保留稳定错误类别及数值码；不把上游正文、URL或凭据写进缺口。 */
+export function futuresFailure(error: unknown, stage: string): Row {
+ if(error instanceof HithinkEnvelopeError)return {kind:'upstream_failed',stage,business_code:error.code};
+ if(error instanceof HithinkHttpError)return {kind:'upstream_failed',stage,http_status:error.status};
+ const sqlCode=(error as {code?:unknown})?.code;
+ if(typeof sqlCode==='string'&&/^[0-9A-Z]{5}$/.test(sqlCode))return {kind:'storage_failed',stage,sql_state:sqlCode};
+ return {kind:stage==='parse'?'invalid':stage==='fetch'?'upstream_failed':'storage_failed',stage};
 }
 
 /** 公开数据串行获取，密钥仅由 hithinkGet 从设置表读取。 */
 export async function syncFuturesDaily(pool: pg.Pool,target: string,deps: HithinkDeps = {}) {
  if(!/^\d{4}-\d{2}-\d{2}$/.test(target))throw new Error('目标日格式无效');
- const get=async(endpoint:string,params:Record<string,string|number>={})=>hithinkGet(endpoint,
- endpoint==='/api/futures/prices/daily' ? {...params,start:Date.parse(`${target}T00:00:00+08:00`),end:Date.parse(`${target}T23:59:59+08:00`)} : params,
- {...deps,db:pool});
+ const targetStart=Date.parse(`${target}T00:00:00+08:00`);
+ if(!Number.isFinite(targetStart)||day(targetStart)!==target)throw new Error('目标日无效');
+ // 单日接口实测会假空：固定前七日缓冲，只解析/存储目标日，不滚动取最近100根。
+ const get=async(endpoint:string,params:Record<string,string|number>={})=>{
+  const request=endpoint==='/api/futures/prices/daily'
+   ? {...params,start:params.start??targetStart-7*86400000,end:targetStart+86400000-1}:params;
+  for(let attempt=0;;attempt++){
+   try{return await hithinkGet(endpoint,request,{...deps,db:pool});}
+   catch(error){
+    // hithinkGet已负责429/4001；这里仅补瞬时5003及服务端5xx的两次有界退避。
+    const transient=(error instanceof HithinkEnvelopeError&&error.code===5003)||(error instanceof HithinkHttpError&&error.status>=500);
+    if(!transient||attempt>=2)throw error;
+    await (deps.sleep??((ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms))))(1000*2**attempt);
+   }
+  }
+ };
+ const loadTargetBars=async(code:string,onStage:(stage:string)=>void)=>{
+  for(let attempt=0;attempt<3;attempt++){
+   onStage('fetch');
+   const data=await get('/api/futures/prices/daily',{thscode:code,...(attempt>0?{start:targetStart-(7+attempt)*86400000}:{})});
+   onStage('parse');
+   const bars=futuresBars(data,target);
+   if(bars.length||attempt===2)return bars;
+   await (deps.sleep??((ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms))))(1000*2**attempt);
+  }
+  return [];
+ };
  const catalog:Row[]=[];
  for(let offset=0;offset<20000;offset+=1000){const page=items(await get('/api/futures/contracts/list',{limit:1000,offset}));catalog.push(...page);if(page.length<1000)break;if(offset===19000)throw new Error('合约分页超出安全上限');}
  const varieties=items(await get('/api/futures/varieties/list'));
@@ -63,30 +96,37 @@ export async function syncFuturesDaily(pool: pg.Pool,target: string,deps: Hithin
  return id;
  };
  for(const r of active){
+ let stage='catalog';
  try{
  const id=await saveContract(r,'listed',r.thscode);
- const bars=futuresBars(await get('/api/futures/prices/daily',{thscode:r.thscode}),target);
- if(!bars.length)throw new Error('无目标日前日线');
+ const bars=await loadTargetBars(r.thscode,value=>{stage=value;});
+ if(!bars.length){gaps.push({code:r.thscode,kind:'missing',stage:'fetch',attempts:3,reason:'三次请求仍无目标日日线，上游返回空或仅邻近日数据'});continue;}
+ stage='store_bars';
  await storeBars(pool,id,'futures_day',bars,SOURCE,{markIndicator:false});
- for(const bar of bars.slice(-1))await storeFuturesDailyDetail(pool,{code:r.thscode,tradeDate:bar.date,openInterest:bar.interest,source:SOURCE,rawSummary:{settlement_status:'missing',reason:'日K接口不提供结算价'}});
- const last=bars.at(-1)!.date;
- if(last> (latest??''))latest=last;
- if(last===target)written++;else gaps.push({code:r.thscode,kind:'stale',latest:last});
- }catch{gaps.push({code:r.thscode,kind:'upstream_failed_or_invalid'});}
+ stage='store_detail';
+ for(const bar of bars)await storeFuturesDailyDetail(pool,{code:r.thscode,tradeDate:bar.date,openInterest:bar.interest,source:SOURCE,rawSummary:{settlement_status:'missing',reason:'日K接口不提供结算价'}});
+ latest=target;written++;
+ }catch(error){gaps.push({code:r.thscode,...futuresFailure(error,stage)});}
  }
  await coverage(product,'daily',active.length>0&&written===active.length?'ok':written?'partial':'missing',active.length,written,latest,gaps);
  if(!variety)gaps.push({kind:'metadata_missing'});
  await coverage(product,'catalog',active.length&&variety?'ok':'missing',active.length,active.length,null,variety?[]:['品种资料缺失']);
+ let continuousStage='catalog';
  try{
- if(!cont)throw new Error('主连清单缺失');
+ if(!cont){gaps.push({kind:'missing',stage:'continuous_catalog'});await coverage(product,'continuous','missing',1,0,null,['主连清单缺失']);}
+ else {
  // 使用来源完整代码独立存储，绝不覆盖既有 CU0/LC0 的其他供应商历史。
  const id=await saveContract(cont,'main_continuous',cont.thscode);
- const bars=futuresBars(await get('/api/futures/prices/daily',{thscode:cont.thscode}),target);
- await storeBars(pool,id,'futures_day',bars,SOURCE,{markIndicator:false});
+ const bars=await loadTargetBars(cont.thscode,value=>{continuousStage=value;});
+ continuousStage='store_bars';await storeBars(pool,id,'futures_day',bars,SOURCE,{markIndicator:false});
  mainLatest=bars.at(-1)?.date??null;
- if(main&&active.some(r=>r.thscode===main.thscode)&&mainLatest===target)await storeFuturesRoll(pool,{continuousCode:cont.thscode,underlyingCode:main.thscode,tradeDate:target,methodCode:'source_defined_current',source:SOURCE,rollReason:'供应商当前主力清单；算法未披露；不回填历史映射'});
- await coverage(product,'continuous',mainLatest===target?'ok':'stale',1,mainLatest===target?1:0,mainLatest,['供应商换月算法未披露；历史成分映射未覆盖']);
- }catch{gaps.push({kind:'continuous_failed'});await coverage(product,'continuous','upstream_failed',1,0,null,['主连获取或映射失败']);}
+ continuousStage='store_mapping';
+ // 当前主力清单不能反填历史日期的成分。
+ if(target===day(Date.now())&&main&&active.some(r=>r.thscode===main.thscode)&&mainLatest===target)await storeFuturesRoll(pool,{continuousCode:cont.thscode,underlyingCode:main.thscode,tradeDate:target,methodCode:'source_defined_current',source:SOURCE,rollReason:'供应商当前主力清单；算法未披露；不回填历史映射'});
+ if(!bars.length)gaps.push({code:cont.thscode,kind:'missing',stage:'continuous_fetch',attempts:3,reason:'三次请求仍无目标日主连日线'});
+ await coverage(product,'continuous',bars.length?'ok':'missing',1,bars.length?1:0,mainLatest,['供应商换月算法未披露；历史成分映射未覆盖']);
+ }
+ }catch(error){const gap={code:cont?.thscode,...futuresFailure(error,continuousStage)};gaps.push(gap);await coverage(product,'continuous','upstream_failed',1,0,null,[gap]);}
  // 仓单原值及单位缺口逐条保存，不把仓单冒充库存，不猜吨/张换算。
  try{
  if(!main)throw new Error('缺主力合约');
@@ -99,5 +139,5 @@ export async function syncFuturesDaily(pool: pg.Pool,target: string,deps: Hithin
  await coverage(product,'inventory','unsupported',null,0,null,['本接口无总库存；原铜官方周库存由独立任务保留']);
  report.push({product,expected:active.length,written,latest,continuous_latest:mainLatest,gaps});
  }
- return {target,products:report,status:report.every(r=>r.expected>0&&r.expected===r.written&&r.continuous_latest===target)?'success':'partial'};
+ return {target,products:report,status:report.every(r=>r.expected>0&&r.expected===r.written&&r.continuous_latest===target)?'success':report.every(r=>r.written===0&&r.continuous_latest!==target)?'failed':'partial'};
 }
