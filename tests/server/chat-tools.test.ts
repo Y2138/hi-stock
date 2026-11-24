@@ -94,6 +94,10 @@ describe.skipIf(!prepared)("数据库查询与批量动作工具（stock_test �
   }
 
   it("任意标的研究一次返回最新正式画像、财报、估值与缺口，不要求入池且识别待重算", async () => {
+    // 此用例使用连续自然日合成序列，显式提供测试日历，不绕过生产日线写入门禁。
+    await pool.query(`INSERT INTO market_trading_day(trade_date,is_open,source)
+      SELECT day::date,true,'test' FROM generate_series('2026-04-01'::date,'2026-06-20'::date,'1 day') day
+      ON CONFLICT(trade_date) DO NOTHING`);
     const id = (await pool.query<{ id: string }>(
       "INSERT INTO market_instrument (code,name,kind) VALUES ('990071.SZ','池外研究测试','stock') RETURNING id::text",
     )).rows[0]!.id;

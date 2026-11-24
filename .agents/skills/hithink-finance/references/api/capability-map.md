@@ -2,7 +2,7 @@
 
 > 根据用户意图快速定位到具体 REST 端点。本页只做路由，参数与字段细节在各端点详情页。
 
-## 全部端点一览（59 个）
+## 全部端点一览（80 个）
 
 ### 元信息（2 个）
 
@@ -105,6 +105,34 @@
 
 详情：[endpoints-fund.md](endpoints-fund.md)
 
+### 期货（21 个）
+
+| 端点 | 用途 | 典型问题 |
+| --- | --- | --- |
+| `GET /api/futures/prices/daily` | 期货合约 / 商品指数日 K（端外仅日线） | 「沪铜最近一个月日 K」「这个期货品种的历史日线」 |
+| `GET /api/futures/prices/intraday` | 当前交易日分时（端外仅当前交易日） | 「螺纹钢今天分时走势」 |
+| `GET /api/futures/contracts/detail` | 单个合约详情 | 「CU2701 什么时候最后交易日」 |
+| `GET /api/futures/contracts/list` | 合约目录分页快照 | 「有哪些沪铜合约」「反查有效合约代码」 |
+| `GET /api/futures/contracts/main-continuous-list` | 各品种主连清单 | 「沪铜主连代码是什么」 |
+| `GET /api/futures/contracts/main-list` | 各品种主力合约清单 | 「现在沪铜主力是哪个合约」 |
+| `GET /api/futures/contracts/secondary-main-list` | 各品种次主力合约清单 | 「沪铜次主力是哪个」 |
+| `GET /api/futures/contracts/commodity-index-list` | 期货商品指数合约清单 | 「有哪些期货商品指数」 |
+| `GET /api/futures/varieties/list` | 期货品种目录与交易属性 | 「沪铜一手多少吨、夜盘到几点」 |
+| `GET /api/futures/variety-plates/list` | 品种所属板块 | 「沪铜属于哪个板块」 |
+| `GET /api/futures/positions/variety-daily` | 指定交易日全品种持仓 | 「某天各品种持仓汇总」 |
+| `GET /api/futures/positions/company-variety-daily` | 指定品种的期货公司持仓 | 「某天沪铜各席位多空」 |
+| `GET /api/futures/positions/contract-daily` | 单合约各公司日持仓与均价 | 「这个合约今天谁在加多」 |
+| `GET /api/futures/positions/contract-historical` | 单合约单公司历史持仓 | 「某席位近半年在这个合约上的持仓变化」 |
+| `GET /api/futures/positions/company-list` | 期货公司列表 | 「有哪些期货公司席位」 |
+| `GET /api/futures/basis/main-continuous-latest` | 主连最新基差快照 | 「今天沪铜基差多少」 |
+| `GET /api/futures/basis/historical` | 历史基差序列 | 「沪铜基差最近一年走势」 |
+| `GET /api/futures/calendar/trading-schedule` | 期货交易日与交易时段 | 「这个合约下周哪几天交易」 |
+| `GET /api/futures/calendar/session-timeline` | 最近交易日交易时间轴 | 「今天这个合约几点开盘收盘」 |
+| `GET /api/futures/warehouse-receipts/historical` | 历史仓单 | 「沪铜仓单最近怎么变化」 |
+| `GET /api/futures/fundamentals/indicators-historical` | 期货 F10 基本面指标（**端外固定返回 `code=2004`，仅 AI 客户端可用**） | 「沪铜基本面指标」——端外不可用 |
+
+详情：[futures/index.md](futures/index.md)
+
 ### 特色数据（11 个）
 
 | 端点 | 用途 | 典型问题 |
@@ -149,6 +177,13 @@
 2. 用 `/api/a-share-index/constituents/ths-stock-list?thscode=<板块代码>` 取当前成分股。
 3. 仅对用户需要的有限成分调用 `/api/a-share/prices/snapshot?thscodes=<逗号列表>` 获取行情；全量结果落盘，不写入对话。
 
+### 期货品种到行情
+
+1. 用 `/api/meta/tickers/search?q=<品种或合约名>` 或 `contracts/main-continuous-list` / `contracts/main-list` 拿 `thscode`（不要手拼代码，`varieties/list` 的 `main_contract_thscode` 可能为 `null`；`meta` 结果里期权也会命中，按 `asset_type` 过滤）。
+2. 需要具体合约时用 `contracts/list` 分页反查，确认未到期（`last_trade_date`）。
+3. 日 K 用 `prices/daily`（端外只有日线），当日分时用 `prices/intraday`。
+4. 需要基差时，先 `basis/main-continuous-latest` 按 `default_value=Y` 选默认口径，再传 `spot_indicator_id` 取 `basis/historical`。
+
 ### 财务与行情联合分析
 
 1. 用财报端点获取指定报告期数据。
@@ -163,15 +198,17 @@
 
 ## 能力边界
 
-- 覆盖 **A 股**（沪深京）、**A 股指数 / 板块**和公募基金资料、经理、披露、财务、净值、收益与公开资讯；场内行情覆盖 ETF/LOF 快照与 ETF 日线。
-- **不覆盖**：分钟 K、tick、Level-2、港股、美股、基金申赎交易、期货、期权。
+- 覆盖 **A 股**（沪深京）、**A 股指数 / 板块**、公募基金资料/经理/披露/财务/净值/收益/公开资讯（场内行情含 ETF/LOF 快照与 ETF 日线），以及**期货**的合约目录、主连/主力、品种与板块、日 K、当日分时、持仓、仓单、基差、交易日与交易时间轴。
+- **不覆盖**：分钟 K、tick、Level-2、港股、美股、基金申赎交易、期权。
+- **期货口径边界**：端外（REST）只有日 K 和当前交易日分时，多周期 K 线与历史分时仅同花顺 AI 客户端内可用；期货 F10 基本面指标端外固定 `code=2004`，不允许用仓单、基差或持仓替代。
 - 财务指标端点不返回行业均值、评分、排名或点评。
 - 端点提供数据，不提供回测引擎、alpha 模型或确定性投资建议。
 - 异动分析（`anomaly-analysis-list` / `anomaly-analysis-stock`）仅支持当日快照，不支持历史查询。
 
 ## 参数语义提醒
 
-- `thscode` 必须带交易所后缀（`.SH` / `.SZ` / `.BJ` / `.TI`），纯 6 位代码不被接受。
+- `thscode` 必须带交易所后缀（`.SH` / `.SZ` / `.BJ` / `.TI` / `.SHF` / `.DCE` / `.CZC` / `.CFE` / `.INE` / `.GFE`），纯 6 位代码不被接受；期货代码必须大写。
+- 期货代码有四种形态并存：具体合约（`CU2701.SHF`）、主连（`CUZL.SHF`）、连续（`CU00.SHF`）、加权（`SS8888.SHF`），不能互换使用于所有端点。
 - 毫秒时间戳（`start` / `end` / `date_ms`）与 `YYYY-MM-DD` 字符串（`from` / `to` / `date`）不可互换，按端点详情页要求传参。
 - `limit/offset` 与 `page/size` 是两种不同分页模型，不要混用。
 - 端点名相似时先确认资产类别、是否支持批量、是否允许省略代码，以及时间窗口上限。

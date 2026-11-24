@@ -367,7 +367,7 @@ export function buildMarketDomainTools(deps: { pool: pg.Pool; sessionId: string 
     {
       name: "stock_research_query",
       label: "查询标的研究证据",
-      description: "一次读取最多20个本地标的在as_of目标日及此前的日线、正式股性、财报和估值。任务内自动绑定任务目标日，普通对话默认今日；财报披露日和报告期都不能晚于目标日。不要求在池内，不同步、不入池；返回日期、计算版本和缺口。本地缺失用扶摇补证，新闻用 web_search。",
+      description: "一次读取最多20个本地标的在as_of目标日及此前的日线、正式股性、财报和估值。任务内自动绑定任务目标日，普通对话默认今日；财报按数据截至的报告日（最近一份包含该报告期的财报日期，不是首次披露日）和报告期双重过滤，都不晚于目标日。不要求在池内，不同步、不入池；返回日期、计算版本和缺口。本地缺失用扶摇补证，新闻用 web_search。",
       parameters: StockResearchSchema,
       execute: async (_id, raw) => {
         const input = validateToolInput<Static<typeof StockResearchSchema>>("stock_research_query", StockResearchSchema, raw);

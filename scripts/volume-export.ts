@@ -1,5 +1,5 @@
 // CLI：导出数据卷快照（npm run volume:export [-- --out-dir <目录>] [-- --keep 14]）
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §九
 // pg_dump 工具：优先本机（主版本须与库一致），缺失时降级 docker compose postgres 容器内工具。
 import path from "node:path";
 import { pathToFileURL } from "node:url";

@@ -32,7 +32,7 @@ let injectedFallbackRuntime: ResolvedChatModel | null = null;
 export const DEFAULT_LLM_MAX_RETRIES = 2;
 export const DEFAULT_LLM_MAX_RETRY_DELAY_MS = 30_000;
 
-/** 模型降级目标（specs/模型降级与首token兜底/状态.md 第三节）：glm-5.3 优先，不可用时 GLM-5.3-Flash。 */
+/** 模型降级目标（docs/product/智能助手与模型接入.md 第三节）：glm-5.3 优先，不可用时 GLM-5.3-Flash。 */
 export const FALLBACK_MODEL_KEYS = ["glm-5.3", "GLM-5.3-Flash"] as const;
 
 /**

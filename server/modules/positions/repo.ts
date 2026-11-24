@@ -1,5 +1,5 @@
 // 持仓 repo：当前持仓（join 最新收盘）、变更事件流、受控记录持仓变化（事务）
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §4.1、§十；产品方案 §6.6
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §4.1、§十；产品方案 §6.6
 // 盈亏口径：pnl_amount = 数量 × (最新收盘 − 成本)
 import type pg from "pg";
 import { requireAccount } from "../accounts/repo.js";

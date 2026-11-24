@@ -1,5 +1,5 @@
 // 数据卷 HTTP 路由测试（M1 收尾波次 A 项）
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九、§十、§十二
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §九、§十、§十二
 // - GET /api/volume/snapshots：列表形状与 manifest 摘要
 // - POST /api/volume/export：真实导出小型测试库（out_dir 隔离到临时目录），列表出现新行
 // - POST /api/volume/restore：参数校验 400（缺 path / 非 .dump / 路径穿越 / 文件不存在）

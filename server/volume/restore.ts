@@ -1,5 +1,5 @@
 // 数据卷恢复：pg_restore 到目标库 + 强制 manifest 校验
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §九
 // 流程：读取并校验 manifest（sha256 防篡改）→ 目标库建 schema → pg_restore →
 // 强制校验 manifest vs 库内计数（不一致列出差异并抛错，不静默通过）→ 写 volume_snapshot 恢复记录。
 // 默认模式要求目标库为空库（pg_restore 全量恢复 schema+数据，随后 runMigrations 补齐更新迁移）；

@@ -97,6 +97,26 @@ export async function queueIndicatorRecompute(pool: pg.Pool, code: string): Prom
   if (!queued.rowCount) throw new Error(`标的 ${code} 没有日线，无法补算指标`);
 }
 
+/** 日更收尾对账：目标日有行情但无指标的序列补入 dirty，不干扰已排队的 generation。 */
+export async function queueMissingDailyIndicators(db: Pick<pg.Pool, "query">, targetDate: string): Promise<number> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate) || !Number.isFinite(Date.parse(`${targetDate}T00:00:00Z`)) || new Date(`${targetDate}T00:00:00Z`).toISOString().slice(0, 10) !== targetDate) {
+    throw new Error("指标对账目标日必须是有效 YYYY-MM-DD");
+  }
+  const queued = await db.query(
+    `INSERT INTO market_indicator_dirty (instrument_id,freq,earliest_date,generation,reason,updated_at)
+     SELECT DISTINCT bar.instrument_id,'day',bar.bar_date,1,'日更收尾：目标日有行情但缺指标',now()
+       FROM market_bar bar
+       JOIN market_trading_day calendar ON calendar.trade_date=bar.bar_date AND calendar.is_open
+      WHERE bar.freq='day' AND bar.bar_date=$1::date
+        AND NOT EXISTS (SELECT 1 FROM market_indicator_value value
+          WHERE value.instrument_id=bar.instrument_id AND value.freq=bar.freq
+            AND value.bar_date=bar.bar_date AND value.bar_time=bar.bar_time)
+     ON CONFLICT (instrument_id,freq) DO NOTHING
+     RETURNING instrument_id`, [targetDate],
+  );
+  return queued.rowCount ?? 0;
+}
+
 export async function nextDirtyIndicator(pool: pg.Pool): Promise<DirtyRow | null> {
   const result = await pool.query<DirtyRow>(
     `SELECT instrument_id::text, freq, generation::text

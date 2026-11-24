@@ -29,7 +29,7 @@ export function shanghaiDate(date: Date): string {
   return shanghaiDateFormatter.format(date);
 }
 
-/** 交易日历缺行时仅用于降级：周一至周五继续取实际行情，周末直接跳过。 */
+/** 历史目标日必须有显式交易日历；仅未来目标日允许暂时按工作日降级。 */
 export function isWeekdayDate(date: string): boolean {
   const day = new Date(`${date}T00:00:00Z`).getUTCDay();
   return day >= 1 && day <= 5;
@@ -45,15 +45,16 @@ function shanghaiMinuteOfDay(date: Date): number {
 /** 日更快照只处理已收盘的当前交易日；历史目标日改走历史 K 线。 */
 export async function dailyMarketGate(db: Db, targetDate: string, now: Date): Promise<DailyMarketGate> {
   const today = shanghaiDate(now);
-  if (targetDate > today) {
-    return { action: "reject", reason: `目标日 ${targetDate} 晚于当前上海日期 ${today}` };
-  }
+  const isFuture = targetDate > today;
   const calendar = await db.query<{ is_open: boolean }>(
     "SELECT is_open FROM market_trading_day WHERE trade_date = $1",
     [targetDate],
   );
-  const isOpen = calendar.rows[0]?.is_open ?? isWeekdayDate(targetDate);
-  if (!isOpen) {
+  if (!calendar.rows[0]) {
+    if (!isFuture) return { action: "reject", reason: `目标日 ${targetDate} 缺少交易日历记录，拒绝按工作日推测` };
+    return { action: "run", mode: "snapshot" };
+  }
+  if (!calendar.rows[0].is_open) {
     return { action: "skip", reason: `目标日 ${targetDate} 为非交易日` };
   }
   if (targetDate === today && shanghaiMinuteOfDay(now) < 15 * 60 + 30) {
@@ -64,8 +65,8 @@ export async function dailyMarketGate(db: Db, targetDate: string, now: Date): Pr
 
 /**
  * cron 入队门禁：目标日是否为交易日。
- * 周末一律休市；日历有行时以 is_open 为准（含显式休市行）；日历未覆盖的日期
- * （次年未发布或目录同步长期缺数）按工作日推测，与 dailyMarketGate 的降级口径一致。
+ * 周末一律休市；日历有行时以 is_open 为准（含显式休市行）；日历未覆盖的未来日期
+ * 才允许按工作日推测，历史缺行必须由调用方拒绝。
  */
 export async function isScheduledTradingDay(db: Db, date: string): Promise<boolean> {
   if (!isWeekdayDate(date)) return false;

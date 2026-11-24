@@ -1,4 +1,4 @@
-// 模型降级兜底（specs/模型降级与首token兜底/状态.md 第九节 8 条验收）。
+// 模型降级兜底（docs/product/智能助手与模型接入.md 第九节 8 条验收）。
 // 全部用 faux provider 脚本化响应，不调用真实模型；数据库为 stock_test 真实库。
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import type pg from "pg";

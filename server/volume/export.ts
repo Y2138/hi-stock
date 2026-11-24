@@ -1,6 +1,6 @@
 // 数据卷导出：pg_dump -Fc → datavolume/stock_YYYY-MM-DD_HHmmss.dump + 同名 .manifest.json，
 // 写 volume_snapshot 行，滚动保留最近 14 份（删最旧 dump+manifest+DB 行）。
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §九
 //
 // pg_dump 工具探测（README「稳定命令」亦有说明）：
 // 优先本机 pg_dump（主版本须与目标库一致，PostgreSQL 16）；本机缺失或主版本不符时

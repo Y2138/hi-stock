@@ -1,5 +1,5 @@
 // 边界 1 服务层：把策略评估器产物归一成「独立信号事件 + 观察计划」，不再只取顶层 invalidation。
-// 契约：specs/策略产物契约与影子接入/实施契约.md（PM 定稿）。
+// 契约：docs/product/Stock_策略运行时与每日计划统筹_产品需求_v1.0.md（PM 定稿）。
 // 五态 observing/pending/triggered/invalidated/expired；连续命中只更新证据与 last_seen，不重置状态、首发、风险锚与窗口。
 // 本文件只做影子写入：不写自选/关注、不产生通知，调用方需显式开启（见 shadowSignalEventsEnabled）。
 import crypto from "node:crypto";

@@ -340,7 +340,7 @@ const NIGHTLY_TRIGGER_REASON: Record<string, string> = {
   新低回升: "60日新低后回升",
   急跌反转: "13日急跌后反抽",
 };
-/** 板块优先级按当日确认度分档，触发线不再决定排序（口径见 docs/strategy/板块机会筛选确认度分级口径.md）。 */
+/** 板块优先级按当日确认度分档，触发线不再决定排序（口径见 docs/product/关注池股性与阶段展示口径.md）。 */
 const NIGHTLY_TIER_ORDER: Record<string, number> = { A: 0, B: 1, C: 2 };
 
 interface NightlySectorConfirmation {

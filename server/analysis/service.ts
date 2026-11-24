@@ -314,7 +314,7 @@ const SECTOR_TREND_RULES = {
   minTurnover20Yuan: 20_000_000,
 } as const;
 
-/** 板块当日确认度分级（docs/strategy/板块机会筛选确认度分级口径.md）：
+/** 板块当日确认度分级（docs/product/关注池股性与阶段展示口径.md）：
  *  触发线只决定是否进入观察，优先级由当日确认度决定。权重与阈值在冻结回测前是初始值，不得临场调参。 */
 const SECTOR_CONFIRMATION_RULES = {
   /** M1 上涨家数占比：≥90% 得 2 分，≥80% 得 1 分。 */

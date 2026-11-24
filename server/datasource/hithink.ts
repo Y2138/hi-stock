@@ -1,5 +1,5 @@
 // hithink 通道：TypeScript 直连扶摇 HTTP API（base https://fuyao.aicubes.cn）
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §5.2
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §5.2
 // 端点路径、参数、信封与错误码语义按扶摇官方接口逐端点验证。
 // 认证头沿用参照实现的 X-api-key；Key 只从 PostgreSQL system_setting 读取，
 // 不入日志、URL、API 响应或任何审计输出。
@@ -430,8 +430,10 @@ async function fetchStatements(
   path: string,
   code: string,
   deps: HithinkDeps,
+  periods = 4,
 ): Promise<FinancialStatementItem[]> {
-  const data = (await hithinkGet(path, { thscode: code, period: "quarterly", limit: 4 }, deps)) as {
+  if (!Number.isInteger(periods) || periods < 1 || periods > 20) throw new Error("财务期数必须为1–20");
+  const data = (await hithinkGet(path, { thscode: code, period: "quarterly", limit: periods }, deps)) as {
     item?: unknown;
   };
   if (!Array.isArray(data?.item)) throw new Error(`${path} 响应中的 item 格式异常`);
@@ -460,6 +462,13 @@ export async function fetchLatestFundamental(
   const incomeRow = income.find((row) => Number(row.period_end_ms) === periodMs)!;
   const balanceRow = balance.find((row) => Number(row.period_end_ms) === periodMs)!;
   const cashflowRow = cashflow.find((row) => Number(row.period_end_ms) === periodMs)!;
+  return deriveFundamental(code, periodMs, incomeRow, balanceRow, cashflowRow);
+}
+
+function deriveFundamental(
+  code: string, periodMs: number,
+  incomeRow: FinancialStatementItem, balanceRow: FinancialStatementItem, cashflowRow: FinancialStatementItem,
+): FundamentalQuote {
   const revenue = nullableNumber(incomeRow.operating_income);
   const operatingCosts = nullableNumber(incomeRow.operating_costs);
   const netProfit = nullableNumber(incomeRow.net_profit);
@@ -497,6 +506,37 @@ export async function fetchLatestFundamental(
       ratio_basis: "同一报告期报表推导：净利润/股东权益、(营收-成本)/营收、负债/资产",
     },
   };
+}
+
+/** 历史同步只接受三表均有真实报告日的共同报告期，不以期末合成日期。该日期是最近一份包含该期的财报日期（数据截至的报告日），不是首次披露日。 */
+export async function fetchFundamentalHistory(code: string, deps: HithinkDeps = {}, periods = 8) {
+  if (!A_SHARE_CODE_RE.test(code)) throw new Error(`基本面代码必须是 A 股完整代码：${code}`);
+  const income = await fetchStatements("/api/a-share/financials/income-statements", code, deps, periods);
+  const balance = await fetchStatements("/api/a-share/financials/balance-sheets", code, deps, periods);
+  const cashflow = await fetchStatements("/api/a-share/financials/cash-flow-statements", code, deps, periods);
+  const quotes: FundamentalQuote[] = [];
+  const gaps: Array<{ report_period: string; reason: string }> = [];
+  const periodValues = [...new Set([...income, ...balance, ...cashflow].map(row => Number(row.period_end_ms)))].sort((a, b) => b - a);
+  for (const periodMs of periodValues) {
+    if (!Number.isFinite(periodMs) || periodMs <= 0 || !Number.isFinite(new Date(periodMs).getTime())) continue;
+    const rows = [income, balance, cashflow].map(items => items.find(row => Number(row.period_end_ms) === periodMs));
+    const reportPeriod = msToDate(periodMs);
+    if (rows.some(row => !row)) {
+      gaps.push({ report_period: reportPeriod, reason: "三表报告期不齐" });
+      continue;
+    }
+    if (rows.some(row => {
+      const value = nullableNumber(row!.report_date_ms);
+      return value === null || value < periodMs || !Number.isFinite(new Date(value).getTime());
+    })) {
+      gaps.push({ report_period: reportPeriod, reason: "三表披露日缺失或非法，未用报告期末替代" });
+      continue;
+    }
+    const quote = deriveFundamental(code, periodMs, rows[0]!, rows[1]!, rows[2]!);
+    quote.rawSummary.disclosure_date_basis = "reported";
+    quotes.push(quote);
+  }
+  return { quotes, gaps };
 }
 
 /** hithink 通道：支持日线（kline）；快照经 fetchSnapshot 走同一限流器 */

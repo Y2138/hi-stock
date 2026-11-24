@@ -1,5 +1,5 @@
 // 对话/确认制/审计 HTTP 路由（M2）
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §6.3、§6.4、§十
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §6.3、§6.4、§十
 // SSE 协议（§6.4）：
 //   POST /api/chat/:sessionId/messages 建立流，帧类型 text/tool_start/tool_update/tool_end/
 //   confirmation_pending/done/error（event: <类型>\ndata: <JSON>\n\n）。

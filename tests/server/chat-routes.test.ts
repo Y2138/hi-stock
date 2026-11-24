@@ -1,5 +1,5 @@
 // 对话 HTTP/SSE 路由测试（M2）：faux provider 全链路
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §6.1/§6.4/§十二
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §6.1/§6.4/§十二
 // - POST /api/chat/:sessionId/messages：SSE 帧 text/tool_*/confirmation_pending/done
 // - 会话/消息持久化往返（chat_message.content 纯 JSON 恢复）
 // - 未配置降级：数据库未选当前模型 / 当前厂商无 key → 503 LLM_NOT_CONFIGURED

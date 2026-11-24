@@ -1,5 +1,5 @@
 // 01 竞价判定：09:18–09:25 对 03 关注池逐只采样、判定并提醒；只更新关注池，不新增候选。
-// 所有阈值都是初始口径，待真实成交样本校准；未标注时按 docs/超短策略/01-竞价判定.md 默认值。
+// 所有阈值都是初始口径，待真实成交样本校准；未标注时按 docs/product/策略口径与提示词规范.md 默认值。
 import type { TransactionDb } from "../../db/transaction.js";
 import { fetchHithinkDataset } from "../../datasource/hithink-datasets.js";
 import type { HithinkDeps } from "../../datasource/hithink.js";

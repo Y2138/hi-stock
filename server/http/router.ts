@@ -1,5 +1,5 @@
 // node:http 路由：JSON 解析、静态页面托管、统一错误 {code,message}
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v1.0.md §五、§七
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §五、§七
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -299,6 +299,7 @@ export function createApiServer(deps: { pool: pg.Pool }): http.Server {
     route("GET", "/api/futures/:code", futuresRoutes.detail),
     route("GET", "/api/market/bars", marketRoutes.bars),
     route("GET", "/api/market/calendar", marketRoutes.calendar),
+    route("GET", "/api/market/research", marketRoutes.research),
     route("GET", "/api/market/structure", marketRoutes.structure),
     route("GET", "/api/market/coverage", marketRoutes.coverage),
     route("GET", "/api/macro/factors", macroRoutes.factors),

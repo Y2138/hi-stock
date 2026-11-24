@@ -1,5 +1,5 @@
 // web/ 独立 Vite 工程：构建产物输出 server/public/app/（gitignored，由 server 托管）
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §1.2 T2、§三
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §1.2 T2、§三
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { defineConfig } from "vite";

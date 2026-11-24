@@ -1,5 +1,5 @@
 // 对话界面展示模型：pi AgentMessage JSON（chat_message.content）→ 渲染用 UiMessage
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §6.1（content 纯 JSON 持久化）
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §6.1（content 纯 JSON 持久化）
 import type { ChatMessageRow, Confirmation, ConfirmationStatus } from "../api/types";
 
 export interface UiConfirmation {

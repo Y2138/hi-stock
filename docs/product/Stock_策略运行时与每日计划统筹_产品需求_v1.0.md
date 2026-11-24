@@ -1372,3 +1372,219 @@ Agent：调用受控工具、解释结果、写入受控业务对象
 - 消息面探查的策略关联层扩展到当前持仓标的（`checked_codes` 校验同步接受关注池与持仓代码），使持仓预案具备逐股消息输入。
 - 抓取健壮性：`web_fetch` 对缺失 Content-Type 的响应按正文嗅探判定文本类型（财联社 detail 页）；透明解压 gzip/deflate/br（含解压大小封顶，SMM 等强制压缩站点）；服务端漏发中间证书时按叶子证书 AIA 下载签发者证书补链重试（仅接受 CA 标志、非自签、可验签的中间证书，自签证书不得成为信任锚，中航期货等站点可用）。
 - 金十数据在 `domains:["jin10.com"]` 检索无 48 小时内条目时，直接核验官网快讯文件 `https://www.jin10.com/flash_newest.js`（逐条含 time 发布时间）作为金十来源。
+
+---
+
+## 策略产物契约与影子接入（影子试点，未切换生产）
+
+> 并入自 `specs/策略产物契约与影子接入/实施契约.md`（2026-11-23 仓库清理）。
+>
+> 现状：影子链路默认关闭（`HISTOCK_SHADOW_SIGNAL_EVENTS` 未设为 `1` 时不写入 `strategy_signal_event`、`observation_plan`、`strategy_signal_outcome`）；`two_year_reversal` 仅为影子试点，生产链路未切换。要开启必须先由主管逐项核对最近 20 个已完成交易日的差异并明确授权，本文不构成开启依据。
+
+## 策略产物契约与影子接入实施契约
+
+### 状态与授权
+
+2026-11-12更新：边界1影子基础链路阶段完成，用户授权继续一次只推进一条链路。PM选定two_year_reversal作为唯一真实业务写入试点，执行判据更新在原第3、4、5、6节；不新建章节或另起方案。第7、8节保留此前交付与复核时间，不代表当前生产已切换。
+
+本段允许准备实施与对照，不授权立即打开生产开关。主管必须先收到最近20个已完成交易日的逐项差异清单，再明确允许开启。其他策略保持原链路；不动页面、server/agent、策略正文、任务提示词，不清业务数据，不改名或修改已应用迁移。已有持仓退出规则、个人/账户权限和人工特别关注保留策略不变。历史未提交文件不得顺带修改；必要集成交主管安排。
+
+### 一、契约字段与语义（PM定稿）
+
+#### 共同信封
+
+- contract_version：契约schema版本，与策略规则版本分开。
+- source_kind：strategy/manual，不能为手工来源虚构策略编码。
+- source_ref：自动来源为评估运行/旧信号引用；手工来源为service接收请求的稳定引用。
+- producer_code / producer_version：注册适配器稳定编码和版本；运行时不按策略名称猜结构。
+- strategy_code：仅自动来源必填；instrument_id：标的身份；scope：个人/账户/共享范围及对应稳定引用。
+- generated_at / data_as_of / available_at：生成时间、事实截至时间、事实当时可得时间。未知可得时间必须标缺口，不能由目标日倒填。
+- input_fingerprint / rule_hash：本次输入指纹与规则摘要；evidence_refs / gaps：证据引用与缺数。价格字段须有currency、原始/复权口径、计算时点与证据来源。
+
+#### 观察计划
+
+- plan_id / revision：计划身份与修订；event_id：归属独立机会事件。
+- lifecycle_status：draft/published/paused/ended，仅描述计划管理状态。
+- actionable：是否具备明确触发窗口、触发规则与取消规则；不是“建议买入”或已成交。
+- trigger：规则编码/版本、参数、可执行价格区间或条件、开始/结束交易时点。
+- risk：结构化风险对象，见下；缺必要项时计划只能为draft且actionable=false。
+- observation_policy：所需数据频率、新鲜度、规则引用；本轮仅校验和保存，不接真实盘中订阅。
+- evaluation_policy：评估器编码/版本、起算方式、期限、费用与成交假设；未配置不得默认0收益。
+- execution_mode：本轮仅shadow；计划可以在影子空间published，但不得产生业务订阅或外发副作用。
+
+#### 独立信号事件
+
+- event_id、来源/标的/范围/规则身份、first_seen、last_seen、first_emitted_at、plan_id、current_revision。
+- status五态：observing（只发现或条件不足）、pending（计划完整待触发）、triggered（规则满足，非成交）、invalidated（取消条件满足）、expired（入场窗口结束未触发）。
+- observing→pending；pending→triggered/invalidated/expired；triggered→invalidated可以记录后续破位，但必须保留triggered_at与原触发事件，不能抹去曾触发事实。暂停属于计划管理层，缺数属于健康层，不增加第六个机会状态。
+- 每次状态转移追加事件，含前后状态、原因、事实时间、执行者、关联运行与幂等键。
+- 每日命中追加观测/证据，更新last_seen，不重置first_seen、风险锚或有效窗口。同来源同标的同触发类型同规则同范围，仅允许一个存续事件。
+- 新事件需要旧事件结束且触发条件已复位后重新满足；新评估run_id或新日期本身不是新事件。历史不完整、无法判断复位时不伪造事件分组。
+- 重复请求同幂等键只能得到同一计划/事件结果；并发创建也必须保证这一点。
+
+#### 风险与价格对象
+
+风险不是统一止损公式。每个价位记录kind、value或lower/upper、price_basis、as_of、evidence_ref、comparison（如收盘跌破）、适用窗口。缺项不得从另一个策略借值。
+
+- initial_stop：波段已计算的初始风险线；来自其evidence.initial_stop，保留原算法，不重新算固定百分比。
+- signal_low：两年反转事件低点；signal_low与signal_low_raw须明确各自价基，不能混入波段止损公式。本轮先保全字段，非试点策略不改变生产结果。
+- confirmation_must_exceed：波段T+1确认突破价，来自原评估证据；不是生成时已经触发。
+- confirmation_price_cap：波段追高上限，超过即不满足原执行窗口，不解释为止损位。
+- invalidation：规则编码/参数及可读说明，可引用风险线或资格失效条件；价格风险与资格失效分开。
+- 手工来源首期接受明确的突破/跌破/区间/到期规则，缺失就保留observing/draft；本轮不让LLM补价格，不调用Agent。
+- 可行动完整率的分母只包含actionable=true的计划；另报草案总数与缺项数量，不能把不完整计划丢弃来伪装覆盖率100%。
+
+### 二、存储与接口（DM确认落位）
+
+PM建议最小存储职责，具体表名、列类型、索引、FK与API形态由DM定：
+
+1. 必要计划存储：保存计划修订、信号事件及追加状态变化。物理是否分成计划/事件/记录表由DM决定，不要求九个模块各建表。
+2. `strategy_signal_outcome`：关联旧signal_id与新event_id/plan_revision（手工无旧signal_id），记录evaluation_code/version、观察起止、entry_basis、可成交性、费用、期限、结果、基准覆盖和不可评估原因；相同事件/修订/评估口径/期限幂等。
+3. 两类outcome必须区分：固定前瞻诊断、完整策略执行模拟；不可互相冒充。起点取valid_from与实际生成可得时间较晚者，统一诊断从之后可交易时点起算；盘中策略实际口径另由其评估器处理。
+4. 不成熟为pending；缺行情为unavailable；不可成交单列；未配置评估为not_configured。都不能记0收益。
+5. 新增迁移从当前最新编号后顺延（当前盘点到0194，执行前DM再次核对，不能预占冲突编号）；保持空库/现有库前向可用。
+6. service入口至少支持“提交手工影子草案”“消费波段评估生成影子计划”“影子状态更新”“增量回填outcome”“读取影子比较结果”。首期无需新HTTP端点，测试/回放调用service即可；如DM选择新增只读接口须列清路径。
+7. daily回填复用现有调度基础或显式service回填入口，本轮不得编辑用户所有的scheduler/runner.ts或Agent文件。若自动每日调度必须改这些受保护文件，先报主管，由对应维护者整合；没有调度则如实标“可回填，尚未每日自动运行”。
+8. 对运行时数据的回放与验证只读生产源、写独立测试/影子目标。集成测试只对独立库；生产库不运行测试。
+
+#### DM 落位（2026-11-11 对齐）
+
+**迁移**：`server/migrations/0195_信号事件与观察计划.sql`（当前库内已应用到 0194，编号不冲突；只新增表）。
+
+**表与索引**
+- `strategy_signal_event`：共同信封 + 五态 + 风险列（`initial_stop`、`signal_low`、`signal_low_raw`、`confirmation_must_exceed`、`confirmation_price_cap`、`invalidation`、`risk_source`）。存续唯一索引 `(COALESCE(strategy_code, producer_code), instrument_id, condition_hash, scope) WHERE status IN ('observing','pending','triggered')`——手工来源用 `producer_code` 参与去重，不为手工虚构策略编码。
+- `strategy_signal_event_transition`：状态转移追加记录，`UNIQUE(event_id, idempotency_key)`。
+- `observation_plan`：`lifecycle_status`（draft/published/paused/ended）、`actionable`、`trigger/risk/observation_policy/evaluation_policy` JSONB、`execution_mode` 固定 `shadow`（CHECK），`UNIQUE(event_id, revision)`。
+- `strategy_signal_outcome`：`assessment_kind`（forward_diagnostic/execution_simulation）、`tradability`、`status`（pending/unavailable/not_executable/not_configured/evaluated），`UNIQUE(event_id, plan_revision, producer_code, producer_version, assessment_kind)`。
+
+**service 签名**（`server/modules/strategy-runtime/signal-events.ts`）
+- `riskObjectFromItem(item, source)`：风险对象归一。
+- `conditionHash(strategyCode, instrumentCode, triggerKind, item)`：稳定条件指纹。
+- `initialEventStatus(signalStatus)`：qualified→pending，approaching→observing。
+- `upsertSignalEvent(db, input)`：写入或续存事件，返回 `{ id, first, status, conditionHash }`；续存不重置 `first_seen/first_emitted_at/valid_from` 与风险锚。
+- `appendEventTransition(db, input)`：追加状态转移，同幂等键只记一次。
+- 计划与 outcome 入口（`observation_plan` 写入、outcome 回填）在本轮随后补，固定 shadow-only，不接真实订阅与投递。
+
+**outcome 回填触发**：本轮提供显式 service 回填入口，不自动每日运行；若需要每日调度须改 `runner.ts`（受保护文件），先报主管集成，未接入前如实标“可回填，尚未每日自动运行”。
+
+**只读接口**：本轮不新增 HTTP 端点，测试与回放直接调用 service（PM 稿第 2.6 同意）。
+
+**与 PM 稿的差异**：五态与计划状态按 PM 定稿用英文小写；事件去重键增加 `scope`，并以 `COALESCE(strategy_code, producer_code)` 覆盖手工来源；`strategy_signal_event` 额外保存 `data_as_of/available_at/input_fingerprint/rule_hash` 以支持缺口与回放。
+
+### 三、改动文件与不动范围（DM确认最终清单）
+
+优先复用并可改（执行前复核git状态）：
+
+- `server/modules/strategy-runtime/registry.ts`：注册产物适配器及契约校验；允许注册表显式列编码，不允许通用分发器按策略名if/switch。
+- `server/modules/strategy-runtime/service.ts`：把本轮产物转换委托适配器；影子入口独立，不偷偷替换旧业务路由。
+- `server/modules/strategy-runtime/types.ts`：共同契约。
+- strategy-runtime目录内必要适配器/计划/outcome service与repo（DM 实际落位）：
+  - `server/modules/strategy-runtime/signal-events.ts`（新增：事件归并、风险对象归一、五态初值、状态转移追加）。
+  - `server/modules/strategy-runtime/service.ts`（修改：落库时把风险评估器输出映射到事件；不再只取顶层 `invalidation`；按 `binding.evaluator_code/version` 传生产者身份）。
+  - 计划与 outcome 的 service 文件按第 2 节后续补，不预建插件框架。
+- 新增迁移：`server/migrations/0195_信号事件与观察计划.sql`。
+- 独立测试：`tests/server/signal-events.test.ts`（新增，7 条验收：风险映射、条件指纹、连续五日 1 事件 1 首发、失效复位、手工来源、五态初值、通用路径无策略名分支）。
+- 回放入口：沿用 `artifacts/signal-export-20261111/` 只读基准，不新增脚本。
+- 本中文bundle：PM维护业务语义，DM可补第2、3节及验收证据，不覆写其他PM段落。
+
+明确不动：server/agent/**、全部任务提示词与策略正文、页面、旧已应用迁移及其文件名、用户已有未提交文件（含scheduler/runner.ts、tests/server/helpers.ts、tests/server/migrate.test.ts等）、固定资产包与导出白名单、持仓/池/行情历史业务数据。
+
+11月11日影子阶段不拆通知、不实现盘中模型绑定；此历史边界保持作为原验收依据。11月12日仅追加一个策略的业务路由切换范围：two_year_reversal适配器、通用写入路由、计划/风险持久化、既有池service接入、通知证据关联、outcome增量回填与回滚。新通用链路仍不加策略名if/switch，策略选择在声明/注册和路由配置中完成。
+
+选择two_year_reversal的理由：当前评估器已产出signal_low及signal_low_raw，风险语义有既有正文依据，可减少价位算法变更；线上痛点明显，能验证候选/正式、重复事件和风险映射。选择它不代表已证明其alpha，也不将其改成右侧确认策略。暂不选波段，是为避免同时处理历史风险字段丢失与T+1确认的多重变化。
+
+筛选阈值、评分、名单预算、正式/接近资格、原始/复权计算、持仓退出全部保持；不得新增“企稳”“站上MA20”“固定3日持有”等条件。事件低点只按既有规则作风险锚，不能反推新入场触发。无明确入场窗口的历史记录不得借关注valid_until补齐；保留扫描合格身份与草案状态即可。
+
+按主管随后裁定，本轮只允许events_only，撤回此前准备直接切写池的范围：旧链路继续按原qualified/approaching和attention_policy写池及通知；新契约不因为风险字段齐备就把草案送入业务池。full要求完整观察计划和单写入验证，另次验收，不在本轮补定义或补历史。
+
+DM最终清单限于0198起新增三档路由及service、事件/草案计划持久化、结果回填入口与路由测试。涉及既有runner.ts/用户未提交文件时先报主管集成；不能以新建第二套调度器绕过。server/agent、提示词、页面、其他策略仍不动。
+
+full前字段级缺口（静态核对现有queryTwoYearReversalSignals与运行时；以下是责任与证据边界，不是本轮自动补字段授权）：
+
+- signal_status、missing_conditions、行业与5日收益/相对收益等筛选证据：two_year_reversal_entry_v1已有qualified/near分组与数值；统一运行时已有qualified/approaching落库。可为新生成计划引用，不得把approaching升级。冻结原记录已有者可原样映射。
+- risk.signal_low、risk.signal_low_raw：同一评估器已读取当日日线low/low_raw并输出；缺的是新契约逐价位用途、判定与证据链接的结构化落位，不需改低点算法。历史仅恢复原证据中存在的值；不能用今天行情回算后冒充原锚。
+- risk.comparison/cancel_rule（何时跌破算失效）：现行研究正文已有事件低点收盘破位的退出依据，评估器没有输出独立规则对象。未来由该策略适配器引用明确批准的规则编码与版本；这不是评估器已算漏存的数值。未成交计划是否共用该取消语义须在full前确认，不能拿持仓退出直接冒充历史入场取消规则。历史无版本/引用则不可恢复。
+- 每个价位price_basis、currency、as_of、evidence_ref：评估器已区分low/low_raw且返回共同data_date，但查询未携带bar.adjustment/逐价位数据来源；币种可引用标的目录，运行时须传递实际数据行的价基、日期与来源，不能仅看字段名就推定前复权。具备当时行情元数据与原证据时可以核验；缺快照或元数据时历史不可恢复，不能静默补默认值。
+- trigger.rule_code/version、参数、资格范围：评估器已有筛选条件与formal判断，但没有完整可执行入场规则对象；未来适配器可忠实表达既有筛选资格，不能另加企稳/MA突破作为触发。完整执行规则若正文未定义，属于需新业务定义而非补算；full之前必须单独定稿。历史不得从“正式信号”四个字倒推出执行规则。
+- trigger.window.start/end、trade_calendar：当前评估器未计算入场截止；attentionValidUntil计算的是下一开市日关注新鲜度，不能替代。若现行入场规则无明确窗口，则字段无可补算依据，须full前明确业务规则及前瞻生效时间；历史不可恢复。
+- generated_at、available_at、data_as_of：运行记录已有created/started/finished及共同数据日，评估器返回data_date；新路由应保存首次真实发出时点与数据可得时间的来源。created_at不自动等于行情可得或执行时点；历史只能引用可核验记录/给保守时间并标限制，缺事件与数据获取记录则精确时刻不可恢复。
+- producer/evaluator_version、rule_hash、input_fingerprint、source_ref：运行时绑定与评估run已有版本、策略摘要和输入指纹，信号有run_id；由运行时透传到计划，属于已有元数据未完整落位。能追到原run则恢复；历史缺原版本/输入时保留未知，不用当前正文哈希倒填。
+- evaluation_policy：next_open、1/3/5/10日、显式往返费用、同价基属于新固定前瞻诊断配置，由结果评估service落实；原策略未输出此对象，不叫历史漏算。费用必须明确，不默认免费。benchmark_coverage与tradability缺证据保持未知；超额与左尾本轮不加实现。
+- notification.plan_ref/evidence_ref、池订阅plan_ref：由未来full写入编排与通知渲染补，不属于股票评估器计算。本轮events_only不写这些旧业务对象；禁止给历史通知伪造关联。
+
+因此B分成三类：已有数值/元数据可透传、以冻结输入可复算的字段、需要新业务定义或缺历史证据无法恢复的字段。后两类没有证据就不能统称“补算”，本轮不做。
+
+### 四、验收（PM语义定稿，DM提供命令与结果）
+
+1. 手工来源提交一份完整价位计划、一份缺风险计划：完整计划pending/actionable，缺项计划observing/draft；均仅写独立目标，无自选订阅、无通知。
+2. 波段来源经适配器接入同一通用入口：initial_stop、T+1突破价与上限值/价基/窗口一致；通用入口无swing/manual名称if/switch，新增来源只注册适配器。
+3. 同一只票同一条件连续5交易日命中：保留5份证据，1个存续事件，1次first_emitted；窗口和风险锚不顺延。破位/到期后无复位不能新开；复位后再次触发允许新事件。
+4. 可行动计划风险与触发字段完整率100%；同时报告草案缺项数。生成时尚未突破的波段不能标triggered。
+5. 同幂等键重试/并发两次：不多事件/修订；行情缺失为未知，不失效；原始价与复权价混用被拒绝。
+6. pending→triggered→invalidated仍保留触发时间；未成交不生成持仓。outcome保留不同评估口径，未成熟与不可成交不记0。
+7. 影子失败、回放或重试前后池成员/关注行数及内容不变；不产生消息/邮件待发送记录，不调用投递适配器。测试用拒绝副作用的fake或独立库断言，不在生产库做破坏性对照。
+8. 冻结基准逐条对照：既有非空字段一致；新补风险字段可追到当时evidence；不可重放明确原因及计数。不得把当前规则算出来的值冒充历史值。
+
+11月12日主管裁定后的本轮events_only验收（优先于下文原full准备项）：
+
+- 仅two_year_reversal开启，事件、草案计划、outcome由新契约写；池、关注、通知及邮件继续旧链路唯一写入。full不可由本轮开关操作进入。
+- 事件合并须能逐行追到来源信号，qualified/approaching原身份保留；43只标的不自动等于43个独立事件，须给每组的来源行、首次时间、终结/复位证据与差异说明，不能简单按代码合并全部历史。
+- 风险字段完整率按新qualified原始行与独立事件两种分母分别报，逐个检查原风险值、价基/时间/来源哪些已知、哪些缺失。43/43有low数值只叫风险锚覆盖率，不等于完整risk契约覆盖率。缺字段保留草案，不补造、不阻断旧链路。
+- outcome只验分析师第1项：应到期的独立事件按首次发布修订冻结，1/3/5/10日到期结果完整率100%、重复结果0、未解释同口径差异0；未成熟不进分母，到期缺数/未配置单列，不能删掉。定义风险/收益基准缺口与不可成交未知，不假称已支持超额或可成交率。确无价基或时间则不可评估，不为达100%造配置；剩余缺口如实报主管。
+- 同一输入在独立库分别走legacy/events_only，对pool_membership、pool_attention_entry、notification_delivery、email_delivery逐行内容对照一致。生产正常调度仍会使旧链路更新，不能把跨时间的绝对行数冻结作为验收；新链路必须证明未增加任何池/投递写入。
+- 回填调用方式和触发频率列清；手工service回填不宣称每日已自动运行。原三条红测试不顺带改，主管单列其对本轮影响。
+- 两个收益质量指标（5/10日超额、10日左尾）按主管决定挂起，不用其赚钱与否替代本次路由正确性验收。
+
+以下为full将来验收的准备要求，本轮不实施、不据此扩大events_only范围：
+
+- 风险完整率分母为试点策略新产出的全部qualified行（去重前逐行核验），100%具有有效风险锚、用途/判定方式、价基、计算时点、实际生成/可得时间、来源run及evidence引用；approaching另报完整率与缺项，仍保持接近身份。不能靠改成草案或删行抬高完整率。风险完整不等于入场计划完整。
+- 价格对象明确signal_low与signal_low_raw分别对应的价基，风险锚不随重复命中下移。每个进入新写池路由的候选均关联计划或草案、事件、旧评估/信号引用；缺风险或冲突不临时补值，不进行部分名单覆盖，整批记失败并保留原池状态，进入回滚判断。
+- 同一事件重复命中仍可更新关注新鲜度以兼容旧收纳行为，但不得延长入场窗口或移动首次风险锚；持续观察、首次发现、状态变化在通知中区分，重复日不伪装成新机会。
+- 池与通知各只有一个业务生产者；新链路发布前持久化计划/事件及待投递引用，重试不重复写池/发消息。通知可追到plan_id/revision、event_id、来源run与证据及数据时间；没有行情或模型解释不能改写已有风险。
+- outcome按事件首次可得时间固定next_open、显式往返费用与同价基，回填1/3/5/10交易日。各期限成熟后evaluated，未成熟pending、缺行情unavailable、配置缺失not_configured，不记零；tradability无成交证据时unknown。固定前瞻与真实执行保持分栏。费用值和基准随分析师本轮建议定稿前，不默认免费、不启用收益比较。
+- 不需等未来10个交易日走完才能检验回填能力：以已成熟真实样本和独立库反例验计算，生产新事件正常等待成熟。验收要展示回填触发和幂等证据，只有手工调用不能标每日已运行。
+- 切换前独立库覆盖新/旧路由重试、并发切换、已提交待投递消息、半途失败回滚。证明旧链路只读且不写池/生成通知，新链路失败不清旧业务数据。其他策略输出不受影响。
+- 开关开启由主管在审阅20日差异清单后批准；PM语义验收、DM技术验证、遗留红测试的影响判定分别列出，不用测试通过冒充业务对照。
+
+### 五、影子开关与退出
+
+11月11日的shadow-only基础保持可回放；11月12日路由按主管裁定改为三档，默认legacy，mode与generation/reason在PG领域service管理，不能用全局环境开关误开其他策略。
+
+- legacy：原业务行为不变；新增自动事件/计划/outcome生产写入关闭，已存结果不删除。
+- events_only：试点策略事件、计划草案与outcome写新表，明确记录生产来源与路由generation；计划仍不可行动时不得伪published。池与通知继续原链路，新增部分不得写订阅、通知outbox或投递。旧strategy_entry_signal可继续作来源与只读兼容依据，不是第二个事件写入方。
+- full：未来完整计划驱动池/通知，旧对应业务写入必须停用。本轮路由可声明该枚举，但转换到full须被服务层明确拒绝，等待主管另次验收与字段前置条件完成；不能只有文案说“不开”。
+
+切换与回滚：仅试点策略，service以expected generation做CAS，成功时generation+1并记reason/操作时间；请求或调度运行固定一次路由代次。切代不得使同一批次在两条路由中各提交一次，靠事务/锁或代次复核保证。无须重启，旧运行不得覆盖新代次。
+
+开启events_only前，DM先把20日差异清单与独立库验证报主管；主管允许后才调用路由service切换，不由PM自动审批替代。其他策略保持legacy。
+
+回滚判据：出现旧池/通知额外变更、身份/qualified升级或风险错配、重复事件/结果、时间/价基错配、事件写入错误拖累旧业务、到期回填有未解释缺口，立即报告并停新增回填；按预备回滚操作将events_only置legacy并generation+1。回滚保留计划/事件/outcome证据，不删表、不清数据、不回退迁移。池/通知本来一直由旧链路负责，回滚无需等待补写即可继续；不重发历史通知。
+
+回滚步骤：读取当前mode/generation及在途运行 → 通过service以该generation切回legacy并填故障reason → 确认新运行仅走旧业务路径、旧代次不再提交新增事件 → 核对四张业务表无额外副作用并记录影响批次 → 保留故障与结果待查。本轮不允许自动从events_only升full。
+
+若新增写入失败，事务应保证不残留半份计划/结果，也不得导致原池清退或重复通知。具体故障隔离实现由DM列入清单，独立库验证后才切。
+
+### 六、冻结回放基准
+
+已有本机私有导出：`artifacts/signal-export-20261111/strategy_entry_signal.jsonl`，908条是待验证输入规模，不是全部独立可执行机会。DM核验文件hash并在本机报告保存；行情和结果不得复制进Git。
+
+- 第一层：归一映射回放。所有可解析行保留旧身份、qualified/approaching、生成时间/valid_from、原evidence与缺口；新契约未知字段保持未知。按来源适配器能力输出完整计划或草案，不宣称所有908条都可行动。
+- 第二层：策略重算。只有当时的评估器版本、点时输入与价格口径可重建才复算；缺任一项标不可重放（缺版本/输入/行业/价基等），不使用最新正文补历史。
+- 第三层：结果诊断。逐期限检查成熟度、起算价格、行业覆盖、成交与费用假设，缺失分开计数；本轮以手工/波段为实现试点，其余来源完整保留、明确未适配，不伪造统一策略成绩。
+- 可重放/部分可重放/不可重放须覆盖全部输入分母，且给出按来源汇总；908行数和hash不一致时先停止该基准验收，调查导出差异。
+- 足够交易日的标准先落为：波段回放覆盖该冻结集全部可获得信号日，并覆盖连续5日、窗口到期、条件复位、缺数等场景。是否足够支持live切换另行验收；本轮不允许因回放通过自动切换。
+
+11月12日试点20日对照补充：
+
+- 截止点冻结为取数时最近一个已完成收盘且数据齐备的交易日，向前取20个开市日；当前11月12日上午不能把11月12日算作已完成。DM已报10月16日至11月12日的窗口须标明取数截至并校正，不能仅取is_open=true且日期不晚于今天。按校正窗口重报实际行数，不强求仍为87行。
+- 对照单位为来源行/run及其数据时点；旧qualified/approaching、代码、风险原值、原因、数据缺口逐行配对。新事件归并单列映射表；无信号/失败/缺数的日期也列出，不能只报19个有信号日冒充20日全覆盖。
+- 每条差异记录旧值/新值、来源引用、差异类型与说明：预期归并、明确缺字段、不可核验历史、或阻断错误。身份/风险错配、状态升级、无依据窗口或价基归为阻断；“数据不足”可解释但不等于计划已完整。
+- 新旧运行时对照与历史策略重算分开。现有历史证据不足不作策略一致性承诺；冻结输入可证明的字段比较值，未知字段保持未知。明示历史归并不具备终结/复位证据的组，不能仅因同票就宣称已证明一个事件。
+- 未解释差异0并不自动授权full或宣称risk完整率100%。本轮对缺字段的明确草案分类可接受；主管裁定允许events_only后才开对应路由，后续真实新输出保留完整证据供前瞻检验。
+- 报告、原始信号及逐行diff均在忽略的本机目录，Git只保存规则和脚本；禁止将真实样本再次硬编码测试源码。
+
+### 六、交付与验收状态
+
+- 契约字段、存储、影子开关与冻结回放基准以本文前五节为准；早期交付过程和逐次复核记录已随 2026-11-23 清理移除，追溯使用 Git 历史。
+- 影子模式的写入由 `HISTOCK_SHADOW_SIGNAL_EVENTS` 控制，默认关闭；开启前必须由主管确认差异清单，未确认前不得打开生产开关。
+- 已有的手工影子草案、波段评估影子计划与固定前瞻诊断只用于对照，不证明计划实际触发成交，tradability 保持 unknown；没有基准超额的结果不得用于跨策略排名。

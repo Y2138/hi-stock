@@ -128,7 +128,7 @@ export function renderModelDegradationNotice(degradation: ModelDegradation): str
   return `> 降级运行：${degradation.from} → ${degradation.to}（原因：${labels[degradation.kind] ?? degradation.kind}，${stamp}）`;
 }
 
-/** 允许模型降级的任务（specs/模型降级与首token兜底/状态.md 第四节）；本轮只开板块机会筛选。 */
+/** 允许模型降级的任务（docs/product/智能助手与模型接入.md 第四节）；本轮只开板块机会筛选。 */
 export const MODEL_FALLBACK_JOBS = new Set(["nightly_sector_opportunity_scan"]);
 /** 盘前类任务：09:15 之后不再降级，避免产出过期报告。 */
 const PRE_MARKET_JOBS = new Set(["pre_market_news_scan", "daily_plan_flow", "evening_plan_preview"]);

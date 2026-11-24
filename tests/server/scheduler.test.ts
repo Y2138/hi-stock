@@ -856,7 +856,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       cron: "20 17 * * 5", agent_role: "data_pipeline", enabled: true,
     });
     expect(jobs.find((job) => job.code === "copper_left_launch_signal_scan")).toMatchObject({
-      cron: "35 17 * * 1-5", strategy_code: "copper_left_launch", agent_role: "strategy_entry_report", enabled: true,
+      cron: "35 17 * * 1-5", strategy_code: "copper_left_launch", agent_role: "strategy_entry_report", enabled: false,
     });
     for (const code of ["copper_inventory_signal_review", "lithium_warehouse_signal_review", "commodity_lithium_warehouse_sync"]) {
       expect(jobs.find((job) => job.code === code)).toBeUndefined();
@@ -1245,6 +1245,7 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       queueManualJob(pool, "daily_data_update", undefined, new Date("2026-08-21T01:00:00Z")),
     ).rejects.toMatchObject({ message: expect.stringContaining("尚未收盘") });
     expect(Number((await pool.query("SELECT count(*) FROM job_run")).rows[0]!.count)).toBe(0);
+    await pool.query("INSERT INTO market_trading_day (trade_date,is_open,source) VALUES ('2026-08-20',true,'test') ON CONFLICT DO NOTHING");
 
     const historical = await queueManualJob(
       pool,
@@ -1255,9 +1256,12 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
     expect(historical.target_date).toBe("2026-08-20");
   });
 
-  it("交易日历缺行时工作日继续取实际行情，周末仍跳过", async () => {
-    await expect(dailyMarketGate(pool, "2026-08-24", new Date("2026-08-24T08:00:00Z")))
-      .resolves.toEqual({ action: "run", mode: "snapshot" });
+  it("历史目标日缺日历时拒绝，未来缺日历时允许降级", async () => {
+    await expect(dailyMarketGate(pool, "2026-08-22", new Date("2026-08-24T08:00:00Z")))
+      .resolves.toEqual({ action: "reject", reason: "目标日 2026-08-22 缺少交易日历记录，拒绝按工作日推测" });
+    await expect(dailyMarketGate(pool, "2026-08-24", new Date("2026-08-25T08:00:00Z")))
+      .resolves.toEqual({ action: "reject", reason: "目标日 2026-08-24 缺少交易日历记录，拒绝按工作日推测" });
+    await pool.query("INSERT INTO market_trading_day (trade_date,is_open,source) VALUES ('2026-08-22',false,'test') ON CONFLICT DO NOTHING");
     await expect(dailyMarketGate(pool, "2026-08-22", new Date("2026-08-24T08:00:00Z")))
       .resolves.toEqual({ action: "skip", reason: "目标日 2026-08-22 为非交易日" });
   });
@@ -2331,7 +2335,8 @@ describe.skipIf(!prepared)("M3 作业调度与 Runner", () => {
       "SELECT output_type, markdown, strategy_change_seq::text, strategy_snapshot_hash FROM job_run_output WHERE run_id = $1",
       [run.id],
     );
-    expect(output.rows[0]).toMatchObject({ output_type: "daily_plan", strategy_change_seq: "0" });
+    const state = (await pool.query<{ change_seq: string; current_hash: string }>("SELECT change_seq::text,current_hash FROM strategy_state WHERE singleton=1")).rows[0]!;
+    expect(output.rows[0]).toMatchObject({ output_type: "daily_plan", strategy_change_seq: state.change_seq, strategy_snapshot_hash: state.current_hash });
     expect(output.rows[0]!.markdown).toContain("# 测试结果");
     expect(output.rows[0]!.strategy_snapshot_hash).toMatch(/^[a-f0-9]{64}$/);
   });
