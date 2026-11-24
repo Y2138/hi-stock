@@ -22,7 +22,7 @@ export interface AgentCoreFrame {
   data: Record<string, unknown>;
 }
 
-/** 模型层失败分类（specs/模型降级与首token兜底/状态.md 第二节）：只有这三类触发降级。 */
+/** 模型层失败分类（docs/product/智能助手与模型接入.md 第二节）：只有这三类触发降级。 */
 export type ModelFailureKind = "zero_token" | "stream_interrupted" | "watchdog";
 
 /** 看门狗：600 秒没有任何文本增量即判连接卡死（600 = 观测到的最长成功首字 562 秒 + 余量）。 */

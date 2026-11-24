@@ -1,5 +1,5 @@
 // 行情与标的档案查询 repo：instrument 检索、market_bar 读库、coverage 对账摘要
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §4.1、§十
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §4.1、§十
 import type pg from "pg";
 
 /** 可查询对象：连接池或事务内客户端（结构化类型，二者均满足） */
@@ -241,6 +241,15 @@ export async function listTradingCalendar(
 }
 
 /** 行情覆盖摘要：按 freq 分组的标的数量、最早/最晚 bar_date、总行数 */
+/** 删除已确认的休市日错误日线；调用方必须显式传入 freq 和日期，避免扩大范围。 */
+export async function deleteInvalidDailyBars(db: Db, barDate: string): Promise<number> {
+  const result = await db.query(
+    "DELETE FROM market_bar WHERE freq='day' AND bar_date=$1::date",
+    [barDate],
+  );
+  return result.rowCount ?? 0;
+}
+
 export async function marketCoverage(db: Db): Promise<CoverageRow[]> {
   const r = await db.query<CoverageRow>(
     `SELECT bar.freq, count(DISTINCT bar.instrument_id)::int AS instrument_count,

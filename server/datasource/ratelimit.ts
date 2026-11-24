@@ -1,5 +1,5 @@
 // 限流与重试：串行间隔限流器 + 指数退避
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §5.2
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §5.2
 // 批量请求串行且间隔不小于 3 秒；仅瞬时错误按调用方判定执行有界指数退避。
 
 export type SleepFn = (ms: number, signal?: AbortSignal) => Promise<void>;

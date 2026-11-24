@@ -1,5 +1,5 @@
 // 会话事件总线：数据库事件是可重放事实，进程内总线只负责低延迟续流。
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §6.4
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §6.4
 // 决定（二选一）：确认结果经独立的 GET /api/chat/:sessionId/events 长连 SSE 推送，
 // 不依赖“下一条消息流携带”；消息流自身只携带本轮 text/tool_*/confirmation_pending/done/error 帧。
 import type { Db } from "./repo.js";

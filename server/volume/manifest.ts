@@ -1,5 +1,5 @@
 // 数据卷 manifest：生成与校验
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §九
 // manifest 内容：导出时间、每表行数、market_bar 各 freq 的 min/max bar_date、manifest sha256。
 import crypto from "node:crypto";
 import type { Db } from "../datasource/service.js";

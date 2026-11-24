@@ -1,5 +1,5 @@
 // 数据卷与安全初始化包测试
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九、§十二
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §九、§十二
 // - volume：stock_test 导出 → 恢复到 stock_test_restore → 校验通过；篡改 manifest 后校验失败；
 // - 无库或无 pg_dump/pg_restore（本机或 docker）时 skip 并打印原因（沿用一期模式）。
 import fs from "node:fs/promises";

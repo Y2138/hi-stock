@@ -1,6 +1,8 @@
 // 行情与标的档案 HTTP 路由处理
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §十
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §十
 import type pg from "pg";
+import { queryIndustryCoverage } from "./industry-coverage.js";
+import { queryStockResearch } from "./research.js";
 import { ApiError, apiErrors } from "../../http/router.js";
 import { resolveRemoteTicker } from "../../datasource/catalog-service.js";
 import { fetchKline } from "../../datasource/hithink.js";
@@ -153,6 +155,16 @@ async function resolveOnDemandInstrument(pool: pg.Pool, code: string): Promise<O
 }
 
 export const marketRoutes = {
+  /** GET /api/market/research：只读本库，不触发抓取、登记或回填。 */
+  async research({ pool, query }: Ctx) {
+    const rawCodes = query.get("codes")?.split(",").map(code => code.trim()) ?? [];
+    if (!rawCodes.length || rawCodes.length > 50 || rawCodes.some(code => !/^\d{6}\.(SH|SZ|BJ)$/.test(code))) {
+      throw apiErrors.badRequest("codes 必须为1–50个完整A股代码");
+    }
+    const date = parseDateOpt(query.get("date"), "date");
+    if (!date) throw apiErrors.badRequest("缺少 date（YYYY-MM-DD）");
+    return { data: await queryStockResearch(pool, [...new Set(rawCodes)], date) };
+  },
   /** GET /api/instruments?kind=&q=：标的检索（命令面板/选择器） */
   async search({ pool, query }: Ctx) {
     const kindRaw = query.get("kind");
@@ -344,7 +356,15 @@ export const marketRoutes = {
   },
 
   /** GET /api/market/coverage：行情覆盖对账摘要（按 freq 分组） */
-  async coverage({ pool }: Ctx) {
+  async coverage({ pool, query }: Ctx) {
+    if (query.has("codes") || query.has("target_date")) {
+      const codes = [...new Set((query.get("codes") ?? "").split(",").map(code => code.trim().toUpperCase()).filter(Boolean))];
+      const target = parseDateOpt(query.get("target_date"), "target_date");
+      if (!target || !codes.length || codes.length > 100 || codes.some(code => !/^(881|884)\d{3}\.TI$/.test(code))) {
+        throw apiErrors.badRequest("行业覆盖须提供 codes（1..100 个 881/884 行业代码，以逗号分隔）及 target_date=YYYY-MM-DD");
+      }
+      return { data: await queryIndustryCoverage(pool, codes, target) };
+    }
     return { data: await marketCoverage(pool) };
   },
 };

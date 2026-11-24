@@ -1,5 +1,5 @@
 // 数据卷 HTTP 路由：快照列表、手动导出、恢复（只追加，复用 export.ts/restore.ts）
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九、§十
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §九、§十
 // 恢复为破坏性操作：这里强制参数校验（路径必须落在仓库根目录内且文件存在），
 // 二次确认与警告文案在 web 侧（数据与同步页）。
 import fs from "node:fs/promises";

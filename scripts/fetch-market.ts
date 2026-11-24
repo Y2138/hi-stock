@@ -3,7 +3,7 @@
 //   npm run market:fetch -- --code 000636.SZ --freq day --start 2026-01-01 --end 2026-08-16 [--name 风华高科]
 //   npm run market:fetch -- --code CU0 --freq futures_day --start 2026-01-01 --end 2026-08-16
 //   npm run market:fetch -- --code 000636.SZ --freq 30m --start 2026-08-01 --end 2026-08-16
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §五
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §五
 import { loadConfig } from "../server/config.js";
 import { closePool, getPool } from "../server/db/client.js";
 import { fetchAndStore } from "../server/datasource/service.js";

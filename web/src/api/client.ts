@@ -1,5 +1,5 @@
 // API 客户端：统一 fetch 封装与错误形状；API 未就绪/服务未启动时优雅降级，不抛裸异常
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §三
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §三
 import { appMessage } from "../stores/message";
 
 export interface ApiOk<T> {

@@ -1,5 +1,5 @@
 // CLI：恢复数据卷快照（npm run volume:restore -- <dump路径> [-- --target <连接串>] [-- --data-only]）
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §九
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §九
 // 默认要求目标库为空库（不存在则自动创建）；恢复后强制校验 manifest vs 库内计数，
 // 不一致列出差异并非零退出，不静默通过。
 import path from "node:path";

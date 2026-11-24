@@ -1,13 +1,15 @@
 // datasource 服务：通道编排（扶摇 → 新浪/东财受控降级）、
 // market_bar 幂等落库、MA5/10/20/60 补算、market_fetch_run 留痕、每日更新链路。
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §5.1、§5.4
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §5.1、§5.4
 import type pg from "pg";
+import { queueMissingDailyIndicators } from "../indicators/service.js";
 import {
   HithinkChannel,
   HithinkEnvelopeError,
   HithinkHttpError,
   fetchRawStockDaily,
   fetchLatestFundamental,
+  fetchFundamentalHistory,
   fetchSnapshot,
   fetchValuationSnapshots,
   snapshotDate,
@@ -87,6 +89,36 @@ export async function storeBars(
   options: { markIndicator?: boolean } = {},
 ): Promise<number> {
   if (bars.length === 0) return 0;
+  if (freq === "day") {
+    const dates = [...new Set(bars.map((bar) => bar.date))];
+    const calendar = await db.query<{ trade_date: string; is_open: boolean }>(
+      `SELECT trade_date::text, is_open FROM market_trading_day WHERE trade_date = ANY($1::date[])`, [dates],
+    );
+    const byDate = new Map(calendar.rows.map((row) => [row.trade_date, row.is_open]));
+    const invalidDates = dates.filter((date) => byDate.get(date) !== true);
+    if (invalidDates.length) {
+      const gaps = invalidDates.map((date) => ({ code: "*", freq, date, reason: byDate.has(date) ? "交易日历标记为非交易日" : "缺少交易日历记录" }));
+      await insertFetchRun(db, { channel, scope: { freq, dates: invalidDates }, rowsWritten: 0, gaps });
+      throw new Error(`日线写入被拒绝：${invalidDates.join(",")} 不具备有效交易日历`);
+    }
+    const duplicateDates: string[] = [];
+    for (const date of dates) {
+      const previous = (await db.query<{ date: string; open: number; high: number; low: number; close: number; volume: number | null }>(
+        `SELECT bar.bar_date::text AS date,bar.open::float,bar.high::float,bar.low::float,bar.close::float,bar.volume::float
+           FROM market_bar bar JOIN market_trading_day day ON day.trade_date=bar.bar_date AND day.is_open=true
+          WHERE bar.instrument_id=$1 AND bar.freq='day' AND bar.bar_date < $2::date
+          ORDER BY bar.bar_date DESC LIMIT 1`,
+        [instrumentId, date],
+      )).rows[0];
+      const current = bars.find((bar) => bar.date === date);
+      if (previous && current && previous.open === current.open && previous.high === current.high && previous.low === current.low && previous.close === current.close && (previous.volume ?? null) === (current.volume ?? null)) duplicateDates.push(date);
+    }
+    if (duplicateDates.length) {
+      const gaps = duplicateDates.map((date) => ({ code: instrumentId, freq, date, reason: "suspected_duplicate：与前一已落库日线OHLCV完全一致" }));
+      await insertFetchRun(db, { channel, scope: { instrument_id: instrumentId, freq, dates: duplicateDates }, rowsWritten: 0, gaps });
+      throw new Error(`日线写入疑似重复数据：${duplicateDates.join(",")}`);
+    }
+  }
   const dates: string[] = [];
   const times: string[] = [];
   const opens: number[] = [];
@@ -350,6 +382,53 @@ export async function fetchFinancialAndStore(
     fetchRunId,
     gaps,
   };
+}
+
+/** 研究台账多期财务：只写带真实报告日的共同报告期（数据截至的报告日，不是首次披露日），估值仍走既有最新快照服务。 */
+export async function fetchFundamentalHistoryAndStore(
+  db: Db,
+  request: FinancialFetchRequest,
+  deps: Pick<ServiceDeps, "hithinkDeps" | "jobRunId"> = {},
+) {
+  if (!/^\d{6}\.(SH|SZ|BJ)$/.test(request.code)) throw new Error("基本面需要完整A股代码");
+  const instrumentId = await ensureInstrument(db, request.code, undefined, "day");
+  const gaps: unknown[] = [];
+  let rowsWritten = 0;
+  try {
+    const history = await fetchFundamentalHistory(request.code, hithinkDeps(db, deps), 8);
+    gaps.push(...history.gaps);
+    if (history.quotes.length < 8) gaps.push({ reason: "可用共同报告期不足8期", available_periods: history.quotes.length });
+    for (const quote of history.quotes) {
+      const result = await db.query(
+        `INSERT INTO fundamental_snapshot
+           (instrument_id, as_of_date, report_period, revenue, net_profit, operating_cashflow,
+            roe, gross_margin, debt_ratio, source, raw_summary)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'hithink',$10)
+         ON CONFLICT (instrument_id, as_of_date, report_period) DO UPDATE SET
+           revenue=EXCLUDED.revenue, net_profit=EXCLUDED.net_profit,
+           operating_cashflow=EXCLUDED.operating_cashflow, roe=EXCLUDED.roe,
+           gross_margin=EXCLUDED.gross_margin, debt_ratio=EXCLUDED.debt_ratio,
+           source=EXCLUDED.source, raw_summary=EXCLUDED.raw_summary`,
+        [instrumentId, quote.asOfDate, quote.reportPeriod, quote.revenue, quote.netProfit,
+          quote.operatingCashflow, quote.roe, quote.grossMargin, quote.debtRatio, JSON.stringify(quote.rawSummary)],
+      );
+      rowsWritten += result.rowCount ?? 0;
+    }
+  } catch (error) {
+    // 上游正文可能回显凭据；持久化只保留安全类别与数值码。
+    gaps.push({ reason: error instanceof HithinkEnvelopeError ? "upstream_failed"
+      : error instanceof HithinkHttpError ? "http_failed" : "fetch_or_storage_failed",
+      ...(error instanceof HithinkEnvelopeError ? { code: error.code } : {}),
+      ...(error instanceof HithinkHttpError ? { http_status: error.status } : {}),
+    });
+  }
+  const fetchRunId = await insertFetchRun(db, {
+    channel: "hithink", scope: { instruments: [request.code], op: "fundamental_history", periods: 8 },
+    rowsWritten, gaps, jobRunId: deps.jobRunId,
+  });
+  if (!rowsWritten) throw new Error(`历史财务未写入（market_fetch_run #${fetchRunId} 已留痕）`);
+  return { code: request.code, status: gaps.length ? "partial" as const : "success" as const,
+    rowsWritten, fundamentalRows: rowsWritten, fetchRunId, gaps };
 }
 
 /**
@@ -649,7 +728,7 @@ export async function dailyMarketUpdate(
   };
   const maDirty = new Map<string, string>();
   const refetchAllowed = new Set(scope.refetchCodes ?? scope.codes);
-  // 指标与均线只对信号相关范围计算；宽域标的的指标交由每周全市场重算任务分批补齐。
+  // 信号相关范围即时触发指标；宽域标的在日更收尾差集对账时统一补入 worker 队列。
   const indicatorAllowed = new Set(scope.indicatorCodes ?? scope.codes);
   const previousOpen = scope.dayMode === "historical" ? null : await db.query<{ date: string | null }>(
     `SELECT max(trade_date)::text AS date
@@ -830,5 +909,18 @@ export async function dailyMarketUpdate(
     }
   }
 
+  // 在所有日线写入结束后对账，避免宽域 markIndicator=false 标的等到周维护才补算。
+  try {
+    const queued = await queueMissingDailyIndicators(db, scope.date);
+    summary.fetchRunIds.push(await insertFetchRun(db, {
+      channel: "indicator_reconciliation",
+      scope: { freq: "day", date: scope.date, op: "missing_indicator_requeue", queued_count: queued },
+      rowsWritten: 0,
+      gaps: [],
+      jobRunId: deps.jobRunId,
+    }));
+  } catch (error) {
+    summary.gaps.push({ code: "*", freq: "day", reason: `指标收尾对账失败: ${(error as Error).message}` });
+  }
   return summary;
 }

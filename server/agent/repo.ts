@@ -1,5 +1,5 @@
 // 对话 repo：chat_session / chat_message / chat_attachment / agent_tool_audit 读写
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §4.2、§6.1
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §4.2、§6.1
 // chat_message.content 存 pi AgentMessage 纯 JSON；role 列只做检索映射（toolResult→tool）。
 import type pg from "pg";
 import { inServiceTransaction, type TransactionDb } from "../db/transaction.js";

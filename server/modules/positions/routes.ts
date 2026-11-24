@@ -1,5 +1,5 @@
 // 持仓 HTTP 路由处理：当前持仓与变更事件流。
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §十；产品方案 §6.6
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §十；产品方案 §6.6
 import type pg from "pg";
 import { apiErrors } from "../../http/router.js";
 import { getRealizedPnlSummary, listPositionChanges, listPositions } from "./repo.js";

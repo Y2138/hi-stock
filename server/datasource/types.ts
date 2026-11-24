@@ -1,5 +1,5 @@
 // datasource 通道抽象类型
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §5.1
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §5.1
 
 /** 行情频率（与 market_bar.freq CHECK 约束一致） */
 export type MarketFreq = "day" | "30m" | "futures_day";

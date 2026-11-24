@@ -1,5 +1,5 @@
 // 确认制（T5）：提案写入 / approve（执行真实写入 + 回填 result + 审计）/ reject / 超时 expired
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §6.3
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §6.3
 // - 领域写工具 execute 不直接写库，只写 confirmation(status='pending') 返回提案；
 // - approve 在事务内锁定提案行，再取得数据库级 Agent 写锁；领域 service 的业务变更、
 //   result 回填与审计同事务提交，旧提案目标状态已变化时拒绝执行；reject 只留审计；

@@ -1,5 +1,5 @@
 // datasource 模块测试：通道选择、降级留痕、限流间隔、退避重试、幂等落库、MA 计算、market_fetch_run 记录
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v2.0.md §五、§十二
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §五、§十二
 // 所有外部 HTTP 均 mock（vi.stubGlobal fetch），不依赖真实网络；DB 用例使用 stock_test 库。
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type pg from "pg";
@@ -14,6 +14,8 @@ import {
   fetchRawStockDaily,
   fetchSnapshot,
   fetchCorporateActions,
+  fetchLatestFundamental,
+  fetchFundamentalHistory,
 } from "../../server/datasource/hithink.js";
 import { fetchAllTickers, fetchTickerPage, fetchTradingDays } from "../../server/datasource/hithink-meta.js";
 import { fetchBoardCatalog, fetchBoardConstituents } from "../../server/datasource/hithink-boards.js";
@@ -34,7 +36,7 @@ import {
   calculateStockCharacterProfile,
   STOCK_CHARACTER_CALCULATION_VERSION,
 } from "../../server/indicators/formulas.js";
-import { recomputeIndicatorSeries } from "../../server/indicators/service.js";
+import { queueMissingDailyIndicators, recomputeIndicatorSeries } from "../../server/indicators/service.js";
 import { repairInvalidForwardOhlc } from "../../server/datasource/forward-ohlc-repair.js";
 import { buildOnDemandBars } from "../../server/modules/market/routes.js";
 import { queryMarketStructure } from "../../server/modules/market/structure.js";
@@ -57,6 +59,7 @@ import {
   fetchAndStore,
   fillRawStockDaily,
   fetchFinancialAndStore,
+  fetchFundamentalHistoryAndStore,
   storeBars,
 } from "../../server/datasource/service.js";
 import type { Bar, Channel, FetchRequest } from "../../server/datasource/types.js";
@@ -889,6 +892,9 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     pool = prepared!.pool;
     await resetSchema(pool);
     await runMigrations(pool);
+    // 数据源单测使用合成日期窗口；生产写入门禁仍以真实交易日历为准。
+    await pool.query(`INSERT INTO market_trading_day (trade_date,is_open,source)
+      SELECT d::date,true,'test' FROM generate_series('2026-01-01'::date,'2026-12-31'::date,'1 day') d`);
   });
 
   afterAll(async () => {
@@ -1033,6 +1039,39 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       report_period: "2025-12-31",
     }]);
     expect(mock).toHaveBeenCalledTimes(8);
+  });
+
+  it("多期财务保存真实报告日（非首次披露日）、缺失期留痕、旧入口默认4期不变", async () => {
+    const periods = ['2025-12-31','2025-09-30','2025-06-30','2025-03-31','2024-12-31','2024-09-30','2024-06-30','2024-03-31'];
+    const limits: number[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) => {
+      const parsed = new URL(String(url));
+      limits.push(Number(parsed.searchParams.get('limit')));
+      return jsonResponse({ code: 0, data: { item: periods.map(period => ({
+        period_end_ms: Date.parse(`${period}T00:00:00+08:00`),
+        report_date_ms: Date.parse(`${Number(period.slice(0,4))+1}-04-28T00:00:00+08:00`),
+        operating_income: 100, operating_costs: 60, net_profit: 10,
+        assets_total: 200, total_debt: 50, holder_equity_total: 150, act_cash_flow_net: 15,
+      })) } });
+    }));
+    await fetchLatestFundamental('990003.SH', noWait);
+    expect(limits).toEqual([4,4,4]);
+    limits.length = 0;
+    const outcome = await fetchFundamentalHistoryAndStore(pool, { code: '990003.SH' }, { hithinkDeps: noWait });
+    expect(outcome).toMatchObject({ status: 'success', rowsWritten: 8 });
+    expect(limits).toEqual([8,8,8]);
+    await fetchFundamentalHistoryAndStore(pool, { code: '990003.SH' }, { hithinkDeps: noWait });
+    const saved = await pool.query(`SELECT count(*)::int n FROM fundamental_snapshot f JOIN market_instrument i ON i.id=f.instrument_id WHERE i.code='990003.SH'`);
+    expect(saved.rows[0].n).toBe(8);
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ code: 0, data: { item: [{ period_end_ms: Date.parse('2025-09-30T00:00:00+08:00'), report_date_ms: null }] } })));
+    const invalid = await fetchFundamentalHistory('990003.SH', noWait);
+    expect(invalid.quotes).toEqual([]);
+    expect(invalid.gaps[0]!.reason).toContain('披露日缺失');
+    await expect(fetchFundamentalHistoryAndStore(pool, { code: '990003.SH' }, { hithinkDeps: noWait })).rejects.toThrow('已留痕');
+    const runs = await pool.query("SELECT rows_written, gaps FROM market_fetch_run WHERE scope->>'op'='fundamental_history' ORDER BY id DESC LIMIT 1");
+    expect(runs.rows[0].rows_written).toBe(0);
+    expect(runs.rows[0].gaps.length).toBeGreaterThan(0);
+    vi.unstubAllGlobals();
   });
 
   it("商品期货点时数据通过领域服务幂等保存且历史修订不被覆盖", async () => {
@@ -1564,7 +1603,8 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
         });
       }
       if (parsed.pathname === "/api/a-share/prices/historical") {
-        expect(parsed.searchParams.get("thscode")).toBe(missingCode);
+        const code = parsed.searchParams.get("thscode");
+        expect([missingCode, continuousCode]).toContain(code);
         return jsonResponse(klinePayload(["2026-09-04", targetDate], [10.5, 11]));
       }
       throw new Error(`未预期的 URL: ${parsed}`);
@@ -1578,8 +1618,8 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     );
 
     expect(summary.gaps).toEqual([]);
-    expect(summary.refetched).toEqual([missingCode]);
-    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/historical"))).toHaveLength(1);
+    expect(summary.refetched).toEqual([missingCode, continuousCode]);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/historical"))).toHaveLength(2);
     expect(Number((await pool.query(
       `SELECT count(*) FROM market_bar bar JOIN market_instrument instrument ON instrument.id = bar.instrument_id
         WHERE instrument.code = $1 AND bar.freq = 'day' AND bar.bar_date = '2026-09-04'`,
@@ -2074,6 +2114,7 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
   });
 
   it("行情 upsert 与指标 dirty 原子提交，generation 递增后按近六年窗口全量重算", async () => {
+    await pool.query("DELETE FROM market_bar WHERE freq='day'");
     const instrumentId = await ensureInstrument(pool, "601999.SH", "指标测试股票", "day");
     await pool.query(
       `INSERT INTO market_bar
@@ -2083,7 +2124,7 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     );
     const bars = indicatorFixture.input.map((close, index) => {
       const date = new Date(Date.UTC(2026, 0, 1 + index)).toISOString().slice(0, 10);
-      return { date, open: close, high: close + 1, low: close - 1, close, volume: 1000, adjustment: "forward" as const };
+      return { date, open: close + (index === 0 ? 0.1 : 0), high: close + 1, low: close - 1, close, volume: 1000, adjustment: "forward" as const };
     });
     await storeBars(pool, instrumentId, "day", bars, "test");
     const firstDirty = await pool.query<{ generation: string; earliest_date: string }>(
@@ -2145,6 +2186,26 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
     )).rows[0]!.count)).toBe(0);
   });
 
+  it("日更收尾补排宽域缺指标序列，重复对账不改 generation，完成后不再入队", async () => {
+    const date = "2026-12-30";
+    const id = await ensureInstrument(pool, "990901.SH", "收尾对账样本", "day");
+    await storeBars(pool, id, "day", [{ date, open: 10, high: 11, low: 9, close: 10.5, volume: 100, adjustment: "forward" }], "test", { markIndicator: false });
+    const summary = await dailyMarketUpdate(pool, { date, codes: [], indicatorCodes: [] });
+    expect(summary.gaps).toEqual([]);
+    const reconciliation = (await pool.query("SELECT scope,rows_written FROM market_fetch_run WHERE id=ANY($1::bigint[]) AND scope->>'op'='missing_indicator_requeue'", [summary.fetchRunIds])).rows;
+    expect(reconciliation).toEqual([{ scope: { freq: "day", date, op: "missing_indicator_requeue", queued_count: 1 }, rows_written: 0 }]);
+    const dirty = (await pool.query<{ instrument_id: string; freq: "day"; generation: string }>(
+      "SELECT instrument_id::text,freq,generation::text FROM market_indicator_dirty WHERE instrument_id=$1 AND freq='day'", [id],
+    )).rows[0]!;
+    expect(dirty.generation).toBe("1");
+    expect(await queueMissingDailyIndicators(pool, date)).toBe(0);
+    expect((await pool.query("SELECT generation::text FROM market_indicator_dirty WHERE instrument_id=$1 AND freq='day'", [id])).rows[0].generation).toBe("1");
+    expect(await recomputeIndicatorSeries(pool, dirty)).toMatchObject({ status: "success", rowCount: 1 });
+    expect(await queueMissingDailyIndicators(pool, date)).toBe(0);
+    expect((await pool.query("SELECT count(*)::int n FROM market_indicator_value WHERE instrument_id=$1 AND bar_date=$2", [id, date])).rows[0].n).toBe(1);
+    await expect(queueMissingDailyIndicators(pool, "2026-02-30")).rejects.toThrow("目标日");
+  });
+
   it("按公司行为修复负前复权比率导致的倒置 OHLC，不更改收盘价或原始价", async () => {
     const code = "600488.SH";
     const instrumentId = await ensureInstrument(pool, code, "复权修复样本", "day");
@@ -2169,6 +2230,18 @@ describe.skipIf(!prepared)("datasource 服务（stock_test）", () => {
       "SELECT reason FROM market_indicator_dirty WHERE instrument_id=$1 AND freq='day'", [instrumentId],
     )).rows[0]).toEqual({ reason: "前复权 OHLC 修复" });
     expect(await repairInvalidForwardOhlc(pool, [{ code, events }])).toEqual([{ code, repaired: 0 }]);
+  });
+
+  it("日线与前一有效交易日 OHLCV 完全一致时拒写并记 suspected_duplicate", async () => {
+    const instrumentId = await ensureInstrument(pool, "600499.SH", "重复日线测试", "day");
+    await pool.query("INSERT INTO market_trading_day (trade_date,is_open,source) VALUES ('2026-08-20',true,'test'),('2026-08-21',true,'test') ON CONFLICT DO NOTHING");
+    await pool.query(`INSERT INTO market_bar (instrument_id,freq,bar_date,bar_time,open,high,low,close,volume,channel)
+      VALUES ($1,'day','2026-08-20','2026-08-20T00:00:00Z',10,11,9,10,1000,'test')`, [instrumentId]);
+    await expect(storeBars(pool, instrumentId, "day", [{ date: "2026-08-21", open: 10, high: 11, low: 9, close: 10, volume: 1000 }], "test"))
+      .rejects.toThrow("疑似重复数据");
+    expect((await pool.query<{ gaps: unknown }>("SELECT gaps FROM market_fetch_run WHERE rows_written=0 ORDER BY id DESC LIMIT 1")).rows[0]!.gaps).toEqual([
+      { code: instrumentId, freq: "day", date: "2026-08-21", reason: "suspected_duplicate：与前一已落库日线OHLCV完全一致" },
+    ]);
   });
 
   it("历史零价日线标为不可信且不阻塞指标队列", async () => {

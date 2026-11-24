@@ -1,5 +1,5 @@
 // 服务端配置：读取 DATABASE_URL / PORT，只加载仓库根目录的 .env.local
-// 设计契约：docs/design/Stock_策略演进系统_技术设计_v1.0.md §2、§八
+// 设计契约：docs/product/Stock_策略演进系统_产品方案_v2.0.md §2、§八
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
